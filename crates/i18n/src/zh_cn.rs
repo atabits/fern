@@ -291,6 +291,8 @@ pub static ZH_CN: Strings = Strings {
     confirm_delete_task_template: "确定要删除这个模板吗？",
     confirm_delete_script: "确定要删除这个脚本吗？",
     confirm_delete_attachment: "确定要删除这个附件吗？",
+    confirm_delete_comment: "确定要删除这条评论吗？",
+    confirm_delete_focus_record: "确定要删除这条专注记录吗？",
     unit_letters: ["年", "月", "日"],
     countdown_date: None,
     dotted_dates: false,

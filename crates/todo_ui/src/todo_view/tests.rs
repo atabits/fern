@@ -2221,3 +2221,108 @@ fn list_section_and_template_delete_require_confirmation_and_summary_focus(cx: &
         assert!(view.read(cx).summary.read(cx).focus_handle(cx).is_focused(window));
     });
 }
+
+#[gpui::test]
+fn escape_in_filter_modal_and_kanban_quick_add_clears_or_restores_focus(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let list = store.create_list("Work").unwrap();
+    let sec = store.add_list_section(Some(list.id), "Todo").unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    cx.run_until_parked();
+
+    // 1. Smart Filter modal: first Escape dismisses nested popup; second Escape from name input
+    //    closes the modal and restores previous focus.
+    let previous = cx.update(|window, cx| window.focused(cx).expect("quick-add field is focused"));
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.open_filter_edit(None, window, cx);
+            v.set_filter_advanced(true, window, cx);
+            let edit = v.filter_edit.as_mut().expect("filter dialog opens");
+            edit.examples_open = true;
+            assert!(edit.name_focus(cx).is_focused(window));
+        });
+    });
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| {
+        let edit = view.read(cx).filter_edit.as_ref().expect("filter dialog remains open");
+        assert!(!edit.examples_open, "first Escape dismisses nested examples popup");
+        assert!(edit.name_focus(cx).is_focused(window));
+    });
+
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| {
+        assert!(view.read(cx).filter_edit.is_none(), "second Escape closes filter modal");
+        assert!(previous.is_focused(window), "focus restores to prior owner");
+    });
+
+    // Condition input inside Smart Filter modal (e.g. Include keywords) also closes on Escape.
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            window.focus(&v.list_focus, cx);
+            v.open_filter_edit(None, window, cx);
+            let edit = v.filter_edit.as_ref().expect("filter dialog opens");
+            let include_ix = edit
+                .draft
+                .rules
+                .conditions
+                .iter()
+                .position(|c| matches!(c.value, fern_core::ConditionValue::Include(_)))
+                .expect("normal filter includes Keywords condition");
+            window.focus(&edit.inputs[include_ix].keywords.focus_handle(cx), cx);
+        });
+    });
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert!(v.filter_edit.is_none());
+        assert!(v.list_focus.is_focused(window));
+    });
+
+    // 2. Kanban inline quick-add boxes: Escape clears non-empty text, then unfocuses to list_focus.
+    let col_key = format!("sec:{}", sec.id);
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.select_view(View::List(list.id), window, cx);
+            v.toggle_kanban_quick_add(cx);
+            v.set_layout(true, false, cx);
+            let (_, input) = v.kanban_quick_adds.get(&col_key).expect("column quick-add exists");
+            window.focus(&input.focus_handle(cx), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_input("Draft kanban task");
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        let (_, input) = v.kanban_quick_adds.get(&col_key).expect("column quick-add exists");
+        assert!(input.read(cx).text().is_empty(), "first Escape clears non-empty quick-add text");
+        assert!(input.focus_handle(cx).is_focused(window));
+    });
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert!(v.list_focus.is_focused(window), "second Escape unfocuses back to kanban board");
+    });
+
+    // Inline column_add ("+") also closes and focuses list_focus on Escape.
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.toggle_kanban_quick_add(cx);
+            v.start_column_add(0, DropTarget::Section(Some(sec.id)), window, cx);
+            assert!(v.column_add.is_some());
+        });
+    });
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert!(v.column_add.is_none());
+        assert!(v.list_focus.is_focused(window));
+    });
+}

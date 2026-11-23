@@ -291,6 +291,8 @@ pub static RU: Strings = Strings {
     confirm_delete_task_template: "Удалить этот шаблон?",
     confirm_delete_script: "Удалить этот скрипт?",
     confirm_delete_attachment: "Удалить это вложение?",
+    confirm_delete_comment: "Удалить этот комментарий?",
+    confirm_delete_focus_record: "Удалить эту запись фокуса?",
     unit_letters: ["л", "мес", "д"],
     // As the Russian original: "До 1 янв 2027 г.".
     countdown_date: Some("{d} {mon} {yyyy} г."),

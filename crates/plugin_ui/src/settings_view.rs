@@ -10,7 +10,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use desktop_common::actions::DismissSettings;
+use desktop_common::actions::{DismissSettings, DismissTransient};
 use desktop_common::text_input::{Changed, Mode, Submitted, TextInput};
 use fern_core::Store;
 use fern_core::plugin_store::UserScript;
@@ -60,6 +60,7 @@ struct SettingInputEntry {
 struct SecretInputEntry {
     input: Entity<TextInput>,
     placeholder: String,
+    _sub: Subscription,
 }
 
 struct ActivePluginPage {
@@ -149,17 +150,20 @@ impl PluginSettingsView {
         let scripts = store.user_scripts().unwrap_or_default();
         let registries = load_registries_from_store(&store);
 
-        let script_name_input =
-            cx.new(|cx| TextInput::new(Mode::SingleLine, i18n::t(cx).plugins_script_name, cx));
+        let script_name_input = cx.new(|cx| {
+            TextInput::new(Mode::SingleLine, i18n::t(cx).plugins_script_name, cx).without_cancel()
+        });
         let script_trigger_arg_input =
-            cx.new(|cx| TextInput::new(Mode::SingleLine, "task.created", cx));
+            cx.new(|cx| TextInput::new(Mode::SingleLine, "task.created", cx).without_cancel());
         let script_code_input = cx.new(|cx| {
             TextInput::new(Mode::MultiLine, "// fern.tasks.list()\n", cx).without_cancel()
         });
-        let browse_search_input =
-            cx.new(|cx| TextInput::new(Mode::SingleLine, i18n::t(cx).focus_picker_search, cx));
+        let browse_search_input = cx.new(|cx| {
+            TextInput::new(Mode::SingleLine, i18n::t(cx).focus_picker_search, cx).without_cancel()
+        });
         let registry_url_input = cx.new(|cx| {
             TextInput::new(Mode::SingleLine, i18n::t(cx).plugins_registry_add_url, cx)
+                .without_cancel()
         });
 
         cx.subscribe(&browse_search_input, |_, _, _: &Changed, cx| cx.notify())
@@ -273,6 +277,41 @@ impl PluginSettingsView {
         cx: &mut Context<Self>,
     ) {
         self.update_plugin_setting_value(plugin_id, key, value, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn setting_input_for_test(
+        &self,
+        plugin_id: &str,
+        key: &str,
+    ) -> Option<Entity<TextInput>> {
+        self.setting_inputs
+            .get(&(plugin_id.to_owned(), key.to_owned()))
+            .map(|e| e.input.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn secret_input_for_test(
+        &self,
+        plugin_id: &str,
+        key: &str,
+    ) -> Option<Entity<TextInput>> {
+        self.secret_inputs
+            .get(&(plugin_id.to_owned(), key.to_owned()))
+            .map(|e| e.input.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn script_name_input_for_test(&self) -> Entity<TextInput> {
+        self.script_name_input.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn browse_inputs_for_test(&self) -> (Entity<TextInput>, Entity<TextInput>) {
+        (
+            self.browse_search_input.clone(),
+            self.registry_url_input.clone(),
+        )
     }
 
     /// Handles an Escape press inside [`PluginSettingsView`].
@@ -1323,6 +1362,11 @@ impl Render for PluginSettingsView {
                         cx.propagate();
                     }
                 }))
+                .on_action(cx.listener(|this, _: &DismissTransient, _, cx| {
+                    if !this.handle_escape(cx) {
+                        cx.propagate();
+                    }
+                }))
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                     if event.keystroke.key == "escape"
                         && !event.keystroke.modifiers.modified()
@@ -1377,6 +1421,11 @@ impl Render for PluginSettingsView {
             .size_full()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &DismissSettings, _, cx| {
+                if !this.handle_escape(cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DismissTransient, _, cx| {
                 if !this.handle_escape(cx) {
                     cx.propagate();
                 }

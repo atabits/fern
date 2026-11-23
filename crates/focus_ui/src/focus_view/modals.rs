@@ -16,7 +16,7 @@ pub(super) struct TimerDraft {
     pub(super) icon_backup: (Option<String>, Option<String>),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RecordMenu {
     Add,
     More,
@@ -74,6 +74,7 @@ impl FocusView {
             if let Err(err) = self.store.set_focus_note(id, &note) {
                 eprintln!("failed to save the focus note: {err:#}");
             }
+            self.pending_focus = Some(PendingFocus::View);
             self.reload(cx);
         }
         cx.notify();
@@ -137,18 +138,95 @@ impl FocusView {
                 )
                 .child(
                     h_flex().justify_end().child(
-                        IconButton::new("delete-open-record", IconName::Trash)
-                            .icon_color(Color::Muted)
-                            .hover_icon_color(Color::Error)
-                            .tooltip(Tooltip::text(strings.delete))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_record = None;
-                                this.delete_record(id, cx);
-                            })),
+                        div()
+                            .when(cfg!(test), |el| {
+                                el.debug_selector(|| "delete-open-record".to_owned())
+                            })
+                            .child(
+                                IconButton::new("delete-open-record", IconName::Trash)
+                                    .icon_color(Color::Muted)
+                                    .hover_icon_color(Color::Error)
+                                    .tooltip(Tooltip::text(strings.delete))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.request_delete_record(id, window, cx);
+                                    })),
+                            ),
                     ),
                 )
                 .into_any_element(),
         )
+    }
+
+    pub(super) fn request_delete_record(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let desc = self
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| {
+                let title = if s.title.trim().is_empty() {
+                    strings.focus
+                } else {
+                    s.title.trim()
+                };
+                format!("{title} · {}", format_minutes(s.minutes(), strings))
+            })
+            .unwrap_or_else(|| strings.focus.to_owned());
+        self.confirm_delete_record = Some((id, desc));
+        self.pending_focus = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    pub(super) fn cancel_delete_record(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.confirm_delete_record.take().is_none() {
+            return;
+        }
+        let target = if self.open_record.is_some() {
+            PendingFocus::RecordNote
+        } else {
+            PendingFocus::View
+        };
+        if let Some(window) = window {
+            let handle = match target {
+                PendingFocus::RecordNote => self.record_note.focus_handle(cx),
+                PendingFocus::View => self.focus_handle.clone(),
+            };
+            window.focus(&handle, cx);
+            self.pending_focus = None;
+        } else {
+            self.pending_focus = Some(target);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn render_confirm_delete_record(&self, id: Id, desc: String, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        div()
+            .absolute()
+            .inset_0()
+            .when(cfg!(test), |el| {
+                el.debug_selector(|| "focus-record-delete-modal".to_owned())
+            })
+            .child(
+                ConfirmDialog::new("focus-record-delete", strings.confirm_delete_focus_record)
+                    .width(px(360.))
+                    .description(desc)
+                    .cancel_label(strings.cancel)
+                    .confirm_label(strings.delete)
+                    .destructive(true)
+                    .on_cancel(cx.listener(|this, _, window, cx| {
+                        this.cancel_delete_record(Some(window), cx);
+                    }))
+                    .on_confirm(cx.listener(move |this, _, window, cx| {
+                        this.confirm_delete_record = None;
+                        this.open_record = None;
+                        this.pending_focus = None;
+                        window.focus(&this.focus_handle, cx);
+                        this.delete_record(id, cx);
+                    })),
+            )
+            .into_any_element()
     }
 
     pub(super) fn delete_record(&mut self, id: fern_core::Id, cx: &mut Context<Self>) {
@@ -178,6 +256,13 @@ impl FocusView {
         let field = |placeholder: &'static str, cx: &mut Context<Self>| {
             let input = cx.new(|cx| TextInput::new(Mode::SingleLine, placeholder, cx));
             cx.subscribe(&input, |this, _, _: &crate::text_input::Submitted, cx| this.confirm_batch_custom(cx)).detach();
+            cx.subscribe(&input, |this, _, _: &crate::text_input::Cancelled, cx| {
+                if this.batch_custom.take().is_some() {
+                    this.pending_focus = Some(PendingFocus::View);
+                    cx.notify();
+                }
+            })
+            .detach();
             input
         };
         let (first, second) = (field(first, cx), field(second, cx));
@@ -205,6 +290,7 @@ impl FocusView {
             self.batch_filter.under = None;
         }
         self.batch_custom = None;
+        self.pending_focus = Some(PendingFocus::View);
         cx.notify();
     }
 
@@ -242,14 +328,17 @@ impl FocusView {
                 .gap_2()
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.batch_custom = None;
+                    this.pending_focus = Some(PendingFocus::View);
                     cx.notify();
                 }))
                 .child(fields)
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(button("batch-custom-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
+                        .child(button("batch-custom-cancel", strings.cancel, false).on_click(cx.listener(|this, _, window, cx| {
                             this.batch_custom = None;
+                            this.pending_focus = None;
+                            window.focus(&this.focus_handle, cx);
                             cx.notify();
                         })))
                         .child(

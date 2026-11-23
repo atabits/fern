@@ -1,5 +1,7 @@
 //! Review long stopwatch sessions using EnsureTimingDialog's minute rounding and
 //! save rules. Method RVAs and the remaining UI differences are in MECHANICS.md.
+use std::time::Duration;
+
 use super::*;
 use gpui::{Bounds, TitlebarOptions, WindowBounds, WindowOptions, size};
 

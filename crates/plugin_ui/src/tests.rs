@@ -1691,3 +1691,195 @@ fn user_script_delete_requires_confirmation_and_escape_cancels(cx: &mut TestAppC
         "confirming dialog must delete the script from SQLite"
     );
 }
+
+#[gpui::test]
+fn settings_secret_input_saves_on_enter_and_inputs_bubble_escape(cx: &mut TestAppContext) {
+    use desktop_common::actions::DismissSettings;
+    use desktop_common::text_input::{Cancelled, Enter};
+    use gpui::{InteractiveElement as _, KeyBinding};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins_dir = tmp.path().join("plugins");
+    let cache_dir = plugins_dir.join(".registry-cache");
+    let db_path = tmp.path().join("tasks.db");
+    let vault_path = tmp.path().join("secrets.vault");
+    let key_path = tmp.path().join("secrets.key");
+    let _seed_store = Store::open(&db_path).unwrap();
+
+    let plugin_id = "com.test.inputs";
+    write_test_plugin(
+        &plugins_dir.join(plugin_id),
+        r#"{
+            "id": "com.test.inputs",
+            "name": "Inputs Plugin",
+            "version": "1.0.0",
+            "api_version": 1,
+            "entry": "index.js",
+            "permissions": [],
+            "settings": [
+                { "key": "endpoint", "label": "Endpoint", "type": "text", "default": "https://a.test" },
+                { "key": "api_key", "label": "API Key", "type": "secret", "placeholder": "Enter key" }
+            ]
+        }"#,
+        "export function activate() {}",
+    );
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(CurrentLocale(Locale::En));
+        cx.bind_keys([
+            KeyBinding::new("enter", Enter, Some("TextInput")),
+            KeyBinding::new("escape", desktop_common::text_input::Cancel, Some("TextInput")),
+            KeyBinding::new("escape", DismissSettings, Some("Settings")),
+        ]);
+        PluginHost::init(
+            PluginHostConfig {
+                plugins_dir: plugins_dir.clone(),
+                registry_cache_dir: cache_dir,
+                db_path: Some(db_path.clone()),
+                secrets_vault_path: vault_path.clone(),
+                secrets_key_path: key_path.clone(),
+                safe_mode: false,
+                locale: "en".to_owned(),
+                theme_appearance: "light".to_owned(),
+                hot_reload: false,
+            },
+            cx,
+        )
+        .unwrap();
+        let mgr = PluginHost::global(cx).unwrap().manager().unwrap().clone();
+        mgr.approve_permissions(plugin_id).unwrap();
+        PluginHost::drain_updates_for_test(cx);
+        PluginHost::request_open_settings_for(plugin_id, cx);
+    });
+    cx.run_until_parked();
+
+    struct SettingsEscapeHost {
+        settings: gpui::Entity<PluginSettingsView>,
+        dismiss_hits: Rc<Cell<usize>>,
+    }
+    impl Render for SettingsEscapeHost {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let hits = Rc::clone(&self.dismiss_hits);
+            div()
+                .key_context("Settings")
+                .size_full()
+                .on_action(move |_: &DismissSettings, _, _| {
+                    hits.set(hits.get() + 1);
+                })
+                .child(self.settings.clone())
+        }
+    }
+
+    let store = Rc::new(Store::open(&db_path).unwrap());
+    let dismiss_hits = Rc::new(Cell::new(0usize));
+    let (host_view, cx) = cx.add_window_view(|_, cx| SettingsEscapeHost {
+        settings: cx.new(|cx| PluginSettingsView::new(Rc::clone(&store), cx)),
+        dismiss_hits: Rc::clone(&dismiss_hits),
+    });
+    cx.simulate_resize(size(px(900.), px(720.)));
+    cx.run_until_parked();
+
+    let (setting_inp, secret_inp, script_name_inp, browse_search_inp, registry_url_inp) = cx
+        .update(|_, cx| {
+            let view = host_view.read(cx).settings.read(cx);
+            let (search, reg) = view.browse_inputs_for_test();
+            (
+                view.setting_input_for_test(plugin_id, "endpoint")
+                    .expect("text setting input"),
+                view.secret_input_for_test(plugin_id, "api_key")
+                    .expect("secret setting input"),
+                view.script_name_input_for_test(),
+                search,
+                reg,
+            )
+        });
+
+    let cancelled_hits = Rc::new(Cell::new(0usize));
+    cx.update(|_, cx| {
+        for inp in [
+            &setting_inp,
+            &secret_inp,
+            &script_name_inp,
+            &browse_search_inp,
+            &registry_url_inp,
+        ] {
+            let c = Rc::clone(&cancelled_hits);
+            cx.subscribe(inp, move |_, _: &Cancelled, _| {
+                c.set(c.get() + 1);
+            })
+            .detach();
+        }
+    });
+
+    // Type into secret input and press Enter -> saves to SecretsVault and clears input.
+    cx.update(|window, cx| window.focus(&secret_inp.focus_handle(cx), cx));
+    cx.simulate_input("sk-enter-secret");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update(|_, cx| PluginHost::drain_updates_for_test(cx));
+    cx.run_until_parked();
+
+    let vault = plugins::SecretsVault::open(&vault_path, &key_path).unwrap();
+    assert_eq!(
+        vault.get(plugin_id, "api_key").unwrap().as_deref(),
+        Some("sk-enter-secret"),
+        "Enter in secret input must trigger save_secret_setting"
+    );
+    cx.update(|_, cx| {
+        assert!(
+            secret_inp.read(cx).text().is_empty(),
+            "secret input must clear after saving on Enter"
+        );
+    });
+
+    // Pressing Enter again when empty is a safe no-op.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        plugins::SecretsVault::open(&vault_path, &key_path)
+            .unwrap()
+            .get(plugin_id, "api_key")
+            .unwrap()
+            .as_deref(),
+        Some("sk-enter-secret")
+    );
+
+    // Escape in secret_input and setting_input bubbles DismissSettings without swallowing Cancel.
+    cx.update(|window, cx| window.focus(&secret_inp.focus_handle(cx), cx));
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| window.focus(&setting_inp.focus_handle(cx), cx));
+    cx.simulate_keystrokes("escape");
+
+    // Escape in Scripts and Browse tab inputs also bubbles cleanly.
+    let settings = cx.update(|_, cx| host_view.read(cx).settings.clone());
+    cx.update(|_, cx| settings.update(cx, |v, cx| v.set_tab(PluginSettingsTab::Scripts, cx)));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.focus(&script_name_inp.focus_handle(cx), cx));
+    cx.simulate_keystrokes("escape");
+
+    cx.update(|_, cx| settings.update(cx, |v, cx| v.set_tab(PluginSettingsTab::Browse, cx)));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.focus(&browse_search_inp.focus_handle(cx), cx));
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| window.focus(&registry_url_inp.focus_handle(cx), cx));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    assert_eq!(
+        cancelled_hits.get(),
+        0,
+        "settings TextInputs must not swallow Escape via text_input::Cancel"
+    );
+    assert_eq!(
+        dismiss_hits.get(),
+        5,
+        "Escape from all settings TextInputs must bubble DismissSettings to parent"
+    );
+
+    cx.update(|_, cx| PluginHost::shutdown(cx));
+}

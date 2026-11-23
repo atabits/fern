@@ -680,7 +680,11 @@ impl FocusView {
                 .flex_1()
                 .min_h_0(),
             )
+            .children(self.render_record_dialog(cx))
             .when(self.confirm_delete_all, |el| el.child(self.render_confirm_delete_all(cx)))
+            .when_some(self.confirm_delete_record.clone(), |el, (id, desc)| {
+                el.child(self.render_confirm_delete_record(id, desc, cx))
+            })
             .into_any_element()
     }
 

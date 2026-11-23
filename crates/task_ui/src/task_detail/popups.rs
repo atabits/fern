@@ -16,8 +16,8 @@ use crate::task_rows;
 use crate::text_input::TextInput;
 
 use super::{
-    EstimateDraft, Popup, PopupWindow, StartFocus, TagDraft, TaskDetail, TaskUpdated, Undoable,
-    check_mark, list_matches, same_tag,
+    EstimateDraft, PendingDelete, Popup, PopupWindow, StartFocus, TagDraft, TaskDetail,
+    TaskUpdated, Undoable, check_mark, list_matches, same_tag,
 };
 
 impl TaskDetail {
@@ -84,6 +84,8 @@ impl TaskDetail {
                         this.comment_open = !this.comment_open;
                         if this.comment_open {
                             window.focus(&this.comment_input.focus_handle(cx), cx);
+                        } else {
+                            this.comment_emoji = false;
                         }
                     })))
             })
@@ -1042,12 +1044,29 @@ impl TaskDetail {
         }
     }
 
-    pub(super) fn dismiss_confirm_delete_attachment(
+    pub(super) fn clear_pending_delete(&mut self) {
+        self.pending_delete = None;
+        self.confirm_return_focus = None;
+    }
+
+    pub(super) fn request_delete(
+        &mut self,
+        target: PendingDelete,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_delete = Some(target);
+        self.confirm_return_focus = window.focused(cx).map(|handle| handle.downgrade());
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    pub(super) fn dismiss_pending_delete(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.confirm_delete_attachment.take().is_none() {
+        if self.pending_delete.take().is_none() {
             return false;
         }
         let return_focus = self
@@ -1062,9 +1081,45 @@ impl TaskDetail {
         true
     }
 
+    pub(super) fn confirm_pending_delete(
+        &mut self,
+        pending: PendingDelete,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_pending_delete(window, cx);
+        if self.is_read_only() {
+            return;
+        }
+        match pending {
+            PendingDelete::Attachment(att) => {
+                if let Some(dir) = &self.session.attachments_dir {
+                    match self.session.store.delete_attachment(&att, dir) {
+                        Ok(()) => cx.emit(TaskUpdated),
+                        Err(err) => {
+                            eprintln!("failed to remove the attachment: {err:#}");
+                        }
+                    }
+                    self.sync_attachments();
+                    cx.notify();
+                }
+            }
+            PendingDelete::Comment { id, .. } => {
+                match self.session.store.delete_comment(id) {
+                    Ok(()) => cx.emit(TaskUpdated),
+                    Err(err) => {
+                        eprintln!("failed to delete the comment: {err:#}");
+                    }
+                }
+                self.sync_comments();
+                cx.notify();
+            }
+        }
+    }
+
     /// Dismisses a popover even if focus is still in the task list or calendar.
     pub fn dismiss_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.dismiss_confirm_delete_attachment(window, cx) {
+        if self.dismiss_pending_delete(window, cx) {
             return true;
         }
         if self.session.popup.is_none() {

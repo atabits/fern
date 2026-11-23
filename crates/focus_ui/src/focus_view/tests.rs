@@ -413,3 +413,105 @@ fn escape_inside_record_note_and_add_inputs_closes_modal_and_restores_focus(cx: 
         assert!(v.focus_handle(cx).is_focused(window));
     });
 }
+
+#[gpui::test]
+fn single_record_delete_requires_confirmation_and_batch_custom_closes_on_escape(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::{KeyBinding, Modifiers, point, size};
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        cx.bind_keys([
+            KeyBinding::new("escape", crate::text_input::Cancel, Some("TextInput")),
+            KeyBinding::new("escape", crate::actions::DismissTransient, None),
+        ]);
+    });
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let now = now_ms();
+    let session = store
+        .add_focus_session(None, "Deep writing", now - 1_500_000, now)
+        .unwrap();
+    let (view, cx) = cx.add_window_view(|_, cx| FocusView::new(store.clone(), cx));
+    cx.simulate_resize(size(px(1000.), px(700.)));
+    cx.run_until_parked();
+
+    // Open record, click trash button -> ConfirmDialog overlays while keeping open_record intact.
+    cx.update(|window, cx| view.update(cx, |v, cx| v.open_record(session.id, window, cx)));
+    cx.run_until_parked();
+    let trash_pos = cx.debug_bounds("delete-open-record").unwrap().center();
+    cx.simulate_click(trash_pos, Modifiers::default());
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert_eq!(
+            v.confirm_delete_record.clone(),
+            Some((session.id, "Deep writing · 25m".to_owned()))
+        );
+        assert_eq!(v.open_record, Some(session.id));
+        assert!(v.focus_handle(cx).is_focused(window));
+    });
+    assert!(cx.debug_bounds("focus-record-delete-modal").is_some());
+    assert_eq!(store.focus_sessions().unwrap().len(), 1);
+
+    // Space hotkey must not start a timer while record delete confirmation is open.
+    cx.simulate_keystrokes("space");
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| !v.is_running()));
+
+    // First Escape cancels only the ConfirmDialog, preserving open_record and restoring note focus.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.confirm_delete_record, None);
+        assert_eq!(v.open_record, Some(session.id));
+        assert!(v.record_note.focus_handle(cx).is_focused(window));
+    });
+    assert!(cx.debug_bounds("focus-record-delete-modal").is_none());
+    assert_eq!(store.focus_sessions().unwrap().len(), 1);
+
+    // Re-trigger delete and confirm -> deletes record, closes open_record, restores view focus.
+    let trash_pos = cx.debug_bounds("delete-open-record").unwrap().center();
+    cx.simulate_click(trash_pos, Modifiers::default());
+    cx.run_until_parked();
+    let modal_bounds = cx.debug_bounds("focus-record-delete-modal").unwrap();
+    let confirm_pos = point(modal_bounds.center().x + px(126.), modal_bounds.center().y + px(34.));
+    cx.simulate_click(confirm_pos, Modifiers::default());
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.confirm_delete_record, None);
+        assert_eq!(v.open_record, None);
+        assert!(v.sessions.is_empty());
+        assert!(v.focus_handle(cx).is_focused(window));
+    });
+    assert!(cx.debug_bounds("focus-record-delete-modal").is_none());
+    assert!(store.focus_sessions().unwrap().is_empty());
+
+    // Escape inside either batch_custom TextInput closes the popover and restores FocusView focus.
+    cx.update(|_, cx| view.update(cx, |v, cx| v.set_record_menu(Some(RecordMenu::Batch), cx)));
+    cx.run_until_parked();
+    for (which, focus_second) in [(0, false), (1, true)] {
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.open_batch_custom(which, window, cx);
+                if focus_second && let Some((_, _, second)) = &v.batch_custom {
+                    window.focus(&second.focus_handle(cx), cx);
+                }
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let v = view.read(cx);
+            assert!(v.batch_custom.is_none());
+            assert_eq!(v.record_menu, Some(RecordMenu::Batch));
+            assert!(v.focus_handle(cx).is_focused(window));
+        });
+    }
+}

@@ -5,7 +5,19 @@ use ui::{Placement, PopoverAttachment, popover};
 
 use crate::i18n::{self, Strings};
 
-use super::{TaskDetail, TaskUpdated, format_size};
+use super::{PendingDelete, TaskDetail, TaskUpdated, format_size};
+
+fn comment_delete_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    let preview: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{}…", preview.trim_end())
+    } else {
+        preview
+    }
+}
 
 impl TaskDetail {
     /// Formats a task's comments section.
@@ -30,6 +42,9 @@ impl TaskDetail {
                 let group_name = SharedString::from(format!("comment-row-{id}"));
                 h_flex()
                     .id(SharedString::from(format!("comment-{id}")))
+                    .when(cfg!(test), |el| {
+                        el.debug_selector(|| "task-comment-row".to_owned())
+                    })
                     .group(group_name.clone())
                     .items_start()
                     .gap_2()
@@ -49,24 +64,36 @@ impl TaskDetail {
                             ),
                     )
                     .when(!read_only, |el| {
+                        let preview = comment_delete_preview(&comment.text);
                         el.child(
-                            div().when(!crate::touch::active(), |el| el.invisible()).group_hover(group_name, |s| s.visible()).child(
-                                IconButton::new(SharedString::from(format!("comment-delete-{id}")), IconName::X)
-                                    .icon_size(IconSize::XSmall)
-                                    .icon_color(sticky.map_or(Color::Muted, |t| Color::Custom(t.muted)))
-                                    .when_some(sticky, |b, t| b.hover_color(t.surface))
-                                    .tooltip(Tooltip::text(strings.delete))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if this.is_read_only() {
-                                            return;
-                                        }
-                                        if this.session.store.delete_comment(id).is_ok() {
-                                            cx.emit(TaskUpdated);
-                                        }
-                                        this.sync_comments();
-                                        cx.notify();
-                                    })),
-                            ),
+                            div()
+                                .when(!crate::touch::active(), |el| el.invisible())
+                                .group_hover(group_name, |s| s.visible())
+                                .when(cfg!(test), |el| {
+                                    el.debug_selector(|| "task-comment-delete".to_owned())
+                                })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    IconButton::new(SharedString::from(format!("comment-delete-{id}")), IconName::X)
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(sticky.map_or(Color::Muted, |t| Color::Custom(t.muted)))
+                                        .when_some(sticky, |b, t| b.hover_color(t.surface))
+                                        .tooltip(Tooltip::text(strings.delete))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            if this.is_read_only() {
+                                                return;
+                                            }
+                                            this.request_delete(
+                                                PendingDelete::Comment {
+                                                    id,
+                                                    preview: preview.clone(),
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                ),
                         )
                     })
             }))
@@ -223,6 +250,7 @@ impl TaskDetail {
                             .when(cfg!(test), |el| {
                                 el.debug_selector(|| "task-attachment-delete".to_owned())
                             })
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 IconButton::new(SharedString::from(format!("attachment-delete-{att_id}")), IconName::X)
                                     .size(px(20.))
@@ -241,11 +269,11 @@ impl TaskDetail {
                                             cx.notify();
                                             return;
                                         }
-                                        this.confirm_delete_attachment = Some(removed.clone());
-                                        this.confirm_return_focus =
-                                            window.focused(cx).map(|handle| handle.downgrade());
-                                        window.focus(&this.focus, cx);
-                                        cx.notify();
+                                        this.request_delete(
+                                            PendingDelete::Attachment(removed.clone()),
+                                            window,
+                                            cx,
+                                        );
                                     })),
                             ),
                     )

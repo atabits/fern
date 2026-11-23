@@ -291,6 +291,8 @@ pub static EN: Strings = Strings {
     confirm_delete_task_template: "Delete this template?",
     confirm_delete_script: "Delete this script?",
     confirm_delete_attachment: "Delete this attachment?",
+    confirm_delete_comment: "Delete this comment?",
+    confirm_delete_focus_record: "Delete this focus record?",
     unit_letters: ["Y", "M", "D"],
     countdown_date: None,
     dotted_dates: false,

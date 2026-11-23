@@ -423,7 +423,7 @@ impl TodoView {
         if next {
             self.column_add = None;
         } else {
-            self.kanban_quick_adds.clear();
+            self.clear_kanban_quick_adds();
         }
         self.sync_kanban_column_state(cx);
         cx.notify();
@@ -519,6 +519,30 @@ impl TodoView {
         }
     }
 
+    pub(super) fn clear_kanban_quick_adds(&mut self) {
+        self.kanban_quick_adds.clear();
+        self.kanban_quick_add_subs.clear();
+    }
+
+    fn cancel_kanban_quick_add(
+        &mut self,
+        input: &Entity<TextInput>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dismiss_transient(window, cx) {
+            return;
+        }
+        if !input.read(cx).text().is_empty() {
+            input.update(cx, |input, cx| input.clear(window, cx));
+            cx.notify();
+            return;
+        }
+        self.column_add = None;
+        window.focus(&self.list_focus, cx);
+        cx.notify();
+    }
+
     /// Keeps per-column scroll handles and quick-add `TextInput` entities synchronized with the
     /// active board columns outside of `render()` (called from `reload_inner`, layout/sort/option
     /// toggles, and section mutations).
@@ -527,7 +551,7 @@ impl TodoView {
             || self.timeline
             || matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_))
         {
-            self.kanban_quick_adds.clear();
+            self.clear_kanban_quick_adds();
             self.kanban_col_scrolls.clear();
             return;
         }
@@ -545,43 +569,56 @@ impl TodoView {
     pub(super) fn sync_kanban_quick_adds(&mut self, columns: &[BoardCol], strings: &'static Strings, cx: &mut Context<Self>) {
         if !self.kanban_quick_add {
             if !self.kanban_quick_adds.is_empty() {
-                self.kanban_quick_adds.clear();
+                self.clear_kanban_quick_adds();
             }
             return;
         }
         let mut active_keys = HashSet::new();
+        let window_handle = self.window_handle;
+        let view = cx.weak_entity();
         for col in columns {
             let Some(target) = col.drop.as_ref().filter(|t| !matches!(t, DropTarget::Complete)) else { continue };
             let key = col.key.clone();
             active_keys.insert(key.clone());
-            let entry = self.kanban_quick_adds.entry(key.clone()).or_insert_with(|| {
-                let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
-                let key_for_sub = key;
-                cx.subscribe(&input, |this, input, _: &Changed, cx| {
-                    let text = input.read(cx).text().to_owned();
-                    let list_names: Vec<String> = this.lists.iter().map(|l| l.name.clone()).collect();
-                    let parsed = fern_core::parse_quick_add_with(&text, Self::today(), &list_names, this.preferences.recognition);
-                    input.update(cx, |input, cx| input.set_highlights(parsed.spans, cx));
-                })
-                .detach();
-                cx.subscribe(&input, move |this, input, Submitted(text), cx| {
-                    if !text.trim().is_empty() {
-                        input.update(cx, |input, cx| input.set_text("", cx));
-                        if let Some(task) = this.add_task(text, cx) {
-                            if let Some((target, _)) = this.kanban_quick_adds.get(&key_for_sub).cloned() {
-                                this.drop_on_column(task.id, target, cx);
-                                return;
-                            }
-                            this.reload(cx);
+            if let Some(entry) = self.kanban_quick_adds.get_mut(&key) {
+                entry.0 = target.clone();
+                continue;
+            }
+            let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
+            let key_for_sub = key.clone();
+            cx.subscribe(&input, |this, input, _: &Changed, cx| {
+                let text = input.read(cx).text().to_owned();
+                let list_names: Vec<String> = this.lists.iter().map(|l| l.name.clone()).collect();
+                let parsed = fern_core::parse_quick_add_with(&text, Self::today(), &list_names, this.preferences.recognition);
+                input.update(cx, |input, cx| input.set_highlights(parsed.spans, cx));
+            })
+            .detach();
+            cx.subscribe(&input, move |this, input, Submitted(text), cx| {
+                if !text.trim().is_empty() {
+                    input.update(cx, |input, cx| input.set_text("", cx));
+                    if let Some(task) = this.add_task(text, cx) {
+                        if let Some((target, _)) = this.kanban_quick_adds.get(&key_for_sub).cloned() {
+                            this.drop_on_column(task.id, target, cx);
+                            return;
                         }
+                        this.reload(cx);
                     }
-                })
-                .detach();
-                (target.clone(), input)
+                }
+            })
+            .detach();
+            let view = view.clone();
+            let cancel_sub = gpui::App::subscribe(cx, &input, move |input, _: &Cancelled, cx| {
+                let _ = window_handle.update(cx, |_, window, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        this.cancel_kanban_quick_add(&input, window, cx);
+                    });
+                });
             });
-            entry.0 = target.clone();
+            self.kanban_quick_adds.insert(key.clone(), (target.clone(), input));
+            self.kanban_quick_add_subs.insert(key, cancel_sub);
         }
         self.kanban_quick_adds.retain(|k, _| active_keys.contains(k));
+        self.kanban_quick_add_subs.retain(|k, _| active_keys.contains(k));
     }
 
     /// A kanban column's "+": a field at the column's top; the task it adds takes the column's
@@ -612,8 +649,9 @@ impl TodoView {
             }
         })
         .detach();
-        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+        cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
             this.column_add = None;
+            window.focus(&this.list_focus, cx);
             cx.notify();
         })
         .detach();

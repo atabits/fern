@@ -59,7 +59,7 @@ fn ensure_setting_input_in(
     let placeholder = spec.placeholder.clone().unwrap_or_default();
     let initial = current_text.to_owned();
     let input = cx.new(|cx| {
-        let mut inp = TextInput::new(Mode::SingleLine, placeholder, cx);
+        let mut inp = TextInput::new(Mode::SingleLine, placeholder, cx).without_cancel();
         inp.set_text(initial, cx);
         inp
     });
@@ -242,12 +242,22 @@ impl PluginSettingsView {
             return entry.input.clone();
         }
         let ph_for_input = desired_ph.clone();
-        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, ph_for_input, cx).masked());
+        let input = cx.new(|cx| {
+            TextInput::new(Mode::SingleLine, ph_for_input, cx)
+                .masked()
+                .without_cancel()
+        });
+        let pid_sub = plugin_id.to_owned();
+        let key_sub = spec.key.clone();
+        let sub_submit = cx.subscribe(&input, move |this, _, _: &Submitted, cx| {
+            this.save_secret_setting(pid_sub.clone(), key_sub.clone(), cx);
+        });
         self.secret_inputs.insert(
             map_key,
             SecretInputEntry {
                 input: input.clone(),
                 placeholder: desired_ph,
+                _sub: sub_submit,
             },
         );
         input

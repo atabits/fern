@@ -123,6 +123,20 @@ fn editor_submissions_keep_the_owner_after_popup_render(cx: &mut TestAppContext)
         assert!(detail.comment_input.read(cx).text().is_empty());
         assert!(detail.comment_input.focus_handle(cx).is_focused(window));
     });
+    owner.update(|_, cx| {
+        detail.update(cx, |detail, cx| {
+            detail.comment_emoji = true;
+            cx.notify();
+        });
+    });
+    draw_last(&detail, &mut popup_cx);
+    owner.simulate_keystrokes("escape");
+    owner.update(|window, cx| {
+        let detail = detail.read(cx);
+        assert!(!detail.comment_emoji);
+        assert!(detail.comment_open);
+        assert!(detail.comment_input.focus_handle(cx).is_focused(window));
+    });
     draw_last(&detail, &mut popup_cx);
     owner.simulate_keystrokes("escape");
     owner.update(|window, cx| {

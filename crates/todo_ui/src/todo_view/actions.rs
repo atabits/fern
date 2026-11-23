@@ -265,7 +265,7 @@ impl TodoView {
         self.section_rename = None;
         self.title_edit = None;
         self.kanban_pan = None;
-        self.kanban_quick_adds.clear();
+        self.clear_kanban_quick_adds();
         self.kanban_col_scrolls.clear();
         self.clear_task_drag_state();
         self.completing.clear();

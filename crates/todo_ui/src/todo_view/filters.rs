@@ -3,7 +3,7 @@ use crate::filter_draft::{InputError, Inputs};
 use fern_core::{Condition, ConditionValue as Value, DateRule, Field, FilterStatus, Join, SmartFilter};
 
 pub(super) struct FilterInputs {
-    keywords: Entity<TextInput>,
+    pub(super) keywords: Entity<TextInput>,
     days: Entity<TextInput>,
     from: Entity<TextInput>,
     to: Entity<TextInput>,
@@ -28,8 +28,12 @@ pub(super) struct FilterEdit {
     pub(super) all_tasks: Vec<Task>,
     pub(super) examples_open: bool,
     error: Option<&'static str>,
+    return_focus: Option<FocusHandle>,
 }
 impl FilterEdit {
+    pub(super) fn name_focus(&self, cx: &App) -> FocusHandle {
+        self.name.focus_handle(cx)
+    }
     fn snapshot(&self, cx: &App) -> Result<SmartFilter, InputError> {
         let mut filter = self.draft.clone();
         filter.name = self.name.read(cx).text().trim().to_owned();
@@ -81,6 +85,7 @@ impl TodoView {
     fn filter_input(
         text: String,
         placeholder: &'static str,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Entity<TextInput> {
         let input = cx.new(|cx| {
@@ -95,28 +100,36 @@ impl TodoView {
             cx.notify();
         })
         .detach();
-        cx.subscribe(&input, |this, _, _: &Submitted, cx| {
-            this.save_filter_inner(None, cx);
+        cx.subscribe_in(&input, window, |this, _, _: &Submitted, window, cx| {
+            this.save_filter(window, cx);
+        })
+        .detach();
+        cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
+            this.cancel_filter_edit(window, cx);
         })
         .detach();
         input
     }
-    fn condition_inputs(value: &Value, cx: &mut Context<Self>) -> FilterInputs {
+    fn condition_inputs(value: &Value, window: &Window, cx: &mut Context<Self>) -> FilterInputs {
         let strings = i18n::t(cx);
         let input = Inputs::new(value);
         FilterInputs {
-            keywords: Self::filter_input(input.keywords, strings.filter_keywords, cx),
-            days: Self::filter_input(input.days, strings.filter_days, cx),
-            from: Self::filter_input(input.from, "", cx),
-            to: Self::filter_input(input.to, "", cx),
+            keywords: Self::filter_input(input.keywords, strings.filter_keywords, window, cx),
+            days: Self::filter_input(input.days, strings.filter_days, window, cx),
+            from: Self::filter_input(input.from, "", window, cx),
+            to: Self::filter_input(input.to, "", window, cx),
         }
     }
-    pub(super) fn filter_inputs(filter: &SmartFilter, cx: &mut Context<Self>) -> Vec<FilterInputs> {
+    pub(super) fn filter_inputs(
+        filter: &SmartFilter,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<FilterInputs> {
         filter
             .rules
             .conditions
             .iter()
-            .map(|c| Self::condition_inputs(&c.value, cx))
+            .map(|c| Self::condition_inputs(&c.value, window, cx))
             .collect()
     }
     pub(super) fn open_filter_edit(
@@ -147,8 +160,13 @@ impl TodoView {
                     .unwrap_or(Field::ALL.len())
             });
         }
-        let name = Self::filter_input(draft.name.clone(), strings.filter_name, cx);
-        let inputs = Self::filter_inputs(&draft, cx);
+        let return_focus = self
+            .filter_edit
+            .as_ref()
+            .and_then(|edit| edit.return_focus.clone())
+            .or_else(|| window.focused(cx));
+        let name = Self::filter_input(draft.name.clone(), strings.filter_name, window, cx);
+        let inputs = Self::filter_inputs(&draft, window, cx);
         let all_tasks = self.store.tasks().unwrap_or_default();
         window.focus(&name.focus_handle(cx), cx);
         self.header_menu_open = false;
@@ -162,17 +180,46 @@ impl TodoView {
             all_tasks,
             examples_open: false,
             error: None,
+            return_focus,
         });
         cx.notify();
     }
-    pub(super) fn set_filter_advanced(&mut self, advanced: bool, cx: &mut Context<Self>) {
+    pub(super) fn dismiss_filter_edit_nested(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(edit) = self.filter_edit.as_mut() else {
+            return false;
+        };
+        if std::mem::take(&mut edit.examples_open) || edit.chain_menu.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+    pub(super) fn close_filter_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.filter_edit.take() else {
+            return;
+        };
+        let focus = edit.return_focus.unwrap_or_else(|| self.list_focus.clone());
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+    fn cancel_filter_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.dismiss_filter_edit_nested(cx) {
+            self.close_filter_edit(window, cx);
+        }
+    }
+    pub(super) fn set_filter_advanced(
+        &mut self,
+        advanced: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(edit) = self.filter_edit.as_mut() else {
             return;
         };
         match edit.snapshot(cx) {
             Ok(mut draft) => {
                 if draft.rules.set_advanced(advanced).is_ok() {
-                    edit.inputs = Self::filter_inputs(&draft, cx);
+                    edit.inputs = Self::filter_inputs(&draft, window, cx);
                     edit.draft = draft;
                     edit.chain_menu = None;
                     edit.error = None;
@@ -198,13 +245,19 @@ impl TodoView {
         }
         cx.notify();
     }
-    fn set_condition_field(&mut self, i: usize, field: Field, cx: &mut Context<Self>) {
+    fn set_condition_field(
+        &mut self,
+        i: usize,
+        field: Field,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(edit) = self.filter_edit.as_mut()
             && let Some(condition) = edit.draft.rules.conditions.get_mut(i)
         {
             if condition.value.field() != field {
                 condition.value = Value::empty(field);
-                edit.inputs[i] = Self::condition_inputs(&condition.value, cx);
+                edit.inputs[i] = Self::condition_inputs(&condition.value, window, cx);
             }
             edit.chain_menu = None;
             edit.error = None;
@@ -229,9 +282,6 @@ impl TodoView {
         cx.notify();
     }
     fn save_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.save_filter_inner(Some(window), cx);
-    }
-    fn save_filter_inner(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         let Some(edit) = self.filter_edit.as_mut() else {
             return;
         };
@@ -240,9 +290,7 @@ impl TodoView {
             Ok(_) => {
                 edit.preview = false;
                 edit.error = Some(i18n::t(cx).filter_name_error);
-                if let Some(window) = window {
-                    window.focus(&edit.name.focus_handle(cx), cx);
-                }
+                window.focus(&edit.name.focus_handle(cx), cx);
                 cx.notify();
                 return;
             }
@@ -256,6 +304,7 @@ impl TodoView {
         let result = self.store.save_filter(&filter);
         if self.check(result).is_some() {
             self.filter_edit = None;
+            window.focus(&self.list_focus, cx);
             if self.view != View::Filter(filter.id) {
                 self.set_view(View::Filter(filter.id), cx);
             } else {
@@ -727,8 +776,8 @@ impl TodoView {
                     .children(Field::ALL.into_iter().map(|field| {
                         ListItem::new(SharedString::from(id(field.key())))
                             .child(Label::new(field_name(field, strings)).size(LabelSize::Small))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_condition_field(i, field, cx)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.set_condition_field(i, field, window, cx)
                             }))
                     }))
                     .into_any_element(),
@@ -842,7 +891,7 @@ impl TodoView {
         if advanced {
             body = body.child(
                 chip("filter-add", strings.filter_add_condition, false, cx).on_click(cx.listener(
-                    |this, _, _, cx| {
+                    |this, _, window, cx| {
                         if let Some(edit) = this.filter_edit.as_mut() {
                             let field = Field::ALL
                                 .into_iter()
@@ -857,7 +906,7 @@ impl TodoView {
                                 .unwrap_or(Field::Tags);
                             let condition = Condition::empty(field);
                             edit.inputs
-                                .push(Self::condition_inputs(&condition.value, cx));
+                                .push(Self::condition_inputs(&condition.value, window, cx));
                             edit.draft.rules.conditions.push(condition);
                             edit.chain_menu = Some(edit.draft.rules.conditions.len() - 1);
                         }
@@ -878,10 +927,10 @@ impl TodoView {
                                     Label::new(strings.filter_example_names[i])
                                         .size(LabelSize::Small),
                                 )
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     if let Some(edit) = this.filter_edit.as_mut() {
                                         edit.draft.rules = example.rules.clone();
-                                        edit.inputs = Self::filter_inputs(&edit.draft, cx);
+                                        edit.inputs = Self::filter_inputs(&edit.draft, window, cx);
                                         edit.examples_open = false;
                                         edit.chain_menu = None;
                                         edit.error = None;
@@ -913,9 +962,8 @@ impl TodoView {
                         IconButton::new("filter-dialog-x", IconName::X)
                             .icon_color(Color::Muted)
                             .tooltip(Tooltip::text(strings.close))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.filter_edit = None;
-                                cx.notify();
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_filter_edit(window, cx);
                             })),
                     ),
             )
@@ -931,7 +979,7 @@ impl TodoView {
                             cx,
                         )
                         .on_click(cx.listener(
-                            move |this, _, _, cx| this.set_filter_advanced(mode, cx),
+                            move |this, _, window, cx| this.set_filter_advanced(mode, window, cx),
                         ))
                     })),
             )
@@ -980,9 +1028,8 @@ impl TodoView {
                         Button::new("filter-close", strings.close)
                             .variant(ButtonVariant::Secondary)
                             .size(ButtonSize::Sm)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.filter_edit = None;
-                                cx.notify();
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_filter_edit(window, cx);
                             })),
                     )
                     .child(

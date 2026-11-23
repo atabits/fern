@@ -1,23 +1,22 @@
 //! The Summary smart list, modeled on the original's: a report of the period's tasks on the left,
 //! its Filter and Display Options on the right, and "Copy" to take it as Markdown.
 
-use std::cell::Cell;
 use std::rc::Rc;
 
 use chrono::{Local, NaiveDate};
 use fern_core::markdown::{self, Format};
-use fern_core::summary::{Field, GroupKey, Grouping, Period, StatusFilter, SummaryGroup, SummaryOptions, summarize};
+use fern_core::summary::{Field, GroupKey, Period, SummaryGroup, SummaryOptions, summarize};
 use fern_core::{List, Priority, Store, Task};
 use gpui::{ClipboardItem, Entity, FocusHandle, Focusable as _, FontWeight};
 use ui::prelude::*;
-use ui::Tooltip;
-use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
+use ui::{Placement, PopoverAttachment, popover};
 
 use crate::actions as md;
 use crate::calendar;
 use crate::i18n::{self, Strings};
 use crate::task_rows::{local_day, short_date};
-use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
+use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
+mod menus;
 #[path = "summary_fields.rs"]
 mod summary_fields;
 
@@ -90,6 +89,8 @@ pub struct SummaryView {
     more_side: Option<u8>,
     /// The "Custom" date fields, while open.
     custom: Option<(Entity<TextInput>, Entity<TextInput>)>,
+    /// Restores focus to `focus_handle` after `dismiss_transient` closes an inline input.
+    pending_focus: bool,
 }
 
 /// A rendered summary: the period's heading and each group's heading and lines.
@@ -246,6 +247,7 @@ impl SummaryView {
             confirm_delete_template: None,
             editing: false,
             heading_menu: false,
+            pending_focus: false,
         }
     }
 
@@ -312,11 +314,20 @@ impl SummaryView {
         let today = Local::now().date_naive();
         let (first, last) = self.options.period.range(today, calendar::week_start());
         let field = |placeholder: &'static str, date: NaiveDate, cx: &mut Context<Self>| {
-            cx.new(|cx| {
+            let input = cx.new(|cx| {
                 let mut input = TextInput::new(Mode::SingleLine, placeholder, cx);
                 input.set_text(calendar::format_date(date, strings), cx);
                 input
+            });
+            cx.subscribe_in(&input, window, |this, _, _: &Submitted, window, cx| {
+                this.confirm_custom(window, cx);
             })
+            .detach();
+            cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
+                this.cancel_custom(window, cx);
+            })
+            .detach();
+            input
         };
         let start = field(strings.summary_start, first, cx);
         let end = field(strings.summary_end, last, cx);
@@ -326,14 +337,23 @@ impl SummaryView {
         cx.notify();
     }
 
+    fn cancel_custom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.custom = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
     /// Template "+": a name for the current options.
     fn start_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let strings = i18n::t(cx);
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.summary_template_name, cx));
-        cx.subscribe(&input, |this, _, Submitted(name), cx| this.save_template(name.clone(), cx)).detach();
-        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
-            this.naming = None;
-            cx.notify();
+        cx.subscribe(&input, |_, _, _: &Changed, cx| cx.notify()).detach();
+        cx.subscribe_in(&input, window, |this, _, Submitted(name), window, cx| {
+            this.save_template(name.clone(), window, cx);
+        })
+        .detach();
+        cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
+            this.cancel_template(window, cx);
         })
         .detach();
         window.focus(&input.focus_handle(cx), cx);
@@ -341,10 +361,17 @@ impl SummaryView {
         cx.notify();
     }
 
-    fn save_template(&mut self, name: String, cx: &mut Context<Self>) {
+    fn cancel_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.naming = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn save_template(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.save_summary_template(&name, &self.options) {
             Ok(_) => {
                 self.naming = None;
+                window.focus(&self.focus_handle, cx);
                 self.refresh_templates(cx);
             }
             Err(err) => {
@@ -354,7 +381,7 @@ impl SummaryView {
         }
     }
 
-    fn confirm_custom(&mut self, cx: &mut Context<Self>) {
+    fn confirm_custom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((start, end)) = &self.custom else { return };
         let strings = i18n::t(cx);
         let today = Local::now().date_naive();
@@ -362,6 +389,7 @@ impl SummaryView {
         if let (Some(first), Some(last)) = (parse(start), parse(end)) {
             self.custom = None;
             self.update(cx, |o| o.period = Period::Custom(first, last));
+            window.focus(&self.focus_handle, cx);
         }
     }
 
@@ -379,15 +407,17 @@ impl SummaryView {
         let dismissed = if self.pending_options.take().is_some()
             || self.confirm_delete_template.take().is_some()
             || self.more_side.take().is_some()
+            || self.menu.take().is_some()
+            || std::mem::take(&mut self.save_menu)
+            || std::mem::take(&mut self.copy_menu)
+            || std::mem::take(&mut self.heading_menu)
         {
             true
+        } else if self.naming.take().is_some() || self.custom.take().is_some() {
+            self.pending_focus = true;
+            true
         } else {
-            self.menu.take().is_some()
-                || std::mem::take(&mut self.save_menu)
-                || std::mem::take(&mut self.copy_menu)
-                || std::mem::take(&mut self.heading_menu)
-                || self.naming.take().is_some()
-                || self.custom.take().is_some()
+            false
         };
         if dismissed {
             cx.notify();
@@ -670,537 +700,13 @@ impl SummaryView {
         let export = summary_fields::export_report(subject, report.groups.clone(), edited.as_deref());
         (export, markdown, mailto)
     }
-
-    /// A Filter or Display Options row whose value opens a dropdown.
-    fn row(
-        &self,
-        label: &'static str,
-        value: String,
-        menu: Menu,
-        options: Vec<(String, bool, Pick)>,
-        // Fields stay open to pick several.
-        keep_open: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let open = self.menu == Some(menu);
-        let dropdown = open.then(|| {
-            let options = Rc::new(options);
-            let items = (0..options.len()).map(|i| {
-                let (label, selected, _) = &options[i];
-                let options = options.clone();
-                ListItem::new(SharedString::from(format!("summary-option-{i}")))
-                    .child(Label::new(label.clone()).color(if *selected { Color::Accent } else { Color::Default }))
-                    .when(*selected, |item| item.end_slot(Icon::new(IconName::Check).color(Color::Accent).size(IconSize::Small)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        (options[i].2)(this, window, cx);
-                        if !keep_open {
-                            this.set_menu(None, cx);
-                        }
-                        if this.pending_options.is_some() {
-                            window.focus(&this.focus_handle, cx);
-                        }
-                    }))
-            });
-            PopoverAttachment::new(
-                Placement::BelowRight,
-                popover(cx)
-                    .min_w(px(200.))
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_menu(None, cx)))
-                    .child(
-                        v_scroll(
-                            ("summary-options-scroll-view", menu as usize),
-                            v_flex().id(("summary-options-scroll", menu as usize)).children(items),
-                        )
-                        .max_h(px(280.))
-                        .compact(),
-                    ),
-            )
-        });
-        let hover_bg = cx.theme().colors().ghost_element_hover;
-        h_flex()
-            .h(px(40.))
-            .px_4()
-            .child(div().flex_1().child(Label::new(label)))
-            .child(
-                h_flex()
-                    .id(SharedString::from(format!("summary-{label}")))
-                    .relative()
-                    .px_1p5()
-                    .py_0p5()
-                    .gap_1()
-                    .rounded(px(5.))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(hover_bg))
-                    .child(Label::new(value).color(Color::Muted))
-                    .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_menu((!open).then_some(menu), cx)))
-                    .children(dropdown),
-            )
-    }
-
-    /// The original's Template row: saved option sets to apply with a click, and "+" to save the
-    /// current ones under a name.
-    fn render_templates(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
-        let templates = self
-            .cache
-            .as_ref()
-            .map(|c| c.templates.as_slice())
-            .unwrap_or(&[]);
-        v_flex()
-            .gap_2()
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_1p5()
-                    .children(templates.iter().map(|template| {
-                        let selected = template.options == self.options;
-                        let (id, template_name, options) = (template.id, template.name.clone(), template.options.clone());
-                        let group = SharedString::from(format!("template-{id}"));
-                        h_flex()
-                            .id(group.clone())
-                            .group(group.clone())
-                            .when(cfg!(test), |el| el.debug_selector(move || format!("template-{id}")))
-                            .h(px(26.))
-                            .pl_2()
-                            .pr_1()
-                            .gap_1()
-                            .rounded(px(13.))
-                            .border_1()
-                            .border_color(if selected { colors.accent } else { colors.border })
-                            .cursor_pointer()
-                            .hover(|s| s.bg(colors.ghost_element_hover))
-                            .child(Label::new(template.name.clone()).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
-                            .child(
-                                div()
-                                    .when(!crate::touch::active(), |el| el.invisible())
-                                    .group_hover(group, |s| s.visible())
-                                    .when(cfg!(test), |el| el.debug_selector(move || format!("delete-template-{id}")))
-                                    .child(
-                                        IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
-                                            .size(px(16.))
-                                            .icon_size(IconSize::XSmall)
-                                            .icon_color(Color::Muted)
-                                            .hover_icon_color(Color::Error)
-                                            .tooltip(Tooltip::text(strings.delete))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.confirm_delete_template = Some((id, template_name.clone()));
-                                                window.focus(&this.focus_handle, cx);
-                                                cx.notify();
-                                            })),
-                                    ),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let options = options.clone();
-                                this.update(cx, |o| *o = options);
-                                if this.pending_options.is_some() {
-                                    window.focus(&this.focus_handle, cx);
-                                }
-                            }))
-                    }))
-                    .child(
-                        h_flex()
-                            .id("add-summary-template")
-                            .h(px(26.))
-                            .justify_center()
-                            .rounded(px(6.))
-                            .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.surface_background)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(colors.element_hover))
-                            .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
-                            .when(templates.is_empty(), |el| {
-                                el.px_2()
-                                    .gap_1()
-                                    .child(Label::new(strings.summary_save_template).size(LabelSize::Small))
-                            })
-                            .when(!templates.is_empty(), |el| {
-                                el.w(px(26.))
-                                    .tooltip(Tooltip::text(strings.summary_save_template))
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| this.start_template(window, cx))),
-                    ),
-            )
-            .children(self.naming.clone().map(|input| {
-                let can_save = !input.read(cx).text().trim().is_empty();
-                v_flex()
-                    .gap_1p5()
-                    .child(Label::new(strings.summary_template_hint).size(LabelSize::XSmall).color(Color::Muted))
-                    .child(h_flex().h(px(28.)).px_2().rounded(px(6.)).bg(colors.surface_background).child(input.clone()))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .justify_end()
-                            .child(
-                                div()
-                                    .id("template-close")
-                                    .px_3()
-                                    .h(px(26.))
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(6.))
-                                    .border_1()
-                                    .border_color(colors.border)
-                                    .hover(|s| s.bg(colors.element_hover))
-                                    .cursor_pointer()
-                                    .child(Label::new(strings.close).size(LabelSize::Small))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.naming = None;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("template-save")
-                                    .px_3()
-                                    .h(px(26.))
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(6.))
-                                    .bg(colors.accent.opacity(if can_save { 1. } else { 0.5 }))
-                                    .when(can_save, |el| el.cursor_pointer().hover(|s| s.opacity(0.9)))
-                                    .child(Label::new(strings.save).size(LabelSize::Small).color(Color::OnAccent))
-                                    .when(can_save, |el| {
-                                        el.on_click(cx.listener(move |this, _, _, cx| {
-                                            let name = input.read(cx).text().to_owned();
-                                            this.save_template(name, cx);
-                                        }))
-                                    }),
-                            ),
-                    )
-            }))
-    }
-
-    /// The original's "More" filter: Tag and Priority side menus with checkable entries.
-    fn render_more_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let strings = i18n::t(cx);
-        let options = &self.options;
-        let open = self.menu == Some(Menu::More);
-        let priorities = [
-            (Priority::High, strings.priority_high),
-            (Priority::Medium, strings.priority_medium),
-            (Priority::Low, strings.priority_low),
-            (Priority::None, strings.priority_none),
-        ];
-        let mut parts = Vec::new();
-        if let Some(tags) = &options.tags {
-            parts.push(tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(", "));
-        }
-        if let Some(chosen) = &options.priorities {
-            parts.push(priorities.iter().filter(|(p, _)| chosen.contains(p)).map(|(_, n)| *n).collect::<Vec<_>>().join(", "));
-        }
-        let value = if parts.is_empty() { strings.none_option.to_owned() } else { parts.join("; ") };
-        let check = |selected: bool, item: ListItem| {
-            item.when(selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
-        };
-        let dropdown = open.then(|| {
-            let tags = self
-                .cache
-                .as_ref()
-                .map(|c| c.tags.as_slice())
-                .unwrap_or(&[]);
-            let tag_items = std::iter::once(
-                check(options.tags.is_none(), ListItem::new("more-tag-all").child(Label::new(strings.summary_all_tags)))
-                    .on_click(cx.listener(|this, _, _, cx| this.update(cx, |o| o.tags = None)))
-                    .into_any_element(),
-            )
-            .chain(tags.iter().map(|tag| {
-                let name = tag.name.clone();
-                let selected = options.tags.as_ref().is_some_and(|t| t.contains(&name));
-                check(selected, ListItem::new(SharedString::from(format!("more-tag-{name}"))).child(Label::new(format!("#{name}"))))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let name = name.clone();
-                        this.update(cx, |o| {
-                            let mut chosen = o.tags.take().unwrap_or_default();
-                            match chosen.iter().position(|t| *t == name) {
-                                Some(i) => {
-                                    chosen.remove(i);
-                                }
-                                None => chosen.push(name),
-                            }
-                            o.tags = (!chosen.is_empty()).then_some(chosen);
-                        })
-                    }))
-                    .into_any_element()
-            }))
-            .collect::<Vec<_>>();
-            let priority_items = std::iter::once(
-                check(options.priorities.is_none(), ListItem::new("more-priority-all").child(Label::new(strings.summary_all_priorities)))
-                    .on_click(cx.listener(|this, _, _, cx| this.update(cx, |o| o.priorities = None)))
-                    .into_any_element(),
-            )
-            .chain(priorities.into_iter().map(|(priority, name)| {
-                let selected = options.priorities.as_ref().is_some_and(|p| p.contains(&priority));
-                check(selected, ListItem::new(SharedString::from(format!("more-priority-{}", priority.to_i64()))).child(Label::new(name)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.update(cx, |o| {
-                            let mut chosen = o.priorities.take().unwrap_or_default();
-                            match chosen.iter().position(|p| *p == priority) {
-                                Some(i) => {
-                                    chosen.remove(i);
-                                }
-                                None => chosen.push(priority),
-                            }
-                            o.priorities = (!chosen.is_empty()).then_some(chosen);
-                        })
-                    }))
-                    .into_any_element()
-            }))
-            .collect::<Vec<_>>();
-            let tag_bounds = Rc::new(Cell::new(None::<gpui::Bounds<Pixels>>));
-            let priority_bounds = Rc::new(Cell::new(None::<gpui::Bounds<Pixels>>));
-            let tag_bounds_out = tag_bounds.clone();
-            let priority_bounds_out = priority_bounds.clone();
-            let side = |index: u8,
-                        id: &'static str,
-                        label: &'static str,
-                        items: Vec<AnyElement>,
-                        bounds: Rc<Cell<Option<gpui::Bounds<Pixels>>>>,
-                        cx: &mut Context<Self>| {
-                SubmenuItem::new(id, label)
-                    .open(self.more_side == Some(index))
-                    .track_bounds(bounds)
-                    .items(items)
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        if *hovered && this.more_side != Some(index) {
-                            this.more_side = Some(index);
-                            cx.notify();
-                        }
-                    }))
-            };
-            PopoverAttachment::new(
-                Placement::BelowRight,
-                popover(cx)
-                    .min_w(px(200.))
-                    .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        if tag_bounds_out.get().is_some_and(|b| b.contains(&event.position))
-                            || priority_bounds_out.get().is_some_and(|b| b.contains(&event.position))
-                        {
-                            return;
-                        }
-                        this.more_side = None;
-                        this.set_menu(None, cx);
-                    }))
-                    .child(side(0, "more-tag", strings.summary_tag, tag_items, tag_bounds, cx))
-                    .child(side(1, "more-priority", strings.summary_priority, priority_items, priority_bounds, cx)),
-            )
-        });
-        let hover_bg = cx.theme().colors().ghost_element_hover;
-        h_flex()
-            .h(px(40.))
-            .px_4()
-            .child(div().flex_1().child(Label::new(strings.summary_more)))
-            .child(
-                h_flex()
-                    .id("summary-more")
-                    .relative()
-                    .px_1p5()
-                    .py_0p5()
-                    .gap_1()
-                    .max_w(px(170.))
-                    .rounded(px(5.))
-                    .hover(move |s| s.bg(hover_bg))
-                    .cursor_pointer()
-                    .child(Label::new(value).color(Color::Muted).truncate())
-                    .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_menu((!open).then_some(Menu::More), cx)))
-                    .children(dropdown),
-            )
-    }
-
-    fn render_options(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
-        let today = Local::now().date_naive();
-        let options = &self.options;
-        let group = || v_flex().py_1().rounded(px(8.)).bg(colors.surface_background);
-        let heading = |text: &'static str| div().pt_3().pb_1p5().child(Label::new(text).weight(FontWeight::SEMIBOLD));
-
-        let mut periods: Vec<(String, bool, Pick)> = Period::ALL
-            .into_iter()
-            .map(|period| {
-                let pick: Pick = Box::new(move |this, _, cx| this.update(cx, |o| o.period = period));
-                (period_label(period, today, strings), period == options.period, pick)
-            })
-            .collect();
-        let custom = matches!(options.period, Period::Custom(..));
-        periods.push((
-            strings.summary_custom.to_owned(),
-            custom,
-            Box::new(|this, window, cx| this.open_custom(window, cx)),
-        ));
-        let lists = self
-            .cache
-            .as_ref()
-            .map(|c| c.lists.as_slice())
-            .unwrap_or(&[]);
-        let list_label = match &options.lists {
-            None if options.habits => format!("{}, {}", strings.summary_all_lists, strings.summary_habits),
-            None => strings.summary_all_lists.to_owned(),
-            Some(chosen) => {
-                let mut names: Vec<String> = chosen
-                    .iter()
-                    .map(|id| match id {
-                        None => strings.inbox.to_owned(),
-                        Some(id) => lists.iter().find(|l| l.id == *id).map(|l| l.name.clone()).unwrap_or_default(),
-                    })
-                    .collect();
-                if options.habits {
-                    names.push(strings.summary_habits.to_owned());
-                }
-                names.join(", ")
-            }
-        };
-        let mut list_options: Vec<(String, bool, Pick)> = vec![(
-            strings.summary_all_lists.to_owned(),
-            options.lists.is_none(),
-            Box::new(|this, _, cx| this.update(cx, |o| o.lists = None)),
-        )];
-        list_options.push((
-            strings.summary_habits.to_owned(),
-            options.habits,
-            Box::new(|this, _, cx| this.update(cx, |o| o.habits = !o.habits)),
-        ));
-        let choices = std::iter::once((None, strings.inbox.to_owned())).chain(lists.iter().map(|l| (Some(l.id), l.name.clone())));
-        list_options.extend(choices.map(|(id, name)| {
-            let selected = options.lists.as_ref().is_some_and(|chosen| chosen.contains(&id));
-            let pick: Pick = Box::new(move |this, _, cx| {
-                this.update(cx, |o| {
-                    let mut chosen = o.lists.take().unwrap_or_default();
-                    match chosen.iter().position(|c| *c == id) {
-                        Some(i) => {
-                            chosen.remove(i);
-                        }
-                        None => chosen.push(id),
-                    }
-                    o.lists = (!chosen.is_empty()).then_some(chosen);
-                })
-            });
-            (name, selected, pick)
-        }));
-        let statuses = StatusFilter::ALL
-            .into_iter()
-            .zip(strings.summary_statuses)
-            .map(|(status, name)| {
-                let pick: Pick = Box::new(move |this, _, cx| this.update(cx, |o| o.status = status));
-                (name.to_owned(), status == options.status, pick)
-            })
-            .collect();
-        let groupings = Grouping::ALL
-            .into_iter()
-            .zip(strings.summary_groupings)
-            .map(|(grouping, name)| {
-                let pick: Pick = Box::new(move |this, _, cx| this.update(cx, |o| o.grouping = grouping));
-                (name.to_owned(), grouping == options.grouping, pick)
-            })
-            .collect();
-        let fields = Field::ALL
-            .into_iter()
-            .zip(strings.summary_fields)
-            .map(|(field, name)| {
-                let pick: Pick = Box::new(move |this, _, cx| {
-                    this.update(cx, |o| match o.fields.iter().position(|f| *f == field) {
-                        Some(i) => {
-                            o.fields.remove(i);
-                        }
-                        None => o.fields.push(field),
-                    })
-                });
-                (name.to_owned(), options.fields.contains(&field), pick)
-            })
-            .collect();
-        let status_index = StatusFilter::ALL.iter().position(|s| *s == options.status).unwrap_or(0);
-        let grouping_index = Grouping::ALL.iter().position(|g| *g == options.grouping).unwrap_or(0);
-
-        let content = v_flex()
-            .id("summary-options-sidebar-content")
-            .px_4()
-            .pb_4()
-            .child(heading(strings.summary_template))
-            .child(self.render_templates(cx))
-            .child(heading(strings.summary_filter))
-            .child(
-                group()
-                    .child(self.row(strings.summary_date, period_label(options.period, today, strings), Menu::Period, periods, false, cx))
-                    .children(self.custom.clone().map(|(start, end)| {
-                        let field = |input: Entity<TextInput>| {
-                            h_flex().h(px(28.)).px_2().rounded(px(6.)).bg(colors.background).child(input)
-                        };
-                        v_flex()
-                            .mx_3()
-                            .mb_2()
-                            .gap_1p5()
-                            .child(field(start))
-                            .child(field(end))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .justify_end()
-                                    .child(
-                                        Button::new("summary-custom-cancel", strings.cancel)
-                                            .variant(ButtonVariant::Secondary)
-                                            .size(ButtonSize::Sm)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.custom = None;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("summary-custom-confirm", strings.confirm)
-                                            .variant(ButtonVariant::Primary)
-                                            .size(ButtonSize::Sm)
-                                            .on_click(cx.listener(|this, _, _, cx| this.confirm_custom(cx))),
-                                    ),
-                            )
-                    }))
-                    .child(self.row(strings.summary_lists, list_label, Menu::Lists, list_options, true, cx))
-                    .child(self.row(strings.summary_status, strings.summary_statuses[status_index].to_owned(), Menu::Status, statuses, false, cx))
-                    .child(self.render_more_row(cx)),
-            )
-            .child(heading(strings.summary_display_options))
-            .child(
-                group()
-                    .child(self.row(strings.summary_grouping, strings.summary_groupings[grouping_index].to_owned(), Menu::Grouping, groupings, false, cx))
-                    .child(self.row(
-                        strings.summary_fields_label,
-                        strings.summary_selected.replace("{n}", &options.fields.len().to_string()),
-                        Menu::Fields,
-                        fields,
-                        true,
-                        cx,
-                    )),
-            )
-            .child(
-                h_flex()
-                    .id("summary-next-period")
-                    .pt_3()
-                    .cursor_pointer()
-                    .child(div().flex_1().child(Label::new(strings.summary_next_period).weight(FontWeight::SEMIBOLD)))
-                    .child(Switch::new().toggle_state(options.next_period))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.update(cx, |o| o.next_period = !o.next_period);
-                        if this.pending_options.is_some() {
-                            window.focus(&this.focus_handle, cx);
-                        }
-                    })),
-            );
-
-        v_flex()
-            .flex_none()
-            .w(px(320.))
-            .h_full()
-            .pt(crate::title_bar::height())
-            .border_l_1()
-            .border_color(colors.border_variant)
-            .child(v_scroll("summary-options-sidebar-scroll", content).flex_1().min_h_0())
-    }
 }
 
 impl Render for SummaryView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.pending_focus) {
+            window.focus(&self.focus_handle, cx);
+        }
         let strings = i18n::t(cx);
         let colors = cx.theme().colors().clone();
         self.ensure_cache(cx);
@@ -1266,9 +772,11 @@ impl Render for SummaryView {
             .size_full()
             .track_focus(&self.focus_handle)
             .items_start()
-            .on_action(cx.listener(|this, _: &md::DismissTransient, _, cx| {
+            .on_action(cx.listener(|this, _: &md::DismissTransient, window, cx| {
                 if !this.dismiss_transient(cx) {
                     cx.propagate();
+                } else if std::mem::take(&mut this.pending_focus) {
+                    window.focus(&this.focus_handle, cx);
                 }
             }))
             .child(
@@ -1489,285 +997,4 @@ impl Render for SummaryView {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::i18n::EN;
-
-    #[test]
-    fn report_lines_and_markdown() {
-        let store = Store::open_in_memory().unwrap();
-        let today = Local::now().date_naive();
-        let done = store.add_task("Ship it").unwrap();
-        store.set_tags(done.id, &["work".to_owned()]).unwrap();
-        store.set_completed(done.id, true).unwrap();
-        let tasks = store.tasks().unwrap();
-        let options = SummaryOptions {
-            period: Period::Today,
-            fields: vec![Field::Status, Field::CompletionTime, Field::Tag, Field::Title],
-            ..Default::default()
-        };
-        let groups = summarize(&tasks, &options, today, calendar::week_start());
-        let report = report(&groups, &options, &[], today, &EN);
-        let day = short_date(today, &EN);
-        assert_eq!(report.groups, [("Completed".to_owned(), vec![format!("[x] [{day}] Ship it #work")])]);
-        assert_eq!(report.markdown(), format!("# {day}\n\n## Completed\n- [x] [{day}] Ship it #work\n"));
-        assert!(report.mailto("Summary").starts_with("mailto:?subject=Summary&body=%23%20"));
-        assert_eq!(percent_encode("a b&c"), "a%20b%26c");
-    }
-
-    #[gpui::test]
-    fn summary_view_caches_report_and_invalidates_on_options_and_data_version(cx: &mut gpui::TestAppContext) {
-        use gpui::AppContext;
-        cx.update(|cx| {
-            theme::init(cx);
-            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
-        });
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let t1 = store.add_task("First shipped task").unwrap();
-        store.set_completed(t1.id, true).unwrap();
-
-        let (view, cx) = cx.add_window_view(|_, cx| SummaryView::new(store.clone(), cx));
-        cx.run_until_parked();
-
-        // Initial render builds cache once.
-        view.read_with(cx, |v, _| {
-            assert_eq!(v.rebuild_count, 1);
-            assert!(v.cache.as_ref().unwrap().report.markdown().contains("First shipped task"));
-        });
-
-        // Repeated re-renders (hover/menu/notify) reuse the cached report with zero DB rebuilds.
-        view.update(cx, |v, cx| {
-            v.save_menu = true;
-            cx.notify();
-        });
-        cx.run_until_parked();
-        view.update(cx, |v, cx| {
-            v.save_menu = false;
-            cx.notify();
-        });
-        cx.run_until_parked();
-        view.read_with(cx, |v, _| assert_eq!(v.rebuild_count, 1));
-
-        // Changing options invalidates and rebuilds once.
-        view.update(cx, |v, cx| v.update(cx, |o| o.period = Period::Today));
-        cx.run_until_parked();
-        view.read_with(cx, |v, _| assert_eq!(v.rebuild_count, 2));
-
-        // External DataVersion change invalidates cache and picks up newly completed task.
-        let t2 = store.add_task("Second shipped task").unwrap();
-        store.set_completed(t2.id, true).unwrap();
-        let other = cx.update(|_, cx| cx.new(|_| ()));
-        cx.update(|_, cx| desktop_common::data_version::data_changed(other.entity_id(), cx));
-        cx.run_until_parked();
-
-        view.read_with(cx, |v, _| {
-            assert_eq!(v.rebuild_count, 3);
-            assert!(v.cache.as_ref().unwrap().report.markdown().contains("Second shipped task"));
-        });
-    }
-
-    #[gpui::test]
-    fn edited_report_is_exported_and_untouched_editor_refreshes_on_reload(cx: &mut gpui::TestAppContext) {
-        use gpui::AppContext;
-        cx.update(|cx| {
-            theme::init(cx);
-            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
-        });
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let t1 = store.add_task("Alpha task").unwrap();
-        store.set_completed(t1.id, true).unwrap();
-
-        let (view, cx) = cx.add_window_view(|_, cx| SummaryView::new(store.clone(), cx));
-        cx.run_until_parked();
-
-        // Enter edit mode, make NO edits, and exit edit mode.
-        view.update_in(cx, |v, window, cx| {
-            v.toggle_editing(window, cx);
-            assert!(v.editing);
-            v.toggle_editing(window, cx);
-            assert!(!v.editing);
-            assert!(v.editor.is_none(), "untouched editor must be cleared on exit");
-        });
-
-        // Complete a new task externally and emit DataVersion.
-        let t2 = store.add_task("Beta task").unwrap();
-        store.set_completed(t2.id, true).unwrap();
-        let other = cx.update(|_, cx| cx.new(|_| ()));
-        cx.update(|_, cx| desktop_common::data_version::data_changed(other.entity_id(), cx));
-        cx.run_until_parked();
-
-        // Re-entering edit mode must show fresh data (including Beta task), not a stale snapshot.
-        view.update_in(cx, |v, window, cx| {
-            v.toggle_editing(window, cx);
-            let editor = v.editor.as_ref().unwrap();
-            assert!(editor.read(cx).text().contains("Beta task"));
-
-            // Now manually edit the report and verify export_snapshot uses the edited content
-            // for PNG/PDF groups, markdown, and mailto.
-            let custom_md = "# Custom Summary\n- Hand-edited highlight";
-            editor.update(cx, |input, cx| input.set_text(custom_md.to_owned(), cx));
-            let (export, md, mailto) = v.export_snapshot(cx);
-            assert_eq!(md, custom_md);
-            assert_eq!(export.groups, vec![(String::new(), vec!["# Custom Summary".to_owned(), "- Hand-edited highlight".to_owned()])]);
-            assert!(mailto.contains(&percent_encode("Hand-edited highlight")));
-        });
-    }
-
-    #[gpui::test]
-    fn rapid_copies_cancel_previous_copied_badge_timer(cx: &mut gpui::TestAppContext) {
-        use std::time::Duration;
-        cx.update(|cx| {
-            theme::init(cx);
-            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
-        });
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let (view, cx) = cx.add_window_view(|_, cx| SummaryView::new(store, cx));
-        cx.run_until_parked();
-
-        view.update(cx, |v, cx| v.copy_text("first".into(), cx));
-        cx.run_until_parked();
-        view.read_with(cx, |v, _| assert!(v.copied));
-
-        // After 1.5s, copy again -> cancels first 2s timer.
-        cx.executor().advance_clock(Duration::from_millis(1500));
-        cx.run_until_parked();
-        view.update(cx, |v, cx| v.copy_text("second".into(), cx));
-        cx.run_until_parked();
-
-        // Advance 1s (2.5s since first copy, 1s since second) -> badge must STILL be shown.
-        cx.executor().advance_clock(Duration::from_millis(1000));
-        cx.run_until_parked();
-        view.read_with(cx, |v, _| assert!(v.copied, "first timer should have been cancelled"));
-
-        // Advance past the second timer's 2s deadline -> badge clears.
-        cx.executor().advance_clock(Duration::from_millis(1100));
-        cx.run_until_parked();
-        view.read_with(cx, |v, _| assert!(!v.copied));
-    }
-
-    #[gpui::test]
-    fn hidden_summary_view_defers_notify_and_rebuilds_when_activated(cx: &mut gpui::TestAppContext) {
-        use gpui::AppContext;
-        cx.update(|cx| {
-            theme::init(cx);
-            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
-        });
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let t1 = store.add_task("Initial done").unwrap();
-        store.set_completed(t1.id, true).unwrap();
-
-        let (view, cx) = cx.add_window_view(|_, cx| SummaryView::new(store.clone(), cx));
-        cx.run_until_parked();
-        view.read_with(cx, |v, _| assert_eq!(v.rebuild_count, 1));
-
-        // Hide SummaryView, then emit external DataVersion change -> marks dirty without rebuilding.
-        view.update(cx, |v, cx| v.set_active(false, cx));
-        let t2 = store.add_task("Added while hidden").unwrap();
-        store.set_completed(t2.id, true).unwrap();
-        let other = cx.update(|_, cx| cx.new(|_| ()));
-        cx.update(|_, cx| desktop_common::data_version::data_changed(other.entity_id(), cx));
-        cx.run_until_parked();
-        view.read_with(cx, |v, _| {
-            assert!(v.cache_dirty);
-            assert_eq!(v.rebuild_count, 1);
-        });
-
-        // Re-activating refreshes once and picks up the new task.
-        view.update(cx, |v, cx| v.set_active(true, cx));
-        cx.run_until_parked();
-        view.read_with(cx, |v, _| {
-            assert!(!v.cache_dirty);
-            assert_eq!(v.rebuild_count, 2);
-            assert!(v.cache.as_ref().unwrap().report.markdown().contains("Added while hidden"));
-        });
-
-        // Toggling off and back on with no changes avoids redundant rebuilds.
-        view.update(cx, |v, cx| v.set_active(false, cx));
-        view.update(cx, |v, cx| v.set_active(true, cx));
-        cx.run_until_parked();
-        view.read_with(cx, |v, _| assert_eq!(v.rebuild_count, 2));
-    }
-
-    #[gpui::test]
-    fn delete_template_requires_confirmation_and_supports_escape_cancel(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            theme::init(cx);
-            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
-        });
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let template = store.save_summary_template("Weekly Review", &SummaryOptions::default()).unwrap();
-
-        let (view, cx) = cx.add_window_view(|_, cx| SummaryView::new(store.clone(), cx));
-        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
-        cx.run_until_parked();
-
-        // Start with the markdown editor focused so we verify opening confirmation dialogs
-        // moves focus back onto SummaryView's focus_handle for Escape dismissal.
-        view.update_in(cx, |v, window, cx| {
-            v.toggle_editing(window, cx);
-            let editor = v.editor.as_ref().unwrap().clone();
-            editor.update(cx, |input, cx| input.set_text("# Manual Edit".to_owned(), cx));
-            assert!(editor.focus_handle(cx).is_focused(window));
-        });
-        cx.run_until_parked();
-
-        // Hover template chip to reveal the delete button, then click delete -> opens ConfirmDialog only.
-        let pill_sel: &'static str = Box::leak(format!("template-{}", template.id).into_boxed_str());
-        let delete_sel: &'static str = Box::leak(format!("delete-template-{}", template.id).into_boxed_str());
-        let pill_center = cx.debug_bounds(pill_sel).unwrap().center();
-        cx.simulate_mouse_move(pill_center, None, gpui::Modifiers::default());
-        cx.run_until_parked();
-        let delete_btn = cx.debug_bounds(delete_sel).unwrap().center();
-        cx.simulate_click(delete_btn, gpui::Modifiers::default());
-        cx.run_until_parked();
-
-        view.read_with(cx, |v, _| {
-            assert_eq!(v.confirm_delete_template, Some((template.id, "Weekly Review".to_owned())));
-        });
-        assert!(cx.debug_bounds("summary-template-delete-modal").is_some());
-        assert_eq!(store.summary_templates().unwrap().len(), 1, "template must remain in SQLite before confirmation");
-
-        // Escape / DismissTransient reaches SummaryView::dismiss_transient and cancels without deleting.
-        cx.update(|window, cx| {
-            assert!(view.read(cx).focus_handle(cx).is_focused(window));
-            window.dispatch_action(Box::new(md::DismissTransient), cx);
-        });
-        cx.run_until_parked();
-        view.read_with(cx, |v, _| assert!(v.confirm_delete_template.is_none()));
-        assert!(cx.debug_bounds("summary-template-delete-modal").is_none());
-        assert_eq!(store.summary_templates().unwrap().len(), 1);
-
-        // Re-trigger delete and confirm -> deletes from SQLite and refreshes cache.
-        cx.simulate_mouse_move(pill_center, None, gpui::Modifiers::default());
-        cx.run_until_parked();
-        cx.simulate_click(delete_btn, gpui::Modifiers::default());
-        cx.run_until_parked();
-        let modal_bounds = cx.debug_bounds("summary-template-delete-modal").unwrap();
-        let confirm_btn = gpui::point(modal_bounds.center().x + px(120.), modal_bounds.center().y + px(38.));
-        cx.simulate_click(confirm_btn, gpui::Modifiers::default());
-        cx.run_until_parked();
-
-        view.read_with(cx, |v, _| {
-            assert!(v.confirm_delete_template.is_none());
-            assert!(v.cache.as_ref().unwrap().templates.is_empty());
-        });
-        assert!(store.summary_templates().unwrap().is_empty());
-
-        // Clicking Reset with editor focused moves focus to SummaryView so Escape dismisses pending_options.
-        cx.update(|window, cx| {
-            let editor = view.read(cx).editor.as_ref().unwrap().clone();
-            window.focus(&editor.focus_handle(cx), cx);
-            assert!(editor.focus_handle(cx).is_focused(window));
-        });
-        let reset_btn = cx.debug_bounds("summary-reset-edits").unwrap().center();
-        cx.simulate_click(reset_btn, gpui::Modifiers::default());
-        cx.run_until_parked();
-        cx.update(|window, cx| {
-            assert!(view.read(cx).pending_options.is_some());
-            assert!(view.read(cx).focus_handle(cx).is_focused(window));
-            window.dispatch_action(Box::new(md::DismissTransient), cx);
-        });
-        cx.run_until_parked();
-        view.read_with(cx, |v, _| assert!(v.pending_options.is_none()));
-    }
-}
+mod tests;

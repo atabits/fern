@@ -399,12 +399,21 @@ impl TodoView {
         }
         if self.filter_edit.as_ref().is_some_and(|edit| edit.preview) {
             self.set_filter_preview(false, cx);
+            if let Some(edit) = &self.filter_edit {
+                window.focus(&edit.name_focus(cx), cx);
+            }
+            return true;
+        }
+        if self.dismiss_filter_edit_nested(cx) {
+            return true;
+        }
+        if self.filter_edit.is_some() {
+            self.close_filter_edit(window, cx);
             return true;
         }
         if self.list_dialog.take().is_some()
             || self.tag_dialog.take().is_some()
             || self.merge_dialog.take().is_some()
-            || self.filter_edit.take().is_some()
             || self.view_options.take().is_some()
         {
             cx.notify();

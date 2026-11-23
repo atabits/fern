@@ -14,7 +14,7 @@ use crate::markdown_toolbar::ToolbarAction;
 use crate::task_rows;
 
 use super::{
-    FocusTarget, OpenTask, Popup, StickyPaletteTokens, TaskDetail, TaskUpdated, activity_text,
+    FocusTarget, OpenTask, PendingDelete, Popup, StickyPaletteTokens, TaskDetail, activity_text,
     sticky_checkbox,
 };
 
@@ -894,6 +894,8 @@ impl TaskDetail {
                                     this.comment_open = !this.comment_open;
                                     if this.comment_open {
                                         window.focus(&this.comment_input.focus_handle(cx), cx);
+                                    } else {
+                                        this.comment_emoji = false;
                                     }
                                     cx.notify();
                                 })),
@@ -948,6 +950,51 @@ impl TaskDetail {
                 }
             })
     }
+
+    fn render_pending_delete(
+        &self,
+        pending: PendingDelete,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (dialog_id, modal_selector, title, description) = match &pending {
+            PendingDelete::Attachment(att) => (
+                "task-attachment-delete",
+                "task-attachment-delete-modal",
+                strings.confirm_delete_attachment,
+                att.name.clone(),
+            ),
+            PendingDelete::Comment { preview, .. } => (
+                "task-comment-delete",
+                "task-comment-delete-modal",
+                strings.confirm_delete_comment,
+                preview.clone(),
+            ),
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .track_focus(&self.focus)
+            .when(cfg!(test), |el| {
+                el.debug_selector(move || modal_selector.to_owned())
+            })
+            .child(
+                ui::ConfirmDialog::new(dialog_id, title)
+                    .width(px(340.))
+                    .when(!description.is_empty(), |dialog| {
+                        dialog.description(description)
+                    })
+                    .cancel_label(strings.cancel)
+                    .confirm_label(strings.delete)
+                    .destructive(true)
+                    .on_cancel(cx.listener(|this, _, window, cx| {
+                        this.dismiss_pending_delete(window, cx);
+                    }))
+                    .on_confirm(cx.listener(move |this, _, window, cx| {
+                        this.confirm_pending_delete(pending.clone(), window, cx);
+                    })),
+            )
+    }
 }
 
 impl Render for TaskDetail {
@@ -989,7 +1036,7 @@ impl Render for TaskDetail {
                 this.print_current(cx);
             }))
             .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
-                if this.dismiss_confirm_delete_attachment(window, cx) {
+                if this.dismiss_pending_delete(window, cx) {
                     return;
                 }
                 if !this.dismiss_popup(window, cx) {
@@ -1210,45 +1257,8 @@ impl Render for TaskDetail {
             // Bottom bar: list ……… formatting, comments, more; for a trashed task, as in the
             // original: Restore ……… delete forever; for an archived-list task, read-only list label.
             .child(self.render_footer_bar(&meta, window, cx))
-            .when_some(self.confirm_delete_attachment.clone(), |el, att| {
-                el.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .track_focus(&self.focus)
-                        .when(cfg!(test), |el| {
-                            el.debug_selector(|| "task-attachment-delete-modal".to_owned())
-                        })
-                        .child(
-                            ui::ConfirmDialog::new(
-                                "task-attachment-delete",
-                                strings.confirm_delete_attachment,
-                            )
-                            .width(px(340.))
-                            .description(att.name.clone())
-                            .cancel_label(strings.cancel)
-                            .confirm_label(strings.delete)
-                            .destructive(true)
-                            .on_cancel(cx.listener(|this, _, window, cx| {
-                                this.dismiss_confirm_delete_attachment(window, cx);
-                            }))
-                            .on_confirm(cx.listener(move |this, _, window, cx| {
-                                this.dismiss_confirm_delete_attachment(window, cx);
-                                if !this.is_read_only()
-                                    && let Some(dir) = &this.session.attachments_dir
-                                {
-                                    match this.session.store.delete_attachment(&att, dir) {
-                                        Ok(()) => cx.emit(TaskUpdated),
-                                        Err(err) => {
-                                            eprintln!("failed to remove the attachment: {err:#}");
-                                        }
-                                    }
-                                    this.sync_attachments();
-                                    cx.notify();
-                                }
-                            })),
-                        ),
-                )
+            .when_some(self.pending_delete.clone(), |el, pending| {
+                el.child(self.render_pending_delete(pending, strings, cx))
             })
     }
 }

@@ -101,8 +101,12 @@ impl EditorWindow {
                 }
             }, cx),
             subscribe(window, detail, comment, |this, _, _: &Cancelled, window, cx| {
-                this.comment_open = false;
-                window.focus(&this.title.focus_handle(cx), cx);
+                if this.comment_emoji {
+                    this.comment_emoji = false;
+                } else {
+                    this.comment_open = false;
+                    window.focus(&this.title.focus_handle(cx), cx);
+                }
                 cx.notify();
             }, cx),
         ];

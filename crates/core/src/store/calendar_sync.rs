@@ -326,7 +326,7 @@ impl Store {
 }
 
 fn rebuild_caldav_feed(tx: &Connection, subscription_id: Id) -> Result<()> {
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare_cached(
         "SELECT ics FROM calendar_events WHERE subscription_id = ?1 AND dirty != 2 ORDER BY uid",
     )?;
     let entries: Vec<String> = stmt.query_map(params![subscription_id.to_string()], |r| r.get(0))?.collect::<Result<_, _>>()?;

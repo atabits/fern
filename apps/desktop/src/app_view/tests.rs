@@ -1,6 +1,8 @@
 use super::*;
+use super::chrome::reorder_visible_rail_items;
 use super::sync_loop::format_sync_error;
 use crate::reminders::Target;
+use desktop_common::plugin_bus::PluginNavAction;
 
 fn builtins_of(items: &[RailItemId]) -> Vec<fern_core::RailSection> {
     items

@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use desktop_common::plugin_bus::{PluginBus, PluginNavAction, PluginSidebarViewSpec};
+use desktop_common::plugin_bus::PluginBus;
 use fern_core::{RailItemId, Store, link::DeepLink};
 use gpui::Focusable as _;
-use plugin_ui::{PluginHost, PluginView, PluginViewEvent, render_plugin_overlays};
+use plugin_ui::{PluginHost, PluginView, render_plugin_overlays};
 use things_ui::{ThingsEvent, ThingsView};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Placement, PopoverAttachment};
 
 mod alerts;
+mod chrome;
+mod plugins;
 mod sync_loop;
 
 use crate::actions::{
@@ -25,7 +27,7 @@ use crate::habit_view::HabitView;
 use crate::i18n;
 use crate::life_clock_view::{LifeClockEvent, LifeClockPaletteMode, LifeClockView};
 use crate::matrix_view::{self, MatrixView};
-use crate::release_notes::{self, ReleaseNotes, action_button};
+use crate::release_notes::{self, ReleaseNotes};
 use crate::reminders::{self, Notice, Notices};
 use crate::search_modal::{SearchEvent, SearchModal};
 use crate::settings_window::{self, SettingsEvent, SettingsWindow};
@@ -41,31 +43,6 @@ pub(crate) fn dismiss_plugin_modal(cx: &mut App) -> bool {
     plugin_ui::handle_plugin_modal_escape(cx)
 }
 
-fn is_plugin_view_reachable(
-    plugin_id: &str,
-    view_id: &str,
-    active_views: &[PluginSidebarViewSpec],
-    cx: &App,
-) -> bool {
-    if active_views
-        .iter()
-        .any(|spec| spec.plugin_id == plugin_id && spec.view_id == view_id)
-    {
-        return true;
-    }
-    PluginHost::global(cx)
-        .and_then(|host| host.plugin(plugin_id))
-        .is_some_and(|info| {
-            matches!(info.status, plugin_ui::PluginStatus::CircuitBroken { .. })
-                && info
-                    .manifest
-                    .contributions
-                    .sidebar
-                    .iter()
-                    .any(|v| v.id == view_id)
-        })
-}
-
 fn first_enabled_task_section(features: fern_core::Features) -> Section {
     if features.tasks {
         Section::Tasks
@@ -74,36 +51,6 @@ fn first_enabled_task_section(features: fern_core::Features) -> Section {
     } else {
         Section::Tasks
     }
-}
-
-fn reorder_visible_rail_items(
-    original: &[RailItemId],
-    visible: &[RailItemId],
-    from: usize,
-    to: usize,
-) -> Vec<RailItemId> {
-    if from >= visible.len() || to >= visible.len() || from == to {
-        return original.to_vec();
-    }
-    let mut base = original.to_vec();
-    for item in visible {
-        if !base.contains(item) {
-            base.push(item.clone());
-        }
-    }
-    let mut reordered_visible = visible.to_vec();
-    let moved = reordered_visible.remove(from);
-    reordered_visible.insert(to, moved);
-    let mut next_visible = reordered_visible.into_iter();
-    base.into_iter()
-        .map(|item| {
-            if visible.contains(&item) {
-                next_visible.next().unwrap_or(item)
-            } else {
-                item
-            }
-        })
-        .collect()
 }
 
 pub struct AppView {
@@ -486,13 +433,6 @@ impl AppView {
         this
     }
 
-    fn unmount_all_plugin_views(&mut self, cx: &mut Context<Self>) {
-        let views: Vec<_> = self.plugin_views.drain().map(|(_, view)| view).collect();
-        for view in views {
-            view.update(cx, |view, cx| view.unmount(cx));
-        }
-    }
-
     fn shutdown_for_main_window_close(&mut self, cx: &mut Context<Self>) {
         self.unmount_all_plugin_views(cx);
         self.close_settings(cx);
@@ -616,82 +556,6 @@ impl AppView {
         self.sync_title_bar_appearance(cx);
         cx.notify();
         true
-    }
-
-    fn start_rail_drag(&mut self, section: Section, cx: &mut Context<Self>) {
-        self.rail_drag_origin = Some(self.rail_items.clone());
-        self.dragging_rail = Some(section);
-        self.nav_hovered = None;
-        cx.notify();
-    }
-
-    fn cancel_rail_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.dragging_rail.take().is_some() {
-            cx.stop_active_drag(window);
-            if let Some(origin) = self.rail_drag_origin.take() {
-                self.rail_items = origin;
-            }
-            self.nav_hovered = None;
-            cx.notify();
-            return true;
-        }
-        false
-    }
-
-    fn finish_rail_drag_up(
-        &mut self,
-        event: &gpui::MouseUpEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if event.button != gpui::MouseButton::Left || self.dragging_rail.take().is_none() {
-            return;
-        }
-        cx.stop_active_drag(window);
-        let origin = self.rail_drag_origin.take();
-        if origin.as_ref() != Some(&self.rail_items) {
-            let items = self.rail_items.clone();
-            if let Ok(prefs) = self.store.update_preferences(|p| p.set_rail_items(items)) {
-                self.rail_items = prefs.rail_items;
-            }
-        }
-        self.nav_hovered = None;
-        cx.notify();
-    }
-
-    fn move_rail_drag(
-        &mut self,
-        event: &gpui::DragMoveEvent<sidebar::DraggedRailItem>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let dragged = event.drag(cx).item.clone();
-        if self.dragging_rail.is_none() {
-            self.rail_drag_origin = Some(self.rail_items.clone());
-        }
-        self.dragging_rail = Some(Section::try_from_rail_item(&dragged));
-        let plugin_views = cx
-            .try_global::<PluginBus>()
-            .map(|bus| bus.sidebar_views.clone())
-            .unwrap_or_default();
-        let visible = sidebar::visible_rail_items(&self.rail_items, self.features, &plugin_views);
-        if visible.is_empty() {
-            self.cancel_rail_drag(window, cx);
-            return;
-        }
-        let top_y = title_bar::height() + px(sidebar::SECTIONS_TOP_OFFSET);
-        let content_y = event.event.position.y - top_y - self.rail_scroll.offset().y;
-        let slot = ((f32::from(content_y) / sidebar::SLOT_HEIGHT).floor() as isize)
-            .clamp(0, (visible.len() - 1) as isize) as usize;
-        let Some(current) = visible.iter().position(|item| item == &dragged) else {
-            self.cancel_rail_drag(window, cx);
-            return;
-        };
-        if current != slot {
-            self.rail_items = reorder_visible_rail_items(&self.rail_items, &visible, current, slot);
-            self.nav_hovered = None;
-            cx.notify();
-        }
     }
 
     fn close_search(&mut self, cx: &mut Context<Self>) -> bool {
@@ -882,54 +746,6 @@ impl AppView {
         }
     }
 
-    fn set_account_menu(&mut self, open: bool, cx: &mut Context<Self>) {
-        self.account_menu_open = open;
-        cx.notify();
-    }
-
-    fn render_account_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let strings = i18n::t(cx);
-        let topmost = self.always_on_top;
-        popover(cx)
-            .min_w(px(196.))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_account_menu(false, cx)))
-            .child(
-                ListItem::new("account-settings")
-                    .start_slot(Icon::new(IconName::Settings).color(Color::Icon))
-                    .child(Label::new(strings.settings))
-                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(None, window, cx))),
-            )
-            .child(
-                ListItem::new("account-statistics")
-                    .start_slot(Icon::new(IconName::ChartNoAxesColumn).color(Color::Icon))
-                    .child(Label::new(strings.statistics))
-                    .on_click(cx.listener(|this, _, window, cx| this.open_statistics(window, cx))),
-            )
-            .child(
-                ListItem::new("account-shortcuts")
-                    .start_slot(Icon::new(IconName::Keyboard).color(Color::Icon))
-                    .child(Label::new(strings.shortcuts))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_settings_page(settings_window::Page::Shortcuts, window, cx);
-                    })),
-            )
-            .child(div().my_1().child(Divider::horizontal()))
-            .child(
-                ListItem::new("account-always-on-top")
-                    .start_slot(Icon::new(if topmost { IconName::PinOff } else { IconName::Pin }).color(if topmost { Color::Accent } else { Color::Icon }))
-                    .child(Label::new(strings.tray_always_on_top).color(if topmost { Color::Accent } else { Color::Default }))
-                    .when(topmost, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.account_menu_open = false;
-                        if let Err(err) = crate::tray::set_always_on_top(&this.store, !topmost, cx) {
-                            eprintln!("failed to toggle always_on_top: {err:#}");
-                        }
-                        cx.notify();
-                    })),
-            )
-            .into_any_element()
-    }
-
     pub(crate) fn open_statistics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.account_menu_open = false;
         self.statistics_open = true;
@@ -1043,60 +859,6 @@ impl AppView {
         cx.notify();
     }
 
-    fn render_update_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let notes = self.update_notice.as_ref()?;
-        let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
-        let message = strings.update_installed.replace("{version}", &notes.version);
-        Some(
-            popover(cx)
-                .id("update-notice")
-                .debug_selector(|| "update-notice".to_owned())
-                .w(px(296.))
-                .p_2()
-                .gap_1()
-                .child(
-                    h_flex().items_start().gap_2()
-                        .child(div().flex_none().pl_1().pt(px(5.)).child(
-                            Icon::new(IconName::CircleCheck).size(IconSize::Small).color(Color::Accent),
-                        ))
-                        .child(div().flex_1().min_w_0().pt_1().line_height(px(20.)).child(
-                            Label::new(message).weight(gpui::FontWeight::MEDIUM),
-                        ))
-                        .child(
-                            action_button("dismiss-update-notice", cx)
-                                .debug_selector(|| "dismiss-update-notice".to_owned())
-                                .size(px(26.))
-                                .min_h(px(26.))
-                                .px_0()
-                                .justify_center()
-                                .tooltip(Tooltip::text(strings.close))
-                                .child(Icon::new(IconName::X).size(IconSize::Small).color(Color::Muted))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.update_notice = None;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    h_flex().pl(px(26.)).pb_1().child(
-                        action_button("updated-whats-new", cx)
-                            .debug_selector(|| "updated-whats-new".to_owned())
-                            .border_color(colors.border)
-                            .child(Label::new(strings.whats_new).size(LabelSize::Small).weight(gpui::FontWeight::MEDIUM))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(notes) = this.update_notice.take() {
-                                    this.open_settings(Some(notes), window, cx);
-                                }
-                            })),
-                    ),
-                )
-                .into_any_element(),
-        )
-    }
-}
-
-impl AppView {
     /// Opens a task from a `fern://task/…` link or notice, routing to Things when Things is active
     /// or Classic Tasks is turned off.
     pub fn open_task(&mut self, task: fern_core::Id, window: &mut Window, cx: &mut Context<Self>) {
@@ -1134,161 +896,6 @@ impl AppView {
                     Some(serde_json::Value::Object(map).to_string())
                 };
                 PluginHost::run_command_async(plugin_id, command, arg, cx);
-            }
-        }
-    }
-
-    fn ensure_plugin_view(
-        &mut self,
-        plugin_id: &str,
-        view_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Entity<PluginView> {
-        let key = (plugin_id.to_owned(), view_id.to_owned());
-        if let Some(existing) = self.plugin_views.get(&key) {
-            return existing.clone();
-        }
-        let pid = plugin_id.to_owned();
-        let vid = view_id.to_owned();
-        let entity = cx.new(|cx| PluginView::new(pid, vid, cx));
-        cx.subscribe_in(&entity, window, |this, _, event: &PluginViewEvent, window, cx| {
-            match event {
-                PluginViewEvent::OpenLogs { plugin_id } => {
-                    // `PluginView` may also have queued `OpenSettingsPlugins` + `requested_settings_plugin`
-                    // via `PluginHost::request_open_logs_for`; consume both so Settings opens and
-                    // fetches logs exactly once instead of double-dispatching on the next bus tick.
-                    let _ = PluginHost::take_requested_settings_plugin(cx);
-                    if cx
-                        .try_global::<PluginBus>()
-                        .is_some_and(|bus| {
-                            bus.pending_nav
-                                .iter()
-                                .any(|a| matches!(a, PluginNavAction::OpenSettingsPlugins))
-                        })
-                    {
-                        PluginBus::update(cx, |bus| {
-                            bus.pending_nav
-                                .retain(|a| !matches!(a, PluginNavAction::OpenSettingsPlugins));
-                        });
-                    }
-                    this.open_plugin_logs(plugin_id.clone(), window, cx);
-                }
-            }
-        })
-        .detach();
-        self.plugin_views.insert(key, entity.clone());
-        entity
-    }
-
-    fn open_plugin_logs(&mut self, plugin_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_settings_at(None, Some(settings_window::Page::Plugins), window, cx);
-        if let Some(settings) = self.settings {
-            let _ = settings.update(cx, |settings, _, cx| {
-                settings.open_plugin_logs(&plugin_id, cx);
-            });
-        }
-    }
-
-    fn on_plugin_bus_changed(&mut self, cx: &mut Context<Self>) {
-        let mut actions = Vec::new();
-        if cx
-            .try_global::<PluginBus>()
-            .is_some_and(|bus| !bus.pending_nav.is_empty())
-        {
-            actions = PluginBus::update(cx, |bus| bus.drain_nav());
-        }
-
-        if let Some(active_views) = cx
-            .try_global::<PluginBus>()
-            .map(|bus| bus.sidebar_views.clone())
-        {
-            let evicted_keys: Vec<(String, String)> = self
-                .plugin_views
-                .keys()
-                .filter(|(pid, vid)| !is_plugin_view_reachable(pid, vid, &active_views, cx))
-                .cloned()
-                .collect();
-            for key in evicted_keys {
-                if let Some(view) = self.plugin_views.remove(&key) {
-                    view.update(cx, |view, cx| view.unmount(cx));
-                }
-            }
-            if PluginHost::global(cx).is_some()
-                && let Section::Plugin {
-                    ref plugin_id,
-                    ref view_id,
-                } = self.section
-                && !is_plugin_view_reachable(plugin_id.as_ref(), view_id.as_ref(), &active_views, cx)
-            {
-                self.section = first_enabled_task_section(self.features);
-                self.sync_active_section(cx);
-            }
-        }
-
-        let mut deferred = Vec::new();
-        for action in actions {
-            match action {
-                PluginNavAction::RunCommand {
-                    plugin_id,
-                    command_id,
-                    arg,
-                } => {
-                    PluginHost::run_command_async(plugin_id, command_id, arg, cx);
-                }
-                other => deferred.push(other),
-            }
-        }
-        if !deferred.is_empty() && let Some(win) = self.window_handle {
-            cx.spawn(async move |_, cx| {
-                let _ = win.update(cx, |view, window, cx| {
-                    for action in deferred {
-                        view.handle_plugin_nav(action, window, cx);
-                    }
-                });
-            })
-            .detach();
-        }
-        cx.notify();
-    }
-
-    fn handle_plugin_nav(
-        &mut self,
-        action: PluginNavAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match action {
-            PluginNavAction::OpenTask(id) => self.open_task(id, window, cx),
-            PluginNavAction::OpenPluginView { plugin_id, view_id } => {
-                let active_views = cx
-                    .try_global::<PluginBus>()
-                    .map(|bus| bus.sidebar_views.clone())
-                    .unwrap_or_default();
-                if is_plugin_view_reachable(&plugin_id, &view_id, &active_views, cx) {
-                    self.select(
-                        Section::Plugin {
-                            plugin_id: plugin_id.into(),
-                            view_id: view_id.into(),
-                        },
-                        window,
-                        cx,
-                    );
-                }
-            }
-            PluginNavAction::OpenSettingsPlugins => {
-                if let Some(plugin_id) = PluginHost::take_requested_settings_plugin(cx) {
-                    self.open_plugin_logs(plugin_id, window, cx);
-                } else {
-                    self.open_settings_page(settings_window::Page::Plugins, window, cx);
-                }
-            }
-            PluginNavAction::RunCommand {
-                plugin_id,
-                command_id,
-                arg,
-            } => {
-                PluginHost::run_command_async(plugin_id, command_id, arg, cx);
             }
         }
     }

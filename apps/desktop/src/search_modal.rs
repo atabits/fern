@@ -8,7 +8,7 @@ use chrono::Local;
 use desktop_common::plugin_bus::{PluginBus, PluginCommandSpec, PluginSearchHit};
 use fern_core::search::{DateRange, TagRule, TaskFilter};
 use fern_core::{Habit, Id, Kind, List, Priority, Store, Tag, Task, View};
-use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, StyledText};
+use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, ScrollHandle, StyledText};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
@@ -19,7 +19,7 @@ use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
 /// How many tasks the popover lists before "View more".
 const TASK_LIMIT: usize = 5;
-/// Delay before querying SQLite while the user is actively typing.
+/// Delay before filtering cached results and querying plugins while the user is actively typing.
 const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(40);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,8 +66,11 @@ pub struct SearchModal {
     plugin_hits: Vec<PluginSearchHit>,
     last_plugin_query: String,
     pending_complete: HashSet<Id>,
+    all_tasks: Vec<Task>,
+    all_habits: Vec<Habit>,
     all_lists: Vec<List>,
     all_tags: Vec<Tag>,
+    results_scroll: ScrollHandle,
     search_task: Option<gpui::Task<()>>,
     pending_search: bool,
     /// The Task filter's choices, the open dropdown, and the choices being made in it (applied
@@ -110,12 +113,19 @@ impl SearchModal {
         })
         .detach();
         cx.subscribe(&input, |this, _, _: &Submitted, cx| this.open_selected(cx)).detach();
+        let all_tasks = store.tasks().unwrap_or_default();
+        let all_habits = store.habits().unwrap_or_default();
         let all_lists = store.lists().unwrap_or_default();
         let all_tags = store.tags().unwrap_or_default();
         cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
-            this.all_lists = this.store.lists().unwrap_or_default();
-            this.all_tags = this.store.tags().unwrap_or_default();
-            cx.notify();
+            if desktop_common::data_version::changed_elsewhere(cx.entity_id(), cx) {
+                this.reload_cache();
+                if !this.query(cx).is_empty() {
+                    this.refresh(cx);
+                } else {
+                    cx.notify();
+                }
+            }
         })
         .detach();
         cx.observe_global::<PluginBus>(|this, cx| {
@@ -136,8 +146,11 @@ impl SearchModal {
             plugin_hits: Vec::new(),
             last_plugin_query: String::new(),
             pending_complete: HashSet::new(),
+            all_tasks,
+            all_habits,
             all_lists,
             all_tags,
+            results_scroll: ScrollHandle::new(),
             search_task: None,
             pending_search: false,
             task_filter: TaskFilter::default(),
@@ -182,21 +195,55 @@ impl SearchModal {
         }));
     }
 
+    fn reload_cache(&mut self) {
+        self.all_tasks = self.store.tasks().unwrap_or_default();
+        self.all_habits = self.store.habits().unwrap_or_default();
+        self.all_lists = self.store.lists().unwrap_or_default();
+        self.all_tags = self.store.tags().unwrap_or_default();
+    }
+
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.search_task = None;
         self.pending_search = false;
         let query = self.query(cx);
-        let today = Local::now().date_naive();
-        self.tasks = self.store.tasks_in(&View::Search(query.clone()), today).unwrap_or_default();
-        if self.filter == Filter::Tasks {
-            let week_start = crate::calendar::week_start();
-            self.tasks.retain(|task| self.task_filter.matches(task, today, week_start));
+        if query.is_empty() {
+            self.tasks.clear();
+            self.habits.clear();
+            self.tags.clear();
+            self.lists.clear();
+        } else {
+            let today = Local::now().date_naive();
+            self.tasks = self
+                .store
+                .tasks_in_from(self.all_tasks.clone(), &View::Search(query.clone()), today)
+                .unwrap_or_default();
+            if self.filter == Filter::Tasks {
+                let week_start = crate::calendar::week_start();
+                self.tasks
+                    .retain(|task| self.task_filter.matches(task, today, week_start));
+            }
+            let matches = |name: &str| !task_rows::match_ranges(name, &query).is_empty();
+            self.habits = self
+                .all_habits
+                .iter()
+                .filter(|h| matches(&h.name))
+                .cloned()
+                .collect();
+            self.tags = self
+                .all_tags
+                .iter()
+                .filter(|t| matches(&t.name))
+                .cloned()
+                .collect();
+            self.lists = self
+                .all_lists
+                .iter()
+                .filter(|l| matches(&l.name))
+                .cloned()
+                .collect();
         }
-        let matches = |name: &str| !task_rows::match_ranges(name, &query).is_empty();
-        self.habits = self.store.habits().unwrap_or_default().into_iter().filter(|h| matches(&h.name)).collect();
-        self.tags = self.all_tags.iter().filter(|t| matches(&t.name)).cloned().collect();
-        self.lists = self.all_lists.iter().filter(|l| matches(&l.name)).cloned().collect();
         self.selected = 0;
+        self.results_scroll.set_offset(gpui::point(px(0.), px(0.)));
         if self.filter != Filter::All || query.is_empty() {
             self.last_plugin_query.clear();
             self.plugin_hits.clear();
@@ -547,6 +594,97 @@ impl SearchModal {
         events
     }
 
+    fn selected_child_index(&self) -> Option<usize> {
+        let mut child_idx = 0usize;
+        let mut sel_idx = 0usize;
+
+        let task_count = if self.shows(Filter::Tasks) {
+            self.tasks.len().min(TASK_LIMIT)
+        } else {
+            0
+        };
+        if task_count > 0 {
+            child_idx += 1;
+            if self.selected < sel_idx + task_count {
+                return Some(child_idx + (self.selected - sel_idx));
+            }
+            child_idx += task_count;
+            sel_idx += task_count;
+            if self.tasks.len() > TASK_LIMIT {
+                child_idx += 1;
+            }
+        }
+
+        let groups = [
+            (self.shows(Filter::Habits), self.habits.len()),
+            (self.shows(Filter::Tags), self.tags.len()),
+            (self.shows(Filter::Lists), self.lists.len()),
+            (self.filter == Filter::All, self.plugin_commands.len()),
+        ];
+        for (shown, len) in groups {
+            if shown && len > 0 {
+                child_idx += 1;
+                if self.selected < sel_idx + len {
+                    return Some(child_idx + (self.selected - sel_idx));
+                }
+                child_idx += len;
+                sel_idx += len;
+            }
+        }
+
+        if self.filter == Filter::All && !self.plugin_hits.is_empty() {
+            child_idx += 1;
+            for hit in &self.plugin_hits {
+                if Self::plugin_hit_event(hit).is_some() {
+                    if sel_idx == self.selected {
+                        return Some(child_idx);
+                    }
+                    sel_idx += 1;
+                }
+                child_idx += 1;
+            }
+        }
+
+        None
+    }
+
+    fn scroll_selected_into_view(&self) {
+        let Some(child_ix) = self.selected_child_index() else {
+            return;
+        };
+        let viewport = self.results_scroll.bounds();
+        if viewport.size.height <= px(0.) {
+            self.results_scroll
+                .scroll_to_item(if self.selected == 0 { 0 } else { child_ix });
+            return;
+        }
+        if self.selected == 0 {
+            let cur = self.results_scroll.offset();
+            if cur.y < px(0.) {
+                self.results_scroll.set_offset(gpui::point(cur.x, px(0.)));
+            }
+            return;
+        }
+        let Some(unscrolled) = self.results_scroll.bounds_for_item(child_ix) else {
+            self.results_scroll.scroll_to_item(child_ix);
+            return;
+        };
+        let cur = self.results_scroll.offset();
+        let top = unscrolled.top() + cur.y;
+        let bottom = unscrolled.bottom() + cur.y;
+        let mut next_y = cur.y;
+        if top < viewport.top() {
+            next_y += viewport.top() - top;
+        } else if bottom > viewport.bottom() {
+            next_y += viewport.bottom() - bottom;
+        } else {
+            return;
+        }
+        let max_y = self.results_scroll.max_offset().y.max(px(0.));
+        self.results_scroll
+            .set_offset(gpui::point(cur.x, next_y.clamp(-max_y, px(0.))));
+    }
+
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = self.visible_events().len();
         if count == 0 {
@@ -556,6 +694,7 @@ impl SearchModal {
         let next = (self.selected as isize + delta).rem_euclid(count as isize) as usize;
         if self.selected != next {
             self.selected = next;
+            self.scroll_selected_into_view();
             cx.notify();
         }
     }
@@ -603,13 +742,17 @@ impl SearchModal {
                         this.pending_complete.remove(&task_id);
                     });
                     if allowed && Self::finish_complete_task(&store, &task_snapshot, entity_id, cx) {
-                        let _ = weak.update(cx, |this, cx| this.refresh(cx));
+                        let _ = weak.update(cx, |this, cx| {
+                            this.reload_cache();
+                            this.refresh(cx);
+                        });
                     }
                 });
                 return;
             }
             self.pending_complete.remove(&task.id);
             if Self::finish_complete_task(&self.store, task, cx.entity_id(), cx) {
+                self.reload_cache();
                 self.refresh(cx);
             }
             return;
@@ -624,6 +767,7 @@ impl SearchModal {
             return;
         }
         desktop_common::data_version::data_changed(cx.entity_id(), cx);
+        self.reload_cache();
         self.refresh(cx);
     }
 
@@ -1184,6 +1328,7 @@ impl Render for SearchModal {
                         .when(!command_rows.is_empty(), |el| el.child(Self::group_heading(strings.plugins_commands)).children(command_rows))
                         .when(!plugin_hit_rows.is_empty(), |el| el.child(Self::group_heading(strings.plugins)).children(plugin_hit_rows)),
                 )
+                .track_scroll(&self.results_scroll)
                 .flex_1()
                 .min_h(px(180.)),
             )
@@ -1427,6 +1572,106 @@ mod tests {
             assert_eq!(cx.global::<PluginBus>().search_hits.len(), 1);
             modal.update(cx, |m, cx| m.emit_close(SearchEvent::Dismissed, cx));
             assert!(cx.global::<PluginBus>().search_hits.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn cached_search_updates_on_data_version_filters_and_scrolls(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        store
+            .add_list(&fern_core::ListDraft {
+                name: "Alpha List".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store.add_tag("alpha-tag", None, None).unwrap();
+        store.add_habit("Alpha Habit").unwrap();
+        let high = store.add_task("Alpha priority").unwrap();
+        store.set_priority(high.id, Priority::High).unwrap();
+        for i in 1..=5 {
+            store.add_task(&format!("Alpha extra {i}")).unwrap();
+        }
+
+        let (modal, cx) = cx.add_window_view(|_window, cx| SearchModal::new(store.clone(), cx));
+        cx.simulate_resize(gpui::size(px(900.), px(640.)));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            modal.update(cx, |m, cx| {
+                m.set_query("Alpha", cx);
+                assert_eq!(m.tasks.len(), 6);
+                assert_eq!(m.habits.len(), 1);
+                assert_eq!(m.tags.len(), 1);
+                assert_eq!(m.lists.len(), 1);
+
+                m.set_filter(Filter::Tasks, cx);
+                m.draft.priorities = vec![Priority::High];
+                m.apply(cx);
+                assert_eq!(m.tasks.len(), 1);
+                assert_eq!(m.tasks[0].id, high.id);
+
+                m.set_filter(Filter::All, cx);
+                assert_eq!(m.tasks.len(), 6);
+            });
+        });
+
+        let live_task = store.add_task("Alpha live task").unwrap();
+        store
+            .add_list(&fern_core::ListDraft {
+                name: "Alpha Live List".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store.add_tag("alpha-live-tag", None, None).unwrap();
+        for i in 1..=8 {
+            store.add_habit(&format!("Alpha Habit {i}")).unwrap();
+        }
+        let other = cx.update(|_, cx| cx.new(|_| ()));
+        cx.update(|_, cx| desktop_common::data_version::data_changed(other.entity_id(), cx));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let m = modal.read(cx);
+            assert_eq!(m.tasks.len(), 7);
+            assert_eq!(m.habits.len(), 9);
+            assert_eq!(m.tags.len(), 2);
+            assert_eq!(m.lists.len(), 2);
+            assert_eq!(m.results_scroll.offset().y, px(0.));
+        });
+
+        cx.update(|_, cx| {
+            modal.update(cx, |m, cx| {
+                for _ in 0..14 {
+                    m.move_selection(1, cx);
+                }
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(
+                modal.read(cx).results_scroll.offset().y < px(0.),
+                "moving selection past visible fold must scroll results_scroll"
+            );
+        });
+
+        cx.update(|_, cx| {
+            modal.update(cx, |m, cx| {
+                let remaining = m.visible_events().len() - m.selected;
+                for _ in 0..remaining {
+                    m.move_selection(1, cx);
+                }
+                assert_eq!(m.selected, 0);
+                m.toggle_task_completion(&live_task, cx);
+                assert!(
+                    m.tasks.iter().any(|t| t.id == live_task.id && t.is_completed()),
+                    "inline completion must refresh cached search results immediately"
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(modal.read(cx).results_scroll.offset().y, px(0.));
         });
     }
 

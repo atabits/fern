@@ -3,195 +3,42 @@
 //! cross-quadrant DnD, floating task detail card, context menu, and keyboard navigation.
 
 mod edit_dialog;
+#[path = "matrix_ui/dialogs.rs"]
+mod dialogs;
+#[path = "matrix_ui/quadrant.rs"]
+mod quadrant;
+#[cfg(test)]
+#[path = "matrix_ui/tests.rs"]
+mod tests;
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use chrono::{Duration, Local, NaiveDate};
+use chrono::{Local, NaiveDate};
+use desktop_common::actions::{
+    DeleteMatrixTask, DismissTransient, OpenMatrixTask, SelectNextMatrixTask,
+    SelectPreviousMatrixTask, ToggleMatrixTask,
+};
+use desktop_common::layout;
+use desktop_common::text_input::{Mode, Submitted, TextInput};
 use fern_core::matrix::{
     DropOutcome, MatrixKind, QuadrantRule, build_tag_families, quadrant_of, quadrants_of,
 };
-use fern_core::{Id, Kind, List, Preferences, Priority, Store, Task, TaskDraft};
-use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Point};
-use ui::prelude::*;
-use ui::{Button, ButtonVariant, ConfirmDialog, EmptyState, Modal, Placement, PopoverAttachment, popover};
-
-use desktop_common::actions::{
-    DeleteMatrixTask, DismissTransient, OpenMatrixTask, SelectNextMatrixTask, SelectPreviousMatrixTask,
-    ToggleMatrixTask,
-};
-use desktop_common::text_input::{Mode, Submitted, TextInput};
-use desktop_common::{layout, touch};
+use fern_core::{Id, Kind, List, Preferences, Store, Task, TaskDraft};
 use fern_i18n::{self as i18n, Strings};
-use task_ui::drag::DraggedTask;
-use task_ui::lists_panel;
-use task_ui::task_detail::{self, StartFocus, TaskDetail, TaskUpdated};
-use task_ui::task_rows::{self, GroupBy, SortBy};
+use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Point};
+use task_ui::task_detail::{self, StartFocus, TaskDetail, TaskTextEdited, TaskTextField, TaskUpdated};
+use ui::prelude::*;
 
-#[cfg(test)]
-use desktop_common::keymap;
+use dialogs::MatrixNotice;
+use quadrant::{QuadrantCache, arrange_with_manual};
+pub use quadrant::{QuadrantView, arrange};
 
 /// Maximum completed tasks loaded into the matrix when Show Completed is enabled.
 const COMPLETED_HISTORY_LIMIT: usize = 100;
 
 /// The user asked to jump to a task in the Tasks section (double-click or context menu).
 pub struct OpenTask(pub Id);
-
-/// A quadrant's Group by, Sort by, and Order direction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct QuadrantView {
-    pub group: GroupBy,
-    pub sort: SortBy,
-    pub newest_first: bool,
-}
-
-impl Default for QuadrantView {
-    /// Default matching the web reference: grouped by Date, sorted by Date ascending.
-    fn default() -> Self {
-        Self { group: GroupBy::Date, sort: SortBy::Date, newest_first: false }
-    }
-}
-
-impl QuadrantView {
-    fn to_storage(self) -> String {
-        format!(
-            "{},{},{}",
-            self.group.key(),
-            self.sort.key(),
-            if self.newest_first { "newest" } else { "oldest" }
-        )
-    }
-
-    fn from_storage(text: &str) -> Self {
-        if text.trim().is_empty() {
-            return Self::default();
-        }
-        let mut parts = text.split(',');
-        let group = parts.next().map(GroupBy::from_key).unwrap_or(GroupBy::Date);
-        let group = match group {
-            GroupBy::Custom => GroupBy::List,
-            other => other,
-        };
-        let sort = parts.next().map(SortBy::from_key).unwrap_or(SortBy::Date);
-        let newest_first = parts.next() == Some("newest");
-        Self { group, sort, newest_first }
-    }
-}
-
-/// Cached grouped tasks for one quadrant so `render()` does not re-filter and re-sort every frame.
-#[derive(Clone, Default)]
-struct QuadrantCache {
-    open_count: usize,
-    /// Open task groups: `(group_label, tasks)`.
-    groups: Vec<(String, Vec<Task>)>,
-    /// Completed tasks shown in a dedicated collapsible section at the bottom.
-    completed: Vec<Task>,
-}
-
-/// Payload for dragging a quadrant header to swap two quadrants' positions.
-#[derive(Clone)]
-struct DraggedQuadrant {
-    quadrant: usize,
-    title: SharedString,
-}
-
-impl Render for DraggedQuadrant {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        div()
-            .px_3()
-            .py_1p5()
-            .rounded(px(6.))
-            .border_1()
-            .border_color(theme.colors().accent)
-            .bg(theme.colors().elevated_surface_background)
-            .shadow_md()
-            .child(Label::new(self.title.clone()).size(LabelSize::Small))
-    }
-}
-
-enum MatrixNotice {
-    SavedElsewhere(SharedString),
-    AlreadyInQuadrant,
-    DropUnsupported,
-    Failed,
-}
-
-/// Arranges open tasks of a quadrant into groups, applying manual order (when present) or the
-/// chosen sort & direction.
-pub fn arrange(
-    tasks: Vec<Task>,
-    view: QuadrantView,
-    lists: &[List],
-    today: NaiveDate,
-    strings: &Strings,
-) -> Vec<(String, Vec<Task>)> {
-    arrange_with_manual(tasks, view, lists, today, strings, &[])
-}
-
-fn arrange_with_manual(
-    mut tasks: Vec<Task>,
-    view: QuadrantView,
-    lists: &[List],
-    today: NaiveDate,
-    strings: &Strings,
-    manual_order: &[Id],
-) -> Vec<(String, Vec<Task>)> {
-    if !manual_order.is_empty() {
-        let pos: HashMap<Id, usize> = manual_order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
-        tasks.sort_by_key(|t| pos.get(&t.id).copied().unwrap_or(usize::MAX));
-    } else {
-        task_rows::sort_tasks(&mut tasks, view.sort);
-        let natural_newest = matches!(view.sort, SortBy::Created | SortBy::Modified);
-        if natural_newest != view.newest_first {
-            tasks.reverse();
-        }
-    }
-
-    match view.group {
-        GroupBy::List | GroupBy::Custom => {
-            let mut groups: Vec<(Option<Id>, Vec<Task>)> = Vec::new();
-            let mut index: HashMap<Option<Id>, usize> = HashMap::new();
-            for task in tasks {
-                let at = *index.entry(task.list_id).or_insert_with(|| {
-                    groups.push((task.list_id, Vec::new()));
-                    groups.len() - 1
-                });
-                groups[at].1.push(task);
-            }
-            groups
-                .into_iter()
-                .map(|(list, tasks)| {
-                    let name = list
-                        .and_then(|id| lists.iter().find(|l| l.id == id))
-                        .map_or_else(|| strings.inbox.to_owned(), |l| l.name.clone());
-                    (name, tasks)
-                })
-                .collect()
-        }
-        GroupBy::None => {
-            if tasks.is_empty() {
-                Vec::new()
-            } else {
-                vec![(String::new(), tasks)]
-            }
-        }
-        other => {
-            let mut groups: Vec<(String, Vec<Task>)> = Vec::new();
-            for row in task_rows::grouped_rows(&tasks, other, today, false, strings) {
-                match row {
-                    task_rows::Row::Day { label, .. } => groups.push((label, Vec::new())),
-                    task_rows::Row::Task { task, .. } => match groups.last_mut() {
-                        Some((_, tasks)) => tasks.push(task),
-                        None => groups.push((String::new(), vec![task])),
-                    },
-                    task_rows::Row::Section { .. } => {}
-                }
-            }
-            groups
-        }
-    }
-}
 
 pub struct MatrixView {
     store: Rc<Store>,
@@ -221,6 +68,7 @@ pub struct MatrixView {
     /// Floating task detail card (lazily initialized on first task click so `new` needs no `Window`).
     detail: Option<Entity<TaskDetail>>,
     detail_task: Option<Id>,
+    text_edit_sync_task: Option<gpui::Task<()>>,
     /// Right-click task context menu.
     task_menu: Option<(Id, Point<Pixels>)>,
     menu_row: Option<u8>,
@@ -292,6 +140,7 @@ impl MatrixView {
             selected_task: None,
             detail: None,
             detail_task: None,
+            text_edit_sync_task: None,
             task_menu: None,
             menu_row: None,
             menu: None,
@@ -334,90 +183,12 @@ impl MatrixView {
     }
 
     pub fn sync_external(&mut self, cx: &mut Context<Self>) {
+        self.text_edit_sync_task = None;
         if self.active {
             self.reload(cx);
         } else {
             self.dirty = true;
         }
-    }
-
-    fn profile_setting_key(&self, base: &str) -> String {
-        let first_id = self.profiles.first().map(|p| p.id);
-        match self.active_profile_id {
-            Some(id) if Some(id) != first_id => format!("{base}_{id}"),
-            _ => base.to_owned(),
-        }
-    }
-
-    fn switch_profile(&mut self, id: Id, cx: &mut Context<Self>) {
-        self.profile_menu = false;
-        self.editing = None;
-        self.emoji_picker_open = false;
-        if let Err(err) = self.store.set_active_matrix_profile(id) {
-            eprintln!("failed to switch matrix profile: {err:#}");
-            return;
-        }
-        self.reload(cx);
-    }
-
-    fn open_profile_editor(&mut self, editing: Option<Id>, initial: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.profile_menu = false;
-        let placeholder = i18n::t(cx).matrix_profile_name;
-        let initial = initial.to_owned();
-        let input = cx.new(|cx| {
-            let mut input = TextInput::new(Mode::SingleLine, placeholder, cx).without_cancel();
-            if !initial.is_empty() {
-                input.set_text(initial, cx);
-            }
-            input
-        });
-        cx.subscribe(&input, |this, _, _: &Submitted, cx| {
-            this.save_profile_editor(cx);
-        })
-        .detach();
-        window.focus(&input.focus_handle(cx), cx);
-        self.profile_editor = Some((editing, input));
-        cx.notify();
-    }
-
-    fn save_profile_editor(&mut self, cx: &mut Context<Self>) {
-        let Some((editing, input)) = self.profile_editor.take() else { return };
-        let name = input.read(cx).text().trim().to_owned();
-        if name.is_empty() {
-            cx.notify();
-            return;
-        }
-        match editing {
-            Some(id) => {
-                if let Err(err) = self.store.rename_matrix_profile(id, &name) {
-                    eprintln!("failed to rename matrix profile: {err:#}");
-                } else {
-                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                }
-            }
-            None => match self.store.create_matrix_profile(&name, None) {
-                Ok(profile) => {
-                    self.editing = None;
-                    self.emoji_picker_open = false;
-                    let _ = self.store.set_active_matrix_profile(profile.id);
-                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                }
-                Err(err) => eprintln!("failed to create matrix profile: {err:#}"),
-            },
-        }
-        self.reload(cx);
-    }
-
-    fn delete_profile(&mut self, id: Id, cx: &mut Context<Self>) {
-        self.profile_menu = false;
-        self.editing = None;
-        self.emoji_picker_open = false;
-        match self.store.delete_matrix_profile(id) {
-            Ok(true) => desktop_common::data_version::data_changed(cx.entity_id(), cx),
-            Ok(false) => {}
-            Err(err) => eprintln!("failed to delete matrix profile: {err:#}"),
-        }
-        self.reload(cx);
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
@@ -555,6 +326,31 @@ impl MatrixView {
         }
     }
 
+    fn apply_task_text_edit(&mut self, edit: &TaskTextEdited, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        } else {
+            for task in self.tasks.iter_mut().filter(|t| t.id == edit.id) {
+                match &edit.field {
+                    TaskTextField::Title(title) => task.title = title.clone(),
+                    TaskTextField::Notes(notes) => task.notes = notes.clone(),
+                    TaskTextField::Location(location) => task.location = location.clone(),
+                }
+            }
+            self.rebuild_cache(cx);
+            cx.notify();
+        }
+        self.text_edit_sync_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.text_edit_sync_task = None;
+                desktop_common::data_version::data_changed(cx.entity_id(), cx);
+            });
+        }));
+    }
+
     fn open_detail_card(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
         let Ok(Some(task)) = self.store.task(id) else { return };
         if task.is_deleted() {
@@ -566,8 +362,13 @@ impl MatrixView {
                 let store = self.store.clone();
                 let entity = cx.new(|cx| TaskDetail::new(store, window, cx));
                 cx.subscribe(&entity, |this, _, _: &TaskUpdated, cx| {
+                    this.text_edit_sync_task = None;
                     desktop_common::data_version::data_changed(cx.entity_id(), cx);
                     this.reload(cx);
+                })
+                .detach();
+                cx.subscribe(&entity, |this, _, edit: &TaskTextEdited, cx| {
+                    this.apply_task_text_edit(edit, cx);
                 })
                 .detach();
                 cx.subscribe_in(&entity, window, |this, _, task_detail::OpenTask(id), window, cx| {
@@ -590,6 +391,9 @@ impl MatrixView {
     }
 
     fn close_detail_card(&mut self, cx: &mut Context<Self>) {
+        if self.text_edit_sync_task.take().is_some() {
+            desktop_common::data_version::data_changed(cx.entity_id(), cx);
+        }
         self.detail_task = None;
         if let Some(detail) = self.detail.as_ref() {
             detail.update(cx, |d, cx| d.show(None, cx));
@@ -712,6 +516,7 @@ impl MatrixView {
                         match this.store.create_task(final_draft, top) {
                             Ok(task) => {
                                 cleared = true;
+                                this.text_edit_sync_task = None;
                                 desktop_common::data_version::data_changed(cx.entity_id(), cx);
                                 this.reload(cx);
                                 this.notice = this.destination_notice(quadrant, &task, today, i18n::t(cx));
@@ -742,6 +547,7 @@ impl MatrixView {
                 }
             };
             input.update(cx, |input, cx| input.clear(window, cx));
+            this.text_edit_sync_task = None;
             desktop_common::data_version::data_changed(cx.entity_id(), cx);
             this.reload(cx);
             this.notice = this.destination_notice(quadrant, &task, today, i18n::t(cx));
@@ -903,6 +709,7 @@ impl MatrixView {
     }
 
     fn finish_toggle_complete(&mut self, task: &Task, done: bool, cx: &mut Context<Self>) {
+        self.text_edit_sync_task = None;
         if let Err(err) = desktop_common::task_ops::toggle_task_completion(
             &self.store,
             task,
@@ -979,53 +786,10 @@ impl MatrixView {
             if self.detail_task == Some(id) {
                 self.close_detail_card(cx);
             }
+            self.text_edit_sync_task = None;
             desktop_common::data_version::data_changed(cx.entity_id(), cx);
         }
         self.reload(cx);
-    }
-
-    fn default_title(quadrant: usize, strings: &Strings) -> &'static str {
-        [
-            strings.matrix_urgent_important,
-            strings.matrix_not_urgent_important,
-            strings.matrix_urgent_unimportant,
-            strings.matrix_not_urgent_unimportant,
-        ][quadrant]
-    }
-
-    pub(crate) fn quadrant_title(&self, quadrant: usize, strings: &Strings) -> (&'static str, SharedString) {
-        let name = &self.rules[quadrant].name;
-        let title = if name.trim().is_empty() {
-            Self::default_title(quadrant, strings).into()
-        } else {
-            name.clone().into()
-        };
-        (["I", "II", "III", "IV"][quadrant], title)
-    }
-
-    /// Exact quadrant accent colors matching the web reference:
-    /// Q1 `#FF5F68`, Q2 `#FFB000`, Q3 `#4772FA`, Q4 `#0CCE9C`.
-    pub(crate) fn quadrant_color(quadrant: usize) -> Hsla {
-        match quadrant {
-            0 => gpui::rgb(0xFF5F68).into(),
-            1 => gpui::rgb(0xFFB000).into(),
-            2 => gpui::rgb(0x4772FA).into(),
-            _ => gpui::rgb(0x0CCE9C).into(),
-        }
-    }
-
-    /// Contrast-safe quadrant header title color (vibrant on Dark, darkened WCAG AA on Light).
-    pub(crate) fn quadrant_text_color(quadrant: usize, dark: bool) -> Hsla {
-        if dark {
-            Self::quadrant_color(quadrant)
-        } else {
-            match quadrant {
-                0 => gpui::rgb(0xD93842).into(),
-                1 => gpui::rgb(0xB45309).into(),
-                2 => gpui::rgb(0x2F58D6).into(),
-                _ => gpui::rgb(0x047857).into(),
-            }
-        }
     }
 
     /// Applies full cross-quadrant drop adjustments (priority, date, list, tag, kind) and surfaces
@@ -1089,6 +853,7 @@ impl MatrixView {
                 }
                 if ok {
                     self.notice = None;
+                    self.text_edit_sync_task = None;
                     desktop_common::data_version::data_changed(cx.entity_id(), cx);
                 } else {
                     self.notice = Some(MatrixNotice::Failed);
@@ -1193,6 +958,7 @@ impl MatrixView {
             if let Err(err) = result {
                 eprintln!("failed to save the quadrant: {err:#}");
             } else {
+                self.text_edit_sync_task = None;
                 desktop_common::data_version::data_changed(cx.entity_id(), cx);
             }
         }
@@ -1225,119 +991,6 @@ impl MatrixView {
         cx.notify();
     }
 
-    fn render_view_rows(&self, quadrant: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let strings = i18n::t(cx);
-        let view = self.views[quadrant];
-        let has_manual = !self.manual_order[quadrant].is_empty();
-        let note_only = self.rules[quadrant].kind == MatrixKind::NoteOnly;
-        let is_time_sort = matches!(view.sort, SortBy::Date | SortBy::Created | SortBy::Modified);
-        let order_labels = if is_time_sort {
-            strings.order_options
-        } else {
-            [strings.matrix_order_asc, strings.matrix_order_desc]
-        };
-
-        type ViewRow = (u8, IconName, &'static str, &'static str, Vec<(&'static str, QuadrantView)>);
-        let mut sort_choices: Vec<SortBy> = vec![SortBy::Date, SortBy::Created, SortBy::Modified, SortBy::Title, SortBy::Tag];
-        if !note_only {
-            sort_choices.push(SortBy::Priority);
-        }
-
-        let mut rows: Vec<ViewRow> = vec![
-            (
-                0,
-                IconName::LayoutGrid,
-                strings.group_by,
-                view.group.label(strings),
-                [GroupBy::Date, GroupBy::List, GroupBy::Created, GroupBy::Tag, GroupBy::Priority, GroupBy::None]
-                    .map(|group| (group.label(strings), QuadrantView { group, ..view }))
-                    .to_vec(),
-            ),
-            (
-                1,
-                IconName::ArrowDownUp,
-                strings.sort_by,
-                view.sort.label(strings),
-                sort_choices.into_iter().map(|sort| (sort.label(strings), QuadrantView { sort, ..view })).collect(),
-            ),
-        ];
-        if !has_manual {
-            rows.push((
-                2,
-                IconName::ArrowDownUp,
-                strings.order,
-                order_labels[view.newest_first as usize],
-                [false, true]
-                    .map(|newest_first| (order_labels[newest_first as usize], QuadrantView { newest_first, ..view }))
-                    .to_vec(),
-            ));
-        }
-
-        let mut items = Vec::new();
-        for (row, icon, label, value, choices) in rows {
-            let open = self.menu_row == Some(row);
-            items.push(
-                ListItem::new(SharedString::from(format!("quadrant-view-{row}")))
-                    .start_slot(Icon::new(icon).color(Color::Muted))
-                    .child(Label::new(label))
-                    .end_slot(
-                        h_flex()
-                            .gap_1()
-                            .child(Label::new(value).size(LabelSize::Small).color(Color::Muted))
-                            .child(
-                                Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.menu_row = if this.menu_row == Some(row) { None } else { Some(row) };
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
-            if open {
-                for (i, (choice, next)) in choices.into_iter().enumerate() {
-                    let selected = next == view;
-                    items.push(
-                        ListItem::new(SharedString::from(format!("quadrant-view-{row}-{i}")))
-                            .child(
-                                div().pl_6().child(
-                                    Label::new(choice)
-                                        .size(LabelSize::Small)
-                                        .color(if selected { Color::Accent } else { Color::Default }),
-                                ),
-                            )
-                            .when(selected, |item| {
-                                item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent))
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.views[quadrant] = next;
-                                let key = this.profile_setting_key(&format!("matrix_view_{quadrant}"));
-                                if let Err(err) = this.store.set_setting(&key, &next.to_storage()) {
-                                    eprintln!("failed to save the quadrant's view: {err:#}");
-                                }
-                                this.menu_row = None;
-                                this.rebuild_cache(cx);
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                    );
-                }
-            }
-        }
-        if has_manual {
-            items.push(
-                ListItem::new("quadrant-reset-manual")
-                    .start_slot(Icon::new(IconName::RotateCcw).color(Color::Muted))
-                    .child(Label::new(strings.matrix_reset_manual_order))
-                    .on_click(cx.listener(move |this, _, _, cx| this.reset_manual_order(quadrant, cx)))
-                    .into_any_element(),
-            );
-        }
-        items
-    }
-
     #[cfg(debug_assertions)]
     pub fn dev_open(&mut self, quadrant: usize, edit: bool, cx: &mut Context<Self>) {
         if self.dirty {
@@ -1350,676 +1003,6 @@ impl MatrixView {
             self.menu_row = Some(0);
             cx.notify();
         }
-    }
-
-    fn task_children(&self, parent_id: Id) -> impl Iterator<Item = &Task> {
-        self.children_by_parent
-            .get(&parent_id)
-            .into_iter()
-            .flat_map(|indices| indices.iter().map(|&idx| &self.tasks[idx]))
-    }
-
-    fn child_subtasks(&self, parent_id: Id) -> Vec<&Task> {
-        self.task_children(parent_id)
-            .filter(|t| {
-                !t.is_deleted()
-                    && !t.is_wont_do()
-                    && (self.show_completed || !t.is_completed())
-            })
-            .collect()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn push_task_tree(
-        &self,
-        task: &Task,
-        quadrant: usize,
-        today: NaiveDate,
-        list_name: &impl Fn(Option<Id>) -> SharedString,
-        depth: usize,
-        out: &mut Vec<AnyElement>,
-        cx: &mut Context<Self>,
-    ) {
-        out.push(self.render_task(task, quadrant, today, &list_name(task.list_id), depth, cx));
-        if !self.show_subtasks && depth < 4 && self.expanded_parents.contains(&(quadrant, task.id)) {
-            for child in self.child_subtasks(task.id) {
-                self.push_task_tree(child, quadrant, today, list_name, depth + 1, out, cx);
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_task(
-        &self,
-        task: &Task,
-        quadrant: usize,
-        today: NaiveDate,
-        list_name: &SharedString,
-        depth: usize,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
-        let id = task.id;
-        let completed = task.is_completed();
-        let is_note = task.kind == Kind::Note;
-        let selected = self.selected_task == Some(id);
-        let tag_color = |name: &str| {
-            lists_panel::color(self.tag_colors.get(name).map(String::as_str), cx)
-        };
-        let countdown_dates = self.preferences.countdown_dates;
-        let due = task
-            .due_date
-            .map(|date| task_rows::row_due_label(date, task.due_time, today, strings, countdown_dates));
-        let badge_group = if completed {
-            GroupBy::None
-        } else {
-            self.views[quadrant].group
-        };
-        let horizon_badge = task_rows::horizon_badge_for_group(task, badge_group, today, strings);
-        let has_notes = !is_note && !task.notes.trim().is_empty();
-        let has_location = task.location.as_deref().is_some_and(|l| !l.trim().is_empty());
-        let mut has_visible_children = false;
-        let (mut done_subs, mut total_subs) = (0usize, 0usize);
-        for child in self.task_children(id) {
-            if child.is_deleted() || child.is_wont_do() {
-                continue;
-            }
-            total_subs += 1;
-            if child.is_completed() {
-                done_subs += 1;
-                if self.show_completed {
-                    has_visible_children = true;
-                }
-            } else {
-                has_visible_children = true;
-            }
-        }
-        let has_children = !self.show_subtasks && has_visible_children;
-        let expanded = has_children && self.expanded_parents.contains(&(quadrant, id));
-        let subtask_progress = (total_subs > 0).then_some((done_subs, total_subs));
-        let checklist_progress = task.checklist;
-        let has_reminder = !task.reminders.is_empty();
-        let dragged = DraggedTask { id, title: task.title.clone().into() };
-        let tags: Vec<AnyElement> =
-            task.tags.iter().map(|tag| Chip::new(tag.clone(), tag_color(tag)).into_any_element()).collect();
-
-        h_flex()
-            .id(SharedString::from(format!("matrix-q{quadrant}-task-{id}")))
-            .debug_selector(move || format!("matrix-task-{id}"))
-            .h(px(40.))
-            .flex_none()
-            .gap(px(8.))
-            .pl(px(8. + depth as f32 * 22.))
-            .pr_2()
-            .rounded(px(6.))
-            .cursor_pointer()
-            .when(selected, |el| el.bg(theme.colors().element_selected))
-            .hover(|s| s.bg(theme.colors().ghost_element_hover))
-            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-            .drag_over::<DraggedTask>(|s, _, _, cx| s.border_t_2().border_color(cx.theme().colors().accent))
-            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
-                cx.stop_propagation();
-                this.drop_task_on_task(dragged.id, id, quadrant, cx);
-            }))
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                this.selected_task = Some(id);
-                if event.click_count() >= 2 {
-                    this.close_detail_card(cx);
-                    cx.emit(OpenTask(id));
-                } else {
-                    this.open_detail_card(id, window, cx);
-                }
-            }))
-            .on_mouse_down(
-                gpui::MouseButton::Right,
-                cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.selected_task = Some(id);
-                    this.task_menu = Some((id, ev.position));
-                    cx.notify();
-                }),
-            )
-            .when(has_children, |el| {
-                el.child(
-                    div()
-                        .id(SharedString::from(format!("matrix-expand-q{quadrant}-{id}")))
-                        .w(px(16.))
-                        .h(px(16.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(4.))
-                        .hover(|s| s.bg(theme.colors().element_hover))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            if !this.expanded_parents.remove(&(quadrant, id)) {
-                                this.expanded_parents.insert((quadrant, id));
-                            }
-                            cx.notify();
-                        }))
-                        .child(
-                            Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        ),
-                )
-            })
-            .child(if is_note {
-                div()
-                    .w(px(16.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted))
-                    .into_any_element()
-            } else {
-                Checkbox::new(SharedString::from(format!("matrix-cb-{quadrant}-{id}")))
-                    .toggle_state(completed)
-                    .in_progress(task.is_in_progress())
-                    .tint(task_rows::priority_color(task.priority, &theme))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.toggle_complete(id, cx);
-                    }))
-                    .into_any_element()
-            })
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .gap(px(6.))
-                    .border_b_1()
-                    .border_color(theme.colors().border_variant)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .when(completed, |el| el.line_through())
-                            .child(
-                                Label::new(task.title.clone())
-                                    .color(if completed { Color::Muted } else { Color::Default })
-                                    .truncate(),
-                            ),
-                    )
-                    .children(tags)
-                    .child(Label::new(list_name.clone()).size(LabelSize::Small).color(Color::Muted))
-                    .when(has_notes, |el| {
-                        el.child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted))
-                    })
-                    .when(has_location, |el| {
-                        el.child(Icon::new(IconName::MapPin).size(IconSize::XSmall).color(Color::Muted))
-                    })
-                    .when_some(checklist_progress, |el, (done_items, total)| {
-                        el.child(
-                            h_flex()
-                                .gap_0p5()
-                                .child(Icon::new(IconName::ListChecks).size(IconSize::XSmall).color(Color::Muted))
-                                .child(Label::new(format!("{done_items}/{total}")).size(LabelSize::XSmall).color(Color::Muted)),
-                        )
-                    })
-                    .when_some(subtask_progress, |el, (done_subs, total_subs)| {
-                        el.child(
-                            h_flex()
-                                .gap_0p5()
-                                .child(Icon::new(IconName::ListTree).size(IconSize::XSmall).color(Color::Muted))
-                                .child(Label::new(format!("{done_subs}/{total_subs}")).size(LabelSize::XSmall).color(Color::Muted)),
-                        )
-                    })
-                    .when(has_reminder, |el| {
-                        el.child(
-                            Icon::new(IconName::AlarmClock)
-                                .size(IconSize::XSmall)
-                                .color(if task.constant_reminder { Color::Accent } else { Color::Muted }),
-                        )
-                    })
-                    .when(task.repeat.is_some(), |el| {
-                        el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent))
-                    })
-                    .when_some(due, |el, (label, overdue)| {
-                        let due_tip = match (countdown_dates, task.due_date) {
-                            (true, Some(d)) => format!("{} · {}", desktop_common::calendar::format_date(d, strings), strings.show_countdown_mode),
-                            _ => strings.show_countdown_mode.to_owned(),
-                        };
-                        el.child(
-                            div()
-                                .id(SharedString::from(format!("matrix-due-toggle-{quadrant}-{id}")))
-                                .px_1()
-                                .rounded(px(4.))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme.colors().element_hover))
-                                .tooltip(Tooltip::text(due_tip))
-                                .child(
-                                    Label::new(label)
-                                        .size(LabelSize::Small)
-                                        .color(if completed {
-                                            Color::Muted
-                                        } else if overdue {
-                                            Color::Error
-                                        } else {
-                                            Color::Accent
-                                        }),
-                                )
-                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    if let Err(err) = this.store.update_preferences(|p| p.countdown_dates = !p.countdown_dates) {
-                                        eprintln!("failed to toggle countdown dates: {err:#}");
-                                    } else {
-                                        this.preferences.countdown_dates = !this.preferences.countdown_dates;
-                                        desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .when_some(horizon_badge, |el, (badge, past)| {
-                        let (fg, bg, border) =
-                            task_rows::horizon_badge_style(past, completed || task.is_wont_do(), &theme);
-                        el.child(
-                            div()
-                                .flex_none()
-                                .px(px(5.))
-                                .py(px(0.5))
-                                .rounded(px(4.))
-                                .bg(bg)
-                                .border_1()
-                                .border_color(border)
-                                .child(Label::new(badge).size(LabelSize::XSmall).color(Color::Custom(fg))),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
-    fn render_task_context_menu(&self, id: Id, pos: Point<Pixels>, cx: &mut Context<Self>) -> AnyElement {
-        let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned() else {
-            return div().into_any_element();
-        };
-        let strings = i18n::t(cx);
-        let today = Local::now().date_naive();
-        let title_pomo = task.title.clone();
-        let title_sw = task.title.clone();
-        let is_note = task.kind == Kind::Note;
-        let read_only = self.is_task_read_only(id);
-
-        div()
-            .id("matrix-task-ctx")
-            .absolute()
-            .left(pos.x)
-            .top(pos.y)
-            .occlude()
-            .child(
-                popover(cx)
-                    .min_w(px(190.))
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        this.task_menu = None;
-                        cx.notify();
-                    }))
-                    .child(
-                        ListItem::new("mctx-open")
-                            .height(px(32.))
-                            .start_slot(Icon::new(IconName::FernTasks).color(Color::Muted))
-                            .child(Label::new(strings.matrix_open_in_tasks))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.task_menu = None;
-                                this.close_detail_card(cx);
-                                cx.emit(OpenTask(id));
-                                cx.notify();
-                            })),
-                    )
-                    .when(!read_only && !is_note, |el| {
-                        el.child(
-                            h_flex().px_2().py_1().gap_1().children(
-                                [
-                                    (Priority::High, strings.priority_high),
-                                    (Priority::Medium, strings.priority_medium),
-                                    (Priority::Low, strings.priority_low),
-                                    (Priority::None, strings.priority_none),
-                                ]
-                                .map(|(p, tip)| {
-                                    let active = task.priority == p;
-                                    IconButton::new(SharedString::from(format!("mctx-p-{}", p.to_i64())), IconName::FlagFilled)
-                                        .size(px(26.))
-                                        .icon_size(IconSize::Small)
-                                        .icon_color(task_rows::priority_color(p, cx.theme()).map(Color::Custom).unwrap_or(Color::Muted))
-                                        .toggle_state(active)
-                                        .tooltip(Tooltip::text(tip))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.task_menu = None;
-                                            let _ = this.store.set_priority(id, p);
-                                            desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                            this.reload(cx);
-                                        }))
-                                }),
-                            ),
-                        )
-                    })
-                    .when(!read_only, |el| {
-                        el.child(
-                            ListItem::new("mctx-today")
-                                .height(px(30.))
-                                .start_slot(Icon::new(IconName::CalendarDays).color(Color::Muted))
-                                .child(Label::new(strings.today))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.task_menu = None;
-                                    let _ = this.store.move_dates(id, today);
-                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                    this.reload(cx);
-                                })),
-                        )
-                        .child(
-                            ListItem::new("mctx-tomorrow")
-                                .height(px(30.))
-                                .start_slot(Icon::new(IconName::Sunrise).color(Color::Muted))
-                                .child(Label::new(strings.tomorrow))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.task_menu = None;
-                                    let _ = this.store.move_dates(id, today + Duration::days(1));
-                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                    this.reload(cx);
-                                })),
-                        )
-                        .child(
-                            ListItem::new("mctx-clear-date")
-                                .height(px(30.))
-                                .start_slot(Icon::new(IconName::CalendarX).color(Color::Muted))
-                                .child(Label::new(strings.clear))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.task_menu = None;
-                                    let _ = this.store.set_due(id, None, None);
-                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                    this.reload(cx);
-                                })),
-                        )
-                        .child(
-                            ListItem::new("mctx-pomo")
-                                .height(px(30.))
-                                .start_slot(Icon::new(IconName::Timer).color(Color::Muted))
-                                .child(Label::new(strings.start_pomo))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.task_menu = None;
-                                    cx.emit(StartFocus(id, title_pomo.clone(), false));
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            ListItem::new("mctx-sw")
-                                .height(px(30.))
-                                .start_slot(Icon::new(IconName::Clock).color(Color::Muted))
-                                .child(Label::new(strings.start_stopwatch))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.task_menu = None;
-                                    cx.emit(StartFocus(id, title_sw.clone(), true));
-                                    cx.notify();
-                                })),
-                        )
-                        .child(div().my_1().child(Divider::horizontal()))
-                        .child(
-                            ListItem::new("mctx-delete")
-                                .height(px(30.))
-                                .start_slot(Icon::new(IconName::Trash).color(Color::Error))
-                                .child(Label::new(strings.delete).color(Color::Error))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.task_menu = None;
-                                    this.delete_task(id, cx);
-                                })),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
-    fn render_quadrant(&self, quadrant: usize, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
-        let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
-        let color = Self::quadrant_color(quadrant);
-        let (numeral, title) = self.quadrant_title(quadrant, strings);
-        let cache = &self.cache[quadrant];
-
-        let list_name = |list: Option<Id>| -> SharedString {
-            list.and_then(|id| self.list_names.get(&id).cloned())
-                .unwrap_or_else(|| SharedString::new_static(strings.inbox))
-        };
-
-        let mut content: Vec<AnyElement> = Vec::new();
-        for (label, tasks) in &cache.groups {
-            let collapsed = !label.is_empty() && self.collapsed_groups.contains(&(quadrant, label.clone()));
-            if !label.is_empty() {
-                let key_label = label.clone();
-                content.push(
-                    h_flex()
-                        .id(SharedString::from(format!("q{quadrant}-grp-{label}")))
-                        .h(px(28.))
-                        .gap_1()
-                        .px_1()
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let key = (quadrant, key_label.clone());
-                            if !this.collapsed_groups.remove(&key) {
-                                this.collapsed_groups.insert(key);
-                            }
-                            cx.notify();
-                        }))
-                        .child(
-                            Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown })
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(Label::new(label.clone()).weight(FontWeight::SEMIBOLD))
-                        .child(Label::new(tasks.len().to_string()).size(LabelSize::XSmall).color(Color::Muted))
-                        .into_any_element(),
-                );
-            }
-            if !collapsed {
-                for task in tasks {
-                    self.push_task_tree(task, quadrant, today, &list_name, 0, &mut content, cx);
-                }
-            }
-        }
-
-        // Dedicated collapsible Completed section at the bottom of the quadrant.
-        if self.show_completed && !cache.completed.is_empty() {
-            let done_key = "__completed__".to_owned();
-            let collapsed = self.collapsed_groups.contains(&(quadrant, done_key.clone()));
-            content.push(
-                h_flex()
-                    .id(SharedString::from(format!("q{quadrant}-completed-hdr")))
-                    .h(px(28.))
-                    .mt_1()
-                    .gap_1()
-                    .px_1()
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let key = (quadrant, done_key.clone());
-                        if !this.collapsed_groups.remove(&key) {
-                            this.collapsed_groups.insert(key);
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown })
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(Label::new(strings.completed).weight(FontWeight::SEMIBOLD).color(Color::Muted))
-                    .child(
-                        Label::new(cache.completed.len().to_string())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .into_any_element(),
-            );
-            if !collapsed {
-                for task in &cache.completed {
-                    self.push_task_tree(task, quadrant, today, &list_name, 0, &mut content, cx);
-                }
-            }
-        }
-
-        let empty = content.is_empty();
-        let drag_title = title.clone();
-
-        v_flex()
-            .id(SharedString::from(format!("quadrant-{numeral}")))
-            .flex_1()
-            .min_w_0()
-            .min_h(px(140.))
-            .h_full()
-            .px(px(14.))
-            .py_2()
-            .gap_1()
-            .rounded(px(12.))
-            .bg(theme.colors().matrix_background)
-            .drag_over::<DraggedTask>(move |style, _, _, _| style.border_1().border_color(color))
-            .drag_over::<DraggedQuadrant>(move |style, _, _, _| style.border_2().border_color(color))
-            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.drop_on(dragged.id, quadrant, cx)))
-            .on_drop(cx.listener(move |this, dragged: &DraggedQuadrant, _, cx| {
-                this.swap_quadrants(dragged.quadrant, quadrant, cx);
-            }))
-            .child({
-                let header_group = SharedString::from(format!("quadrant-header-{quadrant}"));
-                h_flex()
-                    .id(SharedString::from(format!("quadrant-header-{numeral}")))
-                    .group(header_group.clone())
-                    .h(px(36.))
-                    .gap_1p5()
-                    .cursor_grab()
-                    .on_drag(DraggedQuadrant { quadrant, title: drag_title }, |dragged, _, _, cx| {
-                        cx.new(|_| dragged.clone())
-                    })
-                    .child(
-                        div()
-                            .size(px(16.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .bg(color)
-                            .text_color(theme::foreground_on(&[color], 3.))
-                            .text_size(px(8.))
-                            .font_weight(FontWeight::BOLD)
-                            .child(numeral),
-                    )
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            h_flex()
-                                .gap_1p5()
-                                .items_center()
-                                .child(
-                                    Label::new(title)
-                                        .size(LabelSize::Small)
-                                        .weight(FontWeight::SEMIBOLD)
-                                        .color(Color::Custom(Self::quadrant_text_color(quadrant, theme.is_dark())))
-                                        .truncate(),
-                                )
-                                .when(cache.open_count > 0, |el| {
-                                    el.child(
-                                        Label::new(cache.open_count.to_string())
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                }),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .opacity(if touch::active() { 1. } else { 0. })
-                            .group_hover(header_group.clone(), |s| s.opacity(1.))
-                            .child(
-                                IconButton::new(SharedString::from(format!("quadrant-add-{quadrant}")), IconName::Plus)
-                                    .size(px(22.))
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Muted)
-                                    .hover_icon_color(Color::Icon)
-                                    .tooltip(Tooltip::text(strings.add_task))
-                                    .on_click(cx.listener(move |this, _, window, cx| this.start_add(quadrant, window, cx))),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .opacity(if self.menu == Some(quadrant) || touch::active() { 1. } else { 0. })
-                            .group_hover(header_group, |s| s.opacity(1.))
-                            .child(
-                                IconButton::new(SharedString::from(format!("quadrant-more-{quadrant}")), IconName::Ellipsis)
-                                    .size(px(22.))
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Muted)
-                                    .hover_icon_color(Color::Icon)
-                                    .tooltip(Tooltip::text(strings.more))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.menu = if this.menu == Some(quadrant) { None } else { Some(quadrant) };
-                                        this.menu_row = None;
-                                        window.focus(&this.focus, cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .when(self.menu == Some(quadrant), |el| {
-                                el.child(PopoverAttachment::new(
-                                    Placement::BelowRight,
-                                    popover(cx)
-                                        .min_w(px(230.))
-                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                            this.menu = None;
-                                            this.menu_row = None;
-                                            cx.notify();
-                                        }))
-                                        .child(
-                                            ListItem::new("quadrant-edit")
-                                                .start_slot(Icon::new(IconName::Pencil).color(Color::Icon))
-                                                .child(Label::new(strings.edit))
-                                                .on_click(cx.listener(move |this, _, _, cx| this.start_edit(quadrant, cx))),
-                                        )
-                                        .children(self.render_view_rows(quadrant, cx))
-                                        .into_any_element(),
-                                ))
-                            }),
-                    )
-            })
-            .child(
-                v_scroll(
-                    SharedString::from(format!("quadrant-tasks-scroll-{numeral}")),
-                    v_flex()
-                        .id(SharedString::from(format!("quadrant-tasks-{numeral}")))
-                        .debug_selector(move || format!("matrix-quadrant-{numeral}"))
-                        .children(self.adding.as_ref().filter(|(q, _)| *q == quadrant).map(|(_, input)| {
-                            h_flex()
-                                .h(px(34.))
-                                .flex_none()
-                                .mx_1()
-                                .mb_1()
-                                .px_2()
-                                .gap_2()
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(color)
-                                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .debug_selector(|| format!("matrix-add-input-{quadrant}"))
-                                        .child(input.clone()),
-                                )
-                        }))
-                        .when(empty && self.adding.as_ref().is_none_or(|(q, _)| *q != quadrant), |el| {
-                            el.child(
-                                EmptyState::new(IconName::Inbox, strings.no_tasks).action(
-                                    SharedString::from(format!("matrix-empty-add-{quadrant}")),
-                                    strings.add_task,
-                                    cx.listener(move |this, _, window, cx| this.start_add(quadrant, window, cx)),
-                                ),
-                            )
-                        })
-                        .children(content),
-                )
-                .flex_1()
-                .min_h_0(),
-            )
-            .into_any_element()
     }
 }
 
@@ -2035,23 +1018,7 @@ impl Render for MatrixView {
             .as_ref()
             .map(|(q, rule)| self.render_edit_modal(*q, rule, cx));
         let task_ctx = self.task_menu.map(|(id, pos)| self.render_task_context_menu(id, pos, cx));
-        let max_detail_h = window.viewport_size().height * 0.85;
-        let floating_detail = self.detail_task.and(self.detail.clone()).map(|detail| {
-            Modal::new("matrix-detail-backdrop")
-                .width(px(460.))
-                .height(px(560.))
-                .max_height(max_detail_h)
-                .padding(px(0.))
-                .gap(px(0.))
-                .overflow_hidden()
-                .on_dismiss(cx.listener(|this, _, _, cx| {
-                    if this.detail.as_ref().is_none_or(|d| !d.read(cx).has_popup()) {
-                        this.close_detail_card(cx);
-                    }
-                }))
-                .child(detail)
-                .into_any_element()
-        });
+        let floating_detail = self.render_floating_detail(window, cx);
 
         v_flex()
             .relative()
@@ -2090,223 +1057,12 @@ impl Render for MatrixView {
                             .size(LabelSize::Large)
                             .weight(FontWeight::SEMIBOLD),
                     )
-                    .child({
-                        let active_name = self
-                            .active_profile_id
-                            .and_then(|id| self.profiles.iter().find(|p| p.id == id))
-                            .or_else(|| self.profiles.first())
-                            .map(|p| if p.name == "Default" { strings.matrix_default_profile.to_owned() } else { p.name.clone() })
-                            .unwrap_or_else(|| strings.matrix_default_profile.to_owned());
-                        let can_delete = self.profiles.len() > 1;
-                        let menu = self.profile_menu.then(|| {
-                            PopoverAttachment::new(
-                                Placement::BelowLeft,
-                                popover(cx)
-                                    .min_w(px(220.))
-                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                        this.profile_menu = false;
-                                        cx.notify();
-                                    }))
-                                    .children(self.profiles.iter().map(|profile| {
-                                        let id = profile.id;
-                                        let active = self.active_profile_id == Some(id);
-                                        let display_name = if profile.name == "Default" {
-                                            strings.matrix_default_profile.to_owned()
-                                        } else {
-                                            profile.name.clone()
-                                        };
-                                        let raw_name = profile.name.clone();
-                                        ListItem::new(SharedString::from(format!("matrix-profile-{id}")))
-                                            .height(px(34.))
-                                            .start_slot(Icon::new(IconName::LayoutGrid).size(IconSize::XSmall).color(if active { Color::Accent } else { Color::Muted }))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .child(Label::new(display_name.clone()).color(if active { Color::Accent } else { Color::Default }).truncate()),
-                                            )
-                                            .end_slot(
-                                                h_flex()
-                                                    .gap_1()
-                                                    .when(active, |el| el.child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
-                                                    .child(
-                                                        IconButton::new(SharedString::from(format!("matrix-profile-rename-{id}")), IconName::Pencil)
-                                                            .size(px(20.))
-                                                            .icon_size(IconSize::XSmall)
-                                                            .icon_color(Color::Muted)
-                                                            .tooltip(ui::Tooltip::text(strings.edit))
-                                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                                cx.stop_propagation();
-                                                                this.open_profile_editor(Some(id), &raw_name, window, cx);
-                                                            })),
-                                                    )
-                                                    .when(can_delete, |el| {
-                                                        let del_name = display_name.clone();
-                                                        el.child(
-                                                            IconButton::new(SharedString::from(format!("matrix-profile-delete-{id}")), IconName::Trash)
-                                                                .size(px(20.))
-                                                                .icon_size(IconSize::XSmall)
-                                                                .icon_color(Color::Muted)
-                                                                .hover_icon_color(theme.status().error)
-                                                                .tooltip(ui::Tooltip::text(strings.delete))
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    cx.stop_propagation();
-                                                                    this.profile_menu = false;
-                                                                    this.confirm_delete_profile = Some((id, del_name.clone()));
-                                                                    cx.notify();
-                                                                })),
-                                                        )
-                                                    }),
-                                            )
-                                            .on_click(cx.listener(move |this, _, _, cx| this.switch_profile(id, cx)))
-                                    }))
-                                    .child(div().my_1().child(Divider::horizontal()))
-                                    .child(
-                                        ListItem::new("matrix-profile-new")
-                                            .height(px(34.))
-                                            .start_slot(Icon::new(IconName::Plus).color(Color::Accent))
-                                            .child(Label::new(strings.matrix_new_profile).color(Color::Accent))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.open_profile_editor(None, "", window, cx);
-                                            })),
-                                    ),
-                            )
-                        });
-                        div()
-                            .relative()
-                            .child(
-                                h_flex()
-                                    .id("matrix-profile-switcher")
-                                    .h(px(28.))
-                                    .px_2p5()
-                                    .gap_1()
-                                    .rounded(px(6.))
-                                    .border_1()
-                                    .border_color(theme.colors().border)
-                                    .bg(theme.colors().surface_background)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
-                                    .child(Icon::new(IconName::LayoutGrid).size(IconSize::XSmall).color(Color::Muted))
-                                    .child(Label::new(active_name).size(LabelSize::Small))
-                                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.profile_menu = !this.profile_menu;
-                                        cx.notify();
-                                    })),
-                            )
-                            .children(menu)
-                    })
+                    .child(self.render_profile_switcher(cx))
                     .child(div().flex_1())
-                    .child(
-                        div()
-                            .debug_selector(|| "matrix-header-menu-trigger".to_owned())
-                            .relative()
-                            .child(
-                                IconButton::new("matrix-more", IconName::Ellipsis)
-                                    .tooltip(ui::Tooltip::text(strings.more))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.header_menu = !this.header_menu;
-                                        window.focus(&this.focus, cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .when(self.header_menu, |el| {
-                                el.child(PopoverAttachment::new(
-                                    Placement::BelowRight,
-                                    popover(cx)
-                                        .min_w(px(230.))
-                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                            this.header_menu = false;
-                                            cx.notify();
-                                        }))
-                                        .child(
-                                            ListItem::new("matrix-show-completed")
-                                                .height(px(34.))
-                                                .start_slot(Icon::new(IconName::SquareCheck).color(Color::Icon))
-                                                .child(Label::new(if self.show_completed {
-                                                    strings.hide_completed
-                                                } else {
-                                                    strings.show_completed
-                                                }))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.header_menu = false;
-                                                    let value = if this.show_completed { "0" } else { "1" };
-                                                    if let Err(err) = this.store.set_setting("matrix_show_completed", value) {
-                                                        eprintln!("failed to save the setting: {err:#}");
-                                                    }
-                                                    this.reload(cx);
-                                                })),
-                                        )
-                                        .child(
-                                            ListItem::new("matrix-show-subtasks")
-                                                .height(px(34.))
-                                                .start_slot(Icon::new(IconName::ListTree).color(Color::Icon))
-                                                .child(Label::new(if self.show_subtasks {
-                                                    strings.matrix_hide_subtasks
-                                                } else {
-                                                    strings.matrix_show_subtasks
-                                                }))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.header_menu = false;
-                                                    let value = if this.show_subtasks { "0" } else { "1" };
-                                                    if let Err(err) = this.store.set_setting("matrix_show_subtasks", value) {
-                                                        eprintln!("failed to save the setting: {err:#}");
-                                                    }
-                                                    this.reload(cx);
-                                                })),
-                                        )
-                                        .child(
-                                            ListItem::new("matrix-apply-template")
-                                                .height(px(34.))
-                                                .start_slot(Icon::new(IconName::LayoutTemplate).color(Color::Icon))
-                                                .child(Label::new(strings.matrix_apply_date_template))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.header_menu = false;
-                                                    let res = match this.active_profile_id {
-                                                        Some(pid) => this.store.apply_matrix_profile_date_template(pid).map(|_| ()),
-                                                        None => this.store.apply_matrix_date_template().map(|_| ()),
-                                                    };
-                                                    if let Err(err) = res {
-                                                        eprintln!("failed to apply date template: {err:#}");
-                                                    } else {
-                                                        desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                                    }
-                                                    this.reload(cx);
-                                                })),
-                                        ),
-                                ))
-                            }),
-                    ),
+                    .child(self.render_header_menu(cx)),
             )
             .when_some(self.notice.as_ref(), |el, notice| {
-                let (message, color) = match notice {
-                    MatrixNotice::SavedElsewhere(destination) => (
-                        strings.matrix_saved_elsewhere.replace("{destination}", destination.as_ref()),
-                        Color::Default,
-                    ),
-                    MatrixNotice::AlreadyInQuadrant => (strings.matrix_already_in_quadrant.to_owned(), Color::Muted),
-                    MatrixNotice::DropUnsupported => (strings.matrix_drop_unsupported.to_owned(), Color::Warning),
-                    MatrixNotice::Failed => (strings.task_save_failed.to_owned(), Color::Error),
-                };
-                el.child(
-                    h_flex()
-                        .flex_none()
-                        .mx(px(22.))
-                        .px_2()
-                        .py_1()
-                        .gap_2()
-                        .rounded(px(6.))
-                        .bg(theme.colors().surface_background)
-                        .child(div().flex_1().min_w_0().child(Label::new(message).color(color)))
-                        .child(
-                            IconButton::new("matrix-dismiss-add-notice", IconName::X)
-                                .tooltip(Tooltip::text(strings.close))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.notice = None;
-                                    cx.notify();
-                                })),
-                        ),
-                )
+                el.child(self.render_notice_banner(notice, cx))
             })
             .child(
                 v_flex()
@@ -2322,630 +1078,7 @@ impl Render for MatrixView {
             .children(task_ctx)
             .children(floating_detail)
             .children(edit_modal)
-            .when_some(self.confirm_delete_profile.clone(), |el, (id, name)| {
-                el.child(
-                    ConfirmDialog::new("matrix-delete-profile-modal", format!("{} \"{name}\"?", strings.delete))
-                        .width(px(340.))
-                        .cancel_label(strings.cancel)
-                        .confirm_label(strings.delete)
-                        .destructive(true)
-                        .on_cancel(cx.listener(|this, _, window, cx| {
-                            this.confirm_delete_profile = None;
-                            window.focus(&this.focus, cx);
-                            cx.notify();
-                        }))
-                        .on_confirm(cx.listener(move |this, _, window, cx| {
-                            this.confirm_delete_profile = None;
-                            this.delete_profile(id, cx);
-                            window.focus(&this.focus, cx);
-                        })),
-                )
-            })
-            .when_some(self.profile_editor.as_ref(), |el, (editing, input)| {
-                let heading = if editing.is_some() { strings.matrix_rename_profile } else { strings.matrix_new_profile };
-                let can_save = !input.read(cx).text().trim().is_empty();
-                el.child(
-                    Modal::new("matrix-profile-editor-backdrop")
-                        .width(px(320.))
-                        .padding(px(16.))
-                        .on_dismiss(cx.listener(|this, _, window, cx| {
-                            this.profile_editor = None;
-                            window.focus(&this.focus, cx);
-                            cx.notify();
-                        }))
-                        .child(Label::new(heading).weight(FontWeight::SEMIBOLD))
-                        .child(Label::new(strings.matrix_profile_name).size(LabelSize::XSmall).color(Color::Muted))
-                        .child(
-                            div()
-                                .h(px(32.))
-                                .px_2p5()
-                                .flex()
-                                .items_center()
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(theme.colors().border)
-                                .bg(theme.colors().background)
-                                .child(input.clone()),
-                        )
-                        .child(
-                            h_flex()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    Button::new("matrix-profile-cancel", strings.cancel)
-                                        .variant(ButtonVariant::Secondary)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.profile_editor = None;
-                                            window.focus(&this.focus, cx);
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("matrix-profile-save", strings.save)
-                                        .variant(ButtonVariant::Primary)
-                                        .disabled(!can_save)
-                                        .on_click(cx.listener(|this, _, _, cx| this.save_profile_editor(cx))),
-                                ),
-                        ),
-                )
-            })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use fern_core::matrix::MatrixDate;
-    use fern_core::Store;
-    use gpui::EntityInputHandler;
-
-    use super::*;
-
-    #[gpui::test]
-    fn long_quadrant_input_stays_visible_and_saves_in_full(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        cx.update(|cx| {
-            theme::init(cx);
-            keymap::load_default(&assets::Assets, cx).unwrap();
-        });
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            let mut view = MatrixView::new(store.clone(), cx);
-            view.start_add(0, window, cx);
-            view
-        });
-        cx.simulate_resize(gpui::size(px(700.), px(500.)));
-        let empty_field = cx.debug_bounds("matrix-add-input-0").unwrap();
-        let title = format!("{}конец", "ДлинноеНазвание日本語🧑‍💻".repeat(100));
-        cx.simulate_input(&title);
-        cx.run_until_parked();
-        assert_eq!(cx.debug_bounds("matrix-add-input-0").unwrap(), empty_field);
-        for width in [700., 480.] {
-            cx.simulate_resize(gpui::size(px(width), px(500.)));
-            let field = cx.debug_bounds("matrix-add-input-0").unwrap();
-            cx.update(|window, cx| {
-                let input = view.read(cx).adding.as_ref().unwrap().1.clone();
-                let end = title.encode_utf16().count();
-                let caret = input.update(cx, |input, cx| {
-                    input.bounds_for_range(end..end, gpui::Bounds::default(), window, cx).unwrap()
-                });
-                assert!(caret.left() >= field.left() && caret.right() <= field.right(), "{caret:?} outside {field:?}");
-            });
-        }
-        cx.simulate_keystrokes("enter");
-        let tasks = store.tasks().unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].title, title);
-        cx.update(|_, cx| assert!(view.read(cx).adding.as_ref().unwrap().1.read(cx).text().is_empty()));
-    }
-
-    #[gpui::test]
-    fn quadrant_quick_add_saves_recognized_tags(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
-        cx.update(|cx| {
-            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
-            let add = |cx: &App, input| {
-                let id = matrix.read(cx).add_quadrant_task(0, input, today).unwrap().id;
-                store.task(id).unwrap().unwrap()
-            };
-            let task = add(cx, "Plan the sprint #work #team #Work");
-            assert_eq!(task.title, "Plan the sprint");
-            assert_eq!(task.tags, ["team", "work"]);
-            assert_eq!(task.priority, Priority::High);
-
-            let mut preferences = store.preferences().unwrap();
-            preferences.recognition.remove_tag_text = false;
-            store.save_preferences(&preferences).unwrap();
-            let task = add(cx, "Plan the sprint #work");
-            assert_eq!(task.title, "Plan the sprint #work");
-            assert_eq!(task.tags, ["work"]);
-
-            preferences.recognition.tags = false;
-            store.save_preferences(&preferences).unwrap();
-            let task = add(cx, "Plan the sprint #work");
-            assert_eq!(task.title, "Plan the sprint #work");
-            assert!(task.tags.is_empty());
-        });
-    }
-
-    #[gpui::test]
-    fn quadrant_quick_add_uses_an_available_list_after_deletion(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let removed = store.create_list("Remove me").unwrap();
-        let available = store.create_list("Still available").unwrap();
-        let mut preferences = store.preferences().unwrap();
-        preferences.default_list = Some(removed.id);
-        store.save_preferences(&preferences).unwrap();
-        let mut rule = QuadrantRule::defaults()[0].clone();
-        rule.lists = vec![Some(removed.id), Some(available.id)];
-        store.save_matrix_rule(0, Some(&rule)).unwrap();
-        let today = Local::now().date_naive();
-
-        cx.update(|cx| {
-            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
-            store.delete_list(removed.id).unwrap();
-            let id = matrix.read(cx).add_quadrant_task(0, "First #work", today).unwrap().id;
-            let tasks = store.tasks().unwrap();
-            assert_eq!(tasks.len(), 1);
-            assert_eq!(tasks[0].id, id);
-            assert_eq!(tasks[0].list_id, Some(available.id));
-            assert_eq!(tasks[0].tags, ["work"]);
-
-            rule.lists = vec![Some(removed.id)];
-            store.save_matrix_rule(0, Some(&rule)).unwrap();
-            matrix.update(cx, |matrix, cx| matrix.reload(cx));
-            let view = matrix.read(cx);
-            assert_eq!(view.rules[0].lists, rule.lists);
-            let unrelated = &tasks[0];
-            assert!(!view.rules[0].matches(unrelated, today));
-
-            matrix.update(cx, |matrix, cx| {
-                matrix.start_edit(0, cx);
-                matrix.name_input.update(cx, |input, cx| input.set_text("Scoped quadrant", cx));
-                matrix.finish_edit(Some(true), cx);
-            });
-            assert_eq!(store.matrix_rules().unwrap()[0].lists, rule.lists);
-
-            let id = matrix.read(cx).add_quadrant_task(0, "Second", today).unwrap().id;
-            assert_eq!(store.task(id).unwrap().unwrap().list_id, None);
-            assert_eq!(store.tasks().unwrap().len(), 2);
-        });
-    }
-
-    #[gpui::test]
-    fn archiving_the_last_list_keeps_the_quadrant_restricted_until_restore(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let today = Local::now().date_naive();
-        let list = store.create_list("Restricted").unwrap();
-        let fallback = store.create_list("Available").unwrap();
-        let mut preferences = store.preferences().unwrap();
-        preferences.default_list = Some(fallback.id);
-        store.save_preferences(&preferences).unwrap();
-
-        let task = |title: &str, list_id| {
-            store
-                .create_task(
-                    TaskDraft {
-                        title: title.into(),
-                        list_id: Some(list_id),
-                        priority: Priority::High,
-                        due_date: Some(today),
-                        ..TaskDraft::default()
-                    },
-                    true,
-                )
-                .unwrap()
-        };
-        let restricted = task("In the restricted list", list.id);
-        let unrelated = task("In another list", fallback.id);
-        let mut rule = QuadrantRule::defaults()[0].clone();
-        rule.lists = vec![Some(list.id)];
-        store.save_matrix_rule(0, Some(&rule)).unwrap();
-
-        cx.update(|cx| {
-            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
-            store.set_list_archived(list.id, true).unwrap();
-            matrix.update(cx, |matrix, cx| matrix.reload(cx));
-            let view = matrix.read(cx);
-            assert_eq!(view.rules[0].lists, rule.lists);
-            assert!(view.cache[0].open_count == 0);
-            let added = view.add_quadrant_task(0, "Saved in available list", today).unwrap();
-            assert_eq!(added.list_id, Some(fallback.id));
-
-            store.set_list_archived(list.id, false).unwrap();
-            matrix.update(cx, |matrix, cx| matrix.reload(cx));
-            let view = matrix.read(cx);
-            assert!(view.tasks.iter().any(|task| task.id == restricted.id));
-            assert_eq!(quadrant_of(&view.rules, &restricted, today), Some(0));
-            assert_ne!(quadrant_of(&view.rules, &unrelated, today), Some(0));
-            assert_ne!(quadrant_of(&view.rules, &added, today), Some(0));
-        });
-    }
-
-    #[gpui::test]
-    fn matrix_uses_rule_date_without_an_explicit_date_and_explains_other_destinations(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
-        let mut rule = QuadrantRule::defaults()[0].clone();
-        rule.dates = vec![MatrixDate::Tomorrow];
-        store.save_matrix_rule(0, Some(&rule)).unwrap();
-
-        cx.update(|cx| {
-            let matrix = cx.new(|cx| MatrixView::new(store, cx));
-            let task = matrix.read(cx).add_quadrant_task(0, "Plan 9am", today).unwrap();
-            assert_eq!(task.due_date, today.succ_opt());
-            assert_eq!(task.due_time, chrono::NaiveTime::from_hms_opt(9, 0, 0));
-            let other = matrix.read(cx).add_quadrant_task(0, "Plan today", today).unwrap();
-            assert_eq!(other.due_date, Some(today));
-            matrix.update(cx, |matrix, cx| {
-                matrix.reload(cx);
-                let strings = i18n::t(cx);
-                assert!(matrix.destination_notice(0, &task, today, strings).is_none());
-                assert!(matches!(
-                    matrix.destination_notice(0, &other, today, strings),
-                    Some(MatrixNotice::SavedElsewhere(ref list)) if list.as_ref() == strings.inbox,
-                ));
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn escape_dismisses_the_matrix_header_menu(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            theme::init(cx);
-            assert!(keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
-        });
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            let view = MatrixView::new(Rc::new(Store::open_in_memory().unwrap()), cx);
-            window.focus(&view.focus_handle(cx), cx);
-            view
-        });
-        let trigger = cx.debug_bounds("matrix-header-menu-trigger").unwrap().center();
-        cx.simulate_click(trigger, gpui::Modifiers::default());
-        cx.update(|_, cx| assert!(view.read(cx).header_menu));
-        cx.simulate_keystrokes("escape");
-        cx.update(|window, cx| {
-            assert!(!view.read(cx).header_menu);
-            assert!(view.read(cx).focus_handle(cx).is_focused(window));
-        });
-        cx.simulate_keystrokes("escape");
-        cx.update(|window, cx| assert!(view.read(cx).focus_handle(cx).is_focused(window)));
-    }
-
-    #[test]
-    fn quadrant_views_roundtrip_including_list_and_date() {
-        let store = Store::open_in_memory().unwrap();
-        let work = store.create_list("Work").unwrap();
-        let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
-        for (title, days) in [("later", 5), ("soon", 1), ("now", 0)] {
-            let task = store.add_task(title).unwrap();
-            store.set_list(task.id, Some(work.id)).unwrap();
-            store.set_due(task.id, Some(today + Duration::days(days)), None).unwrap();
-        }
-        let tasks = store.tasks().unwrap();
-        let lists = store.lists().unwrap();
-        let strings = &i18n::EN;
-        let titles = |groups: &[(String, Vec<Task>)]| -> Vec<String> {
-            groups.iter().flat_map(|(_, tasks)| tasks.iter().map(|t| t.title.clone())).collect()
-        };
-
-        // Regression test for bug 1: GroupBy::List round-trips cleanly and keeps real list names.
-        let list_view = QuadrantView { group: GroupBy::List, sort: SortBy::Date, newest_first: false };
-        assert_eq!(QuadrantView::from_storage(&list_view.to_storage()), list_view);
-        let by_list = arrange(tasks.clone(), list_view, &lists, today, strings);
-        assert_eq!(by_list.len(), 1);
-        assert_eq!(by_list[0].0, "Work");
-        assert_eq!(titles(&by_list), ["now", "soon", "later"]);
-
-        let newest = arrange(tasks.clone(), QuadrantView { newest_first: true, ..list_view }, &lists, today, strings);
-        assert_eq!(titles(&newest), ["later", "soon", "now"]);
-
-        let by_date = arrange(tasks, QuadrantView::default(), &lists, today, strings);
-        assert_eq!(by_date.iter().map(|(label, _)| label.as_str()).collect::<Vec<_>>(), ["Today", "Tomorrow", "Next 7 Days"]);
-        assert_eq!(QuadrantView::from_storage(&QuadrantView::default().to_storage()), QuadrantView::default());
-        assert_eq!(QuadrantView::from_storage(""), QuadrantView::default());
-    }
-
-    #[gpui::test]
-    fn show_completed_separates_and_toggles_completion(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let task = store.add_task("Finish spec").unwrap();
-        store.set_priority(task.id, Priority::High).unwrap();
-        store.set_completed(task.id, true).unwrap();
-        store.set_setting("matrix_show_completed", "1").unwrap();
-
-        cx.update(|cx| {
-            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
-            assert_eq!(matrix.read(cx).cache[0].open_count, 0);
-            assert_eq!(matrix.read(cx).cache[0].completed.len(), 1);
-
-            // Toggling a completed task reopens it into the open list.
-            matrix.update(cx, |m, cx| m.toggle_complete(task.id, cx));
-            assert_eq!(matrix.read(cx).cache[0].open_count, 1);
-            assert!(matrix.read(cx).cache[0].completed.is_empty());
-        });
-    }
-
-    #[gpui::test]
-    fn overflowing_quadrant_scrolls_when_clicking_scrollbar(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let mut ids = Vec::new();
-        for i in 0..25 {
-            ids.push(store.add_task(&format!("Quadrant item {i:02}")).unwrap().id);
-        }
-
-        cx.update(|cx| {
-            theme::init(cx);
-            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
-            assert!(keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
-        });
-        let (_, cx) = cx.add_window_view(|_, cx| MatrixView::new(store, cx));
-        cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(480.)));
-        cx.run_until_parked();
-
-        // Tasks without priority land in quadrant IV ("Not Urgent & Not Important").
-        let quadrant = cx.debug_bounds("matrix-quadrant-IV").unwrap();
-        let (bottom_sel, bottom_row) = ids
-            .iter()
-            .filter_map(|id| {
-                let sel: &'static str = format!("matrix-task-{id}").leak();
-                cx.debug_bounds(sel).map(|b| (sel, b))
-            })
-            .max_by(|a, b| a.1.bottom().partial_cmp(&b.1.bottom()).unwrap())
-            .expect("quadrant renders task rows");
-        let initial_top = bottom_row.top();
-        assert!(bottom_row.bottom() > quadrant.bottom());
-
-        let bar_bottom = gpui::point(quadrant.right() - gpui::px(6.), quadrant.bottom() - gpui::px(8.));
-        let modifiers = gpui::Modifiers::default();
-        cx.simulate_mouse_move(bar_bottom, None, modifiers);
-        cx.simulate_click(bar_bottom, modifiers);
-        let scrolled_row = cx.debug_bounds(bottom_sel).unwrap();
-        assert!(
-            scrolled_row.top() < initial_top,
-            "clicking quadrant scrollbar should scroll rows upward: {initial_top:?} -> {:?}",
-            scrolled_row.top()
-        );
-    }
-
-    #[gpui::test]
-    fn drop_on_applies_full_rule_patch_and_detects_already_in_quadrant(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let work = store.add_list(&fern_core::ListDraft { name: "Work".into(), ..Default::default() }).unwrap();
-        let task = store.add_task("Draft quarterly plan").unwrap();
-
-        // Configure Q1 with custom list, tag, date, and priority.
-        let mut q1 = QuadrantRule::defaults()[0].clone();
-        q1.lists = vec![Some(work.id)];
-        q1.tags = vec!["focus".into()];
-        q1.dates = vec![fern_core::matrix::MatrixDate::Today];
-        q1.priorities = vec![Priority::High];
-        store.save_matrix_rule(0, Some(&q1)).unwrap();
-
-        cx.update(|cx| {
-            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
-            matrix.update(cx, |m, cx| m.drop_on(task.id, 0, cx));
-
-            let updated = store.task(task.id).unwrap().unwrap();
-            assert_eq!(updated.priority, Priority::High);
-            assert_eq!(updated.list_id, Some(work.id));
-            assert_eq!(updated.due_date, Some(Local::now().date_naive()));
-            assert!(updated.tags.iter().any(|t| t.eq_ignore_ascii_case("focus")));
-            assert!(matrix.read(cx).notice.is_none());
-
-            // Dropping into Q1 again when the task already matches shows AlreadyInQuadrant.
-            matrix.update(cx, |m, cx| m.drop_on(task.id, 0, cx));
-            assert!(matches!(matrix.read(cx).notice, Some(MatrixNotice::AlreadyInQuadrant)));
-        });
-    }
-
-    #[gpui::test]
-    fn swap_quadrants_persists_custom_order(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        cx.update(|cx| {
-            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
-            assert_eq!(matrix.read(cx).quadrant_order, [0, 1, 2, 3]);
-
-            matrix.update(cx, |m, cx| m.swap_quadrants(0, 3, cx));
-            assert_eq!(matrix.read(cx).quadrant_order, [3, 1, 2, 0]);
-
-            // Reloading from store preserves the swapped order.
-            let reloaded = cx.new(|cx| MatrixView::new(store.clone(), cx));
-            assert_eq!(reloaded.read(cx).quadrant_order, [3, 1, 2, 0]);
-        });
-    }
-
-    #[gpui::test]
-    fn manual_task_order_persists_and_resets(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let a = store.add_task("Alpha").unwrap();
-        let b = store.add_task("Beta").unwrap();
-        let c = store.add_task("Gamma").unwrap();
-        for id in [a.id, b.id, c.id] {
-            store.set_priority(id, Priority::High).unwrap();
-        }
-
-        cx.update(|cx| {
-            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
-            matrix.update(cx, |m, cx| {
-                m.views[0] = QuadrantView { group: GroupBy::None, sort: SortBy::Title, newest_first: false };
-                m.rebuild_cache(cx);
-            });
-            let before: Vec<Id> =
-                matrix.read(cx).cache[0].groups[0].1.iter().map(|t| t.id).collect();
-            assert_eq!(before, vec![a.id, b.id, c.id]);
-
-            // Drag Gamma onto Alpha -> Gamma moves before Alpha.
-            matrix.update(cx, |m, cx| m.drop_task_on_task(c.id, a.id, 0, cx));
-            let after: Vec<Id> =
-                matrix.read(cx).cache[0].groups[0].1.iter().map(|t| t.id).collect();
-            assert_eq!(after, vec![c.id, a.id, b.id]);
-            assert!(!matrix.read(cx).manual_order[0].is_empty());
-
-            // Reset restores normal sort order.
-            matrix.update(cx, |m, cx| m.reset_manual_order(0, cx));
-            let reset: Vec<Id> =
-                matrix.read(cx).cache[0].groups[0].1.iter().map(|t| t.id).collect();
-            assert_eq!(reset, vec![a.id, b.id, c.id]);
-            assert!(matrix.read(cx).manual_order[0].is_empty());
-        });
-    }
-
-    #[gpui::test]
-    fn multiple_matrix_profiles_keep_independent_rules_and_settings(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let p2 = store.create_matrix_profile("Focus Profile", None).unwrap();
-
-        cx.update(|cx| {
-            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
-            assert_eq!(matrix.read(cx).profiles.len(), 2);
-
-            // Rename Q1 on profile 1.
-            matrix.update(cx, |m, cx| {
-                m.start_edit(0, cx);
-                m.name_input.update(cx, |i, cx| i.set_text("Profile 1 Q1", cx));
-                m.finish_edit(Some(true), cx);
-            });
-            assert_eq!(matrix.read(cx).rules[0].name, "Profile 1 Q1");
-
-            // Switch to profile 2 -> independent rules and view settings.
-            matrix.update(cx, |m, cx| m.switch_profile(p2.id, cx));
-            assert_eq!(matrix.read(cx).active_profile_id, Some(p2.id));
-            assert_ne!(matrix.read(cx).rules[0].name, "Profile 1 Q1");
-
-            matrix.update(cx, |m, cx| {
-                m.start_edit(0, cx);
-                m.name_input.update(cx, |i, cx| i.set_text("Profile 2 Q1", cx));
-                m.finish_edit(Some(true), cx);
-                m.swap_quadrants(0, 3, cx);
-            });
-            assert_eq!(matrix.read(cx).rules[0].name, "Profile 2 Q1");
-            assert_eq!(matrix.read(cx).quadrant_order, [3, 1, 2, 0]);
-
-            // Switch back -> profile 1 keeps its original order & rules.
-            let p1_id = matrix.read(cx).profiles[0].id;
-            matrix.update(cx, |m, cx| m.switch_profile(p1_id, cx));
-            assert_eq!(matrix.read(cx).rules[0].name, "Profile 1 Q1");
-            assert_eq!(matrix.read(cx).quadrant_order, [0, 1, 2, 3]);
-
-            // Delete profile 2 -> only default remains.
-            matrix.update(cx, |m, cx| m.delete_profile(p2.id, cx));
-            assert_eq!(matrix.read(cx).profiles.len(), 1);
-            assert_eq!(matrix.read(cx).active_profile_id, Some(p1_id));
-        });
-    }
-
-    #[gpui::test]
-    fn rename_profile_prefills_existing_name_and_profile_switch_closes_rule_edit(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let work = store.create_matrix_profile("Work Focus", None).unwrap();
-        cx.update(|cx| {
-            theme::init(cx);
-            keymap::load_default(&assets::Assets, cx).unwrap();
-        });
-        let (view, cx) = cx.add_window_view(|_, cx| MatrixView::new(store.clone(), cx));
-
-        cx.update(|window, cx| {
-            view.update(cx, |m, cx| {
-                // Opening profile editor for rename pre-fills the TextInput text (not just placeholder).
-                m.open_profile_editor(Some(work.id), &work.name, window, cx);
-                let (editing_id, input) = m.profile_editor.as_ref().expect("profile editor open");
-                assert_eq!(*editing_id, Some(work.id));
-                assert_eq!(input.read(cx).text(), "Work Focus");
-
-                // Update and save renamed profile.
-                input.update(cx, |inp, cx| inp.set_text("Deep Work", cx));
-                m.save_profile_editor(cx);
-            });
-        });
-        let renamed = store.matrix_profiles().unwrap().into_iter().find(|p| p.id == work.id).unwrap();
-        assert_eq!(renamed.name, "Deep Work");
-
-        // Opening quadrant rule edit modal and then switching/deleting profile must close it.
-        cx.update(|_, cx| {
-            view.update(cx, |m, cx| {
-                m.start_edit(0, cx);
-                assert!(m.editing.is_some());
-                m.switch_profile(work.id, cx);
-                assert!(m.editing.is_none());
-
-                m.start_edit(1, cx);
-                assert!(m.editing.is_some());
-                m.delete_profile(work.id, cx);
-                assert!(m.editing.is_none());
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn toggle_complete_advances_repeating_tasks_and_reopens_wont_do(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let today = Local::now().date_naive();
-        let rep = store.add_task("Weekly review").unwrap();
-        store.set_priority(rep.id, Priority::High).unwrap();
-        store.set_due(rep.id, Some(today), None).unwrap();
-        store
-            .set_repeat(rep.id, Some(fern_core::Recurrence::new(fern_core::Frequency::Weekly, 1)), today)
-            .unwrap();
-
-        let wd = store.add_task("Skipped chore").unwrap();
-        store.set_priority(wd.id, Priority::High).unwrap();
-        store.set_wont_do(wd.id, true).unwrap();
-
-        let done = store.add_task("Finished item").unwrap();
-        store.set_priority(done.id, Priority::High).unwrap();
-        store.set_completed(done.id, true).unwrap();
-        store.set_setting("matrix_show_completed", "1").unwrap();
-
-        cx.update(|cx| {
-            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
-            let observer = cx.new(|_| ());
-
-            // Completing a repeating task advances its due date and keeps it open.
-            matrix.update(cx, |m, cx| m.toggle_complete(rep.id, cx));
-            let rep_after = store.task(rep.id).unwrap().unwrap();
-            assert!(!rep_after.is_completed());
-            assert!(rep_after.due_date > Some(today));
-            assert!(desktop_common::data_version::changed_elsewhere(observer.entity_id(), cx));
-
-            // Toggling a Won't Do task reopens it cleanly.
-            matrix.update(cx, |m, cx| m.toggle_complete(wd.id, cx));
-            let wd_after = store.task(wd.id).unwrap().unwrap();
-            assert!(!wd_after.is_wont_do());
-            assert!(!wd_after.is_completed());
-
-            // Dropping a completed task in the same quadrant must not flash AlreadyInQuadrant.
-            matrix.update(cx, |m, cx| {
-                m.notice = None;
-                m.drop_task_on_task(done.id, rep.id, 0, cx);
-                assert!(m.notice.is_none());
-                m.drop_on(done.id, 0, cx);
-                assert!(m.notice.is_none());
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn new_inactive_skips_initial_reload_until_activated(cx: &mut gpui::TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let task = store.add_task("Deferred quadrant item").unwrap();
-        store.set_priority(task.id, Priority::High).unwrap();
-
-        cx.update(|cx| {
-            let matrix = cx.new(|cx| MatrixView::new_inactive(store.clone(), cx));
-            {
-                let m = matrix.read(cx);
-                assert!(!m.active);
-                assert!(m.dirty);
-                assert!(m.tasks.is_empty());
-                assert_eq!(m.cache[0].open_count, 0);
-            }
-
-            matrix.update(cx, |m, cx| m.set_active(true, cx));
-            let m = matrix.read(cx);
-            assert!(m.active);
-            assert!(!m.dirty);
-            assert_eq!(m.tasks.len(), 1);
-            assert_eq!(m.cache[0].open_count, 1);
-        });
+            .children(self.render_confirm_delete_profile(cx))
+            .children(self.render_profile_editor_modal(cx))
     }
 }

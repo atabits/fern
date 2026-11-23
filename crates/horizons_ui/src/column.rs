@@ -1,14 +1,12 @@
 //! Reusable TimeStripe-inspired column renderer, collapsed horizon strips, rollover strip,
 //! task rows, and inline task creator.
 
-use std::collections::HashMap;
-
 use chrono::{Datelike, NaiveDate};
 use desktop_common::{calendar, completion_mark};
 use fern_core::{Horizon, Id, Task};
 use fern_i18n as i18n;
 use fern_i18n::Strings;
-use gpui::{AnyElement, Context, FontWeight, Hsla, MouseButton, SharedString, div, px};
+use gpui::{AnyElement, Context, FontWeight, MouseButton, SharedString, div, px};
 use task_ui::drag::DraggedTask;
 use task_ui::task_rows;
 use ui::prelude::*;
@@ -166,15 +164,15 @@ impl ColumnTarget {
 }
 
 /// All precomputed data needed to render one column without touching SQLite.
-pub(crate) struct ColumnSpec {
+pub(crate) struct ColumnSpec<'a> {
     pub(crate) target: ColumnTarget,
     pub(crate) slot: Option<HorizonSlot>,
     pub(crate) title: String,
     pub(crate) subtitle: Option<String>,
     pub(crate) is_current: bool,
-    pub(crate) tasks: Vec<Task>,
-    pub(crate) rollover: Vec<Task>,
-    pub(crate) dated_in_week: Vec<Task>,
+    pub(crate) tasks: Vec<&'a Task>,
+    pub(crate) rollover: Vec<&'a Task>,
+    pub(crate) dated_in_week: Vec<&'a Task>,
     pub(crate) empty_hint: Option<&'static str>,
     pub(crate) show_triage_chips: bool,
     pub(crate) show_board_badge: bool,
@@ -320,9 +318,8 @@ impl HorizonsView {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_column(
         &self,
-        spec: ColumnSpec,
+        spec: ColumnSpec<'_>,
         today: NaiveDate,
-        list_meta: &HashMap<Id, (String, Option<Hsla>)>,
         is_last: bool,
         min_width: f32,
         full_width: bool,
@@ -449,11 +446,10 @@ impl HorizonsView {
         }
 
         // 2. Column tasks.
-        for task in &spec.tasks {
+        for &task in &spec.tasks {
             body_items = body_items.child(self.render_task_row(
                 task,
                 today,
-                list_meta,
                 spec.show_board_badge,
                 spec.show_triage_chips,
                 None,
@@ -481,7 +477,7 @@ impl HorizonsView {
                                     .color(colors.text_muted.opacity(0.75)),
                             ),
                     )
-                    .children(spec.dated_in_week.iter().map(|task| {
+                    .children(spec.dated_in_week.iter().copied().map(|task| {
                         let date_chip = task
                             .due_date
                             .or(task.start_date)
@@ -489,7 +485,6 @@ impl HorizonsView {
                         self.render_task_row(
                             task,
                             today,
-                            list_meta,
                             spec.show_board_badge,
                             false,
                             date_chip,
@@ -559,7 +554,7 @@ impl HorizonsView {
         &self,
         col_key: &str,
         target: ColumnTarget,
-        rollover: &[Task],
+        rollover: &[&Task],
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
@@ -751,7 +746,6 @@ impl HorizonsView {
         &self,
         task: &Task,
         today: NaiveDate,
-        list_meta: &HashMap<Id, (String, Option<Hsla>)>,
         show_board_badge: bool,
         show_triage_chips: bool,
         extra_chip: Option<String>,
@@ -774,7 +768,7 @@ impl HorizonsView {
         };
         let time_range = format_task_time_range(task, strings);
         let board_badge = show_board_badge
-            .then(|| task.list_id.and_then(|lid| list_meta.get(&lid).cloned()))
+            .then(|| task.list_id.and_then(|lid| self.list_meta.get(&lid)))
             .flatten();
         let has_meta = time_range.is_some()
             || task.checklist.is_some()
@@ -854,7 +848,7 @@ impl HorizonsView {
                         .max_w(px(100.))
                         .child(div().size(px(5.)).flex_none().rounded_full().bg(dot))
                         .child(
-                            Label::new(board_name)
+                            Label::new(board_name.clone())
                                 .size(LabelSize::XSmall)
                                 .color(colors.text_muted.opacity(0.75))
                                 .truncate(),

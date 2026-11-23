@@ -20,11 +20,9 @@ gpui.workspace = true
 icons.workspace = true
 plugins.workspace = true
 resvg.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 theme.workspace = true
 ui.workspace = true
-usvg.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

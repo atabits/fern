@@ -130,7 +130,10 @@ pub struct TodoView {
     list_entries: Vec<ListEntry>,
     /// Cached `Row` slice extracted from `list_entries` so `move_task_drag` does not clone every
     /// task on every mouse pixel.
-    list_rows: Vec<Row>,
+    list_rows: Rc<Vec<Row>>,
+    rows_version: u64,
+    cached_rows: RefCell<Option<(RowsCacheKey, Rc<Vec<Row>>)>>,
+    synced_list_key: Option<(RowsCacheKey, bool, bool)>,
     /// Window bounds of currently painted `list_entries` rows, keyed by entry index.
     list_entry_bounds: Rc<RefCell<HashMap<usize, gpui::Bounds<Pixels>>>>,
     /// Active task-list drag origin: `(dragged_task_id, start_mouse_x)`.
@@ -251,7 +254,7 @@ pub struct TodoView {
     busy_days: HashSet<NaiveDate>,
     /// Today and Next 7 Days: the habits due today, whether each is checked in and its amount;
     /// empty elsewhere or when the habit settings keep them out.
-    today_habits: Vec<(fern_core::Habit, bool, f64)>,
+    today_habits: Rc<Vec<(fern_core::Habit, bool, f64)>>,
     /// Today's countdowns shown in the Today list (cached on reload; empty outside Today).
     today_countdowns: Vec<fern_core::Countdown>,
     /// Cached subtask progress `(done, total)` per parent task ID, computed in O(N) on reload.
@@ -466,7 +469,10 @@ impl TodoView {
             list_focus: cx.focus_handle(),
             list_state: Self::new_list_state(),
             list_entries: Vec::new(),
-            list_rows: Vec::new(),
+            list_rows: Rc::new(Vec::new()),
+            rows_version: 0,
+            cached_rows: RefCell::new(None),
+            synced_list_key: None,
             list_entry_bounds: Rc::new(RefCell::new(HashMap::new())),
             task_drag_origin: None,
             task_drop: None,
@@ -559,7 +565,7 @@ impl TodoView {
             mini_expanded,
             mini_month: crate::calendar::month_start(Self::today()),
             busy_days: HashSet::new(),
-            today_habits: Vec::new(),
+            today_habits: Rc::new(Vec::new()),
             today_countdowns: Vec::new(),
             subtask_progress: HashMap::new(),
             cached_templates: Vec::new(),
@@ -873,7 +879,10 @@ impl TodoView {
                     });
                 }
                 Some(("menu", "lists")) => self.closed_menu = Some(ClosedMenu::Lists(self.closed_lists.clone())),
-                Some(("range", "this-week")) => self.closed_range = ClosedRange::ThisWeek,
+                Some(("range", "this-week")) => {
+                self.closed_range = ClosedRange::ThisWeek;
+                self.invalidate_rows();
+            }
                 Some(("complete", needle)) => {
                     if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
                         self.toggle(id, true, cx);
@@ -1016,8 +1025,8 @@ impl TodoView {
         if matches!(self.view, View::Summary | View::Horizons) || self.uses_board_layout() || self.uses_popup_details() {
             return None;
         }
-        self.rows(i18n::t(cx)).into_iter().find_map(|row| match row {
-            Row::Task { task, .. } => Some(task),
+        self.rows_rc(i18n::t(cx)).iter().find_map(|row| match row {
+            Row::Task { task, .. } => Some(task.clone()),
             Row::Section { .. } | Row::Day { .. } => None,
         })
     }
@@ -1142,7 +1151,7 @@ impl TodoView {
             .ok()
             .flatten()
             .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty() && s.parse::<chrono_tz::Tz>().is_ok());
+            .filter(|s| !s.is_empty() && crate::calendar::is_valid_timezone(s));
         self.timeline_color_by = self
             .store
             .setting("timeline_color_by")
@@ -1217,12 +1226,14 @@ impl TodoView {
         }
         self.reload_today_habits();
         self.reload_today_countdowns();
+        self.invalidate_rows();
         let lists = self.active_lists();
         if switched {
             self.reset_view_transients(cx);
             self.list_state = Self::new_list_state();
             self.list_entries.clear();
-            self.list_rows.clear();
+            self.list_rows = Rc::new(Vec::new());
+            self.synced_list_key = None;
             let selected = self.default_task_for_view(cx);
             self.selected = selected.as_ref().map(|t| t.id);
             self.detail.update(cx, |detail, cx| {
@@ -1288,7 +1299,7 @@ impl TodoView {
 
     /// Today and Next 7 Days list the habits due today, unless turned off in the habit settings.
     fn reload_today_habits(&mut self) {
-        self.today_habits.clear();
+        self.today_habits = Rc::new(Vec::new());
         if !matches!(self.view, View::Today | View::Next7Days)
             || self.store.setting(crate::habit_view::IN_TODAY_SETTING).ok().flatten().as_deref() == Some("0")
         {
@@ -1311,7 +1322,7 @@ impl TodoView {
             }
         }
         items.sort_by_key(|(sec_idx, sort_order, _, _, _)| (*sec_idx, *sort_order));
-        self.today_habits = items.into_iter().map(|(_, _, h, c, a)| (h, c, a)).collect();
+        self.today_habits = Rc::new(items.into_iter().map(|(_, _, h, c, a)| (h, c, a)).collect());
     }
 
 
@@ -1339,8 +1350,8 @@ impl TodoView {
             }
             return ids;
         }
-        self.rows(strings)
-            .into_iter()
+        self.rows_rc(strings)
+            .iter()
             .filter_map(|row| match row {
                 Row::Task { task, .. } => Some(task.id),
                 Row::Section { .. } | Row::Day { .. } => None,
@@ -1356,7 +1367,7 @@ impl TodoView {
         ListState::new(0, ListAlignment::Top, px(400.)).measure_all()
     }
 
-    fn sync_list(&mut self, entries: Vec<ListEntry>) {
+    fn sync_list(&mut self, entries: Vec<ListEntry>, rows: Rc<Vec<Row>>) {
         let old = &self.list_entries;
         let start = old.iter().zip(&entries).take_while(|(a, b)| a == b).count();
         let end = old[start..].iter().rev().zip(entries[start..].iter().rev()).take_while(|(a, b)| a == b).count();
@@ -1372,13 +1383,7 @@ impl TodoView {
                 self.list_state.remeasure_items(ix..ix + 1);
             }
         }
-        self.list_rows = entries
-            .iter()
-            .filter_map(|e| match e {
-                ListEntry::Row(row) => Some(row.clone()),
-                _ => None,
-            })
-            .collect();
+        self.list_rows = rows;
         self.list_entries = entries;
     }
 
@@ -1462,8 +1467,50 @@ impl TodoView {
         }
     }
 
+    pub(super) fn invalidate_rows(&mut self) {
+        self.rows_version = self.rows_version.wrapping_add(1);
+        self.cached_rows.borrow_mut().take();
+        self.synced_list_key = None;
+    }
+
+    fn rows_cache_key(&self, strings: &Strings) -> RowsCacheKey {
+        RowsCacheKey {
+            version: self.rows_version,
+            today: Self::today(),
+            strings_ptr: strings as *const Strings as usize,
+            sort: self.sort_by,
+            group: self.group_by,
+            show_completed: self.show_completed,
+            descending: self.sort_descending,
+            closed_range: self.closed_range,
+            closed_lists: self.closed_lists.clone(),
+            collapsed_tasks_len: self.collapsed_tasks.len(),
+            collapsed_sections_len: self.collapsed_sections.len(),
+            collapsed_days_len: self.collapsed_days.len(),
+            completing_len: self.completing.len(),
+            overdue_last: self.preferences.task_defaults.overdue_last,
+            horizons_enabled: crate::calendar::horizons_enabled(),
+            week_start: crate::calendar::week_start(),
+        }
+    }
+
+    fn rows_rc(&self, strings: &Strings) -> Rc<Vec<Row>> {
+        let key = self.rows_cache_key(strings);
+        if let Some((cached_key, rows)) = self.cached_rows.borrow().as_ref()
+            && *cached_key == key
+        {
+            return Rc::clone(rows);
+        }
+        let built = Rc::new(task_rows::fold_days(
+            self.rows_with(strings, &self.collapsed_tasks, &self.collapsed_sections),
+            &self.collapsed_days,
+        ));
+        *self.cached_rows.borrow_mut() = Some((key, Rc::clone(&built)));
+        built
+    }
+
     fn rows(&self, strings: &Strings) -> Vec<Row> {
-        task_rows::fold_days(self.rows_with(strings, &self.collapsed_tasks, &self.collapsed_sections), &self.collapsed_days)
+        (*self.rows_rc(strings)).clone()
     }
 
     fn tasks_for_rows(&self) -> Vec<Task> {
@@ -1942,6 +1989,7 @@ impl TodoView {
         };
         self.sort_by = SortBy::from_key(&get("sort"));
         self.group_by = group;
+        self.invalidate_rows();
     }
 
     /// Cached per-list switch of the header's "…" menu ("Show Completed", "Show Details", etc.).
@@ -2354,6 +2402,7 @@ impl TodoView {
         self.kanban_col_scrolls.clear();
         self.clear_task_drag_state();
         self.completing.clear();
+        self.invalidate_rows();
     }
 
     pub fn select_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
@@ -2417,6 +2466,7 @@ impl TodoView {
         }
         self.list_state = Self::new_list_state();
         self.list_entries.clear();
+        self.invalidate_rows();
         self.sync_layout_selection(cx);
         cx.notify();
     }
@@ -2681,6 +2731,7 @@ impl TodoView {
         if !self.collapsed_tasks.remove(&id) {
             self.collapsed_tasks.insert(id);
         }
+        self.invalidate_rows();
         cx.notify();
     }
 
@@ -2688,6 +2739,7 @@ impl TodoView {
         if !self.collapsed_days.remove(&label) {
             self.collapsed_days.insert(label);
         }
+        self.invalidate_rows();
         cx.notify();
     }
 
@@ -2695,6 +2747,7 @@ impl TodoView {
         if !self.collapsed_sections.remove(&section) {
             self.collapsed_sections.insert(section);
         }
+        self.invalidate_rows();
         cx.notify();
     }
 
@@ -2904,12 +2957,14 @@ impl TodoView {
                 cx.background_executor().timer(crate::completion_mark::SETTLE_DURATION).await;
                 this.update(cx, |this, cx| {
                     this.completing.remove(&id);
+                    this.invalidate_rows();
                     cx.notify();
                 }).ok();
             });
             self.completing.insert(id, CompletingTask {
                 before, index, view: self.view.clone(), undo: action.clone(), _timer: timer,
             });
+            self.invalidate_rows();
         }
         let expected = action.clone();
         let timer = cx.spawn(async move |this, cx| {
@@ -3232,6 +3287,7 @@ impl TodoView {
                 self.collapsed_tasks.remove(&id);
             }
         }
+        self.invalidate_rows();
         cx.notify();
     }
 
@@ -3278,6 +3334,7 @@ impl TodoView {
                 self.collapsed_days.remove(&d);
             }
         }
+        self.invalidate_rows();
         cx.notify();
     }
 
@@ -3962,7 +4019,7 @@ impl TodoView {
     fn render_habits(&self, strings: &Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = cx.theme().clone();
         let today = Self::today();
-        let habits = self.today_habits.clone();
+        let habits = Rc::clone(&self.today_habits);
         if habits.is_empty() {
             return None;
         }
@@ -3984,7 +4041,9 @@ impl TodoView {
                 )
                 // As the original's rows: the icon and name, then "0 / 2 unit" and "Today" on
                 // the right, no box; a click checks the habit in or adds a step.
-                .children(habits.into_iter().map(|(habit, checked, amount)| {
+                .children(habits.iter().map(|(habit, checked, amount)| {
+                    let checked = *checked;
+                    let amount = *amount;
                     let id = habit.id;
                     let has_goal = habit.goal.is_some();
                     let (target, unit) = habit.goal.as_ref().map_or((1.0, String::new()), |g| (g.amount, g.unit.clone()));
@@ -4020,7 +4079,7 @@ impl TodoView {
                                     this.reload_today_habits();
                                     cx.notify();
                                 }))
-                                .child(crate::habit_view::avatar(&habit, px(20.), cx)),
+                                .child(crate::habit_view::avatar(habit, px(20.), cx)),
                         )
                         .child(
                             div().flex_1().min_w_0().child(
@@ -4261,24 +4320,38 @@ impl Render for TodoView {
         };
         let board: Option<AnyElement> = board
             .or_else(|| kanban_view.then(|| self.render_kanban_board(&tag_colors, today, strings, window, cx)));
-        let rows = if kanban_view { Vec::new() } else { self.rows(strings) };
-        let rows_empty = rows.is_empty();
-        if !kanban_view {
+        let (rows_empty, rows_rc) = if kanban_view {
+            (true, None)
+        } else {
+            let rows = self.rows_rc(strings);
+            (rows.is_empty(), Some(rows))
+        };
+        if let Some(rows) = rows_rc {
             self.tag_colors = tag_colors;
-            let mut entries = Vec::with_capacity(rows.len() + 3);
-            if self.new_section.is_some() {
-                entries.push(ListEntry::NewSection);
+            let list_key = (self.rows_cache_key(strings), self.new_section.is_some(), self.view == View::Next7Days);
+            if self.synced_list_key.as_ref() == Some(&list_key) && !self.list_entries.is_empty() {
+                for (ix, entry) in self.list_entries.iter().enumerate() {
+                    if !matches!(entry, ListEntry::Row(_)) {
+                        self.list_state.remeasure_items(ix..ix + 1);
+                    }
+                }
+            } else {
+                let mut entries = Vec::with_capacity(rows.len() + 3);
+                if self.new_section.is_some() {
+                    entries.push(ListEntry::NewSection);
+                }
+                // In Next 7 Days today's habits come first, as the original's.
+                if self.view == View::Next7Days {
+                    entries.push(ListEntry::Habits);
+                }
+                entries.extend(rows.iter().cloned().map(ListEntry::Row));
+                if self.view != View::Next7Days {
+                    entries.push(ListEntry::Habits);
+                }
+                entries.push(ListEntry::Countdowns);
+                self.sync_list(entries, rows);
+                self.synced_list_key = Some(list_key);
             }
-            // In Next 7 Days today's habits come first, as the original's.
-            if self.view == View::Next7Days {
-                entries.push(ListEntry::Habits);
-            }
-            entries.extend(rows.into_iter().map(ListEntry::Row));
-            if self.view != View::Next7Days {
-                entries.push(ListEntry::Habits);
-            }
-            entries.push(ListEntry::Countdowns);
-            self.sync_list(entries);
         }
 
         let list = v_flex()
@@ -4900,6 +4973,26 @@ impl Render for TodoView {
     }
 }
 
+
+#[derive(Clone, PartialEq, Eq)]
+struct RowsCacheKey {
+    version: u64,
+    today: NaiveDate,
+    strings_ptr: usize,
+    sort: SortBy,
+    group: GroupBy,
+    show_completed: bool,
+    descending: bool,
+    closed_range: ClosedRange,
+    closed_lists: Option<Vec<Option<Id>>>,
+    collapsed_tasks_len: usize,
+    collapsed_sections_len: usize,
+    collapsed_days_len: usize,
+    completing_len: usize,
+    overdue_last: bool,
+    horizons_enabled: bool,
+    week_start: chrono::Weekday,
+}
 
 #[derive(Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]

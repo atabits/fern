@@ -11,7 +11,7 @@ use chrono::{Duration, Local, NaiveDate};
 use fern_core::matrix::{
     DropOutcome, MatrixKind, QuadrantRule, build_tag_families, quadrant_of, quadrants_of,
 };
-use fern_core::{Id, Kind, List, Preferences, Priority, Store, Task, TaskDraft, TaskTree};
+use fern_core::{Id, Kind, List, Preferences, Priority, Store, Task, TaskDraft};
 use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Point};
 use ui::prelude::*;
 use ui::{Button, ButtonVariant, ConfirmDialog, EmptyState, Modal, Placement, PopoverAttachment, popover};
@@ -197,6 +197,8 @@ pub struct MatrixView {
     store: Rc<Store>,
     focus: FocusHandle,
     tasks: Vec<Task>,
+    /// Cached parent -> child indices into `self.tasks`, rebuilt once in `reload()`.
+    children_by_parent: HashMap<Id, Vec<usize>>,
     lists: Vec<List>,
     list_names: HashMap<Id, SharedString>,
     tags: Vec<fern_core::Tag>,
@@ -265,6 +267,7 @@ impl MatrixView {
             store,
             focus: cx.focus_handle(),
             tasks: Vec::new(),
+            children_by_parent: HashMap::new(),
             lists: Vec::new(),
             list_names: HashMap::new(),
             tags: Vec::new(),
@@ -434,6 +437,17 @@ impl MatrixView {
             .store
             .matrix_tasks(&self.rules, self.show_completed, COMPLETED_HISTORY_LIMIT)
             .unwrap_or_default();
+        let task_ids: HashSet<Id> = self.tasks.iter().map(|t| t.id).collect();
+        let mut children_by_parent: HashMap<Id, Vec<usize>> = HashMap::new();
+        for (idx, task) in self.tasks.iter().enumerate() {
+            if let Some(parent_id) = task.parent_id
+                && parent_id != task.id
+                && task_ids.contains(&parent_id)
+            {
+                children_by_parent.entry(parent_id).or_default().push(idx);
+            }
+        }
+        self.children_by_parent = children_by_parent;
         self.lists = self.store.lists().unwrap_or_default();
         self.list_names = self
             .lists
@@ -1308,8 +1322,15 @@ impl MatrixView {
         }
     }
 
-    fn child_subtasks<'a>(&self, tree: &TaskTree<'a>, parent_id: Id) -> Vec<&'a Task> {
-        tree.children(parent_id)
+    fn task_children(&self, parent_id: Id) -> impl Iterator<Item = &Task> {
+        self.children_by_parent
+            .get(&parent_id)
+            .into_iter()
+            .flat_map(|indices| indices.iter().map(|&idx| &self.tasks[idx]))
+    }
+
+    fn child_subtasks(&self, parent_id: Id) -> Vec<&Task> {
+        self.task_children(parent_id)
             .filter(|t| {
                 !t.is_deleted()
                     && !t.is_wont_do()
@@ -1322,7 +1343,6 @@ impl MatrixView {
     fn push_task_tree(
         &self,
         task: &Task,
-        tree: &TaskTree<'_>,
         quadrant: usize,
         today: NaiveDate,
         list_name: &impl Fn(Option<Id>) -> SharedString,
@@ -1330,10 +1350,10 @@ impl MatrixView {
         out: &mut Vec<AnyElement>,
         cx: &mut Context<Self>,
     ) {
-        out.push(self.render_task(task, tree, quadrant, today, &list_name(task.list_id), depth, cx));
+        out.push(self.render_task(task, quadrant, today, &list_name(task.list_id), depth, cx));
         if !self.show_subtasks && depth < 4 && self.expanded_parents.contains(&(quadrant, task.id)) {
-            for child in self.child_subtasks(tree, task.id) {
-                self.push_task_tree(child, tree, quadrant, today, list_name, depth + 1, out, cx);
+            for child in self.child_subtasks(task.id) {
+                self.push_task_tree(child, quadrant, today, list_name, depth + 1, out, cx);
             }
         }
     }
@@ -1342,7 +1362,6 @@ impl MatrixView {
     fn render_task(
         &self,
         task: &Task,
-        tree: &TaskTree<'_>,
         quadrant: usize,
         today: NaiveDate,
         list_name: &SharedString,
@@ -1372,7 +1391,7 @@ impl MatrixView {
         let has_location = task.location.as_deref().is_some_and(|l| !l.trim().is_empty());
         let mut has_visible_children = false;
         let (mut done_subs, mut total_subs) = (0usize, 0usize);
-        for child in tree.children(id) {
+        for child in self.task_children(id) {
             if child.is_deleted() || child.is_wont_do() {
                 continue;
             }
@@ -1722,7 +1741,7 @@ impl MatrixView {
             .into_any_element()
     }
 
-    fn render_quadrant(&self, quadrant: usize, tree: &TaskTree<'_>, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
+    fn render_quadrant(&self, quadrant: usize, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let color = Self::quadrant_color(quadrant);
@@ -1765,7 +1784,7 @@ impl MatrixView {
             }
             if !collapsed {
                 for task in tasks {
-                    self.push_task_tree(task, tree, quadrant, today, &list_name, 0, &mut content, cx);
+                    self.push_task_tree(task, quadrant, today, &list_name, 0, &mut content, cx);
                 }
             }
         }
@@ -1804,7 +1823,7 @@ impl MatrixView {
             );
             if !collapsed {
                 for task in &cache.completed {
-                    self.push_task_tree(task, tree, quadrant, today, &list_name, 0, &mut content, cx);
+                    self.push_task_tree(task, quadrant, today, &list_name, 0, &mut content, cx);
                 }
             }
         }
@@ -1979,8 +1998,7 @@ impl Render for MatrixView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Local::now().date_naive();
-        let tree = TaskTree::build(&self.tasks);
-        let [q0, q1, q2, q3] = self.quadrant_order.map(|quadrant| self.render_quadrant(quadrant, &tree, today, cx));
+        let [q0, q1, q2, q3] = self.quadrant_order.map(|quadrant| self.render_quadrant(quadrant, today, cx));
 
         let edit_modal = self
             .editing

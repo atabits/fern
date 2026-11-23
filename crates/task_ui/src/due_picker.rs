@@ -1,7 +1,7 @@
 //! State and labels of the due-date popover, matched to TickTick's: the user edits a draft
 //! (date, time, repeat) and nothing is saved until "OK".
 
-use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Offset as _, TimeZone as _, Timelike, Utc};
+use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use fern_core::reminder::{ALL_DAY_OFFSETS, ALL_DAY_REMINDER_HOUR, TIMED_OFFSETS};
 use fern_core::{Frequency, Horizon, Recurrence, Task};
 
@@ -436,67 +436,9 @@ pub fn extended_repeat_options(date: NaiveDate, strings: &Strings, locale: Local
     out
 }
 
-const MAJOR_TIMEZONES: [&str; 29] = [
-    "UTC",
-    "America/New_York",
-    "America/Chicago",
-    "America/Denver",
-    "America/Los_Angeles",
-    "America/Toronto",
-    "America/Sao_Paulo",
-    "Europe/London",
-    "Europe/Paris",
-    "Europe/Berlin",
-    "Europe/Madrid",
-    "Europe/Rome",
-    "Europe/Amsterdam",
-    "Europe/Warsaw",
-    "Europe/Kyiv",
-    "Europe/Istanbul",
-    "Europe/Moscow",
-    "Asia/Dubai",
-    "Asia/Almaty",
-    "Asia/Kolkata",
-    "Asia/Bangkok",
-    "Asia/Singapore",
-    "Asia/Shanghai",
-    "Asia/Hong_Kong",
-    "Asia/Taipei",
-    "Asia/Tokyo",
-    "Asia/Seoul",
-    "Australia/Sydney",
-    "Pacific/Auckland",
-];
-
-fn format_tz_offset(tz: chrono_tz::Tz) -> String {
-    let now = Utc::now().naive_utc();
-    let offset_secs = tz.offset_from_utc_datetime(&now).fix().local_minus_utc();
-    let mins = offset_secs / 60;
-    let sign = if mins >= 0 { '+' } else { '-' };
-    let abs = mins.abs();
-    let (h, m) = (abs / 60, abs % 60);
-    if m == 0 {
-        format!("UTC{sign}{h}")
-    } else {
-        format!("UTC{sign}{h}:{m:02}")
-    }
-}
-
 /// Lists `(iana_name, utc_offset)` pairs matching `query` (curated major zones when empty).
 pub fn timezone_options(query: &str) -> Vec<(String, String)> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return MAJOR_TIMEZONES
-            .iter()
-            .filter_map(|name| name.parse::<chrono_tz::Tz>().ok().map(|tz| ((*name).to_owned(), format_tz_offset(tz))))
-            .collect();
-    }
-    chrono_tz::TZ_VARIANTS
-        .iter()
-        .filter(|tz| tz.name().to_lowercase().contains(&q))
-        .take(40)
-        .map(|tz| (tz.name().to_owned(), format_tz_offset(*tz)))
-        .collect()
+    calendar::timezone_options(query)
 }
 
 /// Compact badge text for a task's time zone or floating status; `None` for default local time.
@@ -506,9 +448,9 @@ pub fn short_timezone_label(timezone: Option<&str>, is_floating: bool, strings: 
     }
     let tz_name = timezone?;
     let city = tz_name.rsplit('/').next().unwrap_or(tz_name).replace('_', " ");
-    match tz_name.parse::<chrono_tz::Tz>() {
-        Ok(tz) => Some(format!("{city} ({})", format_tz_offset(tz))),
-        Err(_) => Some(city),
+    match calendar::timezone_offset_label(tz_name) {
+        Some(offset) => Some(format!("{city} ({offset})")),
+        None => Some(city),
     }
 }
 

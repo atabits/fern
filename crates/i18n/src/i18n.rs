@@ -889,9 +889,9 @@ pub struct Strings {
     /// Monday, Sunday, Saturday, as in `fern_core::WEEK_STARTS`.
     pub week_start_names: [&'static str; 3],
     pub color_series: &'static str,
-    /// Display names in the order of the bundled preset catalog.
-    pub light_theme_names: [&'static str; theme::LIGHT_PRESETS.len()],
-    pub dark_theme_names: [&'static str; theme::DARK_PRESETS.len()],
+    /// Display names in the order of the bundled preset catalog (`theme::LIGHT_PRESETS` / `DARK_PRESETS`).
+    pub light_theme_names: [&'static str; 11],
+    pub dark_theme_names: [&'static str; 6],
     pub dark_theme: &'static str,
     pub night_theme: &'static str,
     pub switch_theme: &'static str,
@@ -5083,23 +5083,17 @@ impl Strings {
             (h, m) => format!("{h}{}{m}{}", self.duration_hour_short, self.duration_min_short),
         }
     }
-
-    pub fn filter_date_label(&self, rule: fern_core::DateRule) -> &'static str {
-        use fern_core::DateRule::*;
-        match rule {
-            All => self.filter_all, Overdue => self.filter_date_overdue,
-            Today => self.filter_date_today, Tomorrow => self.filter_date_tomorrow,
-            ThisWeek => self.filter_date_this_week, NoDate => self.filter_date_no_date,
-            NextWeek => self.filter_date_next_week, ThisMonth => self.filter_date_this_month,
-            NextMonth => self.filter_date_next_month, NextDays(_) => self.filter_date_next_days,
-            Recurring => self.filter_date_recurring, Span { .. } => self.filter_date_range,
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_preset_name_counts_match_catalog() {
+        assert_eq!(EN.light_theme_names.len(), theme::LIGHT_PRESETS.len());
+        assert_eq!(EN.dark_theme_names.len(), theme::DARK_PRESETS.len());
+    }
 
     #[test]
     fn chinese_welcome_examples_set_due_dates() {

@@ -731,7 +731,7 @@ mod tests {
             r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:s="http://www.w3.org/2000/svg" xmlns:x="http://www.w3.org/1999/xlink" viewBox="0 0 16 16"><s:image x:href="{}" width="16" height="16"/></svg>"#,
             dummy.display()
         );
-        let tree = usvg::Tree::from_str(&svg, &opts).unwrap();
+        let tree = resvg::usvg::Tree::from_str(&svg, &opts).unwrap();
         assert!(
             tree.root().children().is_empty(),
             "external image node should not resolve with no-op ImageHrefResolver"

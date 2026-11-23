@@ -576,7 +576,7 @@ impl TodoView {
                             };
                             chip(
                                 id(&format!("date-{n}")),
-                                strings.filter_date_label(rule),
+                                desktop_common::calendar::filter_date_label(rule, strings),
                                 selected,
                                 cx,
                             )

@@ -61,12 +61,14 @@ impl MatrixView {
 
         // Lists
         let mut list_chips = vec![all("matrix-lists-all", rule.lists.is_empty(), Box::new(|r: &mut QuadrantRule| r.lists.clear()))];
+        let known_list_ids: std::collections::HashSet<_> = self.lists.iter().map(|list| list.id).collect();
+        let selected_lists: std::collections::HashSet<_> = rule.lists.iter().copied().collect();
         let unavailable_lists = rule
             .lists
             .iter()
             .flatten()
             .copied()
-            .filter(|id| !self.lists.iter().any(|list| list.id == *id))
+            .filter(|id| !known_list_ids.contains(id))
             .map(|id| (Some(id), strings.matrix_unavailable_list.to_owned()));
         let list_choices = std::iter::once((None, strings.inbox.to_owned()))
             .chain(self.lists.iter().filter(|l| !l.archived).map(|list| (Some(list.id), list.name.clone())))
@@ -75,16 +77,18 @@ impl MatrixView {
             list_chips.push(chip(
                 SharedString::from(format!("matrix-list-{}", id.map_or("inbox".to_owned(), |i| i.to_string()))),
                 name.into(),
-                rule.lists.contains(&id),
+                selected_lists.contains(&id),
                 Box::new(move |r: &mut QuadrantRule| toggle(&mut r.lists, &id)),
             ));
         }
 
         // Tags (case-insensitive matching + display stale/unavailable tags)
         let mut tag_chips = vec![all("matrix-tags-all", rule.tags.is_empty(), Box::new(|r: &mut QuadrantRule| r.tags.clear()))];
+        let selected_tags: std::collections::HashSet<String> = rule.tags.iter().map(|t| t.to_lowercase()).collect();
+        let known_tags: std::collections::HashSet<String> = self.tags.iter().map(|t| t.name.to_lowercase()).collect();
         for tag in self.tags.iter().map(|t| &t.name) {
             let name = tag.clone();
-            let active = rule.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase());
+            let active = selected_tags.contains(&tag.to_lowercase());
             tag_chips.push(chip(
                 SharedString::from(format!("matrix-tag-{tag}")),
                 tag.clone().into(),
@@ -95,7 +99,7 @@ impl MatrixView {
         for stale in rule
             .tags
             .iter()
-            .filter(|rt| !self.tags.iter().any(|t| t.name.to_lowercase() == rt.to_lowercase()))
+            .filter(|rt| !known_tags.contains(&rt.to_lowercase()))
         {
             let label = format!("{stale} ({})", strings.matrix_unavailable_tag);
             let remove_name = stale.clone();

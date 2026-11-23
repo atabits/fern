@@ -122,7 +122,7 @@ impl Render for DraggedSection {
 pub struct HabitView {
     store: Rc<Store>,
     focus_handle: gpui::FocusHandle,
-    habits: Vec<Habit>,
+    habits: Rc<Vec<Habit>>,
     /// Completed (`Done`) dates per habit.
     checkins: HashMap<Id, HashSet<NaiveDate>>,
     /// All daily records (Done, Undone, partial, log-only) per habit.
@@ -196,7 +196,7 @@ impl HabitView {
         let mut this = Self {
             store,
             focus_handle: cx.focus_handle(),
-            habits: Vec::new(),
+            habits: Rc::new(Vec::new()),
             checkins: HashMap::new(),
             records: HashMap::new(),
             sections: Vec::new(),
@@ -257,7 +257,7 @@ impl HabitView {
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.dirty = false;
-        self.habits = self.store.habits().unwrap_or_default();
+        self.habits = Rc::new(self.store.habits().unwrap_or_default());
         self.sections = self.store.habit_sections().unwrap_or_default();
         self.records = self.store.all_habit_checkins().unwrap_or_default();
         self.in_today = self
@@ -1492,7 +1492,7 @@ impl Render for HabitView {
         let week_start = calendar::week_start();
         let week: [NaiveDate; 7] = std::array::from_fn(|i| today - Duration::days(6 - i as i64));
 
-        let habits = self.habits.clone();
+        let habits = Rc::clone(&self.habits);
         let visible: Vec<&Habit> = habits
             .iter()
             .filter(|h| h.archived == self.show_archived)

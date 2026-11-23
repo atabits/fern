@@ -1,0 +1,488 @@
+use gpui::{Entity, FontWeight};
+use ui::prelude::*;
+use ui::{Placement, PopoverAttachment, popover};
+
+use crate::i18n::{self, Locale};
+use crate::subscriptions::{ChinaHolidaySource, ChinaHolidayStatus};
+
+use super::{Menu, ROW_HEIGHT, SettingsWindow};
+
+impl SettingsWindow {
+    pub(super) fn render_china_holiday_source(
+        &self,
+        current: Option<(fern_core::Id, ChinaHolidaySource)>,
+        enabled: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let strings = i18n::t(cx);
+        let hover = cx.theme().colors().ghost_element_hover;
+        let subscription = current.map(|(id, _)| id);
+        let selected = current.map(|(_, source)| source);
+        let menu = Menu::ChinaHolidays(subscription);
+        let open = enabled && self.menu == Some(menu);
+        let dropdown = open.then(|| {
+            PopoverAttachment::new(
+                Placement::BelowLeft,
+                popover(cx)
+                    .min_w(px(156.))
+                    .debug_selector(|| "china-holiday-source-menu".to_owned())
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_menu(None, cx)))
+                    .children(ChinaHolidaySource::ALL.map(|source| {
+                        h_flex()
+                            .id(source.label())
+                            .debug_selector(move || source.label().to_owned())
+                            .tab_index(0)
+                            .h(px(32.))
+                            .gap_2()
+                            .px_2()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(hover))
+                            .focus_visible(|style| style.bg(hover))
+                            .child(div().flex_1().child(Label::new(source.label())))
+                            .when(selected == Some(source), |el| {
+                                el.child(Icon::new(IconName::Check).color(Color::Accent).size(IconSize::Small))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_menu(None, cx);
+                                cx.stop_propagation();
+                                if selected != Some(source)
+                                    && let Some(feeds) = crate::subscriptions::feeds(cx)
+                                {
+                                    feeds.update(cx, |feeds, cx| {
+                                        feeds.select_china_holiday_source(subscription, source, strings.holidays_name, cx);
+                                    });
+                                }
+                            }))
+                    })),
+            )
+        });
+        let color = if enabled { Color::Accent } else { Color::Muted };
+        h_flex()
+            .id(match subscription {
+                Some(id) => SharedString::from(format!("china-holiday-source-{id}")),
+                None => SharedString::from("subscription-holidays"),
+            })
+            .debug_selector(|| "china-holiday-source".to_owned())
+            .relative()
+            .flex_none()
+            .gap_1()
+            .child(
+                Label::new(selected.map_or(strings.add_holidays, ChinaHolidaySource::label))
+                    .color(color)
+                    .when(selected.is_some(), |label| label.size(LabelSize::Small)),
+            )
+            .when(enabled, |el| {
+                el.cursor_pointer()
+                    .tab_index(0)
+                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(color))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_menu((!open).then_some(menu), cx)))
+                    .when(selected.is_some(), |el| el.tooltip(Tooltip::text(strings.subscription_change_source)))
+            })
+            .children(dropdown)
+            .into_any_element()
+    }
+
+    /// Integrations, as the original's URL calendars: each subscribed calendar with its color,
+    /// whether it is read and when, show or hide, change and unsubscribe; and the form that adds
+    /// or changes one (name, address, color).
+    pub(super) fn render_integrations(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors().clone();
+        let Some(feeds) = crate::subscriptions::feeds(cx) else { return Vec::new() };
+        let feeds = feeds.read(cx);
+        let chinese = i18n::locale(cx) == Locale::ZhCn;
+        let china_status = feeds.china_holiday_status();
+        let china_sources = ChinaHolidaySource::ALL.map(|source| {
+            feeds.calendars().iter().any(|calendar| {
+                ChinaHolidaySource::from_url(&calendar.subscription.url) == Some(source)
+            })
+        });
+        let has_china_holidays = china_sources.into_iter().any(|installed| installed);
+        let can_choose_source = china_status != ChinaHolidayStatus::Reading && !china_sources.into_iter().all(|installed| installed);
+        let rows: Vec<AnyElement> = feeds
+            .calendars()
+            .iter()
+            .map(|calendar| {
+                let subscription = &calendar.subscription;
+                let id = subscription.id;
+                let hidden = subscription.hidden;
+                let china_source = ChinaHolidaySource::from_url(&subscription.url);
+                let status = if feeds.is_reading(id) {
+                    (strings.subscription_reading.to_owned(), Color::Muted)
+                } else if let Some(error) = &subscription.error {
+                    (error.clone(), Color::Error)
+                } else {
+                    (strings.subscription_events.replace("{n}", &calendar.events.len().to_string()), Color::Muted)
+                };
+                let dot = crate::lists_panel::parse_color(subscription.color.as_deref()).unwrap_or(colors.accent);
+                h_flex()
+                    .id(SharedString::from(format!("subscription-{id}")))
+                    .when_some(subscription.error.as_ref(), |el, error| el.tooltip(Tooltip::text(error.clone())))
+                    .min_h(px(ROW_HEIGHT))
+                    .px_4()
+                    .gap_3()
+                    .child(div().size(px(10.)).flex_none().rounded_full().bg(dot))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(Label::new(subscription.title().to_owned()).truncate().color(if hidden { Color::Muted } else { Color::Default }))
+                                    .when(subscription.is_caldav(), |el| {
+                                        el.child(
+                                            div()
+                                                .px_1p5()
+                                                .py(px(1.))
+                                                .rounded(px(4.))
+                                                .bg(colors.accent.opacity(0.14))
+                                                .child(Label::new(strings.cal_badge_caldav).size(LabelSize::XSmall).color(Color::Accent)),
+                                        )
+                                    }),
+                            )
+                            .child(Label::new(status.0).size(LabelSize::XSmall).color(status.1).truncate()),
+                    )
+                    .children(china_source.map(|source| self.render_china_holiday_source(Some((id, source)), can_choose_source, cx)))
+                    .child(
+                        div()
+                            .debug_selector(move || format!("subscription-show-{id}"))
+                            .child(
+                                IconButton::new(SharedString::from(format!("subscription-show-{id}")), if hidden { IconName::EyeOff } else { IconName::Eye })
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(if hidden { strings.subscription_show } else { strings.subscription_hide }))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        if let Some(feeds) = crate::subscriptions::feeds(cx) {
+                                            feeds.update(cx, |feeds, cx| {
+                                                if let Some(s) = feeds.calendars().iter().find(|c| c.subscription.id == id).map(|c| c.subscription.clone()) {
+                                                    if s.is_caldav() {
+                                                        feeds.update_caldav(id, &s.name, &s.url, s.color.as_deref(), !hidden, s.provider, &s.username, &s.password, s.writable, cx);
+                                                    } else {
+                                                        feeds.update_subscription(id, &s.name, &s.url, s.color.as_deref(), !hidden, cx);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    })),
+                            ),
+                    )
+                    .child(
+                        IconButton::new(SharedString::from(format!("subscription-read-{id}")), IconName::RefreshCw)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(strings.subscription_read_now))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                if let Some(feeds) = crate::subscriptions::feeds(cx) {
+                                    feeds.update(cx, |feeds, cx| feeds.read(id, cx));
+                                }
+                            })),
+                    )
+                    .child(
+                        IconButton::new(SharedString::from(format!("subscription-edit-{id}")), IconName::Pencil)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(strings.subscription_edit))
+                            .on_click(cx.listener(move |this, _, window, cx| this.open_subscription_form(Some(id), window, cx))),
+                    )
+                    .child(
+                        IconButton::new(SharedString::from(format!("subscription-delete-{id}")), IconName::Trash)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(strings.subscription_delete))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                if let Some(feeds) = crate::subscriptions::feeds(cx) {
+                                    feeds.update(cx, |feeds, cx| feeds.delete(id, cx));
+                                }
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let group = || v_flex().py_1p5().rounded(px(8.)).bg(colors.surface_background);
+        let field = |label: &'static str, input: Entity<crate::text_input::TextInput>| {
+            h_flex()
+                .h(px(40.))
+                .px_4()
+                .gap_4()
+                .child(div().w(px(80.)).child(Label::new(label)))
+                .child(div().flex_1().min_w_0().overflow_hidden().h(px(28.)).px_2().flex().items_center().rounded(px(6.)).bg(colors.background).child(input))
+        };
+        let form = self.subscription_form.as_ref().map(|(_, color)| {
+            let has_url = !self.subscription_url.read(cx).text().trim().is_empty();
+            let swatches = h_flex().gap_1p5().children(std::iter::once(None).chain(crate::lists_panel::LIST_COLORS.iter().map(|c| Some(*c))).map(|swatch| {
+                let selected = color.as_deref() == swatch;
+                let fill = crate::lists_panel::parse_color(swatch).unwrap_or(colors.accent);
+                div()
+                    .id(SharedString::from(format!("subscription-color-{}", swatch.unwrap_or("none"))))
+                    .size(px(20.))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(fill.opacity(if swatch.is_none() { 0.35 } else { 1. }))
+                    .when(selected, |el| el.border_2().border_color(colors.text))
+                    .when(!selected, |el| el.hover(|s| s.border_2().border_color(colors.border)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some((_, color)) = &mut this.subscription_form {
+                            *color = swatch.map(str::to_owned);
+                        }
+                        cx.notify();
+                    }))
+            }));
+            let is_caldav = self.subscription_kind == fern_core::ical::CalendarKind::CalDav;
+            let mode_btn = |id: &'static str, label: &'static str, kind: fern_core::ical::CalendarKind| {
+                let active = self.subscription_kind == kind;
+                div()
+                    .id(id)
+                    .debug_selector(move || id.to_owned())
+                    .px_2p5()
+                    .h(px(26.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when(active, |el| el.bg(colors.element_selected))
+                    .when(!active, |el| el.hover(|s| s.bg(colors.ghost_element_hover)))
+                    .child(Label::new(label).size(LabelSize::Small).color(if active { Color::Accent } else { Color::Default }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.subscription_kind = kind;
+                        if kind == fern_core::ical::CalendarKind::CalDav && this.subscription_provider == fern_core::ical::CalendarProvider::Url {
+                            this.subscription_provider = fern_core::ical::CalendarProvider::CalDav;
+                        }
+                        cx.notify();
+                    }))
+            };
+            let provider_label = |p: fern_core::ical::CalendarProvider| match p {
+                fern_core::ical::CalendarProvider::Url => strings.cal_provider_url,
+                fern_core::ical::CalendarProvider::CalDav => strings.cal_provider_caldav,
+                fern_core::ical::CalendarProvider::ICloud => strings.cal_provider_icloud,
+                fern_core::ical::CalendarProvider::Google => strings.cal_provider_google,
+                fern_core::ical::CalendarProvider::Outlook => strings.cal_provider_outlook,
+                fern_core::ical::CalendarProvider::Nextcloud => strings.cal_provider_nextcloud,
+                fern_core::ical::CalendarProvider::Fastmail => strings.cal_provider_fastmail,
+            };
+            group()
+                .child(
+                    h_flex()
+                        .px_4()
+                        .py_2()
+                        .gap_1()
+                        .child(mode_btn("subscription-kind-ics", strings.cal_source_ics, fern_core::ical::CalendarKind::Ics))
+                        .child(mode_btn("subscription-kind-caldav", strings.cal_source_caldav, fern_core::ical::CalendarKind::CalDav)),
+                )
+                .when(is_caldav, |el| {
+                    el.child(
+                        h_flex()
+                            .min_h(px(36.))
+                            .px_4()
+                            .gap_4()
+                            .child(div().w(px(80.)).child(Label::new(strings.cal_provider)))
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(fern_core::ical::CalendarProvider::CALDAV_PRESETS.into_iter().map(|preset| {
+                                        let active = self.subscription_provider == preset;
+                                        let label = provider_label(preset);
+                                        div()
+                                            .id(SharedString::from(format!("caldav-provider-{}", preset.code())))
+                                            .debug_selector(move || format!("caldav-provider-{}", preset.code()))
+                                            .px_2()
+                                            .h(px(24.))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(5.))
+                                            .border_1()
+                                            .border_color(if active { colors.accent } else { colors.border })
+                                            .when(active, |el| el.bg(colors.accent.opacity(0.14)))
+                                            .when(!active, |el| el.hover(|s| s.bg(colors.ghost_element_hover)))
+                                            .cursor_pointer()
+                                            .child(Label::new(label).size(LabelSize::XSmall).color(if active { Color::Accent } else { Color::Default }))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.subscription_provider = preset;
+                                                let suggested = preset.default_discovery_url();
+                                                if !suggested.is_empty() {
+                                                    let cur = this.subscription_url.read(cx).text().trim().to_owned();
+                                                    let is_preset_url = cur.is_empty()
+                                                        || fern_core::ical::CalendarProvider::CALDAV_PRESETS
+                                                            .iter()
+                                                            .any(|p| p.default_discovery_url() == cur);
+                                                    if is_preset_url {
+                                                        this.subscription_url.update(cx, |input, cx| input.set_text(suggested, cx));
+                                                    }
+                                                }
+                                                cx.notify();
+                                            }))
+                                    })),
+                            ),
+                    )
+                })
+                .child(field(strings.subscription_name, self.subscription_name.clone()))
+                .child(field("URL", self.subscription_url.clone()))
+                .when(is_caldav, |el| {
+                    el.child(field(strings.cal_username, self.subscription_username.clone()))
+                        .child(field(strings.cal_password, self.subscription_password.clone()))
+                        .child(
+                            h_flex()
+                                .id("caldav-writable-toggle")
+                                .h(px(36.))
+                                .px_4()
+                                .gap_4()
+                                .cursor_pointer()
+                                .child(div().flex_1().child(Label::new(strings.cal_writable).size(LabelSize::Small)))
+                                .child(ui::Switch::new().toggle_state(self.subscription_writable))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.subscription_writable = !this.subscription_writable;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            h_flex()
+                                .px_4()
+                                .py_1()
+                                .gap_2()
+                                .child(
+                                    form_button(
+                                        "caldav-discover",
+                                        if self.subscription_discovering { "…" } else { strings.cal_discover },
+                                        false,
+                                        &colors,
+                                    )
+                                    .when(!has_url || self.subscription_discovering, |el| el.opacity(0.45).cursor_default())
+                                    .on_click(cx.listener(|this, _, _, cx| this.discover_caldav(cx))),
+                                )
+                                .when_some(self.subscription_discover_error.as_ref(), |el, err| {
+                                    el.child(div().flex_1().min_w_0().child(Label::new(err.clone()).size(LabelSize::XSmall).color(Color::Error).truncate()))
+                                }),
+                        )
+                        .when(!self.subscription_discovered.is_empty(), |el| {
+                            el.child(
+                                h_flex()
+                                    .px_4()
+                                    .py_1()
+                                    .flex_wrap()
+                                    .gap_1p5()
+                                    .children(self.subscription_discovered.iter().enumerate().map(|(i, cal)| {
+                                        let cal = cal.clone();
+                                        let selected = self.subscription_url.read(cx).text().trim() == cal.url;
+                                        div()
+                                            .id(SharedString::from(format!("caldav-discovered-{i}")))
+                                            .px_2p5()
+                                            .h(px(26.))
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .rounded(px(6.))
+                                            .border_1()
+                                            .border_color(if selected { colors.accent } else { colors.border })
+                                            .when(selected, |el| el.bg(colors.accent.opacity(0.12)))
+                                            .when(!selected, |el| el.hover(|s| s.bg(colors.ghost_element_hover)))
+                                            .cursor_pointer()
+                                            .child(Icon::new(IconName::CalendarPlus).size(IconSize::XSmall).color(Color::Muted))
+                                            .child(Label::new(cal.name.clone()).size(LabelSize::XSmall))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                let name = cal.name.clone();
+                                                let url = cal.url.clone();
+                                                this.subscription_name.update(cx, |input, cx| input.set_text(name, cx));
+                                                this.subscription_url.update(cx, |input, cx| input.set_text(url, cx));
+                                                this.subscription_writable = cal.writable;
+                                                cx.notify();
+                                            }))
+                                    })),
+                            )
+                        })
+                })
+                .child(h_flex().h(px(40.)).px_4().gap_4().child(div().w(px(80.)).child(Label::new(strings.color))).child(swatches))
+                .child(
+                    h_flex()
+                        .px_4()
+                        .py_2()
+                        .gap_2()
+                        .justify_end()
+                        .child(form_button("subscription-cancel", strings.cancel, false, &colors).on_click(cx.listener(|this, _, _, cx| {
+                            this.subscription_form = None;
+                            cx.notify();
+                        })))
+                        .child(
+                            form_button("subscription-save", strings.ok, true, &colors)
+                                .when(!has_url, |el| el.opacity(0.45).cursor_default())
+                                .on_click(cx.listener(|this, _, _, cx| this.save_subscription_form(cx))),
+                        ),
+                )
+                .into_any_element()
+        });
+        let mut page = vec![
+            div().pb_3().child(Label::new(strings.subscribed_calendars).weight(FontWeight::MEDIUM)).into_any_element(),
+            div().pb_2().px_1().text_size(px(12.)).text_color(colors.text_muted).child(strings.subscriptions_hint).into_any_element(),
+        ];
+        if !rows.is_empty() {
+            page.push(group().children(rows).into_any_element());
+        }
+        if chinese || has_china_holidays {
+            let message = match china_status {
+                ChinaHolidayStatus::Idle => None,
+                ChinaHolidayStatus::Reading => Some((strings.subscription_reading, Color::Muted)),
+                ChinaHolidayStatus::Failed => Some((strings.holiday_source_failed, Color::Error)),
+            };
+            if let Some((text, color)) = message {
+                page.push(div().px_1().child(Label::new(text).size(LabelSize::Small).color(color)).into_any_element());
+            }
+        }
+        match form {
+            Some(form) => page.push(form),
+            None => {
+                // The original's Holidays: the public holidays of the language's country, a
+                // calendar like any other once added.
+                let has_holidays = if chinese {
+                    has_china_holidays
+                } else {
+                    feeds.calendars().iter().any(|c| c.subscription.url == strings.holidays_url)
+                };
+                page.push(
+                    h_flex()
+                        .px_1()
+                        .gap_5()
+                        .child(
+                            div()
+                                .id("subscription-add")
+                                .cursor_pointer()
+                                .child(Label::new(strings.add_calendar).color(Color::Accent))
+                                .on_click(cx.listener(|this, _, window, cx| this.open_subscription_form(None, window, cx))),
+                        )
+                        .when(!has_holidays, |el| {
+                            if chinese {
+                                return el.child(self.render_china_holiday_source(None, can_choose_source, cx));
+                            }
+                            el.child(
+                                div()
+                                    .id("subscription-holidays")
+                                    .cursor_pointer()
+                                    .child(Label::new(strings.add_holidays).color(Color::Accent))
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        let strings = i18n::t(cx);
+                                        if let Some(feeds) = crate::subscriptions::feeds(cx) {
+                                            feeds.update(cx, |feeds, cx| feeds.add(strings.holidays_name, strings.holidays_url, Some("#22C55E"), cx));
+                                        }
+                                    })),
+                            )
+                        })
+                        .into_any_element(),
+                )
+            }
+        }
+        page
+    }
+}
+
+/// A small dialog button: the accent for the one that confirms, a frame for the other.
+fn form_button(id: &'static str, label: &'static str, primary: bool, colors: &theme::ThemeColors) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(80.))
+        .h(px(28.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .cursor_pointer()
+        .when(primary, |el| el.bg(colors.accent).hover(|s| s.opacity(0.9)))
+        .when(!primary, |el| el.border_1().border_color(colors.border).hover(|s| s.bg(colors.element_hover)))
+        .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
+}

@@ -429,7 +429,7 @@ pub fn render_when_popover<V: 'static>(
             })))
     });
 
-    let scroll_max_h = px(450.);
+    let scroll_max_h = px(492.);
 
     popover(cx)
         .id("things-when-popover")

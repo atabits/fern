@@ -1893,13 +1893,13 @@ fn render_svg_node(
 
 /// `usvg` options with external/data `<image>` resolution disabled so untrusted
 /// plugin SVGs cannot read local files or recursively load embedded images.
-pub fn safe_usvg_options() -> usvg::Options<'static> {
-    usvg::Options {
-        image_href_resolver: usvg::ImageHrefResolver {
+pub fn safe_usvg_options() -> resvg::usvg::Options<'static> {
+    resvg::usvg::Options {
+        image_href_resolver: resvg::usvg::ImageHrefResolver {
             resolve_data: Box::new(|_, _, _| None),
             resolve_string: Box::new(|_, _| None),
         },
-        ..usvg::Options::default()
+        ..resvg::usvg::Options::default()
     }
 }
 
@@ -1923,7 +1923,7 @@ pub fn rasterize_svg(
     };
 
     let opts = safe_usvg_options();
-    let tree = usvg::Tree::from_str(&resolved_svg, &opts).ok()?;
+    let tree = resvg::usvg::Tree::from_str(&resolved_svg, &opts).ok()?;
     let svg_size = tree.size();
     let sx = width_px as f32 / svg_size.width().max(1.0);
     let sy = height_px as f32 / svg_size.height().max(1.0);

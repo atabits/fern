@@ -11,10 +11,10 @@ workspace = true
 path = "src/i18n.rs"
 
 [dependencies]
-fern_core.workspace = true
 gpui.workspace = true
 sys-locale.workspace = true
-theme.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
+fern_core.workspace = true
+theme.workspace = true

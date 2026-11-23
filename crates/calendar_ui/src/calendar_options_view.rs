@@ -155,12 +155,7 @@ impl CalendarOptionsDialog {
                 "Australia/Sydney",
             ]
         } else {
-            chrono_tz::TZ_VARIANTS
-                .iter()
-                .map(|z| z.name())
-                .filter(|name| name.to_lowercase().contains(&tz_query))
-                .take(40)
-                .collect()
+            desktop_common::calendar::matching_timezone_names(&tz_query, 40)
         };
         let tz_menu = self.tz_menu.then(|| {
             popover(cx)

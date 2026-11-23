@@ -138,6 +138,7 @@ pub struct HorizonsView {
     // Cached SQLite data (zero DB reads in `render()`).
     pub(crate) tasks: Vec<Task>,
     pub(crate) lists: Vec<List>,
+    pub(crate) list_meta: HashMap<Id, (SharedString, Option<Hsla>)>,
     tags: Vec<Tag>,
 
     // Persisted view options.
@@ -229,6 +230,7 @@ impl HorizonsView {
             period_offset: 0,
             tasks: Vec::new(),
             lists: Vec::new(),
+            list_meta: HashMap::new(),
             tags: Vec::new(),
             collapsed_cols: HorizonSlot::DEFAULT_COLLAPSED.into_iter().collect(),
             show_completed: false,
@@ -275,6 +277,11 @@ impl HorizonsView {
         self.dirty = false;
         self.tasks = self.store.tasks().unwrap_or_default();
         self.lists = self.store.lists().unwrap_or_default();
+        self.list_meta = self
+            .lists
+            .iter()
+            .map(|l| (l.id, (SharedString::from(l.name.clone()), colors::parse_color(l.color.as_deref()))))
+            .collect();
         self.tags = self.store.tags().unwrap_or_default();
         self.load_settings();
 
@@ -747,15 +754,14 @@ impl HorizonsView {
         true
     }
 
-    fn filter_vec(&self, items: Vec<&Task>) -> Vec<Task> {
+    fn filter_vec<'a>(&self, items: Vec<&'a Task>) -> Vec<&'a Task> {
         items
             .into_iter()
             .filter(|t| self.matches_filter(t))
-            .cloned()
             .collect()
     }
 
-    fn inbox_tasks(&self) -> Vec<Task> {
+    fn inbox_tasks(&self) -> Vec<&Task> {
         self.tasks
             .iter()
             .filter(|t| {
@@ -763,7 +769,6 @@ impl HorizonsView {
                     && (self.show_completed || !t.is_completed())
                     && self.matches_filter(t)
             })
-            .cloned()
             .collect()
     }
 
@@ -780,7 +785,7 @@ impl HorizonsView {
         today: NaiveDate,
         slot: Option<HorizonSlot>,
         strings: &Strings,
-    ) -> ColumnSpec {
+    ) -> ColumnSpec<'_> {
         let (items, rollover) =
             horizons_day_partition(&self.tasks, &self.lists, day, today, self.show_completed);
         let diff = (day - today).num_days();
@@ -813,7 +818,7 @@ impl HorizonsView {
         slot: Option<HorizonSlot>,
         exclude_today_in_week: bool,
         strings: &Strings,
-    ) -> ColumnSpec {
+    ) -> ColumnSpec<'_> {
         let (items, rollover) =
             horizons_bucket_partition(&self.tasks, &self.lists, horizon, today, self.show_completed);
         let (title, subtitle) = calendar::format_horizon_heading(horizon, today, strings);
@@ -865,13 +870,6 @@ impl HorizonsView {
                 _ => 0,
             },
         }
-    }
-
-    fn build_list_meta(&self) -> HashMap<Id, (String, Option<Hsla>)> {
-        self.lists
-            .iter()
-            .map(|l| (l.id, (l.name.clone(), colors::parse_color(l.color.as_deref()))))
-            .collect()
     }
 
     fn scale_range_hint(&self, today: NaiveDate, strings: &Strings) -> Option<String> {
@@ -1205,7 +1203,6 @@ impl HorizonsView {
 
     fn render_main_canvas(&self, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let list_meta = self.build_list_meta();
 
         match self.mode {
             HorizonsMode::Horizons => {
@@ -1281,7 +1278,6 @@ impl HorizonsView {
                         cols.push(self.render_column(
                             spec,
                             today,
-                            &list_meta,
                             is_last,
                             PANORAMIC_MIN_WIDTH,
                             false,
@@ -1315,7 +1311,6 @@ impl HorizonsView {
                     .child(self.render_column(
                         spec,
                         today,
-                        &list_meta,
                         true,
                         STRIP_MIN_WIDTH,
                         true,
@@ -1336,7 +1331,6 @@ impl HorizonsView {
                         self.render_column(
                             spec,
                             today,
-                            &list_meta,
                             idx == last_idx,
                             STRIP_MIN_WIDTH,
                             false,
@@ -1360,7 +1354,6 @@ impl HorizonsView {
                         self.render_column(
                             spec,
                             today,
-                            &list_meta,
                             idx == last_idx,
                             STRIP_MIN_WIDTH,
                             false,
@@ -1384,7 +1377,6 @@ impl HorizonsView {
                         self.render_column(
                             spec,
                             today,
-                            &list_meta,
                             idx == last_idx,
                             STRIP_MIN_WIDTH,
                             false,
@@ -1408,7 +1400,6 @@ impl HorizonsView {
                         self.render_column(
                             spec,
                             today,
-                            &list_meta,
                             idx == last_idx,
                             STRIP_MIN_WIDTH,
                             false,
@@ -1432,7 +1423,6 @@ impl HorizonsView {
                         self.render_column(
                             spec,
                             today,
-                            &list_meta,
                             idx == last_idx,
                             STRIP_MIN_WIDTH,
                             false,
@@ -1456,7 +1446,6 @@ impl HorizonsView {
                         self.render_column(
                             spec,
                             today,
-                            &list_meta,
                             idx == last_idx,
                             STRIP_MIN_WIDTH,
                             false,

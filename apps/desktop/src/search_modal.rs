@@ -721,6 +721,11 @@ impl Render for SearchModal {
         let selected_index = self.selected;
 
         let task_rows: Vec<AnyElement> = if self.shows(Filter::Tasks) {
+            let list_names: std::collections::HashMap<_, _> = self
+                .all_lists
+                .iter()
+                .map(|l| (l.id, l.name.as_str()))
+                .collect();
             self.tasks
                 .iter()
                 .take(TASK_LIMIT)
@@ -730,8 +735,8 @@ impl Render for SearchModal {
                     let id = task.id;
                     let list = task
                         .list_id
-                        .and_then(|id| self.all_lists.iter().find(|l| l.id == id))
-                        .map_or(SharedString::new_static(strings.inbox), |l| l.name.clone().into());
+                        .and_then(|id| list_names.get(&id).copied())
+                        .map_or(SharedString::new_static(strings.inbox), |name| SharedString::from(name.to_owned()));
                     let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
                     let horizon = crate::calendar::horizons_enabled()
                         .then(|| task_rows::horizon_badge(task, today, strings))

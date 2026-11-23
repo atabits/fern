@@ -731,10 +731,13 @@ fn kanban_keeps_pinned_completed_and_subtasks_inside_their_own_columns(cx: &mut 
     });
 }
 
+static HORIZONS_FLAG_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 #[gpui::test]
 fn sidebar_drag_and_drop_reorders_smart_lists_sections_lists_folders_tags_and_filters(
     cx: &mut TestAppContext,
 ) {
+    let _horizons_read = HORIZONS_FLAG_LOCK.read().unwrap_or_else(|e| e.into_inner());
     use fern_core::{
         FilterRules, SidebarSection, SmartFilter, SmartList,
     };
@@ -1903,6 +1906,7 @@ fn trash_delete_forever_requires_confirmation_and_supports_restore(cx: &mut Test
 
 #[gpui::test]
 fn horizons_embedded_view_quick_add_due_picker_and_feature_toggle(cx: &mut TestAppContext) {
+    let _horizons_write = HORIZONS_FLAG_LOCK.write().unwrap_or_else(|e| e.into_inner());
     struct RestoreHorizonsEnabled;
     impl Drop for RestoreHorizonsEnabled {
         fn drop(&mut self) {

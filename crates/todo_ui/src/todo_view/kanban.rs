@@ -459,8 +459,8 @@ impl TodoView {
                     (SharedString::from(l.name.clone()), lists_panel::parse_color(l.color.as_deref()))
                 })
         });
+        let has_badges_row = !task.tags.is_empty() || horizon_badge.is_some();
         let has_tips_row = due.is_some()
-            || horizon_badge.is_some()
             || has_note_icon
             || has_location
             || task.repeat.is_some()
@@ -468,7 +468,7 @@ impl TodoView {
             || checklist.is_some()
             || (collapsed && has_children)
             || list_info.is_some();
-        let has_meta = details_line.is_some() || !task.tags.is_empty() || has_tips_row;
+        let has_meta = details_line.is_some() || has_badges_row || has_tips_row;
 
         let indent_px = depth as f32 * INDENT;
         let row_pl = px(KANBAN_GUTTER + indent_px);
@@ -556,6 +556,7 @@ impl TodoView {
                             if !this.collapsed_tasks.remove(&id) {
                                 this.collapsed_tasks.insert(id);
                             }
+                            this.invalidate_rows();
                             cx.notify();
                         })),
                 )
@@ -662,10 +663,30 @@ impl TodoView {
                         .when_some(details_line, |el, text| {
                             el.child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted).truncate())
                         })
-                        .when(!task.tags.is_empty(), |el| {
-                            el.child(h_flex().gap_1().flex_wrap().children(task.tags.iter().map(|tag| {
-                                Chip::new(tag.clone(), tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted))
-                            })))
+                        .when(has_badges_row, |el| {
+                            el.child(
+                                h_flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(task.tags.iter().map(|tag| {
+                                        Chip::new(tag.clone(), tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted))
+                                    }))
+                                    .when_some(horizon_badge, |el, (badge, past)| {
+                                        let (fg, bg, border) =
+                                            task_rows::horizon_badge_style(past, done || task.is_wont_do(), &theme);
+                                        el.child(
+                                            div()
+                                                .flex_none()
+                                                .px(px(5.))
+                                                .py(px(0.5))
+                                                .rounded(px(4.))
+                                                .bg(bg)
+                                                .border_1()
+                                                .border_color(border)
+                                                .child(Label::new(badge).size(LabelSize::XSmall).color(Color::Custom(fg))),
+                                        )
+                                    }),
+                            )
                         })
                         .when(has_tips_row, |el| {
                             el.child(
@@ -693,21 +714,6 @@ impl TodoView {
                                                     cx.stop_propagation();
                                                     this.save_preferences(|p| p.countdown_dates = !p.countdown_dates, cx);
                                                 })),
-                                        )
-                                    })
-                                    .when_some(horizon_badge, |el, (badge, past)| {
-                                        let (fg, bg, border) =
-                                            task_rows::horizon_badge_style(past, done || task.is_wont_do(), &theme);
-                                        el.child(
-                                            div()
-                                                .flex_none()
-                                                .px(px(5.))
-                                                .py(px(0.5))
-                                                .rounded(px(4.))
-                                                .bg(bg)
-                                                .border_1()
-                                                .border_color(border)
-                                                .child(Label::new(badge).size(LabelSize::XSmall).color(Color::Custom(fg))),
                                         )
                                     })
                                     .when(has_note_icon, |el| {
@@ -1648,7 +1654,7 @@ impl TodoView {
     pub(super) fn render_habit_column(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = cx.theme().clone();
         let today = Self::today();
-        let habits: Vec<(fern_core::Habit, bool, f64)> = self.today_habits.clone();
+        let habits = Rc::clone(&self.today_habits);
         if habits.is_empty() {
             return None;
         }
@@ -1658,8 +1664,10 @@ impl TodoView {
         let habit_border = theme.colors().border_variant;
         let habit_hover = base_surface.blend(theme.colors().ghost_element_hover);
         let cards: Vec<AnyElement> = habits
-            .into_iter()
+            .iter()
             .map(|(habit, checked, amount)| {
+                let checked = *checked;
+                let amount = *amount;
                 let id = habit.id;
                 let has_goal = habit.goal.is_some();
                 let (target, unit) = habit.goal.as_ref().map_or((1.0, String::new()), |g| (g.amount, g.unit.clone()));
@@ -1688,7 +1696,7 @@ impl TodoView {
                     .child(
                         h_flex()
                             .gap(px(7.))
-                            .child(crate::habit_view::avatar(&habit, px(20.), cx))
+                            .child(crate::habit_view::avatar(habit, px(20.), cx))
                             .child(
                                 div().flex_1().min_w_0().child(
                                     Label::new(habit.name.clone())

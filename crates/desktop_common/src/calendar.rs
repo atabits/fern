@@ -82,6 +82,25 @@ pub fn format_day_month(date: NaiveDate, strings: &Strings) -> String {
     format_date_as(date, selected_date_format(strings), strings.dotted_dates, false)
 }
 
+/// Localized label for a filter's date rule chip.
+pub fn filter_date_label(rule: fern_core::DateRule, strings: &Strings) -> &'static str {
+    use fern_core::DateRule::*;
+    match rule {
+        All => strings.filter_all,
+        Overdue => strings.filter_date_overdue,
+        Today => strings.filter_date_today,
+        Tomorrow => strings.filter_date_tomorrow,
+        ThisWeek => strings.filter_date_this_week,
+        NoDate => strings.filter_date_no_date,
+        NextWeek => strings.filter_date_next_week,
+        ThisMonth => strings.filter_date_this_month,
+        NextMonth => strings.filter_date_next_month,
+        NextDays(_) => strings.filter_date_next_days,
+        Recurring => strings.filter_date_recurring,
+        Span { .. } => strings.filter_date_range,
+    }
+}
+
 fn selected_date_format(strings: &Strings) -> Option<fern_core::DateFormat> {
     explicit_date_format().or(strings.year_first_dates.then_some(fern_core::DateFormat::YearMonthDay))
 }
@@ -334,9 +353,12 @@ pub mod week_axis {
         NaiveTime::from_hms_opt(snapped / 60, snapped % 60, 0).unwrap_or(NaiveTime::MIN)
     }
 
-    /// Maps `date` at `local_hour:00` (system `Local`) into `(hour, minute, day_delta)` in `tz`.
-    pub fn hour_in_timezone(date: NaiveDate, local_hour: u32, tz: chrono_tz::Tz) -> (u32, u32, i8) {
+    /// Maps `date` at `local_hour:00` (system `Local`) into `(hour, minute, day_delta)` in `tz_name`.
+    pub fn hour_in_timezone(date: NaiveDate, local_hour: u32, tz_name: &str) -> (u32, u32, i8) {
         use chrono::TimeZone as _;
+        let Ok(tz) = tz_name.parse::<chrono_tz::Tz>() else {
+            return (local_hour.min(23), 0, 0);
+        };
         let Some(naive) = date.and_hms_opt(local_hour.min(23), 0, 0) else {
             return (local_hour.min(23), 0, 0);
         };
@@ -452,6 +474,165 @@ pub fn format_horizon_heading(
         }
         fern_core::Horizon::Life => (strings.horizons_life.to_owned(), None),
     }
+}
+
+/// Curated major IANA time zones shown when a timezone search query is empty.
+pub const MAJOR_TIMEZONES: [&str; 29] = [
+    "UTC",
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "America/Toronto",
+    "America/Sao_Paulo",
+    "Europe/London",
+    "Europe/Paris",
+    "Europe/Berlin",
+    "Europe/Madrid",
+    "Europe/Rome",
+    "Europe/Amsterdam",
+    "Europe/Warsaw",
+    "Europe/Kyiv",
+    "Europe/Istanbul",
+    "Europe/Moscow",
+    "Asia/Dubai",
+    "Asia/Almaty",
+    "Asia/Kolkata",
+    "Asia/Bangkok",
+    "Asia/Singapore",
+    "Asia/Shanghai",
+    "Asia/Hong_Kong",
+    "Asia/Taipei",
+    "Asia/Tokyo",
+    "Asia/Seoul",
+    "Australia/Sydney",
+    "Pacific/Auckland",
+];
+
+/// Returns `true` if `name` is a valid IANA time zone identifier.
+pub fn is_valid_timezone(name: &str) -> bool {
+    name.parse::<chrono_tz::Tz>().is_ok()
+}
+
+/// Canonicalizes a valid IANA time zone name (returns `None` if unrecognized).
+pub fn canonical_timezone_name(name: &str) -> Option<&'static str> {
+    name.parse::<chrono_tz::Tz>().ok().map(|tz| tz.name())
+}
+
+fn format_offset_minutes(mins: i32) -> String {
+    let sign = if mins >= 0 { '+' } else { '-' };
+    let abs = mins.abs();
+    let (h, m) = (abs / 60, abs % 60);
+    if m == 0 {
+        format!("UTC{sign}{h}")
+    } else {
+        format!("UTC{sign}{h}:{m:02}")
+    }
+}
+
+fn format_tz_offset(tz: chrono_tz::Tz) -> String {
+    use chrono::{Offset as _, TimeZone as _, Utc};
+    let now = Utc::now().naive_utc();
+    let offset_secs = tz.offset_from_utc_datetime(&now).fix().local_minus_utc();
+    format_offset_minutes(offset_secs / 60)
+}
+
+/// Formats the current UTC offset for a valid IANA time zone name (e.g. `"UTC+3"`, `"UTC+5:30"`).
+pub fn timezone_offset_label(tz_name: &str) -> Option<String> {
+    tz_name.parse::<chrono_tz::Tz>().ok().map(format_tz_offset)
+}
+
+/// Formats the UTC offset of `tz_name` at `date` 12:00 local time (e.g. `"UTC-4"`, `"UTC+5:30"`).
+pub fn timezone_offset_label_on(date: NaiveDate, tz_name: &str) -> String {
+    use chrono::{Offset as _, TimeZone as _};
+    let Ok(tz) = tz_name.parse::<chrono_tz::Tz>() else {
+        return String::new();
+    };
+    let Some(noon) = date.and_hms_opt(12, 0, 0) else {
+        return String::new();
+    };
+    let Some(dt) = tz
+        .from_local_datetime(&noon)
+        .earliest()
+        .or_else(|| tz.from_local_datetime(&noon).latest())
+    else {
+        return String::new();
+    };
+    format_offset_minutes(dt.offset().fix().local_minus_utc() / 60)
+}
+
+/// Difference in minutes between `target_tz_name` and `local_tz` at `date` 12:00 in `local_tz`.
+pub fn timezone_offset_diff_minutes<L: chrono::TimeZone>(
+    date: NaiveDate,
+    local_tz: &L,
+    target_tz_name: &str,
+) -> Option<i32> {
+    use chrono::Offset as _;
+    let target_tz: chrono_tz::Tz = target_tz_name.parse().ok()?;
+    let noon = date.and_hms_opt(12, 0, 0)?;
+    let local_dt = local_tz
+        .from_local_datetime(&noon)
+        .earliest()
+        .or_else(|| local_tz.from_local_datetime(&noon).latest())?;
+    let target_dt = local_dt.with_timezone(&target_tz);
+    let local_secs = local_dt.offset().fix().local_minus_utc();
+    let target_secs = target_dt.offset().fix().local_minus_utc();
+    Some((target_secs - local_secs) / 60)
+}
+
+/// Converts a local `(date, time)` into the wall-clock `(date, time)` in `tz_name`.
+/// Falls back to `(date, time)` if `tz_name` is unrecognized or local conversion fails.
+pub fn local_to_timezone(date: NaiveDate, time: NaiveTime, tz_name: &str) -> (NaiveDate, NaiveTime) {
+    use chrono::TimeZone as _;
+    let Ok(tz) = tz_name.parse::<chrono_tz::Tz>() else {
+        return (date, time);
+    };
+    let naive = date.and_time(time);
+    let local_dt = chrono::Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .or_else(|| chrono::Local.from_local_datetime(&naive).latest());
+    match local_dt {
+        Some(dt) => {
+            let zoned = dt.with_timezone(&tz);
+            (zoned.date_naive(), zoned.time())
+        }
+        None => (date, time),
+    }
+}
+
+/// Lists `(iana_name, utc_offset)` pairs matching `query` (curated major zones when empty).
+pub fn timezone_options(query: &str) -> Vec<(String, String)> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return MAJOR_TIMEZONES
+            .iter()
+            .filter_map(|name| name.parse::<chrono_tz::Tz>().ok().map(|tz| ((*name).to_owned(), format_tz_offset(tz))))
+            .collect();
+    }
+    chrono_tz::TZ_VARIANTS
+        .iter()
+        .filter(|tz| tz.name().to_lowercase().contains(&q))
+        .take(40)
+        .map(|tz| (tz.name().to_owned(), format_tz_offset(*tz)))
+        .collect()
+}
+
+/// Lists up to `limit` IANA time zone names containing `query` (case-insensitive).
+pub fn matching_timezone_names(query: &str, limit: usize) -> Vec<&'static str> {
+    let q = query.trim().to_lowercase();
+    chrono_tz::TZ_VARIANTS
+        .iter()
+        .map(|z| z.name())
+        .filter(|name| name.to_lowercase().contains(&q))
+        .take(limit)
+        .collect()
+}
+
+/// Converts a local `DateTime` into the wall-clock `NaiveTime` of the named IANA time zone.
+pub fn time_in_timezone(local: chrono::DateTime<chrono::Local>, tz_name: &str) -> Option<NaiveTime> {
+    let tz: chrono_tz::Tz = tz_name.parse().ok()?;
+    Some(local.with_timezone(&tz).time())
 }
 
 #[cfg(test)]
@@ -634,7 +815,7 @@ mod tests {
         let t2145 = NaiveTime::from_hms_opt(21, 45, 0).unwrap();
         assert_eq!(week_axis::time_at_offset(week_axis::offset(t2145)), t2145);
 
-        let (h, m, _delta) = week_axis::hour_in_timezone(d(2026, 10, 18), 12, chrono_tz::UTC);
+        let (h, m, _delta) = week_axis::hour_in_timezone(d(2026, 10, 18), 12, "UTC");
         assert!(h < 24 && m == 0);
     }
 

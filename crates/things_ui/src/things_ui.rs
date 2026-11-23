@@ -89,6 +89,15 @@ struct TaskGroup {
     tasks: Vec<Task>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GroupsCacheKey {
+    version: u64,
+    today: NaiveDate,
+    strings_ptr: usize,
+    view: ThingsViewKind,
+    week_start: chrono::Weekday,
+}
+
 /// Root GPUI view for the Things 3 workspace panel.
 pub struct ThingsView {
     store: Rc<Store>,
@@ -104,6 +113,8 @@ pub struct ThingsView {
     progress: HashMap<Id, ProjectProgress>,
     sections: Vec<ListSection>,
     visible_order: Vec<Id>,
+    groups_version: u64,
+    cached_groups: std::cell::RefCell<Option<(GroupsCacheKey, Rc<Vec<TaskGroup>>)>>,
     selected_id: Option<Id>,
     expanded: Option<ExpandedCardState>,
     collapsed_areas: HashSet<Id>,
@@ -145,6 +156,8 @@ impl ThingsView {
             progress: HashMap::new(),
             sections: Vec::new(),
             visible_order: Vec::new(),
+            groups_version: 0,
+            cached_groups: std::cell::RefCell::new(None),
             selected_id: None,
             expanded: None,
             collapsed_areas: HashSet::new(),
@@ -307,8 +320,9 @@ impl ThingsView {
             _ => Vec::new(),
         };
 
+        self.invalidate_groups();
         let strings = i18n::t(cx);
-        let groups = self.build_groups(today, strings);
+        let groups = self.groups_rc(today, strings);
         self.visible_order = groups
             .iter()
             .flat_map(|g| g.tasks.iter().map(|t| t.id))
@@ -1805,6 +1819,29 @@ impl ThingsView {
         }
     }
 
+    fn invalidate_groups(&mut self) {
+        self.groups_version = self.groups_version.wrapping_add(1);
+        self.cached_groups.borrow_mut().take();
+    }
+
+    fn groups_rc(&self, today: NaiveDate, strings: &'static Strings) -> Rc<Vec<TaskGroup>> {
+        let key = GroupsCacheKey {
+            version: self.groups_version,
+            today,
+            strings_ptr: strings as *const Strings as usize,
+            view: self.view,
+            week_start: calendar::week_start(),
+        };
+        if let Some((cached_key, groups)) = self.cached_groups.borrow().as_ref()
+            && *cached_key == key
+        {
+            return Rc::clone(groups);
+        }
+        let built = Rc::new(self.build_groups(today, strings));
+        *self.cached_groups.borrow_mut() = Some((key, Rc::clone(&built)));
+        built
+    }
+
     fn build_groups(&self, today: NaiveDate, strings: &'static Strings) -> Vec<TaskGroup> {
         match self.view {
             ThingsViewKind::Inbox => vec![TaskGroup {
@@ -2482,19 +2519,19 @@ impl ThingsView {
     fn render_task_pane(&self, today: NaiveDate, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let accent = colors.accent;
-        let groups = self.build_groups(today, strings);
+        let groups = self.groups_rc(today, strings);
         let active_drag = cx.has_active_drag();
 
-        let logged_tasks: Vec<Task> = match self.view {
+        let logged_tasks: Vec<&Task> = match self.view {
             ThingsViewKind::Project(_) => {
-                self.tasks.iter().filter(|t| t.is_closed()).cloned().collect()
+                self.tasks.iter().filter(|t| t.is_closed()).collect()
             }
             _ => Vec::new(),
         };
         let has_any_visible_tasks = groups.iter().any(|g| !g.tasks.is_empty());
 
         let mut group_elements: Vec<AnyElement> = Vec::new();
-        for group in groups {
+        for group in groups.iter() {
             let show_when_empty = matches!(self.view, ThingsViewKind::Area(_))
                 || (active_drag
                     && (group.id.as_ref() == "group-today-evening"
@@ -2508,7 +2545,7 @@ impl ThingsView {
             let is_evening_group = group.id.as_ref() == "group-today-evening";
             let is_today_day_group = group.id.as_ref() == "group-today-day";
 
-            let header = group.title.map(|title| {
+            let header = group.title.as_ref().map(|title| {
                 let click_proj = group.click_project;
                 let task_count = group.tasks.len();
                 h_flex()
@@ -2539,7 +2576,7 @@ impl ThingsView {
                     })
                     .child(
                         div().min_w_0().child(
-                            Label::new(title)
+                            Label::new(title.clone())
                                 .size(LabelSize::Small)
                                 .weight(FontWeight::SEMIBOLD)
                                 .color(if is_evening_group {
@@ -2596,7 +2633,7 @@ impl ThingsView {
 
             group_elements.push(
                 v_flex()
-                    .id(group.id)
+                    .id(group.id.clone())
                     .rounded(px(8.))
                     .when_some(drop_for_task, |el, d| {
                         el.drag_over::<DraggedTask>(move |style, _, _, _| {
@@ -2702,6 +2739,7 @@ impl ThingsView {
                     col.children(
                         logged_tasks
                             .iter()
+                            .copied()
                             .map(|t| self.render_task_item(t, today, strings, cx)),
                     )
                 })

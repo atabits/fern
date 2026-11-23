@@ -12,7 +12,6 @@ path = "src/calendar_ui.rs"
 
 [dependencies]
 chrono.workspace = true
-chrono-tz.workspace = true
 desktop_common.workspace = true
 fern_core.workspace = true
 fern_i18n.workspace = true

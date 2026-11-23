@@ -33,7 +33,7 @@ impl TodoView {
         let cleaned = tz
             .as_deref()
             .map(str::trim)
-            .filter(|z| !z.is_empty() && z.parse::<chrono_tz::Tz>().is_ok())
+            .filter(|z| !z.is_empty() && crate::calendar::is_valid_timezone(z))
             .map(str::to_owned);
         let result = self.store.set_setting("timeline_secondary_tz", cleaned.as_deref().unwrap_or(""));
         self.check(result);
@@ -98,12 +98,7 @@ impl TodoView {
                 "Australia/Sydney",
             ]
         } else {
-            chrono_tz::TZ_VARIANTS
-                .iter()
-                .map(|z| z.name())
-                .filter(|name| name.to_lowercase().contains(&query))
-                .take(40)
-                .collect()
+            crate::calendar::matching_timezone_names(&query, 40)
         };
         div()
             .relative()
@@ -261,24 +256,20 @@ impl TodoView {
             .filter(|d| self.timeline_show_weekends || !weekend(d))
             .collect();
         let visible_cols = days.len().max(1);
-        let secondary_tz = self
-            .timeline_secondary_tz
-            .as_deref()
-            .and_then(|z| z.parse::<chrono_tz::Tz>().ok());
         let groups = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
         let scale_button = self.render_scale_button(strings, cx);
         let tz_button = self.render_timeline_tz_button(strings, cx);
-        let dual_clock = secondary_tz.map(|tz| {
+        let dual_clock = self.timeline_secondary_tz.as_deref().and_then(|tz_name| {
             let now_local = Local::now();
-            let now_sec = now_local.with_timezone(&tz);
-            let city = tz.name().rsplit('/').next().unwrap_or(tz.name()).replace('_', " ");
-            format!(
+            let sec_time = crate::calendar::time_in_timezone(now_local, tz_name)?;
+            let city = tz_name.rsplit('/').next().unwrap_or(tz_name).replace('_', " ");
+            Some(format!(
                 "{} {} · {} {}",
                 strings.timezone_local,
                 crate::calendar::format_time(now_local.time(), strings),
                 city,
-                crate::calendar::format_time(now_sec.time(), strings)
-            )
+                crate::calendar::format_time(sec_time, strings)
+            ))
         });
         let shift = |delta: i64| {
             cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
@@ -457,16 +448,16 @@ impl TodoView {
                             let dragged = DraggedTask { id, title: handle_title.clone() };
                             let span_start = task.due_date.unwrap_or(today);
                             let span_end = task.end_date.unwrap_or(span_start).max(span_start);
-                            let sec_time_label = secondary_tz.and_then(|tz| {
+                            let sec_time_label = self.timeline_secondary_tz.as_deref().and_then(|tz_name| {
                                 let d = task.due_date?;
                                 let t = task.due_time?;
                                 let naive = d.and_time(t);
                                 let local_dt = Local.from_local_datetime(&naive).earliest()?;
-                                let sec_dt = local_dt.with_timezone(&tz);
+                                let sec_time = crate::calendar::time_in_timezone(local_dt, tz_name)?;
                                 Some(format!(
                                     "{} ({})",
                                     crate::calendar::format_time(t, strings),
-                                    crate::calendar::format_time(sec_dt.time(), strings)
+                                    crate::calendar::format_time(sec_time, strings)
                                 ))
                             });
                             let resize_handle = |edge: ResizeEdge| {

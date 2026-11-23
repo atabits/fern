@@ -73,7 +73,6 @@ dispatch2 = "0.3"
 futures = "0.3"
 getrandom = "0.2"
 hex = "0.4"
-hmac = "0.12"
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 notify-rust = "4"
 objc2 = "0.6"
@@ -95,7 +94,6 @@ objc2-app-kit = { version = "0.3", features = [
     "NSWindow",
     "objc2-core-foundation",
 ] }
-objc2-core-foundation = "0.3"
 objc2-foundation = { version = "0.3", features = [
     "NSArray",
     "NSBundle",

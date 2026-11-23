@@ -17,25 +17,23 @@ chrono-tz.workspace = true
 dirs.workspace = true
 fern_core.workspace = true
 fern_i18n.workspace = true
-futures.workspace = true
 gpui.workspace = true
 raw-window-handle.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 theme.workspace = true
 ui.workspace = true
 unicode-segmentation.workspace = true
 ureq.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+futures.workspace = true
 windows.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 dispatch2.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
-objc2-core-foundation.workspace = true
 objc2-foundation.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

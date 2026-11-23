@@ -243,9 +243,11 @@ impl TodoView {
     pub(super) fn render_batch_panel(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let ids = self.selected_task_ids();
+        let task_by_id: std::collections::HashMap<Id, &Task> =
+            self.tasks.iter().map(|t| (t.id, t)).collect();
         let selected_tasks: Vec<&Task> = ids
             .iter()
-            .filter_map(|id| self.tasks.iter().find(|t| t.id == *id))
+            .filter_map(|id| task_by_id.get(id).copied())
             .collect();
         let all_completed = !selected_tasks.is_empty() && selected_tasks.iter().all(|t| t.is_completed());
         let all_in_progress = !selected_tasks.is_empty() && selected_tasks.iter().all(|t| t.is_in_progress());
@@ -660,9 +662,11 @@ impl TodoView {
     pub(super) fn render_batch_bar(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let ids = self.selected_task_ids();
+        let task_by_id: std::collections::HashMap<Id, &Task> =
+            self.tasks.iter().map(|t| (t.id, t)).collect();
         let selected_tasks: Vec<&Task> = ids
             .iter()
-            .filter_map(|id| self.tasks.iter().find(|t| t.id == *id))
+            .filter_map(|id| task_by_id.get(id).copied())
             .collect();
         let all_completed = !selected_tasks.is_empty() && selected_tasks.iter().all(|t| t.is_completed());
         let all_in_progress = !selected_tasks.is_empty() && selected_tasks.iter().all(|t| t.is_in_progress());

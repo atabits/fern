@@ -2,43 +2,44 @@
 //! habit cards/rows with check-in modes, and a resizable details panel with stats, cycles,
 //! monthly calendar, daily goals chart, and mood-tagged habit logs.
 
+mod cards;
 mod detail;
 mod dialogs;
 mod modal;
+#[cfg(all(test, debug_assertions))]
+mod tests;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use fern_core::habit::{
-    self, Checkin, CheckinMode, CustomSection, DayProgress, Habit, HabitSection, done_dates, format_amount,
-    goal_cycles, stats_with,
+    self, Checkin, CheckinMode, CustomSection, DayProgress, Habit, HabitSection, done_dates, goal_cycles,
 };
 use fern_core::{Id, Store};
-use gpui::{Entity, Focusable as _, FontWeight, Point};
+use gpui::{Entity, Focusable as _, FontWeight, Point, ScrollHandle};
 use ui::prelude::*;
 use ui::{EmptyState, Placement, PopoverAttachment, popover};
 
 use desktop_common::data_version::{DataVersion, changed_elsewhere, data_changed};
 use desktop_common::habit_helpers::progress_ring;
 use desktop_common::text_input::{Cancelled, Mode, Submitted, TextInput};
-use desktop_common::{actions, calendar, colors as lists_panel, export, layout, resize};
+use desktop_common::{actions, calendar, export, layout, resize};
 use fern_i18n as i18n;
 
 pub use desktop_common::habit_helpers::{HABIT_EMOJI, IN_TODAY_SETTING, avatar, icon_avatar};
 
+use cards::{CardContextMenu, DayContextMenu, HeaderMore};
 use dialogs::{AmountModal, CompletedCyclesModal, ConfirmAction, CycleCompletedModal, HabitLogModal};
 use modal::HabitEdit;
 
-const CARD_WIDTH: f32 = 340.;
-const CARD_HEIGHT: f32 = 108.;
-const COMPACT_CARD_HEIGHT: f32 = 60.;
 const DEFAULT_DETAIL_WIDTH: f32 = 380.;
 const MIN_DETAIL_WIDTH: f32 = 300.;
 const MAX_DETAIL_WIDTH: f32 = 620.;
 
 const LAYOUT_SETTING: &str = "habit_layout";
-const SORT_SETTING: &str = "habits_sort_by_status";
+pub(crate) const SORT_SETTING: &str = "habits_sort_by_status";
 const DETAIL_WIDTH_SETTING: &str = "habit_detail_width";
 const COLLAPSED_SECTIONS_SETTING: &str = "habit_collapsed_sections";
 pub(crate) const STREAK_BEST_SETTING: &str = "habit_streak_best";
@@ -58,70 +59,22 @@ pub struct StartFocus {
 
 impl gpui::EventEmitter<StartFocus> for HabitView {}
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HeaderMore {
-    Menu,
-    Settings,
+enum HabitGroupKind {
+    Section { section: HabitSection, grouped: bool },
+    Completed,
 }
 
-#[derive(Clone, Copy)]
-struct CardContextMenu {
-    habit_id: Id,
-    position: Point<Pixels>,
-}
-
-#[derive(Clone, Copy)]
-struct DayContextMenu {
-    habit_id: Id,
-    date: NaiveDate,
-    position: Point<Pixels>,
-}
-
-#[derive(Clone)]
-struct DraggedHabit {
-    id: Id,
-    name: String,
-}
-
-impl Render for DraggedHabit {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        div()
-            .px_3()
-            .py_1p5()
-            .rounded(px(6.))
-            .border_1()
-            .border_color(theme.colors().accent)
-            .bg(theme.colors().elevated_surface_background)
-            .shadow_md()
-            .child(Label::new(self.name.clone()).size(LabelSize::Small))
-    }
-}
-
-#[derive(Clone)]
-struct DraggedSection {
-    id: Id,
-    name: String,
-}
-
-impl Render for DraggedSection {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        div()
-            .px_3()
-            .py_1p5()
-            .rounded(px(6.))
-            .border_1()
-            .border_color(theme.colors().accent)
-            .bg(theme.colors().elevated_surface_background)
-            .shadow_md()
-            .child(Label::new(self.name.clone()).size(LabelSize::Small))
-    }
+struct HabitGroup<'a> {
+    kind: HabitGroupKind,
+    habits: Vec<&'a Habit>,
+    collapsed: bool,
 }
 
 pub struct HabitView {
     store: Rc<Store>,
     focus_handle: gpui::FocusHandle,
+    grid_scroll: ScrollHandle,
+    card_bounds: Rc<RefCell<HashMap<Id, gpui::Bounds<Pixels>>>>,
     habits: Rc<Vec<Habit>>,
     /// Completed (`Done`) dates per habit.
     checkins: HashMap<Id, HashSet<NaiveDate>>,
@@ -204,6 +157,8 @@ impl HabitView {
         let mut this = Self {
             store,
             focus_handle: cx.focus_handle(),
+            grid_scroll: ScrollHandle::new(),
+            card_bounds: Rc::new(RefCell::new(HashMap::new())),
             habits: Rc::new(Vec::new()),
             checkins: HashMap::new(),
             records: HashMap::new(),
@@ -400,7 +355,7 @@ impl HabitView {
         cx.notify();
     }
 
-    fn set_list_layout(&mut self, list: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_list_layout(&mut self, list: bool, cx: &mut Context<Self>) {
         self.list_layout = list;
         if let Err(err) = self.store.set_setting(LAYOUT_SETTING, if list { "list" } else { "cards" }) {
             eprintln!("failed to save habit layout: {err:#}");
@@ -408,7 +363,7 @@ impl HabitView {
         cx.notify();
     }
 
-    fn toggle_section_collapsed(&mut self, key: String, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_section_collapsed(&mut self, key: String, cx: &mut Context<Self>) {
         if !self.collapsed_sections.remove(&key) {
             self.collapsed_sections.insert(key);
         }
@@ -472,7 +427,7 @@ impl HabitView {
         cx.notify();
     }
 
-    fn open_card_menu(&mut self, habit_id: Id, position: Point<Pixels>, cx: &mut Context<Self>) {
+    pub(crate) fn open_card_menu(&mut self, habit_id: Id, position: Point<Pixels>, cx: &mut Context<Self>) {
         self.day_menu = None;
         self.card_menu = Some(CardContextMenu { habit_id, position });
         cx.notify();
@@ -565,7 +520,7 @@ impl HabitView {
         }
     }
 
-    fn mark_undone(&mut self, habit_id: Id, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn mark_undone(&mut self, habit_id: Id, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
         let Some(habit) = self.habits.iter().find(|h| h.id == habit_id).cloned() else {
             return;
         };
@@ -584,7 +539,7 @@ impl HabitView {
         }
     }
 
-    fn toggle_skip(&mut self, habit_id: Id, date: NaiveDate, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_skip(&mut self, habit_id: Id, date: NaiveDate, cx: &mut Context<Self>) {
         let skipped = self
             .habits
             .iter()
@@ -603,7 +558,7 @@ impl HabitView {
         self.reload(cx);
     }
 
-    fn export_csv(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn export_csv(&mut self, cx: &mut Context<Self>) {
         let data: Vec<(Habit, Vec<Checkin>)> = self
             .habits
             .iter()
@@ -618,7 +573,7 @@ impl HabitView {
         cx.notify();
     }
 
-    fn start_rename_section(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn start_rename_section(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.sections.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default();
         let strings = i18n::t(cx);
         let input = cx.new(|cx| {
@@ -646,7 +601,7 @@ impl HabitView {
         cx.notify();
     }
 
-    fn reorder_habit_drop(&mut self, dragged_id: Id, target_section: HabitSection, before_id: Option<Id>, cx: &mut Context<Self>) {
+    pub(crate) fn reorder_habit_drop(&mut self, dragged_id: Id, target_section: HabitSection, before_id: Option<Id>, cx: &mut Context<Self>) {
         if self.show_archived {
             return;
         }
@@ -678,7 +633,7 @@ impl HabitView {
         self.reload(cx);
     }
 
-    fn reorder_custom_section_drop(&mut self, dragged_id: Id, target_id: Id, cx: &mut Context<Self>) {
+    pub(crate) fn reorder_custom_section_drop(&mut self, dragged_id: Id, target_id: Id, cx: &mut Context<Self>) {
         if dragged_id == target_id {
             return;
         }
@@ -696,9 +651,35 @@ impl HabitView {
         self.reload(cx);
     }
 
-    fn visible_habit_ids(&self) -> Vec<Id> {
+    fn has_modal_open(&self) -> bool {
+        self.editing.is_some()
+            || self.log_modal.is_some()
+            || self.amount_modal.is_some()
+            || self.confirm.is_some()
+            || self.cycle_completed.is_some()
+            || self.cycles_modal.is_some()
+    }
+
+    fn has_popover_open(&self) -> bool {
+        self.header_menu_open
+            || self.header_more.is_some()
+            || self.detail_menu_open
+            || self.section_menu.is_some()
+            || self.card_menu.is_some()
+            || self.day_menu.is_some()
+            || self.renaming_section.is_some()
+    }
+
+    fn is_handled_on(&self, habit: &Habit, day: NaiveDate) -> bool {
+        self.records
+            .get(&habit.id)
+            .and_then(|recs| recs.iter().find(|r| r.date == day))
+            .is_some_and(|r| r.is_handled())
+    }
+
+    fn visible_sections<'a>(&self, habits: &'a [Habit], today: NaiveDate) -> Vec<HabitGroup<'a>> {
         let week_start = calendar::week_start();
-        self.habits
+        let visible: Vec<&Habit> = habits
             .iter()
             .filter(|h| h.archived == self.show_archived)
             .filter(|h| match self.selected_date {
@@ -708,12 +689,90 @@ impl HabitView {
                 }
                 _ => true,
             })
-            .map(|h| h.id)
+            .collect();
+
+        let sort_by_status = self.flag(SORT_SETTING, false);
+        let split_completed = self.selected_date.is_some() && !self.show_archived && sort_by_status;
+        let (main_visible, completed_visible): (Vec<&Habit>, Vec<&Habit>) = if split_completed {
+            let day = self.selected_date.unwrap_or(today);
+            visible.into_iter().partition(|h| !self.is_handled_on(h, day))
+        } else {
+            (visible, Vec::new())
+        };
+
+        let grouped = main_visible.iter().any(|h| h.section != HabitSection::Others) || !self.sections.is_empty();
+        let mut groups = Vec::new();
+        for (i, section) in HabitSection::ordered(&self.sections).into_iter().enumerate() {
+            let mut in_section: Vec<&Habit> = main_visible
+                .iter()
+                .copied()
+                .filter(|h| !grouped || h.section == section)
+                .collect();
+            if sort_by_status && !split_completed {
+                let day = self.selected_date.unwrap_or(today);
+                in_section.sort_by_key(|h| self.is_handled_on(h, day));
+            }
+            if in_section.is_empty() || (!grouped && i > 0) {
+                continue;
+            }
+            let collapsed = grouped && self.collapsed_sections.contains(&section.key());
+            groups.push(HabitGroup {
+                kind: HabitGroupKind::Section { section, grouped },
+                habits: in_section,
+                collapsed,
+            });
+        }
+
+        if !completed_visible.is_empty() {
+            let collapsed = self.collapsed_sections.contains("completed");
+            groups.push(HabitGroup {
+                kind: HabitGroupKind::Completed,
+                habits: completed_visible,
+                collapsed,
+            });
+        }
+        groups
+    }
+
+    fn visible_habit_ids(&self, today: NaiveDate) -> Vec<Id> {
+        self.visible_sections(&self.habits, today)
+            .into_iter()
+            .filter(|g| !g.collapsed)
+            .flat_map(|g| g.habits.into_iter().map(|h| h.id))
             .collect()
     }
 
+    fn scroll_habit_into_view(&self, habit_id: Id, is_first: bool) {
+        let viewport = self.grid_scroll.bounds();
+        if viewport.size.height <= px(0.) {
+            return;
+        }
+        let Some(unscrolled) = self.card_bounds.borrow().get(&habit_id).copied() else {
+            return;
+        };
+        let cur = self.grid_scroll.offset();
+        let top = unscrolled.top() + cur.y;
+        let bottom = unscrolled.bottom() + cur.y;
+        let mut next_y = cur.y;
+        if top < viewport.top() {
+            next_y = if is_first {
+                px(0.)
+            } else {
+                next_y + (viewport.top() - top)
+            };
+        } else if bottom > viewport.bottom() {
+            next_y += viewport.bottom() - bottom;
+        } else {
+            return;
+        }
+        let max_y = self.grid_scroll.max_offset().y.max(px(0.));
+        self.grid_scroll
+            .set_offset(gpui::point(cur.x, next_y.clamp(-max_y, px(0.))));
+    }
+
     fn select_relative(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let ids = self.visible_habit_ids();
+        let today = Local::now().date_naive();
+        let ids = self.visible_habit_ids(today);
         if ids.is_empty() {
             return;
         }
@@ -722,660 +781,11 @@ impl HabitView {
                 let target = (idx as isize + delta).clamp(0, ids.len() as isize - 1) as usize;
                 ids[target]
             }
+            None if delta < 0 => ids[ids.len() - 1],
             None => ids[0],
         };
         self.select(next, cx);
-    }
-
-    pub(crate) fn menu_entry(&self, id: &'static str, item: ListItem, cx: &mut Context<Self>) -> Stateful<Div> {
-        div()
-            .id(id)
-            .on_hover(cx.listener(|this, hovered, _, cx| {
-                if *hovered && this.detail_submenu.take().is_some() {
-                    cx.notify();
-                }
-            }))
-            .child(item)
-    }
-
-    /// Renders a single day's check-in dot/ring (Done, Undone, Partial ring, Skipped, Rest, Unchecked).
-    pub(crate) fn checkin_mark(&self, habit: &Habit, date: NaiveDate, size: Pixels, cx: &App) -> Div {
-        let theme = cx.theme();
-        let status_colors = theme.status();
-        let accent = lists_panel::parse_color(habit.color.as_deref()).unwrap_or(theme.colors().accent);
-        let rec = self.records.get(&habit.id).and_then(|r| r.iter().find(|c| c.date == date));
-        let done_set = self.checkins.get(&habit.id);
-        let empty = HashSet::new();
-        let is_skipped = habit.is_skipped(date);
-        let is_due = habit.is_due_on(date, done_set.unwrap_or(&empty), calendar::week_start());
-
-        let base = div().size(size).rounded_full().flex().items_center().justify_center();
-
-        if let Some(c) = rec {
-            if c.is_done() {
-                if habit.icon_checkins {
-                    let glyph = habit
-                        .icon
-                        .clone()
-                        .unwrap_or_else(|| habit.name.chars().next().map(|ch| ch.to_uppercase().collect()).unwrap_or_default());
-                    return base
-                        .bg(accent.opacity(0.24))
-                        .border_1()
-                        .border_color(accent)
-                        .text_size(size * 0.55)
-                        .child(glyph);
-                }
-                return base
-                    .bg(accent)
-                    .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::IconOnAccent));
-            }
-            if c.is_undone() {
-                return base
-                    .bg(status_colors.error.opacity(0.16))
-                    .border_1()
-                    .border_color(status_colors.error.opacity(0.65))
-                    .child(Icon::new(IconName::X).size(IconSize::XSmall).color(Color::Error));
-            }
-            if c.is_partial() {
-                return base.relative().child(progress_ring(
-                    size,
-                    c.progress(),
-                    accent,
-                    theme.colors().border.opacity(0.55),
-                    px(2.5),
-                ));
-            }
-        }
-
-        if is_skipped {
-            return base
-                .border_1()
-                .border_color(theme.colors().border)
-                .bg(theme.colors().surface_background.opacity(0.6))
-                .child(Icon::new(IconName::Minus).size(IconSize::XSmall).color(Color::Muted));
-        }
-
-        if !is_due {
-            return base
-                .border_1()
-                .border_color(theme.colors().border.opacity(0.35))
-                .bg(theme.colors().border.opacity(0.12));
-        }
-
-        base.border_2().border_color(theme.colors().text_muted.opacity(0.55))
-    }
-
-    fn render_header_more(&self, more: HeaderMore, cx: &mut Context<Self>) -> Div {
-        let strings = i18n::t(cx);
-        let in_today = self.flag(IN_TODAY_SETTING, true);
-        let sort_status = self.flag(SORT_SETTING, false);
-        match more {
-            HeaderMore::Menu => popover(cx)
-                .min_w(px(176.))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.header_more = None;
-                    cx.notify();
-                }))
-                .child(
-                    ListItem::new("habit-open-settings")
-                        .height(px(34.))
-                        .start_slot(Icon::new(IconName::Settings).color(Color::Muted))
-                        .child(Label::new(strings.habit_settings))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.header_more = Some(HeaderMore::Settings);
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    ListItem::new("habit-export-csv")
-                        .height(px(34.))
-                        .start_slot(Icon::new(IconName::Share).color(Color::Muted))
-                        .child(Label::new(strings.export))
-                        .on_click(cx.listener(|this, _, _, cx| this.export_csv(cx))),
-                ),
-            HeaderMore::Settings => {
-                let hover_bg = cx.theme().colors().element_hover;
-                popover(cx)
-                    .w(px(270.))
-                    .p_3()
-                    .gap_3()
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        this.header_more = None;
-                        cx.notify();
-                    }))
-                    .child(
-                        h_flex()
-                            .id("habit-set-in-today")
-                            .px_1p5()
-                            .py_1()
-                            .rounded(px(5.))
-                            .hover(move |s| s.bg(hover_bg))
-                            .justify_between()
-                            .items_center()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| this.set_flag(IN_TODAY_SETTING, !in_today, cx)))
-                            .child(Label::new(strings.habits_in_today).size(LabelSize::Small))
-                            .child(Checkbox::new("habit-in-today-box").toggle_state(in_today)),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                h_flex()
-                                    .id("habit-set-sort")
-                                    .px_1p5()
-                                    .py_1()
-                                    .rounded(px(5.))
-                                    .hover(move |s| s.bg(hover_bg))
-                                    .justify_between()
-                                    .items_center()
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.set_flag(SORT_SETTING, !sort_status, cx);
-                                    }))
-                                    .child(Label::new(strings.habits_sort_by_status).size(LabelSize::Small))
-                                    .child(Checkbox::new("habit-sort-box").toggle_state(sort_status)),
-                            )
-                            .child(div().px_1p5().child(Label::new(strings.habits_sort_hint).size(LabelSize::XSmall).color(Color::Muted))),
-                    )
-            }
-        }
-    }
-
-    fn render_section_header(
-        &self,
-        section: HabitSection,
-        title: String,
-        count: usize,
-        allow_add: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
-        let key = section.key();
-        let collapsed = self.collapsed_sections.contains(&key);
-        let custom_id = match section {
-            HabitSection::Custom(id) => Some(id),
-            _ => None,
-        };
-        let is_renaming = custom_id.is_some() && self.renaming_section.as_ref().is_some_and(|(id, _)| Some(*id) == custom_id);
-
-        let key_toggle = key.clone();
-        let title_for_drag = title.clone();
-        h_flex()
-            .id(SharedString::from(format!("habit-sec-hdr-{key}")))
-            .h(px(30.))
-            .gap_1p5()
-            .items_center()
-            .rounded(px(6.))
-            .when_some(custom_id, |el, cid| {
-                el.on_drag(DraggedSection { id: cid, name: title_for_drag.clone() }, |dragged, _, _, cx| {
-                    cx.new(|_| dragged.clone())
-                })
-                .drag_over::<DraggedSection>(|s, _, _, cx| s.border_t_2().border_color(cx.theme().colors().accent))
-                .on_drop(cx.listener(move |this, dragged: &DraggedSection, _, cx| {
-                    this.reorder_custom_section_drop(dragged.id, cid, cx);
-                }))
-            })
-            .drag_over::<DraggedHabit>(|s, _, _, cx| s.bg(cx.theme().colors().accent.opacity(0.12)))
-            .on_drop(cx.listener(move |this, dragged: &DraggedHabit, _, cx| {
-                this.reorder_habit_drop(dragged.id, section, None, cx);
-            }))
-            .child(
-                h_flex()
-                    .id(SharedString::from(format!("habit-sec-toggle-{key}")))
-                    .gap_1()
-                    .px_1()
-                    .rounded(px(4.))
-                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
-                    .items_center()
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_section_collapsed(key_toggle.clone(), cx);
-                    }))
-                    .child(
-                        Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown })
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(if is_renaming {
-                        match &self.renaming_section {
-                            Some((_, input)) => h_flex()
-                                .w(px(160.))
-                                .h(px(24.))
-                                .px_1p5()
-                                .rounded(px(4.))
-                                .border_1()
-                                .border_color(theme.colors().accent)
-                                .bg(theme.colors().background)
-                                .child(input.clone())
-                                .into_any_element(),
-                            None => div().into_any_element(),
-                        }
-                    } else {
-                        Label::new(title).size(LabelSize::Small).weight(FontWeight::MEDIUM).color(Color::Muted).into_any_element()
-                    })
-                    .child(Label::new(count.to_string()).size(LabelSize::XSmall).color(Color::Muted)),
-            )
-            .child(div().flex_1())
-            .when(allow_add && !self.show_archived, |el| {
-                el.child(
-                    IconButton::new(SharedString::from(format!("sec-add-{key}")), IconName::Plus)
-                        .icon_size(IconSize::XSmall)
-                        .tooltip(Tooltip::text(strings.habit_add_title))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_create_modal(section, window, cx);
-                        })),
-                )
-            })
-            .when_some(custom_id, |el, cid| {
-                el.child(
-                    div()
-                        .relative()
-                        .child(
-                            IconButton::new(SharedString::from(format!("sec-more-{cid}")), IconName::Ellipsis)
-                                .icon_size(IconSize::XSmall)
-                                .tooltip(Tooltip::text(strings.more))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.section_menu = Some(cid);
-                                    cx.notify();
-                                })),
-                        )
-                        .when(self.section_menu == Some(cid), |el| {
-                            el.child(PopoverAttachment::new(
-                                Placement::BelowRight,
-                                popover(cx)
-                                    .min_w(px(140.))
-                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                        this.section_menu = None;
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        ListItem::new("sec-rename")
-                                            .height(px(32.))
-                                            .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
-                                            .child(Label::new(strings.rename_section))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.start_rename_section(cid, window, cx);
-                                            })),
-                                    )
-                                    .child(
-                                        ListItem::new("sec-delete")
-                                            .height(px(32.))
-                                            .start_slot(Icon::new(IconName::Trash).color(Color::Error))
-                                            .child(Label::new(strings.delete).color(Color::Error))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.section_menu = None;
-                                                this.confirm = Some(ConfirmAction::DeleteSection { section_id: cid });
-                                                cx.notify();
-                                            })),
-                                    ),
-                            ))
-                        }),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_card(
-        &self,
-        habit: &Habit,
-        week: [NaiveDate; 7],
-        today: NaiveDate,
-        allow_dnd: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
-        let id = habit.id;
-        let empty = HashSet::new();
-        let checked = self.checkins.get(&id).unwrap_or(&empty);
-        let stats = stats_with(&habit.frequency, checked, today, calendar::week_start());
-        let compact = self.selected_date.is_some() || habit.archived;
-        let list = self.list_layout;
-        let target_single_day = self.selected_date.unwrap_or(today);
-        let single_day_rec = self
-            .records
-            .get(&id)
-            .and_then(|r| r.iter().find(|c| c.date == target_single_day));
-        let single_day_handled = single_day_rec.is_some_and(|c| c.is_handled());
-
-        let subtitle_el: AnyElement = if let Some(date) = self.selected_date
-            && let Some(goal) = habit.goal.as_ref()
-        {
-            let current = self
-                .records
-                .get(&id)
-                .and_then(|r| r.iter().find(|c| c.date == date))
-                .map_or(0.0, |c| c.value);
-            Label::new(format!("{}/{} {}", format_amount(current), format_amount(goal.amount), goal.unit))
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .truncate()
-                .into_any_element()
-        } else {
-            let total_text = if self.selected_date.is_none() && !habit.archived {
-                match habit.goal_days {
-                    Some(goal) => format!("{}/{goal} {}", stats.total_days, strings.habit_days),
-                    None => format!("{} {}", stats.total_days, strings.habit_days),
-                }
-            } else {
-                format!("{} {}", stats.total_days, strings.habit_days)
-            };
-            let (streak_count, streak_label) = if habit.archived && self.selected_date.is_none() {
-                (stats.best_streak, strings.habit_best_streak)
-            } else {
-                (stats.streak, strings.habit_streak)
-            };
-            h_flex()
-                .gap_2()
-                .items_center()
-                .overflow_hidden()
-                .child(
-                    h_flex()
-                        .gap_0p5()
-                        .items_center()
-                        .child(
-                            Icon::new(IconName::Zap)
-                                .size(IconSize::XSmall)
-                                .color(if stats.total_days > 0 { Color::Accent } else { Color::Muted }),
-                        )
-                        .child(Label::new(total_text).size(LabelSize::XSmall).color(Color::Muted)),
-                )
-                .child(
-                    h_flex()
-                        .gap_0p5()
-                        .items_center()
-                        .child(
-                            Icon::new(IconName::Flame)
-                                .size(IconSize::XSmall)
-                                .color(if streak_count > 0 { Color::Warning } else { Color::Muted }),
-                        )
-                        .child(Label::new(format!("{streak_count} {streak_label}")).size(LabelSize::XSmall).color(Color::Muted)),
-                )
-                .into_any_element()
-        };
-
-        let habit_section = habit.section;
-        let habit_name = habit.name.clone();
-
-        let card_el = div()
-            .id(SharedString::from(format!("habit-card-{id}")))
-            .flex()
-            .map(|el| {
-                if list || compact {
-                    el.flex_row()
-                        .when(list, |el| el.w_full())
-                        .when(!list, |el| el.w(px(CARD_WIDTH)))
-                        .h(px(COMPACT_CARD_HEIGHT))
-                        .px_3()
-                        .gap_3()
-                        .items_center()
-                } else {
-                    el.flex_col()
-                        .w(px(CARD_WIDTH))
-                        .h(px(CARD_HEIGHT))
-                        .p_3()
-                        .justify_between()
-                }
-            });
-
-        let header_info = h_flex()
-            .gap_2()
-            .flex_1()
-            .min_w_0()
-            .items_center()
-            .child(avatar(habit, px(30.), cx))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_0p5()
-                    .child(
-                        Label::new(habit.name.clone())
-                            .weight(FontWeight::SEMIBOLD)
-                            .truncate()
-                            .when(self.selected_date.is_some() && single_day_handled, |l| l.color(Color::Muted)),
-                    )
-                    .child(subtitle_el),
-            );
-
-        let dots_el: AnyElement = if let Some(single_day) = self.selected_date {
-            self.checkin_mark(habit, single_day, px(24.), cx)
-                .id(SharedString::from(format!("checkin-{id}-{single_day}")))
-                .when(!habit.archived && single_day <= today, |el| {
-                    el.cursor_pointer()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.handle_dot_click(id, single_day, window, cx);
-                        }))
-                        .on_mouse_down(
-                            gpui::MouseButton::Right,
-                            cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.open_day_menu(id, single_day, ev.position, cx);
-                            }),
-                        )
-                })
-                .into_any_element()
-        } else if habit.archived {
-            div().into_any_element()
-        } else {
-            h_flex()
-                .justify_between()
-                .px_1()
-                .when(list, |el| el.w(px(210.)).flex_none())
-                .children(week.map(|date| {
-                    let blocked = habit.archived || date > today;
-                    self.checkin_mark(habit, date, px(if list { 22. } else { 18. }), cx)
-                        .id(SharedString::from(format!("checkin-{id}-{date}")))
-                        .when(date > today, |el| el.opacity(0.4))
-                        .when(!blocked, |el| {
-                            el.cursor_pointer()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.handle_dot_click(id, date, window, cx);
-                                }))
-                                .on_mouse_down(
-                                    gpui::MouseButton::Right,
-                                    cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        this.open_day_menu(id, date, ev.position, cx);
-                                    }),
-                                )
-                        })
-                }))
-                .into_any_element()
-        };
-
-        card_el
-            .flex_none()
-            .rounded(px(8.))
-            .border_1()
-            .border_color(if self.selected == Some(id) {
-                theme.colors().accent
-            } else {
-                gpui::transparent_black()
-            })
-            .bg(theme.colors().surface_background)
-            .hover(|s| s.bg(theme.colors().element_hover))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
-            .on_mouse_down(
-                gpui::MouseButton::Right,
-                cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.open_card_menu(id, ev.position, cx);
-                }),
-            )
-            .when(allow_dnd && !habit.archived, |el| {
-                el.on_drag(DraggedHabit { id, name: habit_name.clone() }, |dragged, _, _, cx| {
-                    cx.new(|_| dragged.clone())
-                })
-                .drag_over::<DraggedHabit>(|s, _, _, cx| s.border_color(cx.theme().colors().accent))
-                .on_drop(cx.listener(move |this, dragged: &DraggedHabit, _, cx| {
-                    if dragged.id != id {
-                        this.reorder_habit_drop(dragged.id, habit_section, Some(id), cx);
-                    }
-                }))
-            })
-            .child(header_info)
-            .child(dots_el)
-            .into_any_element()
-    }
-
-    fn render_card_context_menu(&self, menu: CardContextMenu, cx: &mut Context<Self>) -> AnyElement {
-        let Some(habit) = self.habits.iter().find(|h| h.id == menu.habit_id).cloned() else {
-            return div().into_any_element();
-        };
-        let strings = i18n::t(cx);
-        let id = habit.id;
-        let name = habit.name.clone();
-        let archived = habit.archived;
-
-        div()
-            .id("habit-card-ctx")
-            .absolute()
-            .left(menu.position.x)
-            .top(menu.position.y)
-            .occlude()
-            .child(
-                popover(cx)
-                    .min_w(px(176.))
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        this.card_menu = None;
-                        cx.notify();
-                    }))
-                    .child(
-                        ListItem::new("ctx-habit-edit")
-                            .height(px(32.))
-                            .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
-                            .child(Label::new(strings.edit_habit))
-                            .on_click(cx.listener(move |this, _, window, cx| this.open_edit_modal(id, window, cx))),
-                    )
-                    .when(!archived, |el| {
-                        let name_pomo = name.clone();
-                        let name_sw = name.clone();
-                        el.child(
-                            ListItem::new("ctx-habit-pomo")
-                                .height(px(32.))
-                                .start_slot(Icon::new(IconName::Timer).color(Color::Muted))
-                                .child(Label::new(strings.habit_start_pomo))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.card_menu = None;
-                                    cx.emit(StartFocus {
-                                        habit_id: Some(id),
-                                        title: name_pomo.clone(),
-                                        stopwatch: false,
-                                    });
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            ListItem::new("ctx-habit-sw")
-                                .height(px(32.))
-                                .start_slot(Icon::new(IconName::Clock).color(Color::Muted))
-                                .child(Label::new(strings.habit_start_stopwatch))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.card_menu = None;
-                                    cx.emit(StartFocus {
-                                        habit_id: Some(id),
-                                        title: name_sw.clone(),
-                                        stopwatch: true,
-                                    });
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .child(
-                        ListItem::new("ctx-habit-archive")
-                            .height(px(32.))
-                            .start_slot(
-                                Icon::new(if archived { IconName::ArchiveRestore } else { IconName::Archive })
-                                    .color(Color::Muted),
-                            )
-                            .child(Label::new(if archived { strings.habit_unarchive } else { strings.habit_archive }))
-                            .on_click(cx.listener(move |this, _, _, cx| this.set_archived(id, !archived, cx))),
-                    )
-                    .child(
-                        ListItem::new("ctx-habit-delete")
-                            .height(px(32.))
-                            .start_slot(Icon::new(IconName::Trash).color(Color::Error))
-                            .child(Label::new(strings.delete).color(Color::Error))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.card_menu = None;
-                                this.confirm = Some(ConfirmAction::DeleteHabit { habit_id: id });
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_day_context_menu(&self, menu: DayContextMenu, cx: &mut Context<Self>) -> AnyElement {
-        let strings = i18n::t(cx);
-        let id = menu.habit_id;
-        let date = menu.date;
-        let skipped = self.habits.iter().find(|h| h.id == id).is_some_and(|h| h.is_skipped(date));
-        let rec = self.records.get(&id).and_then(|r| r.iter().find(|c| c.date == date));
-        let is_handled_or_partial = rec.is_some_and(|c| c.is_handled() || c.is_partial());
-
-        div()
-            .id("habit-day-ctx")
-            .absolute()
-            .left(menu.position.x)
-            .top(menu.position.y)
-            .occlude()
-            .child(
-                popover(cx)
-                    .min_w(px(164.))
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        this.day_menu = None;
-                        cx.notify();
-                    }))
-                    .child(
-                        ListItem::new("day-ctx-log")
-                            .height(px(32.))
-                            .start_slot(Icon::new(IconName::MessageSquareText).color(Color::Muted))
-                            .child(Label::new(strings.habit_log_on.trim_end_matches([' ', ':', '-', '—'])))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_log_modal(id, date, false, window, cx);
-                            })),
-                    )
-                    .child(
-                        ListItem::new("day-ctx-skip")
-                            .height(px(32.))
-                            .start_slot(Icon::new(IconName::Minus).color(Color::Muted))
-                            .child(Label::new(if skipped { strings.habit_unskip } else { strings.habit_skip }))
-                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_skip(id, date, cx))),
-                    )
-                    .child(
-                        ListItem::new("day-ctx-undone")
-                            .height(px(32.))
-                            .start_slot(Icon::new(IconName::Ban).color(Color::Muted))
-                            .child(Label::new(strings.habit_unachieved))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.mark_undone(id, date, window, cx);
-                            })),
-                    )
-                    .when(is_handled_or_partial || skipped, |el| {
-                        el.child(
-                            ListItem::new("day-ctx-reset")
-                                .height(px(32.))
-                                .start_slot(Icon::new(IconName::RotateCcw).color(Color::Muted))
-                                .child(Label::new(strings.habit_reset))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.day_menu = None;
-                                    if let Err(err) = this.store.reset_checkin(id, date, true) {
-                                        eprintln!("failed to reset check-in: {err:#}");
-                                    }
-                                    this.notify_data_changed(cx);
-                                    this.reload(cx);
-                                })),
-                        )
-                    }),
-            )
-            .into_any_element()
+        self.scroll_habit_into_view(next, next == ids[0]);
     }
 
     #[cfg(debug_assertions)]
@@ -1508,100 +918,54 @@ impl Render for HabitView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Local::now().date_naive();
-        let week_start = calendar::week_start();
         let week: [NaiveDate; 7] = std::array::from_fn(|i| today - Duration::days(6 - i as i64));
 
+        self.card_bounds.borrow_mut().clear();
         let habits = Rc::clone(&self.habits);
-        let visible: Vec<&Habit> = habits
-            .iter()
-            .filter(|h| h.archived == self.show_archived)
-            .filter(|h| match self.selected_date {
-                Some(day) if !self.show_archived => {
-                    let recs = self.records.get(&h.id).map(Vec::as_slice).unwrap_or(&[]);
-                    h.is_active_on(day, recs, week_start)
-                }
-                _ => true,
-            })
-            .collect();
-
-        let sort_by_status = self.flag(SORT_SETTING, false);
-        let split_completed = self.selected_date.is_some() && !self.show_archived && sort_by_status;
-        let is_handled_on_selected = |h: &Habit| -> bool {
-            let Some(day) = self.selected_date else { return false };
-            self.records
-                .get(&h.id)
-                .and_then(|recs| recs.iter().find(|r| r.date == day))
-                .is_some_and(|r| r.is_handled())
-        };
-
-        let (main_visible, completed_visible): (Vec<&Habit>, Vec<&Habit>) = if split_completed {
-            visible.into_iter().partition(|h| !is_handled_on_selected(h))
-        } else {
-            (visible, Vec::new())
-        };
-
-        let grouped = main_visible.iter().any(|h| h.section != HabitSection::Others) || !self.sections.is_empty();
+        let groups = self.visible_sections(&habits, today);
         let mut sections_ui: Vec<AnyElement> = Vec::new();
-        for (i, section) in HabitSection::ordered(&self.sections).into_iter().enumerate() {
-            let mut in_section: Vec<&Habit> = main_visible
-                .iter()
-                .copied()
-                .filter(|h| !grouped || h.section == section)
-                .collect();
-            if sort_by_status && !split_completed {
-                in_section.sort_by_key(|h| {
-                    let day = self.selected_date.unwrap_or(today);
-                    self.records
-                        .get(&h.id)
-                        .and_then(|recs| recs.iter().find(|r| r.date == day))
-                        .is_some_and(|r| r.is_handled())
+        for group in groups {
+            let allow_dnd = matches!(group.kind, HabitGroupKind::Section { .. });
+            let card_ids: Vec<Id> = group.habits.iter().map(|h| h.id).collect();
+            let section_cards: Vec<AnyElement> = if group.collapsed {
+                Vec::new()
+            } else {
+                group
+                    .habits
+                    .iter()
+                    .map(|h| self.render_card(h, week, today, allow_dnd, cx))
+                    .collect()
+            };
+            let card_bounds = Rc::clone(&self.card_bounds);
+            let grid_scroll = self.grid_scroll.clone();
+            let cards_wrap = div()
+                .flex()
+                .flex_wrap()
+                .gap(px(if self.list_layout { 10. } else { 12. }))
+                .children(section_cards)
+                .on_children_prepainted(move |children_bounds, _, _| {
+                    let offset = grid_scroll.offset();
+                    let mut map = card_bounds.borrow_mut();
+                    for (idx, habit_id) in card_ids.iter().enumerate() {
+                        if let Some(bounds) = children_bounds.get(idx) {
+                            map.insert(*habit_id, gpui::Bounds::new(bounds.origin - offset, bounds.size));
+                        }
+                    }
                 });
-            }
-            if in_section.is_empty() || (!grouped && i > 0) {
-                continue;
-            }
-            let title = self.section_label(section, cx);
-            let collapsed = grouped && self.collapsed_sections.contains(&section.key());
-            let section_cards: Vec<AnyElement> = if collapsed {
-                Vec::new()
-            } else {
-                in_section
-                    .iter()
-                    .map(|h| self.render_card(h, week, today, true, cx))
-                    .collect()
-            };
-            sections_ui.push(
-                v_flex()
-                    .w_full()
-                    .gap_2()
-                    .when(grouped, |el| el.child(self.render_section_header(section, title, in_section.len(), true, cx)))
-                    .when(!collapsed, |el| {
-                        el.child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap(px(if self.list_layout { 10. } else { 12. }))
-                                .children(section_cards),
-                        )
-                    })
-                    .into_any_element(),
-            );
-        }
 
-        // Bottom "Completed" section when single-date filter + Sort by Check-in Status are active.
-        if !completed_visible.is_empty() {
-            let completed_key = "completed".to_owned();
-            let collapsed = self.collapsed_sections.contains(&completed_key);
-            let completed_cards: Vec<AnyElement> = if collapsed {
-                Vec::new()
-            } else {
-                completed_visible
-                    .iter()
-                    .map(|h| self.render_card(h, week, today, false, cx))
-                    .collect()
-            };
-            sections_ui.push(
-                v_flex()
+            let group_el = match group.kind {
+                HabitGroupKind::Section { section, grouped } => {
+                    let title = self.section_label(section, cx);
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .when(grouped, |el| {
+                            el.child(self.render_section_header(section, title, group.habits.len(), true, cx))
+                        })
+                        .when(!group.collapsed, |el| el.child(cards_wrap))
+                        .into_any_element()
+                }
+                HabitGroupKind::Completed => v_flex()
                     .w_full()
                     .gap_2()
                     .pt_2()
@@ -1616,7 +980,7 @@ impl Render for HabitView {
                                 this.toggle_section_collapsed("completed".to_owned(), cx);
                             }))
                             .child(
-                                Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown })
+                                Icon::new(if group.collapsed { IconName::ChevronRight } else { IconName::ChevronDown })
                                     .size(IconSize::XSmall)
                                     .color(Color::Muted),
                             )
@@ -1626,19 +990,12 @@ impl Render for HabitView {
                                     .weight(FontWeight::MEDIUM)
                                     .color(Color::Muted),
                             )
-                            .child(Label::new(completed_visible.len().to_string()).size(LabelSize::XSmall).color(Color::Muted)),
+                            .child(Label::new(group.habits.len().to_string()).size(LabelSize::XSmall).color(Color::Muted)),
                     )
-                    .when(!collapsed, |el| {
-                        el.child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap(px(if self.list_layout { 10. } else { 12. }))
-                                .children(completed_cards),
-                        )
-                    })
+                    .when(!group.collapsed, |el| el.child(cards_wrap))
                     .into_any_element(),
-            );
+            };
+            sections_ui.push(group_el);
         }
 
         // Interactive 7-day progress strip (Active view only).
@@ -1787,6 +1144,7 @@ impl Render for HabitView {
                                                         this.show_archived = value;
                                                         this.header_menu_open = false;
                                                         this.selected = None;
+                                                        this.grid_scroll.set_offset(gpui::point(px(0.), px(0.)));
                                                         if value {
                                                             this.selected_date = None;
                                                         }
@@ -1880,6 +1238,7 @@ impl Render for HabitView {
                         })
                         .child(v_flex().gap_3().children(sections_ui)),
                 )
+                .track_scroll(&self.grid_scroll)
                 .flex_1()
                 .min_h_0(),
             );
@@ -1926,16 +1285,29 @@ impl Render for HabitView {
                     cx.propagate();
                 }
             }))
-            .on_action(cx.listener(|this, _: &actions::SelectNextHabit, _, cx| this.select_relative(1, cx)))
-            .on_action(cx.listener(|this, _: &actions::SelectPreviousHabit, _, cx| this.select_relative(-1, cx)))
+            .on_action(cx.listener(|this, _: &actions::SelectNextHabit, _, cx| {
+                if !this.has_modal_open() && !this.has_popover_open() {
+                    this.select_relative(1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &actions::SelectPreviousHabit, _, cx| {
+                if !this.has_modal_open() && !this.has_popover_open() {
+                    this.select_relative(-1, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &actions::CheckInSelectedHabit, window, cx| {
-                if let Some(id) = this.selected {
+                if !this.has_modal_open()
+                    && !this.has_popover_open()
+                    && let Some(id) = this.selected
+                {
                     let day = this.selected_date.unwrap_or_else(|| Local::now().date_naive());
                     this.handle_dot_click(id, day, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &actions::NewHabit, window, cx| {
-                this.open_create_modal(HabitSection::Others, window, cx);
+                if !this.has_modal_open() && this.renaming_section.is_none() {
+                    this.open_create_modal(HabitSection::Others, window, cx);
+                }
             }))
             .on_drag_move::<resize::DraggedEdge>(cx.listener(move |this, event: &gpui::DragMoveEvent<resize::DraggedEdge>, _, cx| {
                 if event.drag(cx).0 == resize::Panel::Detail {
@@ -1965,238 +1337,5 @@ impl Render for HabitView {
             .children(cycles_list_modal)
             .children(cycle_done_modal)
             .children(confirm_modal)
-    }
-}
-
-#[cfg(all(test, debug_assertions))]
-mod tests {
-    use super::*;
-    use fern_core::habit::{Goal, HabitDraft};
-    use gpui::TestAppContext;
-
-    #[gpui::test]
-    fn restoring_the_last_archived_habit_shows_its_weekly_progress_only_in_active(cx: &mut TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let today = Local::now().date_naive();
-        let habit = store.add_habit("Read").unwrap();
-        assert!(store.toggle_checkin(habit.id, today).unwrap());
-        store.set_habit_archived(habit.id, true).unwrap();
-
-        cx.update(theme::init);
-        let (view, cx) = cx.add_window_view(|_, cx| {
-            let mut view = HabitView::new(store.clone(), cx);
-            view.show_archived = true;
-            view.selected = Some(habit.id);
-            view
-        });
-        assert!(cx.debug_bounds("habit-week-progress").is_none());
-
-        // Archived habits are strictly read-only: clicking a dot does nothing.
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| view.handle_dot_click(habit.id, today, window, cx));
-        });
-        assert!(store.checkins(habit.id).unwrap().contains(&today));
-
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| view.set_archived(habit.id, false, cx));
-        });
-        assert!(cx.debug_bounds("habit-week-progress").is_none());
-        cx.update(|_, cx| {
-            let view = view.read(cx);
-            assert!(view.show_archived);
-            assert!(view.habits.iter().all(|habit| !habit.archived));
-            assert!(view.selected.is_none());
-        });
-
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.show_archived = false;
-                cx.notify();
-            });
-        });
-        assert!(cx.debug_bounds("habit-week-progress").is_some());
-        cx.update(|_, cx| assert_eq!(view.read(cx).day_progress(today), DayProgress::Fraction(1.0)));
-    }
-
-    #[gpui::test]
-    fn edit_modal_preserves_unset_start_date_and_navigates_calendar(cx: &mut TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let habit = store.add_habit("Stretch").unwrap();
-        assert_eq!(habit.start_date, None);
-
-        cx.update(theme::init);
-        let (view, cx) = cx.add_window_view(|_, cx| HabitView::new(store.clone(), cx));
-
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.open_edit_modal(habit.id, window, cx);
-                assert_eq!(view.editing.as_ref().unwrap().start_date, None);
-                view.request_save_edit(cx);
-            });
-        });
-        // Saving without picking a start date must NOT silently overwrite start_date with Some(today).
-        assert_eq!(store.habits().unwrap()[0].start_date, None);
-
-        // Opening StartDate row initializes start_calendar so month shifting works.
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.open_edit_modal(habit.id, window, cx);
-                let today = Local::now().date_naive();
-                view.update_edit(cx, |e| {
-                    e.open = Some(modal::EditRow::StartDate);
-                    e.start_calendar = Some(calendar::month_start(today));
-                });
-                let initial = view.editing.as_ref().unwrap().start_calendar.unwrap();
-                view.update_edit(cx, |e| {
-                    e.start_calendar = Some(calendar::add_months(initial, -1));
-                });
-                assert_ne!(view.editing.as_ref().unwrap().start_calendar.unwrap(), initial);
-                assert!(view.dismiss_transient(cx));
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn checkin_modes_and_reset_confirmation(cx: &mut TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let today = Local::now().date_naive();
-        let water = store
-            .create_habit(&HabitDraft {
-                name: "Water".into(),
-                goal: Some(Goal { amount: 2.0, unit: "L".into(), mode: CheckinMode::Auto { step: 1.0 } }),
-                ..Default::default()
-            })
-            .unwrap();
-
-        cx.update(theme::init);
-        let (view, cx) = cx.add_window_view(|_, cx| HabitView::new(store.clone(), cx));
-
-        // Step 1 -> 1.0 (partial), Step 2 -> 2.0 (Done), Step 3 -> opens Reset confirm modal!
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.handle_dot_click(water.id, today, window, cx);
-                assert!(!view.checkins.get(&water.id).unwrap().contains(&today));
-                view.handle_dot_click(water.id, today, window, cx);
-                assert!(view.checkins.get(&water.id).unwrap().contains(&today));
-                view.handle_dot_click(water.id, today, window, cx);
-                assert!(matches!(view.confirm, Some(ConfirmAction::ResetCheckin { .. })));
-                view.execute_confirm(cx);
-                assert!(!view.checkins.get(&water.id).unwrap().contains(&today));
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn day_menu_enforces_90_day_limit_and_calendar_blocks_archived_quantifiable_habits(cx: &mut TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let today = Local::now().date_naive();
-        let active = store.add_habit("Meditate").unwrap();
-        let archived_goal = store
-            .create_habit(&HabitDraft {
-                name: "Hydrate".into(),
-                goal: Some(Goal { amount: 2.0, unit: "L".into(), mode: CheckinMode::Manual }),
-                ..Default::default()
-            })
-            .unwrap();
-        store.set_habit_archived(archived_goal.id, true).unwrap();
-
-        cx.update(theme::init);
-        let (view, cx) = cx.add_window_view(|_, cx| HabitView::new(store.clone(), cx));
-
-        // Right-clicking a day older than MAX_EDITABLE_PAST_DAYS must NOT open day_menu and sets detail_notice.
-        let too_old = today - Duration::days(habit::MAX_EDITABLE_PAST_DAYS + 1);
-        let within_limit = today - Duration::days(habit::MAX_EDITABLE_PAST_DAYS);
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.open_day_menu(active.id, too_old, gpui::point(px(10.), px(10.)), cx);
-                assert!(view.day_menu.is_none());
-                assert!(view.detail_notice.is_some());
-
-                // Right-clicking at the exact boundary succeeds and clears the notice.
-                view.open_day_menu(active.id, within_limit, gpui::point(px(10.), px(10.)), cx);
-                assert!(view.day_menu.is_some());
-                assert!(view.detail_notice.is_none());
-
-                // Clicking calendar day on an archived quantifiable habit must NOT open amount_modal.
-                view.handle_detail_calendar_click(archived_goal.id, today, true, window, cx);
-                assert!(view.amount_modal.is_none());
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn amount_modal_preserves_typo_and_auto_pops_log_on_completion(cx: &mut TestAppContext) {
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let today = Local::now().date_naive();
-        let run = store
-            .create_habit(&HabitDraft {
-                name: "Run".into(),
-                goal: Some(Goal { amount: 5.0, unit: "km".into(), mode: CheckinMode::Manual }),
-                record_enable: true,
-                ..Default::default()
-            })
-            .unwrap();
-
-        cx.update(theme::init);
-        let (view, cx) = cx.add_window_view(|_, cx| HabitView::new(store.clone(), cx));
-
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.open_amount_modal(run.id, today, true, window, cx);
-                let input = view.amount_modal.as_ref().unwrap().input.clone();
-                input.update(cx, |inp, cx| inp.set_text("5..km", cx));
-
-                // Submitting invalid text keeps the modal open and preserves the typed string.
-                view.submit_amount_modal(Some(window), cx);
-                let still_open = view.amount_modal.as_ref().expect("modal must remain open on invalid input");
-                assert_eq!(still_open.input.read(cx).text(), "5..km");
-                assert!(!view.checkins.get(&run.id).unwrap().contains(&today));
-                assert!(view.log_modal.is_none());
-
-                // Fixing the typo and submitting completes the habit and auto-pops Habit Log.
-                input.update(cx, |inp, cx| inp.set_text("5", cx));
-                view.submit_amount_modal(Some(window), cx);
-                assert!(view.amount_modal.is_none());
-                assert!(view.checkins.get(&run.id).unwrap().contains(&today));
-                let log = view.log_modal.as_ref().expect("auto-pop Habit Log should open");
-                assert!(log.auto_popped);
-                assert_eq!(log.habit_id, run.id);
-                assert_eq!(log.date, today);
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn new_inactive_defers_reload_until_activated_or_selected(cx: &mut TestAppContext) {
-        use gpui::AppContext;
-        let store = Rc::new(Store::open_in_memory().unwrap());
-        let active_habit = store.add_habit("Read").unwrap();
-        let archived_habit = store.add_habit("Run").unwrap();
-        store.set_habit_archived(archived_habit.id, true).unwrap();
-
-        cx.update(|cx| {
-            let view = cx.new(|cx| HabitView::new_inactive(store.clone(), cx));
-            {
-                let v = view.read(cx);
-                assert!(!v.active);
-                assert!(v.dirty);
-                assert!(v.habits.is_empty());
-            }
-
-            view.update(cx, |v, cx| v.set_active(true, cx));
-            let v = view.read(cx);
-            assert!(v.active);
-            assert!(!v.dirty);
-            assert_eq!(v.habits.len(), 2);
-
-            let view_select = cx.new(|cx| HabitView::new_inactive(store.clone(), cx));
-            assert!(view_select.read(cx).dirty);
-            view_select.update(cx, |v, cx| v.select(archived_habit.id, cx));
-            let vs = view_select.read(cx);
-            assert!(!vs.dirty);
-            assert!(vs.show_archived);
-            assert_eq!(vs.selected, Some(archived_habit.id));
-            assert!(vs.habits.iter().any(|h| h.id == active_habit.id));
-        });
     }
 }

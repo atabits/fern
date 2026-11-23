@@ -6,13 +6,12 @@ use fern_core::habit::{
 };
 use gpui::{Entity, Focusable as _, FontWeight};
 use ui::prelude::*;
-use ui::{Modal, Placement, PopoverAttachment, popover};
+use ui::{Button, ButtonSize, ButtonVariant, Modal, Placement, PopoverAttachment, popover};
 
 use desktop_common::text_input::{Cancelled, Mode, Submitted, TextInput};
 use desktop_common::{calendar, colors as lists_panel};
 use fern_i18n as i18n;
 
-use crate::dialogs::action_button;
 use crate::{ConfirmAction, HABIT_EMOJI, HabitView, avatar};
 
 /// Unified Create / Edit Habit modal state.
@@ -328,6 +327,10 @@ impl HabitView {
                 e.icon = (!text.is_empty()).then_some(text);
                 e.icon_picker = None;
             });
+        })
+        .detach();
+        cx.subscribe(&icon_text, |this, _, _: &Cancelled, cx| {
+            this.update_edit(cx, |e| e.icon_picker = None);
         })
         .detach();
         icon_text
@@ -728,11 +731,10 @@ impl HabitView {
                             div()
                                 .relative()
                                 .child(
-                                    action_button("habit-rem-add", "+", false, false, false, cx)
-                                        .h(px(28.))
-                                        .w(px(28.))
-                                        .px_0()
-                                        .when(picker_open, |b| b.border_color(theme.colors().accent))
+                                    IconButton::new("habit-rem-add", IconName::Plus)
+                                        .size(px(28.))
+                                        .icon_size(IconSize::XSmall)
+                                        .toggle_state(picker_open)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.open_reminder_picker(None, window, cx);
                                         })),
@@ -770,15 +772,19 @@ impl HabitView {
                     .justify_end()
                     .gap_2()
                     .pt_2()
-                    .child(action_button("habit-edit-cancel", strings.cancel, false, false, false, cx).on_click(cx.listener(|this, _, _, cx| {
-                        this.editing = None;
-                        cx.notify();
-                    })))
                     .child(
-                        action_button("habit-edit-save", strings.save, true, false, !can_save, cx)
-                            .when(can_save, |el| {
-                                el.on_click(cx.listener(|this, _, _, cx| this.request_save_edit(cx)))
-                            }),
+                        Button::new("habit-edit-cancel", strings.cancel)
+                            .variant(ButtonVariant::Secondary)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.editing = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("habit-edit-save", strings.save)
+                            .variant(ButtonVariant::Primary)
+                            .disabled(!can_save)
+                            .on_click(cx.listener(|this, _, _, cx| this.request_save_edit(cx))),
                     ),
             )
             .into_any_element()
@@ -964,24 +970,30 @@ impl HabitView {
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(action_button("freq-int-dec", "-", false, false, false, cx).h(px(26.)).px_2().on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.update_edit(cx, |e| {
-                                        if let HabitFrequency::Interval { days } = &mut e.frequency {
-                                            *days = (*days).saturating_sub(1).max(2);
-                                        }
-                                    });
-                                },
-                            )))
-                            .child(action_button("freq-int-inc", "+", false, false, false, cx).h(px(26.)).px_2().on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.update_edit(cx, |e| {
-                                        if let HabitFrequency::Interval { days } = &mut e.frequency {
-                                            *days = (*days + 1).min(30);
-                                        }
-                                    });
-                                },
-                            ))),
+                            .child(
+                                Button::new("freq-int-dec", "-")
+                                    .variant(ButtonVariant::Secondary)
+                                    .size(ButtonSize::Sm)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.update_edit(cx, |e| {
+                                            if let HabitFrequency::Interval { days } = &mut e.frequency {
+                                                *days = (*days).saturating_sub(1).max(2);
+                                            }
+                                        });
+                                    })),
+                            )
+                            .child(
+                                Button::new("freq-int-inc", "+")
+                                    .variant(ButtonVariant::Secondary)
+                                    .size(ButtonSize::Sm)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.update_edit(cx, |e| {
+                                            if let HabitFrequency::Interval { days } = &mut e.frequency {
+                                                *days = (*days + 1).min(30);
+                                            }
+                                        });
+                                    })),
+                            ),
                     )
                     .into_any_element(),
             })
@@ -1191,19 +1203,22 @@ impl HabitView {
                 h_flex()
                     .justify_between()
                     .pt_1()
-                    .child(action_button("start-cal-today", strings.today, false, false, false, cx).h(px(26.)).px_2().on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            this.update_edit(cx, |e| {
-                                e.start_date = Some(today);
-                                e.open = None;
-                                e.start_calendar = None;
-                            });
-                        }),
-                    ))
                     .child(
-                        action_button("start-cal-clear", strings.habit_clear_date, false, false, false, cx)
-                            .h(px(26.))
-                            .px_2()
+                        Button::new("start-cal-today", strings.today)
+                            .variant(ButtonVariant::Secondary)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_edit(cx, |e| {
+                                    e.start_date = Some(today);
+                                    e.open = None;
+                                    e.start_calendar = None;
+                                });
+                            })),
+                    )
+                    .child(
+                        Button::new("start-cal-clear", strings.habit_clear_date)
+                            .variant(ButtonVariant::Secondary)
+                            .size(ButtonSize::Sm)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.update_edit(cx, |e| {
                                     e.start_date = None;
@@ -1364,6 +1379,7 @@ impl HabitView {
                             cx.subscribe(&input, |this, _, Submitted(text), cx| {
                                 if let Ok(section) = this.store.add_habit_section(text) {
                                     this.sections = this.store.habit_sections().unwrap_or_default();
+                                    this.notify_data_changed(cx);
                                     this.update_edit(cx, |e| {
                                         e.section = HabitSection::Custom(section.id);
                                         e.new_section = None;

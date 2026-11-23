@@ -2,6 +2,10 @@
 //! `PluginBus` synchronization, `DataVersion` <-> outbox bridging, active-window hot-reload,
 //! plugin theme loading, and reactive plugin view tree state.
 
+mod dispatch;
+mod themes;
+mod updates;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(not(test))]
@@ -10,35 +14,41 @@ use std::path::PathBuf;
 #[cfg(not(test))]
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+#[cfg(test)]
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 #[cfg(not(test))]
 use std::task::{Context as TaskContext, Poll};
 use std::task::Waker;
 use std::time::Duration;
 
 use anyhow::Result;
-use desktop_common::data_version::{DataVersion, changed_elsewhere, data_changed};
+use desktop_common::data_version::{DataVersion, changed_elsewhere};
 use desktop_common::paths;
-use desktop_common::plugin_bus::{
-    PluginBus, PluginCommandSpec, PluginHookDecision, PluginHooksGlobal, PluginModalKind,
-    PluginModalSpec, PluginNavAction, PluginSearchHit, PluginSidebarViewSpec,
-    ToastLevel as BusToastLevel,
-};
+use desktop_common::plugin_bus::{PluginBus, PluginHookDecision, PluginHooksGlobal, PluginNavAction};
 use gpui::{
-    App, AppContext as _, BorrowAppContext as _, ClipboardItem, Entity, EntityId, Global,
-    Subscription,
+    App, AppContext as _, BorrowAppContext as _, Entity, EntityId, Global, Subscription,
 };
-use plugins::manifest::resolve_inside_dir;
-use plugins::ui_ast::{UiEvent, UiTreePayload};
+use plugins::ui_ast::UiTreePayload;
+#[cfg(test)]
+use plugins::HostUpdate;
 use plugins::{
-    HookDecision, HostUpdate, PluginEngineConfig, PluginInfo, PluginManager, PluginStatus,
-    PluginUiEffect, PromptReplyValue, RegistryClient, ToastLevel as PluginToastLevel,
+    HookDecision, PluginEngineConfig, PluginInfo, PluginManager, PluginStatus, RegistryClient,
 };
-use theme::{Theme, ThemeRegistry};
+use theme::Theme;
 
-const TOAST_AUTO_DISMISS_DELAY: Duration = Duration::from_millis(4500);
+pub use themes::collect_plugin_themes;
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use updates::{apply_ui_effect, resolve_displaced_modal, schedule_toast_expiry};
+
+use themes::ThemeSourceSignature;
+#[cfg(test)]
+use updates::apply_host_update;
+#[cfg(not(test))]
+use updates::spawn_update_consumer;
+use updates::{dismiss_active_modal_on_shutdown, sync_bus_contributions};
+
 const HOT_RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(1200);
-const MAX_PENDING_TOASTS: usize = 6;
 
 /// Configuration used to initialize [`PluginHost`].
 #[derive(Clone, Debug)]
@@ -80,10 +90,10 @@ impl PluginHostConfig {
 /// Sentinel GPUI entity used as the `EntityId` source when plugins mutate SQLite data.
 struct HostDataMarker;
 
-struct WakeSignal {
+pub(super) struct WakeSignal {
     #[cfg(not(test))]
     woken: AtomicBool,
-    closed: AtomicBool,
+    pub(super) closed: AtomicBool,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -116,7 +126,7 @@ impl WakeSignal {
 }
 
 #[cfg(not(test))]
-struct WaitForWake(Arc<WakeSignal>);
+pub(super) struct WaitForWake(pub(super) Arc<WakeSignal>);
 
 #[cfg(not(test))]
 impl Future for WaitForWake {
@@ -142,12 +152,7 @@ impl Future for WaitForWake {
     }
 }
 
-#[derive(Default)]
-struct ScheduledToastTimers(HashSet<u64>);
-
-impl Global for ScheduledToastTimers {}
-
-enum PluginViewOp {
+pub(super) enum PluginViewOp {
     Mount { view_id: String, generation: u64 },
     Render { view_id: String, generation: u64 },
     Unmount { view_id: String },
@@ -157,23 +162,23 @@ enum PluginViewOp {
 }
 
 #[derive(Default)]
-struct PluginOpState {
-    view_generations: HashMap<(String, String), u64>,
-    mounting_views: HashSet<(String, String)>,
-    in_flight_reload_or_reset: HashSet<String>,
-    queues: HashMap<String, VecDeque<PluginViewOp>>,
-    running: HashSet<String>,
+pub(super) struct PluginOpState {
+    pub(super) view_generations: HashMap<(String, String), u64>,
+    pub(super) mounting_views: HashSet<(String, String)>,
+    pub(super) in_flight_reload_or_reset: HashSet<String>,
+    pub(super) queues: HashMap<String, VecDeque<PluginViewOp>>,
+    pub(super) running: HashSet<String>,
 }
 
 impl PluginOpState {
-    fn next_view_gen(&mut self, plugin_id: &str, view_id: &str) -> u64 {
+    pub(super) fn next_view_gen(&mut self, plugin_id: &str, view_id: &str) -> u64 {
         let key = (plugin_id.to_owned(), view_id.to_owned());
         let entry = self.view_generations.entry(key).or_insert(0);
         *entry = entry.wrapping_add(1);
         *entry
     }
 
-    fn invalidate_plugin_views(&mut self, plugin_id: &str) {
+    pub(super) fn invalidate_plugin_views(&mut self, plugin_id: &str) {
         for ((pid, _), generation) in &mut self.view_generations {
             if pid == plugin_id {
                 *generation = generation.wrapping_add(1);
@@ -182,8 +187,6 @@ impl PluginOpState {
         self.mounting_views.retain(|(pid, _)| pid != plugin_id);
     }
 }
-
-type ThemeSourceSignature = Vec<(String, PathBuf, String)>;
 
 /// Global GPUI host coordinating the plugin runtime, UI bus, view trees, themes, and registry.
 pub struct PluginHost {
@@ -222,7 +225,7 @@ pub struct PluginHost {
     _data_sub: Subscription,
 }
 
-fn has_active_hook_plugins(safe_mode: bool, has_manager: bool, plugins: &[PluginInfo]) -> bool {
+pub(super) fn has_active_hook_plugins(safe_mode: bool, has_manager: bool, plugins: &[PluginInfo]) -> bool {
     !safe_mode
         && has_manager
         && plugins.iter().any(|info| {
@@ -810,7 +813,7 @@ impl PluginHost {
         Self::ensure_hot_reload_poller(cx);
     }
 
-    fn ensure_hot_reload_poller(cx: &mut App) {
+    pub(super) fn ensure_hot_reload_poller(cx: &mut App) {
         let Some(host) = cx.try_global::<Self>() else {
             return;
         };
@@ -920,675 +923,6 @@ impl PluginHost {
         })
         .detach();
     }
-
-    fn enqueue_plugin_op(plugin_id: String, op: PluginViewOp, cx: &mut App) {
-        let should_start = {
-            let Some(host) = cx.try_global::<Self>() else {
-                return;
-            };
-            if host.manager.is_none() {
-                return;
-            }
-            let mut ops = host.op_state.borrow_mut();
-            ops.queues
-                .entry(plugin_id.clone())
-                .or_default()
-                .push_back(op);
-            ops.running.insert(plugin_id.clone())
-        };
-        if !should_start {
-            return;
-        }
-
-        cx.spawn(async move |cx| {
-            let bg = cx.background_executor().clone();
-            loop {
-                let next = cx.update(|cx| {
-                    let host = cx.try_global::<PluginHost>()?;
-                    let mut ops = host.op_state.borrow_mut();
-                    let Some(mgr) = host.manager.clone() else {
-                        ops.queues.remove(&plugin_id);
-                        ops.running.remove(&plugin_id);
-                        return None;
-                    };
-                    let op = ops
-                        .queues
-                        .get_mut(&plugin_id)
-                        .and_then(VecDeque::pop_front);
-                    match op {
-                        Some(op) => Some((op, mgr, Arc::clone(&host.wake_signal))),
-                        None => {
-                            ops.queues.remove(&plugin_id);
-                            ops.running.remove(&plugin_id);
-                            None
-                        }
-                    }
-                });
-
-                let Some((op, mgr, signal)) = next else {
-                    break;
-                };
-
-                match op {
-                    PluginViewOp::Mount {
-                        view_id,
-                        generation,
-                    } => {
-                        let pid = plugin_id.clone();
-                        let vid = view_id.clone();
-                        let res = bg.spawn(async move { mgr.mount_view(&pid, &vid) }).await;
-                        if !signal.closed.load(Ordering::Acquire) {
-                            cx.update(|cx| {
-                                apply_view_render_result(
-                                    &plugin_id, &view_id, generation, res, &signal, cx,
-                                );
-                            });
-                        }
-                    }
-                    PluginViewOp::Render {
-                        view_id,
-                        generation,
-                    } => {
-                        let pid = plugin_id.clone();
-                        let vid = view_id.clone();
-                        let res = bg.spawn(async move { mgr.render_view(&pid, &vid) }).await;
-                        if !signal.closed.load(Ordering::Acquire) {
-                            cx.update(|cx| {
-                                apply_view_render_result(
-                                    &plugin_id, &view_id, generation, res, &signal, cx,
-                                );
-                            });
-                        }
-                    }
-                    PluginViewOp::Unmount { view_id } => {
-                        let pid = plugin_id.clone();
-                        let _ = bg.spawn(async move { mgr.unmount_view(&pid, &view_id) }).await;
-                    }
-                    PluginViewOp::Reload => {
-                        let pid = plugin_id.clone();
-                        let res = bg.spawn(async move { mgr.reload_plugin(&pid) }).await;
-                        if !signal.closed.load(Ordering::Acquire) {
-                            cx.update(|cx| {
-                                let matches = cx
-                                    .try_global::<PluginHost>()
-                                    .is_some_and(|h| Arc::ptr_eq(&h.wake_signal, &signal));
-                                if matches {
-                                    cx.update_global::<PluginHost, _>(|host, _| {
-                                        host.loaded_theme_signature = None;
-                                        host.views.retain(|(p, _), _| p != &plugin_id);
-                                        host.view_errors.retain(|(p, _), _| p != &plugin_id);
-                                        host.view_revisions.retain(|(p, _), _| p != &plugin_id);
-                                        host.op_state
-                                            .borrow_mut()
-                                            .invalidate_plugin_views(&plugin_id);
-                                        let rev = host
-                                            .plugin_revisions
-                                            .entry(plugin_id.clone())
-                                            .or_insert(0);
-                                        *rev = rev.wrapping_add(1);
-                                        if let Err(err) = res {
-                                            host.view_errors.insert(
-                                                (plugin_id.clone(), String::new()),
-                                                format!("{err:#}"),
-                                            );
-                                        }
-                                    });
-                                }
-                            });
-                        }
-                    }
-                    PluginViewOp::ReloadAndMount {
-                        view_id,
-                        generation,
-                    } => {
-                        cx.update(|cx| {
-                            if let Some(host) = cx.try_global::<PluginHost>() {
-                                host.op_state
-                                    .borrow_mut()
-                                    .in_flight_reload_or_reset
-                                    .insert(plugin_id.clone());
-                            }
-                        });
-                        let pid = plugin_id.clone();
-                        let vid = view_id.clone();
-                        let res = bg
-                            .spawn(async move {
-                                match mgr.reload_plugin(&pid) {
-                                    Ok(()) => Ok(mgr.mount_view(&pid, &vid)),
-                                    Err(err) => Err(err),
-                                }
-                            })
-                            .await;
-                        if !signal.closed.load(Ordering::Acquire) {
-                            cx.update(|cx| {
-                                let matches = cx
-                                    .try_global::<PluginHost>()
-                                    .is_some_and(|h| Arc::ptr_eq(&h.wake_signal, &signal));
-                                if !matches {
-                                    return;
-                                }
-                                cx.update_global::<PluginHost, _>(|host, _| {
-                                    host.loaded_theme_signature = None;
-                                    host.views.retain(|(p, _), _| p != &plugin_id);
-                                    host.view_errors.retain(|(p, _), _| p != &plugin_id);
-                                    host.view_revisions.retain(|(p, _), _| p != &plugin_id);
-                                    let rev = host
-                                        .plugin_revisions
-                                        .entry(plugin_id.clone())
-                                        .or_insert(0);
-                                    *rev = rev.wrapping_add(1);
-                                    let rev_val = *rev;
-                                    let key = (plugin_id.clone(), view_id.clone());
-                                    let mut ops = host.op_state.borrow_mut();
-                                    ops.in_flight_reload_or_reset.remove(&plugin_id);
-                                    let is_current =
-                                        ops.view_generations.get(&key) == Some(&generation);
-                                    if is_current {
-                                        ops.mounting_views.remove(&key);
-                                    }
-                                    drop(ops);
-                                    match res {
-                                        Err(reload_err) => {
-                                            host.view_errors.insert(
-                                                (plugin_id.clone(), String::new()),
-                                                format!("{reload_err:#}"),
-                                            );
-                                        }
-                                        Ok(mount_res) => {
-                                            if is_current {
-                                                host.view_revisions.insert(key.clone(), rev_val);
-                                                match mount_res {
-                                                    Ok(payload) => {
-                                                        host.views.insert(key, Arc::new(payload));
-                                                    }
-                                                    Err(mount_err) => {
-                                                        host.view_errors.insert(
-                                                            key,
-                                                            format!("{mount_err:#}"),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-                            });
-                        }
-                    }
-                    PluginViewOp::ResetAndMount {
-                        view_id,
-                        generation,
-                    } => {
-                        cx.update(|cx| {
-                            if let Some(host) = cx.try_global::<PluginHost>() {
-                                host.op_state
-                                    .borrow_mut()
-                                    .in_flight_reload_or_reset
-                                    .insert(plugin_id.clone());
-                            }
-                        });
-                        let pid = plugin_id.clone();
-                        let vid = view_id.clone();
-                        let res = bg
-                            .spawn(async move {
-                                mgr.reset_and_enable_plugin(&pid)?;
-                                mgr.mount_view(&pid, &vid)
-                            })
-                            .await;
-                        if !signal.closed.load(Ordering::Acquire) {
-                            cx.update(|cx| {
-                                if let Some(host) = cx.try_global::<PluginHost>()
-                                    && Arc::ptr_eq(&host.wake_signal, &signal)
-                                {
-                                    host.op_state
-                                        .borrow_mut()
-                                        .in_flight_reload_or_reset
-                                        .remove(&plugin_id);
-                                }
-                                apply_view_render_result(
-                                    &plugin_id, &view_id, generation, res, &signal, cx,
-                                );
-                            });
-                        }
-                    }
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// Mounts and renders a plugin sidebar view off the UI thread, updating `PluginHost` state.
-    pub fn mount_view_async(plugin_id: String, view_id: String, cx: &mut App) {
-        Self::request_view_async(plugin_id, view_id, true, cx);
-    }
-
-    /// Re-renders an already mounted plugin view off the UI thread.
-    pub fn render_view_async(plugin_id: String, view_id: String, cx: &mut App) {
-        Self::request_view_async(plugin_id, view_id, false, cx);
-    }
-
-    fn request_view_async(plugin_id: String, view_id: String, mount: bool, cx: &mut App) {
-        let generation = {
-            let Some(host) = cx.try_global::<Self>() else {
-                return;
-            };
-            if host.manager.is_none() {
-                return;
-            }
-            let mut ops = host.op_state.borrow_mut();
-            let generation = ops.next_view_gen(&plugin_id, &view_id);
-            if mount {
-                ops.mounting_views
-                    .insert((plugin_id.clone(), view_id.clone()));
-            }
-            generation
-        };
-        let op = if mount {
-            PluginViewOp::Mount {
-                view_id,
-                generation,
-            }
-        } else {
-            PluginViewOp::Render {
-                view_id,
-                generation,
-            }
-        };
-        Self::enqueue_plugin_op(plugin_id, op, cx);
-    }
-
-    /// Unmounts a plugin view off the UI thread and evicts its cached tree immediately.
-    pub fn unmount_view_async(plugin_id: String, view_id: String, cx: &mut App) {
-        let key = (plugin_id.clone(), view_id.clone());
-        let had_cached = cx.try_global::<Self>().is_some_and(|h| {
-            h.views.contains_key(&key)
-                || h.view_errors.contains_key(&key)
-                || h.view_revisions.contains_key(&key)
-        });
-        if had_cached {
-            cx.update_global::<Self, _>(|host, _| {
-                host.views.remove(&key);
-                host.view_errors.remove(&key);
-                host.view_revisions.remove(&key);
-            });
-        }
-        let has_mgr = if let Some(host) = cx.try_global::<Self>() {
-            let mut ops = host.op_state.borrow_mut();
-            let _ = ops.next_view_gen(&plugin_id, &view_id);
-            ops.mounting_views.remove(&key);
-            host.manager.is_some()
-        } else {
-            false
-        };
-        if has_mgr {
-            Self::enqueue_plugin_op(plugin_id, PluginViewOp::Unmount { view_id }, cx);
-        }
-    }
-
-    /// Sequentially reloads a plugin and mounts `view_id` in a single queued task (no race or double-mount).
-    pub fn reload_and_mount_view_async(plugin_id: String, view_id: String, cx: &mut App) {
-        let key = (plugin_id.clone(), view_id.clone());
-        let generation = {
-            let Some(host) = cx.try_global::<Self>() else {
-                return;
-            };
-            if host.manager.is_none() {
-                return;
-            }
-            let mut ops = host.op_state.borrow_mut();
-            let generation = ops.next_view_gen(&plugin_id, &view_id);
-            ops.mounting_views.insert(key.clone());
-            generation
-        };
-        cx.update_global::<Self, _>(|host, _| {
-            host.views.remove(&key);
-            host.view_errors.retain(|(p, _), _| p != &plugin_id);
-            host.view_revisions.remove(&key);
-        });
-        Self::enqueue_plugin_op(
-            plugin_id,
-            PluginViewOp::ReloadAndMount {
-                view_id,
-                generation,
-            },
-            cx,
-        );
-    }
-
-    /// Sequentially resets a circuit-broken plugin and mounts `view_id` without racing or double-mounting.
-    pub fn reset_and_mount_view_async(plugin_id: String, view_id: String, cx: &mut App) {
-        let key = (plugin_id.clone(), view_id.clone());
-        let generation = {
-            let Some(host) = cx.try_global::<Self>() else {
-                return;
-            };
-            if host.manager.is_none() {
-                return;
-            }
-            let mut ops = host.op_state.borrow_mut();
-            let generation = ops.next_view_gen(&plugin_id, &view_id);
-            ops.mounting_views.insert(key);
-            generation
-        };
-        cx.update_global::<Self, _>(|host, _| {
-            host.view_errors.retain(|(p, _), _| p != &plugin_id);
-        });
-        Self::enqueue_plugin_op(
-            plugin_id,
-            PluginViewOp::ResetAndMount {
-                view_id,
-                generation,
-            },
-            cx,
-        );
-    }
-
-    /// Dispatches an interactive `UiEvent` from a native widget back to QuickJS off-thread.
-    pub fn dispatch_ui_event_async(plugin_id: String, event: UiEvent, cx: &mut App) {
-        let Some(mgr) = Self::global(cx).and_then(|h| h.manager.clone()) else {
-            return;
-        };
-        let pid = plugin_id.clone();
-        let vid = event.view_id.clone();
-        let task = cx.background_spawn(async move { mgr.dispatch_ui_event(&pid, event) });
-        cx.spawn(async move |cx| {
-            let res = task.await;
-            cx.update(|cx| match res {
-                Ok(Some(payload)) => Self::set_view_tree(plugin_id, vid, payload, cx),
-                Ok(None) => {
-                    if vid == "__modal__" {
-                        Self::clear_view_error(&plugin_id, &vid, cx);
-                    }
-                }
-                Err(err) => {
-                    let msg = format!("{err:#}");
-                    if vid == "__modal__" {
-                        let modal_open = PluginBus::global(cx)
-                            .and_then(|b| b.active_modal.as_ref())
-                            .is_some_and(|m| m.plugin_id == plugin_id && m.view_id == vid);
-                        if modal_open {
-                            Self::set_view_error(plugin_id, vid, msg, cx);
-                        } else {
-                            push_toast_capped(plugin_id, msg, BusToastLevel::Error, now_ms(), cx);
-                        }
-                    } else {
-                        Self::set_view_error(plugin_id, vid, msg, cx);
-                    }
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// Resolves a pending `fern.ui.confirm` / `fern.ui.prompt` JS promise off-thread.
-    pub fn resolve_prompt_async(request_id: u64, reply: PromptReplyValue, cx: &mut App) {
-        let Some(mgr) = Self::global(cx).and_then(|h| h.manager.clone()) else {
-            return;
-        };
-        cx.background_spawn(async move {
-            let _ = mgr.resolve_prompt(request_id, reply);
-        })
-        .detach();
-    }
-
-    /// Executes a contributed plugin command off the UI thread.
-    pub fn run_command_async(
-        plugin_id: String,
-        command_id: String,
-        arg: Option<String>,
-        cx: &mut App,
-    ) {
-        let Some(mgr) = Self::global(cx).and_then(|h| h.manager.clone()) else {
-            return;
-        };
-        let pid = plugin_id.clone();
-        let task = cx.background_spawn(async move { mgr.run_command(&pid, &command_id, arg) });
-        cx.spawn(async move |cx| {
-            if let Err(err) = task.await {
-                let msg = format!("{err:#}");
-                cx.update(|cx| {
-                    push_toast_capped(plugin_id, msg, BusToastLevel::Error, now_ms(), cx);
-                });
-            }
-        })
-        .detach();
-    }
-
-    /// Queries enabled plugin search providers off-thread and updates `PluginBus::search_hits`.
-    pub fn search_async(query: String, cx: &mut App) {
-        let seq = Self::global(cx).map_or(0, |h| {
-            h.search_seq.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
-        });
-        if query.trim().is_empty() {
-            PluginBus::update(cx, |bus| bus.search_hits.clear());
-            return;
-        }
-        let Some(mgr) = Self::global(cx).and_then(|h| h.manager.clone()) else {
-            PluginBus::update(cx, |bus| bus.search_hits.clear());
-            return;
-        };
-        let task = cx.background_spawn(async move { mgr.search(&query) });
-        cx.spawn(async move |cx| {
-            let res = task.await;
-            cx.update(|cx| {
-                let is_latest =
-                    Self::global(cx).is_some_and(|h| h.search_seq.load(Ordering::Acquire) == seq);
-                if !is_latest {
-                    return;
-                }
-                match res {
-                    Ok(hits) => {
-                        let mapped: Vec<PluginSearchHit> = hits
-                            .into_iter()
-                            .map(|h| PluginSearchHit {
-                                id: h.id,
-                                plugin_id: h.plugin_id,
-                                provider_id: h.provider_id,
-                                title: h.title,
-                                subtitle: h.subtitle,
-                                badge: h.badge,
-                                task_id: h.task_id,
-                                command_id: h.command_id,
-                                command_arg: h.command_arg,
-                            })
-                            .collect();
-                        PluginBus::update(cx, |bus| {
-                            bus.search_hits = mapped;
-                        });
-                    }
-                    Err(_) => {
-                        PluginBus::update(cx, |bus| bus.search_hits.clear());
-                    }
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// Reloads a single plugin off the UI thread and bumps its view revision once reload finishes.
-    pub fn reload_plugin_async(plugin_id: String, cx: &mut App) {
-        if Self::global(cx).and_then(|h| h.manager.as_ref()).is_none() {
-            return;
-        }
-        Self::enqueue_plugin_op(plugin_id, PluginViewOp::Reload, cx);
-    }
-
-    /// Reloads all plugins from disk off the UI thread.
-    pub fn reload_all_async(cx: &mut App) {
-        let Some(mgr) = Self::global(cx).and_then(|h| h.manager.clone()) else {
-            return;
-        };
-        if cx.has_global::<Self>() {
-            cx.update_global::<Self, _>(|host, _| {
-                host.loaded_theme_signature = None;
-            });
-        }
-        let task = cx.background_spawn(async move { mgr.reload_all() });
-        cx.spawn(async move |cx| {
-            if let Ok(infos) = task.await {
-                cx.update(|cx| {
-                    apply_registry_changed(infos, cx);
-                });
-            }
-        })
-        .detach();
-    }
-
-    /// Loads `themes` contributions from all enabled plugins into [`ThemeRegistry`],
-    /// preserving any user-defined custom themes already loaded from `<data_dir>/themes`.
-    pub fn sync_plugin_themes(cx: &mut App) {
-        if !cx.has_global::<ThemeRegistry>() {
-            return;
-        }
-        let Some(host) = cx.try_global::<Self>() else {
-            return;
-        };
-        let sig = theme_contribution_signature(&host.plugins);
-        let (plugin_themes, errors) = if host.loaded_theme_signature.as_ref() == Some(&sig) {
-            (
-                host.cached_plugin_themes.clone(),
-                host.plugin_theme_errors.clone(),
-            )
-        } else if sig.is_empty() {
-            (Vec::new(), Vec::new())
-        } else {
-            let plugins = Arc::clone(&host.plugins);
-            collect_plugin_themes(&plugins)
-        };
-        // Invalidate any in-flight async theme load so it cannot overwrite this synchronous sync.
-        host.theme_sync_seq.fetch_add(1, Ordering::AcqRel);
-        apply_plugin_themes(sig, plugin_themes, errors, cx);
-    }
-}
-
-fn theme_contribution_signature(plugins: &[PluginInfo]) -> ThemeSourceSignature {
-    plugins
-        .iter()
-        .filter(|p| p.enabled && !p.manifest.contributions.themes.is_empty())
-        .map(|p| (p.manifest.id.clone(), p.dir.clone(), p.manifest_hash.clone()))
-        .collect()
-}
-
-fn apply_plugin_themes(
-    signature: ThemeSourceSignature,
-    plugin_themes: Vec<Theme>,
-    errors: Vec<String>,
-    cx: &mut App,
-) {
-    if !cx.has_global::<ThemeRegistry>() {
-        return;
-    }
-    let Some(host) = cx.try_global::<PluginHost>() else {
-        return;
-    };
-    let prev_plugin_ids = host.loaded_plugin_theme_ids.clone();
-    let prev_errors = host.plugin_theme_errors.clone();
-
-    let next_plugin_ids: HashSet<String> =
-        plugin_themes.iter().map(|t| t.id().to_owned()).collect();
-
-    let registry = ThemeRegistry::global(cx);
-    let mut combined: Vec<Theme> = registry
-        .custom_themes()
-        .iter()
-        .filter(|t| !prev_plugin_ids.contains(t.id()))
-        .map(|t| (**t).clone())
-        .collect();
-    combined.extend(plugin_themes.clone());
-
-    let mut combined_errors: Vec<String> = registry
-        .errors()
-        .iter()
-        .filter(|err| !prev_errors.contains(err))
-        .cloned()
-        .collect();
-    combined_errors.extend(errors.clone());
-
-    theme::reload_user_themes(combined, combined_errors, cx);
-    cx.update_global::<PluginHost, _>(|host, _| {
-        host.loaded_plugin_theme_ids = next_plugin_ids;
-        host.plugin_theme_errors = errors;
-        host.loaded_theme_signature = Some(signature);
-        host.cached_plugin_themes = plugin_themes;
-    });
-}
-
-fn sync_plugin_themes_async(
-    plugins: Arc<Vec<PluginInfo>>,
-    sig: ThemeSourceSignature,
-    cx: &mut App,
-) {
-    if !cx.has_global::<ThemeRegistry>() {
-        return;
-    }
-    if sig.is_empty() {
-        PluginHost::sync_plugin_themes(cx);
-        return;
-    }
-    let Some((seq, signal)) = cx.try_global::<PluginHost>().map(|h| {
-        (
-            h.theme_sync_seq
-                .fetch_add(1, Ordering::AcqRel)
-                .wrapping_add(1),
-            Arc::clone(&h.wake_signal),
-        )
-    }) else {
-        return;
-    };
-
-    let task = cx.background_spawn(async move { collect_plugin_themes(&plugins) });
-    cx.spawn(async move |cx| {
-        let (themes, errors) = task.await;
-        if signal.closed.load(Ordering::Acquire) {
-            return;
-        }
-        cx.update(|cx| {
-            let is_latest = cx.try_global::<PluginHost>().is_some_and(|h| {
-                Arc::ptr_eq(&h.wake_signal, &signal)
-                    && h.theme_sync_seq.load(Ordering::Acquire) == seq
-            });
-            if is_latest {
-                apply_plugin_themes(sig, themes, errors, cx);
-            }
-        });
-    })
-    .detach();
-}
-
-fn apply_view_render_result(
-    plugin_id: &str,
-    view_id: &str,
-    generation: u64,
-    res: Result<UiTreePayload>,
-    signal: &Arc<WakeSignal>,
-    cx: &mut App,
-) {
-    let key = (plugin_id.to_owned(), view_id.to_owned());
-    let is_current = cx.try_global::<PluginHost>().is_some_and(|host| {
-        if !Arc::ptr_eq(&host.wake_signal, signal) {
-            return false;
-        }
-        let mut ops = host.op_state.borrow_mut();
-        if ops.view_generations.get(&key) == Some(&generation) {
-            ops.mounting_views.remove(&key);
-            true
-        } else {
-            false
-        }
-    });
-    if !is_current {
-        return;
-    }
-    match res {
-        Ok(payload) => PluginHost::set_view_tree(plugin_id, view_id, payload, cx),
-        Err(err) => {
-            cx.update_global::<PluginHost, _>(|host, _| {
-                let rev = host.plugin_revision(&key.0);
-                host.view_revisions.insert(key.clone(), rev);
-                host.view_errors.insert(key, format!("{err:#}"));
-            });
-        }
-    }
 }
 
 fn handle_hot_reload_changed(
@@ -1622,553 +956,6 @@ fn handle_hot_reload_changed(
             }
         }
     });
-}
-
-/// Parses and validates all `themes` contributed by enabled plugins.
-pub fn collect_plugin_themes(plugins: &[PluginInfo]) -> (Vec<Theme>, Vec<String>) {
-    let mut themes = Vec::new();
-    let mut errors = Vec::new();
-
-    for info in plugins {
-        if !info.enabled || info.manifest.contributions.themes.is_empty() {
-            continue;
-        }
-        for contrib in &info.manifest.contributions.themes {
-            if let Some(rel_path) = &contrib.path {
-                match resolve_inside_dir(&info.dir, rel_path)
-                    .and_then(|path| std::fs::read_to_string(&path).map_err(anyhow::Error::from))
-                    .and_then(|raw| theme::load_theme_family_from_str(&raw))
-                {
-                    Ok((loaded, warnings)) => {
-                        themes.extend(loaded);
-                        for w in warnings {
-                            errors.push(format!("{}: {w}", info.manifest.id));
-                        }
-                    }
-                    Err(err) => {
-                        errors.push(format!(
-                            "{}: theme {:?} failed: {err:#}",
-                            info.manifest.id, contrib.id
-                        ));
-                    }
-                }
-            } else if let Some(colors) = &contrib.colors {
-                let doc = if colors.get("themes").is_some() || colors.get("style").is_some() {
-                    colors.clone()
-                } else {
-                    serde_json::json!({
-                        "id": contrib.id,
-                        "name": contrib.name,
-                        "appearance": contrib.appearance.as_deref().unwrap_or("dark"),
-                        "author": info.manifest.author,
-                        "style": colors,
-                    })
-                };
-                match serde_json::to_string(&doc)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|json| theme::load_theme_family_from_str(&json))
-                {
-                    Ok((loaded, warnings)) => {
-                        themes.extend(loaded);
-                        for w in warnings {
-                            errors.push(format!("{}: {w}", info.manifest.id));
-                        }
-                    }
-                    Err(err) => {
-                        errors.push(format!(
-                            "{}: inline theme {:?} failed: {err:#}",
-                            info.manifest.id, contrib.id
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    (themes, errors)
-}
-
-#[cfg(not(test))]
-fn spawn_update_consumer(
-    rx: mpsc::Receiver<HostUpdate>,
-    signal: Arc<WakeSignal>,
-    cx: &mut App,
-) {
-    cx.spawn(async move |cx| {
-        loop {
-            let mut batch = Vec::new();
-            let mut disconnected = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(update) => batch.push(update),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-
-            if !batch.is_empty() {
-                cx.update(|cx| {
-                    for update in batch {
-                        apply_host_update(update, cx);
-                    }
-                });
-            }
-
-            if disconnected || !WaitForWake(Arc::clone(&signal)).await {
-                break;
-            }
-        }
-    })
-    .detach();
-}
-
-fn apply_host_update(update: HostUpdate, cx: &mut App) {
-    match update {
-        HostUpdate::RegistryChanged(infos) => {
-            apply_registry_changed(infos, cx);
-        }
-        HostUpdate::PluginStatusChanged {
-            plugin_id,
-            status,
-            metrics,
-        } => {
-            let mut updated_plugins = None;
-            let mut should_sync_themes = false;
-            if cx.has_global::<PluginHost>() {
-                cx.update_global::<PluginHost, _>(|host, _| {
-                    let deactivated = matches!(
-                        status,
-                        PluginStatus::Disabled
-                            | PluginStatus::NeedsApproval { .. }
-                            | PluginStatus::CircuitBroken { .. }
-                    );
-                    if let Some(info) = Arc::make_mut(&mut host.plugins)
-                        .iter_mut()
-                        .find(|p| p.manifest.id == plugin_id)
-                    {
-                        if deactivated {
-                            if info.enabled && !info.manifest.contributions.themes.is_empty() {
-                                should_sync_themes = true;
-                            }
-                            info.enabled = false;
-                        }
-                        info.status = status.clone();
-                        info.metrics = metrics;
-                    }
-                    if deactivated {
-                        host.views.retain(|(p, _), _| p != &plugin_id);
-                        host.view_revisions.retain(|(p, _), _| p != &plugin_id);
-                        host.op_state.borrow_mut().invalidate_plugin_views(&plugin_id);
-                    }
-                    if host.pending_hot_reload.remove(&plugin_id) {
-                        host.views.retain(|(p, _), _| p != &plugin_id);
-                        host.view_revisions.retain(|(p, _), _| p != &plugin_id);
-                        host.op_state.borrow_mut().invalidate_plugin_views(&plugin_id);
-                        let rev = host
-                            .plugin_revisions
-                            .entry(plugin_id.clone())
-                            .or_insert(0);
-                        *rev = rev.wrapping_add(1);
-                    }
-                    updated_plugins = Some(Arc::clone(&host.plugins));
-                });
-            }
-            if let Some(plugins) = updated_plugins {
-                sync_bus_contributions(&plugins, cx);
-                if should_sync_themes {
-                    let sig = theme_contribution_signature(&plugins);
-                    sync_plugin_themes_async(plugins, sig, cx);
-                }
-                PluginHost::ensure_hot_reload_poller(cx);
-            }
-        }
-        HostUpdate::ViewRendered(payload) => {
-            PluginHost::set_view_tree(
-                payload.plugin_id.clone(),
-                payload.view_id.clone(),
-                payload,
-                cx,
-            );
-        }
-        HostUpdate::ViewError {
-            plugin_id,
-            view_id,
-            error,
-        } => {
-            PluginHost::set_view_error(plugin_id, view_id, error, cx);
-        }
-        HostUpdate::UiEffect(effect) => apply_ui_effect(effect, cx),
-        HostUpdate::DataChanged => {
-            if let Some(host) = cx.try_global::<PluginHost>() {
-                let marker_id = host.marker_id;
-                data_changed(marker_id, cx);
-            }
-        }
-    }
-}
-
-fn apply_registry_changed(infos: Vec<PluginInfo>, cx: &mut App) {
-    let infos = Arc::new(infos);
-    let next_theme_sig = theme_contribution_signature(&infos);
-    let mut should_sync_themes = false;
-
-    if cx.has_global::<PluginHost>() {
-        cx.update_global::<PluginHost, _>(|host, _| {
-            host.registry_change_seq = host.registry_change_seq.wrapping_add(1);
-            for info in infos.iter() {
-                let prev = host
-                    .plugins
-                    .iter()
-                    .find(|p| p.manifest.id == info.manifest.id);
-                let prev_enabled = prev.is_some_and(|p| p.enabled);
-                let prev_hash = prev.map(|p| p.manifest_hash.as_str());
-                let was_hot_reloaded = host.pending_hot_reload.remove(&info.manifest.id);
-                let changed = (!prev_enabled && info.enabled)
-                    || prev_hash != Some(info.manifest_hash.as_str())
-                    || was_hot_reloaded;
-                let reloading_or_resetting = host
-                    .op_state
-                    .borrow()
-                    .in_flight_reload_or_reset
-                    .contains(&info.manifest.id);
-                if changed && !reloading_or_resetting {
-                    host.views.retain(|(pid, _), _| pid != &info.manifest.id);
-                    host.view_revisions
-                        .retain(|(pid, _), _| pid != &info.manifest.id);
-                    host.op_state
-                        .borrow_mut()
-                        .invalidate_plugin_views(&info.manifest.id);
-                }
-                if changed || !host.plugin_revisions.contains_key(&info.manifest.id) {
-                    let rev = host
-                        .plugin_revisions
-                        .entry(info.manifest.id.clone())
-                        .or_insert(0);
-                    *rev = rev.wrapping_add(1);
-                }
-                let inactive = !info.enabled
-                    || matches!(
-                        info.status,
-                        PluginStatus::Disabled
-                            | PluginStatus::NeedsApproval { .. }
-                            | PluginStatus::CircuitBroken { .. }
-                    );
-                if inactive {
-                    host.views.retain(|(pid, _), _| pid != &info.manifest.id);
-                    host.view_errors
-                        .retain(|(pid, _), _| pid != &info.manifest.id);
-                    host.view_revisions
-                        .retain(|(pid, _), _| pid != &info.manifest.id);
-                    host.op_state
-                        .borrow_mut()
-                        .invalidate_plugin_views(&info.manifest.id);
-                }
-            }
-            let alive: HashSet<&str> = infos.iter().map(|p| p.manifest.id.as_str()).collect();
-            host.views.retain(|(pid, _), _| alive.contains(pid.as_str()));
-            host.view_errors
-                .retain(|(pid, _), _| alive.contains(pid.as_str()));
-            host.view_revisions
-                .retain(|(pid, _), _| alive.contains(pid.as_str()));
-            host.pending_hot_reload
-                .retain(|pid| alive.contains(pid.as_str()));
-            should_sync_themes = host.loaded_theme_signature.as_ref() != Some(&next_theme_sig);
-            host.hooks_active.store(
-                has_active_hook_plugins(host.safe_mode, host.manager.is_some(), &infos),
-                Ordering::Release,
-            );
-            host.plugins = Arc::clone(&infos);
-        });
-    }
-    sync_bus_contributions(&infos, cx);
-    if should_sync_themes {
-        sync_plugin_themes_async(infos, next_theme_sig, cx);
-    }
-    PluginHost::ensure_hot_reload_poller(cx);
-}
-
-fn sync_bus_contributions(plugins: &[PluginInfo], cx: &mut App) {
-    let mut sidebar_views = Vec::new();
-    let mut commands = Vec::new();
-
-    for info in plugins {
-        if !info.enabled
-            || matches!(
-                info.status,
-                PluginStatus::Disabled
-                    | PluginStatus::NeedsApproval { .. }
-                    | PluginStatus::CircuitBroken { .. }
-            )
-        {
-            continue;
-        }
-        for view in &info.manifest.contributions.sidebar {
-            sidebar_views.push(PluginSidebarViewSpec {
-                plugin_id: info.manifest.id.clone(),
-                view_id: view.id.clone(),
-                title: view.title.clone(),
-                icon_svg: info
-                    .sidebar_icons
-                    .get(&view.id)
-                    .map(|svg| Arc::<str>::from(svg.as_str())),
-            });
-        }
-        for cmd in &info.manifest.contributions.commands {
-            commands.push(PluginCommandSpec {
-                plugin_id: info.manifest.id.clone(),
-                command_id: cmd.id.clone(),
-                title: cmd.title.clone(),
-                plugin_name: info.manifest.name.clone(),
-            });
-        }
-    }
-
-    PluginBus::update(cx, |bus| {
-        bus.sidebar_views = sidebar_views;
-        bus.commands = commands;
-    });
-}
-
-/// Resolves a displaced or closed `Confirm`/`Prompt` modal so awaited JS Promises never hang,
-/// and cleans up `"__modal__"` scope handlers for displaced `View` modals.
-pub(crate) fn resolve_displaced_modal(
-    prev: PluginModalSpec,
-    replaced_by: Option<(&str, &str, bool)>,
-    cx: &mut App,
-) {
-    match prev.kind {
-        PluginModalKind::Confirm { request_id, .. } => {
-            PluginHost::resolve_prompt_async(request_id, PromptReplyValue::Confirm(false), cx);
-        }
-        PluginModalKind::Prompt { request_id, .. } => {
-            PluginHost::resolve_prompt_async(request_id, PromptReplyValue::Prompt(None), cx);
-        }
-        PluginModalKind::View { .. } => {
-            PluginHost::clear_view_error(&prev.plugin_id, &prev.view_id, cx);
-            let same_view_replacement = replaced_by.is_some_and(|(pid, vid, is_view)| {
-                is_view && pid == prev.plugin_id && vid == prev.view_id
-            });
-            if !same_view_replacement {
-                PluginHost::unmount_view_async(prev.plugin_id, prev.view_id, cx);
-            }
-        }
-    }
-}
-
-fn dismiss_active_modal_on_shutdown(cx: &mut App) {
-    let has_modal = PluginBus::global(cx).is_some_and(|bus| bus.active_modal.is_some());
-    if !has_modal {
-        return;
-    }
-    let prev = PluginBus::update(cx, |bus| bus.active_modal.take());
-    PluginHost::bump_modal_generation(cx);
-    if let Some(modal) = prev {
-        match modal.kind {
-            PluginModalKind::Confirm { request_id, .. } => {
-                PluginHost::resolve_prompt_async(request_id, PromptReplyValue::Confirm(false), cx);
-            }
-            PluginModalKind::Prompt { request_id, .. } => {
-                PluginHost::resolve_prompt_async(request_id, PromptReplyValue::Prompt(None), cx);
-            }
-            PluginModalKind::View { .. } => {
-                PluginHost::clear_view_error(&modal.plugin_id, &modal.view_id, cx);
-            }
-        }
-    }
-}
-
-pub(crate) fn push_toast_capped(
-    plugin_id: String,
-    message: String,
-    level: BusToastLevel,
-    created_at_ms: i64,
-    cx: &mut App,
-) -> u64 {
-    let toast_id = PluginBus::update(cx, |bus| {
-        while bus.toasts.len() >= MAX_PENDING_TOASTS {
-            bus.toasts.remove(0);
-        }
-        bus.push_toast(plugin_id, message, level, created_at_ms)
-    });
-    schedule_toast_expiry(toast_id, cx);
-    toast_id
-}
-
-pub(crate) fn apply_ui_effect(effect: PluginUiEffect, cx: &mut App) {
-    match effect {
-        PluginUiEffect::Toast {
-            plugin_id,
-            message,
-            level,
-            created_at_ms,
-        } => {
-            let bus_level = match level {
-                PluginToastLevel::Info => BusToastLevel::Info,
-                PluginToastLevel::Success => BusToastLevel::Success,
-                PluginToastLevel::Warning => BusToastLevel::Warning,
-                PluginToastLevel::Error => BusToastLevel::Error,
-            };
-            push_toast_capped(plugin_id, message, bus_level, created_at_ms, cx);
-        }
-        PluginUiEffect::Confirm {
-            request_id,
-            plugin_id,
-            title,
-            body,
-        } => {
-            let pid_ref = plugin_id.clone();
-            let prev = PluginBus::update(cx, |bus| {
-                let old = bus.active_modal.take();
-                bus.open_modal(PluginModalSpec {
-                    plugin_id,
-                    view_id: "__confirm__".to_owned(),
-                    title,
-                    kind: PluginModalKind::Confirm { body, request_id },
-                });
-                old
-            });
-            PluginHost::bump_modal_generation(cx);
-            if let Some(old) = prev {
-                resolve_displaced_modal(old, Some((&pid_ref, "__confirm__", false)), cx);
-            }
-        }
-        PluginUiEffect::Prompt {
-            request_id,
-            plugin_id,
-            title,
-            placeholder,
-            default_value,
-        } => {
-            let pid_ref = plugin_id.clone();
-            let prev = PluginBus::update(cx, |bus| {
-                let old = bus.active_modal.take();
-                bus.open_modal(PluginModalSpec {
-                    plugin_id,
-                    view_id: "__prompt__".to_owned(),
-                    title,
-                    kind: PluginModalKind::Prompt {
-                        placeholder,
-                        default_value,
-                        request_id,
-                    },
-                });
-                old
-            });
-            PluginHost::bump_modal_generation(cx);
-            if let Some(old) = prev {
-                resolve_displaced_modal(old, Some((&pid_ref, "__prompt__", false)), cx);
-            }
-        }
-        PluginUiEffect::OpenModal {
-            plugin_id,
-            view_id,
-            title,
-            tree,
-        } => {
-            if let Ok(tree_json) = serde_json::to_value(&tree) {
-                PluginHost::clear_view_error(&plugin_id, &view_id, cx);
-                let pid_ref = plugin_id.clone();
-                let vid_ref = view_id.clone();
-                let prev = PluginBus::update(cx, |bus| {
-                    let old = bus.active_modal.take();
-                    bus.open_modal(PluginModalSpec {
-                        plugin_id,
-                        view_id,
-                        title,
-                        kind: PluginModalKind::View { tree: tree_json },
-                    });
-                    old
-                });
-                PluginHost::bump_modal_generation(cx);
-                if let Some(old) = prev {
-                    resolve_displaced_modal(old, Some((&pid_ref, &vid_ref, true)), cx);
-                }
-            }
-        }
-        PluginUiEffect::CloseModal { plugin_id } => {
-            let matches_modal = PluginBus::global(cx)
-                .and_then(|bus| bus.active_modal.as_ref())
-                .is_some_and(|modal| modal.plugin_id == plugin_id);
-            if matches_modal {
-                let prev = PluginBus::update(cx, |bus| bus.active_modal.take());
-                PluginHost::bump_modal_generation(cx);
-                if let Some(old) = prev {
-                    match old.kind {
-                        PluginModalKind::Confirm { request_id, .. } => {
-                            PluginHost::resolve_prompt_async(
-                                request_id,
-                                PromptReplyValue::Confirm(false),
-                                cx,
-                            );
-                        }
-                        PluginModalKind::Prompt { request_id, .. } => {
-                            PluginHost::resolve_prompt_async(
-                                request_id,
-                                PromptReplyValue::Prompt(None),
-                                cx,
-                            );
-                        }
-                        PluginModalKind::View { .. } => {
-                            PluginHost::clear_view_error(&old.plugin_id, &old.view_id, cx);
-                        }
-                    }
-                }
-            }
-        }
-        PluginUiEffect::OpenTask { task_id } => {
-            PluginBus::update(cx, |bus| bus.push_nav(PluginNavAction::OpenTask(task_id)));
-        }
-        PluginUiEffect::OpenSettings { plugin_id } => {
-            PluginHost::request_open_settings_for(plugin_id, cx);
-        }
-        PluginUiEffect::OpenExternal { url } => {
-            let trimmed = url.trim();
-            let lower = trimmed.to_ascii_lowercase();
-            if lower.starts_with("https://") || lower.starts_with("http://") {
-                cx.open_url(trimmed);
-            }
-        }
-        PluginUiEffect::ClipboardWrite { text } => {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-        }
-    }
-}
-
-pub(crate) fn schedule_toast_expiry(toast_id: u64, cx: &mut App) {
-    let timers = cx.default_global::<ScheduledToastTimers>();
-    if !timers.0.insert(toast_id) {
-        return;
-    }
-    cx.spawn(async move |cx| {
-        cx.background_executor()
-            .timer(TOAST_AUTO_DISMISS_DELAY)
-            .await;
-        cx.update(|cx| {
-            if let Some(timers) = cx.try_global::<ScheduledToastTimers>()
-                && timers.0.contains(&toast_id)
-            {
-                cx.update_global::<ScheduledToastTimers, _>(|timers, _| {
-                    timers.0.remove(&toast_id);
-                });
-            }
-            let still_present = PluginBus::global(cx)
-                .is_some_and(|bus| bus.toasts.iter().any(|t| t.id == toast_id));
-            if still_present {
-                PluginBus::update(cx, |bus| bus.dismiss_toast(toast_id));
-            }
-        });
-    })
-    .detach();
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 #[cfg(test)]

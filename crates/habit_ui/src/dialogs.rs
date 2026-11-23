@@ -14,43 +14,6 @@ use fern_i18n as i18n;
 
 use crate::HabitView;
 
-pub(crate) fn action_button(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-    filled: bool,
-    destructive: bool,
-    disabled: bool,
-    cx: &App,
-) -> Stateful<Div> {
-    let theme = cx.theme();
-    let accent = if destructive { theme.status().error } else { theme.colors().accent };
-    div()
-        .id(id)
-        .h(px(30.))
-        .px_3()
-        .rounded(px(6.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .when(!disabled, |el| el.cursor_pointer())
-        .when(disabled, |el| el.opacity(0.45))
-        .map(|el| {
-            if filled {
-                el.bg(accent).hover(|s| s.bg(accent.opacity(0.88)))
-            } else {
-                el.border_1()
-                    .border_color(theme.colors().border)
-                    .bg(theme.colors().surface_background)
-                    .hover(|s| s.bg(theme.colors().element_hover))
-            }
-        })
-        .child(
-            Label::new(label)
-                .size(LabelSize::Small)
-                .color(if filled { Color::OnAccent } else { Color::Default }),
-        )
-}
-
 /// Modal for creating or editing a day's Habit Log (mood + note).
 pub(crate) struct HabitLogModal {
     pub habit_id: Id,

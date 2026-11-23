@@ -1,4 +1,16 @@
 use super::*;
+use super::sync_loop::format_sync_error;
+use crate::reminders::Target;
+
+fn builtins_of(items: &[RailItemId]) -> Vec<fern_core::RailSection> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            RailItemId::BuiltIn(section) => Some(*section),
+            RailItemId::Plugin { .. } => None,
+        })
+        .collect()
+}
 
 #[gpui::test]
 fn update_notification_opens_the_installed_notes_without_an_updater(cx: &mut gpui::TestAppContext) {
@@ -1089,4 +1101,101 @@ fn go_to_horizons_and_summary_actions_respect_horizons_flag(cx: &mut gpui::TestA
     cx.run_until_parked();
     cx.update(|_, cx| assert_eq!(app.read(cx).section, Section::Calendar));
     assert!(cx.debug_bounds("horizons-view").is_none());
+}
+
+mod ux_perf_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn bell_clear_dismisses_active_alerts_and_renders_alerts_top_right(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            let _ = crate::keymap::load_default(&assets::Assets, cx);
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Pay taxes").unwrap();
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        let at = chrono::Local::now().naive_local();
+        let notice = Notice {
+            target: Target::Task(task.id),
+            title: task.title.clone(),
+            at,
+            constant: true,
+            has_goal: false,
+        };
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.add_notices(vec![notice.clone()], cx);
+                app.push_active_alerts(vec![notice], cx);
+                app.set_notices_open(true, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let alerts_bounds = cx.debug_bounds("active-reminder-alerts").unwrap();
+        assert!(
+            alerts_bounds.top() >= title_bar::height(),
+            "alerts banner must anchor below the title bar, got top={:?}",
+            alerts_bounds.top()
+        );
+        assert!(
+            alerts_bounds.bottom() < px(350.),
+            "alerts banner must stay top-right rather than covering bottom-right footers, got bottom={:?}",
+            alerts_bounds.bottom()
+        );
+        let notice_row_bounds = cx.debug_bounds("notice-0").unwrap();
+        assert!(
+            notice_row_bounds.size.height > px(44.),
+            "bell row with wrapped action buttons should size dynamically without fixed clipping: {:?}",
+            notice_row_bounds.size.height
+        );
+
+        let clear_bounds = cx.debug_bounds("notices-clear-all").unwrap();
+        cx.simulate_click(clear_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let view = app.read(cx);
+            assert!(view.notices.items.is_empty());
+            assert_eq!(view.notices.unread, 0);
+            assert!(!view.has_active_alert(Target::Task(task.id)));
+        });
+        assert!(cx.debug_bounds("active-reminder-alerts").is_none());
+    }
+
+    #[gpui::test]
+    fn unconfigured_sync_skips_background_polling_and_leaves_status_off_with_db_path(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = std::env::temp_dir().join(format!("fern-sync-idle-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("tasks.db");
+        let store = Rc::new(Store::open(&db_path).unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(crate::DbPath(db_path.clone()));
+        });
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let view = app.read(cx);
+            assert!(!view.has_sync_config);
+            assert!(view.sync_task.is_none());
+            assert_eq!(view.sync, crate::sync::SyncStatus::Off);
+        });
+
+        // Manual sync_now when unconfigured must stay Off without starting background work.
+        cx.update(|_, cx| app.update(cx, |app, cx| app.sync_now(cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).sync, crate::sync::SyncStatus::Off);
+        });
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

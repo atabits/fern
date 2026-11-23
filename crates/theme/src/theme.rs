@@ -298,7 +298,11 @@ impl Theme {
                 text: if dark { background.blend(ink.opacity(0.90)) } else { ink },
                 text_muted,
                 text_placeholder: text_muted,
-                text_accent: readable_accent(accent, background, ink),
+                text_accent: readable_accent_on(
+                    accent,
+                    &[background, surface, elevated, surface.blend(accent.opacity(0.22))],
+                    ink,
+                ),
                 icon: background.blend(ink.opacity(0.85)),
                 icon_muted: text_muted,
                 checkbox_border: background.blend(ink.opacity(0.48)),
@@ -308,7 +312,8 @@ impl Theme {
                 text_selection: accent.opacity(if dark { 0.34 } else { 0.25 }),
             },
             status: {
-                let error: Hsla = rgb(if dark { 0xe5484d } else { 0xe13e39 }).into();
+                let base_error: Hsla = rgb(if dark { 0xf25c61 } else { 0xc92a2a }).into();
+                let error = readable_accent_on(base_error, &[background, surface, elevated], ink);
                 StatusColors {
                     error,
                     on_error: foreground_on(&[error], 3.),
@@ -356,18 +361,19 @@ pub fn foreground_on(stops: &[Hsla], target: f32) -> Hsla {
     }
 }
 
-/// Keep the original fill color for controls while small accent text remains readable.
-pub(crate) fn readable_accent(accent: Hsla, surface: Hsla, ink: Hsla) -> Hsla {
-    if contrast(accent, surface) >= 4.5 {
+/// Keep the original fill color for controls while small accent text remains readable across all surfaces.
+pub(crate) fn readable_accent_on(accent: Hsla, surfaces: &[Hsla], ink: Hsla) -> Hsla {
+    let passes = |candidate| surfaces.iter().all(|&surface| contrast(candidate, surface) >= 4.5);
+    if passes(accent) {
         return accent;
     }
     let (mut low, mut high) = (0., 1.);
-    for _ in 0..8 {
+    for _ in 0..10 {
         let mid = (low + high) * 0.5;
-        if contrast(accent.blend(ink.opacity(mid)), surface) < 4.5 {
-            low = mid;
-        } else {
+        if passes(accent.blend(ink.opacity(mid))) {
             high = mid;
+        } else {
+            low = mid;
         }
     }
     accent.blend(ink.opacity(high))
@@ -415,6 +421,12 @@ mod tests {
             let theme = Theme::from_preset(preset);
             let colors = theme.colors();
             assert!(contrast(colors.text_accent, colors.background) >= 4.49, "{}", preset.id);
+            assert!(contrast(colors.text_accent, colors.surface_background) >= 4.49, "{}", preset.id);
+            assert!(
+                contrast(colors.text_accent, colors.surface_background.blend(colors.accent.opacity(0.22))) >= 4.49,
+                "accent pill {}",
+                preset.id,
+            );
             assert!(contrast(colors.on_accent, colors.accent) >= 3.8, "{}", preset.id);
             assert_eq!(colors.on_accent, colors.icon_on_accent, "{}", preset.id);
             if let Some(gradient) = preset.gradient {
@@ -481,6 +493,11 @@ mod tests {
             assert!(
                 contrast(status.on_error, status.error) >= 3.0,
                 "on_error contrast too low for {}",
+                preset.id
+            );
+            assert!(
+                contrast(status.error, theme.colors().surface_background) >= 4.49,
+                "error text contrast too low for {}",
                 preset.id
             );
             assert!(

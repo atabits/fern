@@ -403,3 +403,47 @@ fn escape_from_custom_reminder_restores_name_focus_and_escape_from_name_restores
         assert!(v.focus_handle(cx).is_focused(window));
     });
 }
+
+#[gpui::test]
+fn russian_countdown_modal_preserves_input_column_and_saves_every_kind(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::Ru));
+        calendar::set_date_format(Some(DateFormat::DayMonthYear));
+        assert!(keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+    });
+    let (view, cx) = cx.add_window_view(|_, cx| CountdownView::new(store.clone(), cx));
+    cx.simulate_resize(size(px(900.), px(700.)));
+
+    for kind in [
+        CountdownKind::Countdown,
+        CountdownKind::Anniversary,
+        CountdownKind::Birthday,
+        CountdownKind::Holiday,
+    ] {
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.start_new_kind(kind, window, cx);
+                let draft = v.draft.as_mut().unwrap();
+                draft.name.update(cx, |inp, cx| inp.set_text("Событие", cx));
+            });
+        });
+        if matches!(kind, CountdownKind::Countdown | CountdownKind::Anniversary) {
+            let day = cx.debug_bounds(DateField::Day.id()).unwrap();
+            let year = cx.debug_bounds(DateField::Year.id()).unwrap();
+            assert!(
+                year.right() - day.left() >= px(300.),
+                "widening label column must preserve the 308px input column for {kind:?}"
+            );
+        } else {
+            assert!(cx.debug_bounds("countdown-date-popup-trigger").is_some());
+        }
+        let save = cx.debug_bounds("countdown-save").unwrap().center();
+        cx.simulate_click(save, Modifiers::default());
+        assert!(view.read_with(cx, |v, _| v.draft.is_none()));
+    }
+
+    assert_eq!(store.countdowns().unwrap().len(), 4);
+    cx.update(|_, _| calendar::set_date_format(None));
+}

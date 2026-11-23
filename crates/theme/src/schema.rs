@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Appearance, StatusColors, Theme, ThemeColors, ThemePreset, foreground_on, presets,
-    readable_accent,
+    readable_accent_on,
 };
 
 pub const EXAMPLE_THEME_TEMPLATE: &str = r##"// Fern custom themes — JSONC format.
@@ -840,7 +840,16 @@ fn refine_theme(content: &ThemeContent, author: Option<&str>) -> (Theme, Vec<Str
         if accent_override.is_some() || background_override.is_some() || text_override.is_some() {
             let on_accent = foreground_on(&[accent], 3.8);
             theme.colors.accent = accent;
-            theme.colors.text_accent = readable_accent(accent, background, ink);
+            theme.colors.text_accent = readable_accent_on(
+                accent,
+                &[
+                    theme.colors.background,
+                    theme.colors.surface_background,
+                    theme.colors.elevated_surface_background,
+                    theme.colors.surface_background.blend(accent.opacity(0.22)),
+                ],
+                ink,
+            );
             theme.colors.on_accent = on_accent;
             theme.colors.icon_on_accent = on_accent;
             theme.colors.element_selected = background.blend(accent.opacity(if dark { 0.22 } else { 0.13 }));
@@ -854,7 +863,16 @@ fn refine_theme(content: &ThemeContent, author: Option<&str>) -> (Theme, Vec<Str
             theme.colors.background = background;
         }
         if accent_override.is_some() || background_override.is_some() || text_override.is_some() {
-            theme.colors.text_accent = readable_accent(accent, theme.colors.background, ink);
+            theme.colors.text_accent = readable_accent_on(
+                accent,
+                &[
+                    theme.colors.background,
+                    theme.colors.surface_background,
+                    theme.colors.elevated_surface_background,
+                    theme.colors.surface_background.blend(accent.opacity(0.22)),
+                ],
+                ink,
+            );
         }
         if accent_override.is_some() {
             let on_accent = foreground_on(&[accent], 3.8);
@@ -913,6 +931,15 @@ mod tests {
         for theme in &themes {
             assert!(theme.is_custom());
             assert!(contrast(theme.colors().text_accent, theme.colors().background) >= 4.49, "{}", theme.id());
+            assert!(contrast(theme.colors().text_accent, theme.colors().surface_background) >= 4.49, "{}", theme.id());
+            assert!(
+                contrast(
+                    theme.colors().text_accent,
+                    theme.colors().surface_background.blend(theme.colors().accent.opacity(0.22)),
+                ) >= 4.49,
+                "accent pill {}",
+                theme.id(),
+            );
             assert!(contrast(theme.colors().on_accent, theme.colors().accent) >= 3.8, "{}", theme.id());
         }
         assert_eq!(themes[0].id(), "fern-dusk");

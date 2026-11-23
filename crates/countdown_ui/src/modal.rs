@@ -15,6 +15,8 @@ use fern_i18n::{self as i18n, Strings};
 
 use crate::{CountdownView, Filter, PendingFocus, kind_icon, kind_label};
 
+const LABEL_WIDTH: Pixels = px(114.);
+
 /// The "new countdown" popover's state.
 pub(crate) struct Draft {
     pub(crate) name: Entity<TextInput>,
@@ -201,7 +203,7 @@ fn render_form_row(label: &'static str, content: AnyElement) -> impl IntoElement
     h_flex()
         .min_h(px(32.))
         .gap_2()
-        .child(div().w(px(80.)).flex_none().child(Label::new(label)))
+        .child(div().w(LABEL_WIDTH).flex_none().child(Label::new(label)))
         .child(div().flex_1().min_w_0().child(content))
 }
 
@@ -666,7 +668,7 @@ impl CountdownView {
         let presets = (open == Some(DraftRow::Presets)).then(|| self.render_presets_popover(kind, cx));
 
         Modal::new("countdown-modal")
-            .width(px(430.))
+            .width(px(464.))
             .padding(px(16.))
             .gap(px(8.))
             .child(
@@ -693,7 +695,7 @@ impl CountdownView {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(div().w(px(80.)).flex_none().child(icon))
+                    .child(div().w(LABEL_WIDTH).flex_none().child(icon))
                     .child(
                         h_flex()
                             .flex_1()

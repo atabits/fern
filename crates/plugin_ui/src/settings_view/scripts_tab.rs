@@ -6,7 +6,7 @@ use fern_i18n as i18n;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, Context, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, div, px,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use icons::IconName;
 use plugins::PermissionSet;
@@ -24,6 +24,7 @@ use crate::host::PluginHost;
 
 impl PluginSettingsView {
     pub(super) fn load_script_into_editor(&mut self, script: &UserScript, cx: &mut Context<Self>) {
+        self.confirm_delete_script = None;
         self.selected_script_id = Some(script.id.clone());
         self.script_enabled = script.enabled;
         self.script_trigger_kind = if script.trigger_kind.is_empty() {
@@ -53,6 +54,7 @@ impl PluginSettingsView {
     }
 
     pub(super) fn reset_new_script_editor(&mut self, cx: &mut Context<Self>) {
+        self.confirm_delete_script = None;
         self.selected_script_id = None;
         self.script_enabled = true;
         self.script_trigger_kind = "manual".to_owned();
@@ -120,7 +122,31 @@ impl PluginSettingsView {
         cx.notify();
     }
 
-    fn delete_current_script(&mut self, cx: &mut Context<Self>) {
+    fn arm_delete_current_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_script_id.clone() else {
+            return;
+        };
+        let name = self
+            .scripts
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.name.clone())
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| {
+                let raw = self.script_name_input.read(cx).text().trim().to_owned();
+                if raw.is_empty() {
+                    "Untitled Script".to_owned()
+                } else {
+                    raw
+                }
+            });
+        self.confirm_delete_script = Some((id, name));
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    pub(super) fn delete_current_script(&mut self, cx: &mut Context<Self>) {
+        self.confirm_delete_script = None;
         let Some(id) = self.selected_script_id.clone() else {
             return;
         };
@@ -552,13 +578,24 @@ impl PluginSettingsView {
                             )
                             .when(self.selected_script_id.is_some(), |row| {
                                 row.child(
-                                    Button::new("script-delete", strings.plugins_script_delete)
-                                        .variant(ButtonVariant::Destructive)
-                                        .size(ButtonSize::Sm)
-                                        .icon(IconName::Trash)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.delete_current_script(cx);
-                                        })),
+                                    div()
+                                        .when(cfg!(test), |el| {
+                                            el.debug_selector(|| {
+                                                "plugin-script-delete-btn".to_owned()
+                                            })
+                                        })
+                                        .child(
+                                            Button::new(
+                                                "script-delete",
+                                                strings.plugins_script_delete,
+                                            )
+                                            .variant(ButtonVariant::Destructive)
+                                            .size(ButtonSize::Sm)
+                                            .icon(IconName::Trash)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.arm_delete_current_script(window, cx);
+                                            })),
+                                        ),
                                 )
                             }),
                     ),

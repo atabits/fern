@@ -408,6 +408,8 @@ pub struct Strings {
     pub confirm_delete_countdown: &'static str,
     pub confirm_delete_timer: &'static str,
     pub confirm_delete_summary_template: &'static str,
+    pub confirm_delete_task_template: &'static str,
+    pub confirm_delete_script: &'static str,
     /// Unit letters for years, months, days in countdown cards.
     pub unit_letters: [&'static str; 3],
     /// A countdown's date under its numbers, as a `task_rows::format_day` template; `None` for

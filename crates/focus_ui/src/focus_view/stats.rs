@@ -658,7 +658,7 @@ impl FocusView {
                     .child(h_flex().items_start().gap_4().child(most_focused).child(year_grid)),
             });
 
-        self.bind_focus_root(v_flex().size_full(), cx)
+        self.bind_focus_root(v_flex().relative().size_full(), cx)
             .items_center()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
@@ -680,6 +680,7 @@ impl FocusView {
                 .flex_1()
                 .min_h_0(),
             )
+            .when(self.confirm_delete_all, |el| el.child(self.render_confirm_delete_all(cx)))
             .into_any_element()
     }
 

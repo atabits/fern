@@ -288,6 +288,8 @@ pub static ZH_CN: Strings = Strings {
     confirm_delete_countdown: "确定要删除这个倒数日吗？",
     confirm_delete_timer: "确定要删除这个计时器吗？",
     confirm_delete_summary_template: "确定要删除这个汇总模板吗？",
+    confirm_delete_task_template: "确定要删除这个模板吗？",
+    confirm_delete_script: "确定要删除这个脚本吗？",
     unit_letters: ["年", "月", "日"],
     countdown_date: None,
     dotted_dates: false,

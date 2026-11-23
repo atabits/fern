@@ -85,6 +85,9 @@ impl TodoView {
             Some(DropTarget::Section(Some(id))) => Some(*id),
             _ => None,
         };
+        let sec_title = section
+            .and_then(|id| self.sections.iter().find(|s| s.id == id).map(|s| s.name.clone()))
+            .unwrap_or_else(|| label.clone());
         let renaming = section.and_then(|id| self.section_rename.as_ref().filter(|(s, _)| *s == id)).map(|(_, input)| input.clone());
         let group: SharedString = match section {
             Some(id) => format!("group-header-sec-{id}").into(),
@@ -104,21 +107,26 @@ impl TodoView {
                     .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
             })
             .when_some(section.filter(|_| !self.is_current_view_archived_list()), |el, id| {
+                let sec_title = sec_title.clone();
                 el.child(div().flex_1()).child(
                     div()
                         .relative()
                         .opacity(if self.section_menu == Some(id) || crate::touch::active() { 1. } else { 0. })
                         .group_hover(group, |s| s.opacity(1.))
                         .child(
-                            IconButton::new(SharedString::from(format!("section-more-{id}")), IconName::Ellipsis)
-                                .size(px(22.))
-                                .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text(strings.more))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.section_menu = Some(id);
-                                    cx.notify();
-                                })),
+                            div()
+                                .when(cfg!(test), |el| el.debug_selector(move || format!("section-more-{id}")))
+                                .child(
+                                    IconButton::new(SharedString::from(format!("section-more-{id}")), IconName::Ellipsis)
+                                        .size(px(22.))
+                                        .icon_size(IconSize::Small)
+                                        .tooltip(Tooltip::text(strings.more))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.section_menu = Some(id);
+                                            cx.notify();
+                                        })),
+                                ),
                         )
                         .when(self.section_menu == Some(id), |el| {
                             el.child(PopoverAttachment::new(
@@ -136,15 +144,19 @@ impl TodoView {
                                             .on_click(cx.listener(move |this, _, window, cx| this.start_rename_section(id, window, cx))),
                                     )
                                     .child(
-                                        ListItem::new("delete-section")
-                                            .start_slot(Icon::new(IconName::Trash).color(Color::Error))
-                                            .child(Label::new(strings.delete_section).color(Color::Error))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.section_menu = None;
-                                                let result = this.store.delete_list_section(id);
-                                                this.check(result);
-                                                this.reload(cx);
-                                            })),
+                                        div()
+                                            .when(cfg!(test), |el| el.debug_selector(|| "delete-section".to_owned()))
+                                            .child(
+                                                ListItem::new("delete-section")
+                                                    .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                                                    .child(Label::new(strings.delete_section).color(Color::Error))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.section_menu = None;
+                                                        this.confirm_delete = Some(ConfirmDeleteTarget::Section(id, sec_title.clone()));
+                                                        cx.notify();
+                                                    })),
+                                            ),
                                     ),
                             ))
                         }),
@@ -699,6 +711,11 @@ impl TodoView {
                 let result = self.store.delete_list_section(id);
                 self.check(result);
             }
+            ConfirmDeleteTarget::Template(id, _) => {
+                let result = self.store.delete_template(id);
+                self.check(result);
+                self.cached_templates = self.store.templates().unwrap_or_default();
+            }
             ConfirmDeleteTarget::PurgeTask(id, _) => {
                 let result = self.store.purge_task(id);
                 self.check(result);
@@ -888,38 +905,44 @@ impl TodoView {
         strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (title, hint) = match &target {
+        let (title, hint): (SharedString, SharedString) = match &target {
             ConfirmDeleteTarget::List(_, name) => (
-                format!("{} \"{name}\"?", strings.delete),
-                strings.confirm_delete_list_hint,
+                format!("{} \"{name}\"?", strings.delete).into(),
+                strings.confirm_delete_list_hint.into(),
             ),
             ConfirmDeleteTarget::Tag(tag) => (
-                format!("{} \"#{tag}\"?", strings.delete),
-                strings.confirm_delete_tag_hint,
+                format!("{} \"#{tag}\"?", strings.delete).into(),
+                strings.confirm_delete_tag_hint.into(),
             ),
             ConfirmDeleteTarget::Filter(_, name) => (
-                format!("{} \"{name}\"?", strings.delete_filter),
-                strings.confirm_delete_filter_hint,
+                format!("{} \"{name}\"?", strings.delete_filter).into(),
+                strings.confirm_delete_filter_hint.into(),
             ),
             ConfirmDeleteTarget::Section(_, name) => (
-                format!("{} \"{name}\"?", strings.delete),
-                strings.confirm_delete_section_hint,
+                format!("{} \"{name}\"?", strings.delete).into(),
+                strings.confirm_delete_section_hint.into(),
+            ),
+            ConfirmDeleteTarget::Template(_, title) => (
+                strings.confirm_delete_task_template.into(),
+                title.clone().into(),
             ),
             ConfirmDeleteTarget::PurgeTask(_, title) => (
                 if title.trim().is_empty() {
                     format!("{}?", strings.delete_forever)
                 } else {
                     format!("{} \"{title}\"?", strings.delete_forever)
-                },
-                strings.confirm_delete_forever_single_hint,
+                }
+                .into(),
+                strings.confirm_delete_forever_single_hint.into(),
             ),
             ConfirmDeleteTarget::BatchPurge(count) => (
                 format!(
                     "{} ({})?",
                     strings.delete_forever,
                     strings.batch_selected.replace("{n}", &count.to_string())
-                ),
-                strings.confirm_delete_forever_hint,
+                )
+                .into(),
+                strings.confirm_delete_forever_hint.into(),
             ),
         };
         div()

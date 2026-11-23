@@ -2102,3 +2102,122 @@ fn lazy_inactive_text_edit_in_place_and_kanban_cache(cx: &mut TestAppContext) {
         });
     });
 }
+
+#[gpui::test]
+fn list_section_and_template_delete_require_confirmation_and_summary_focus(cx: &mut TestAppContext) {
+    use gpui::AppContext;
+
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let list = store.create_list("Work").unwrap();
+    let section = store.add_list_section(Some(list.id), "Backlog").unwrap();
+    let tpl_task = store.add_task("Standup").unwrap();
+    let template = store.save_template(tpl_task.id).unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    cx.simulate_resize(gpui::size(px(1200.), px(780.)));
+    cx.update(|window, cx| view.update(cx, |v, cx| v.select_view(View::List(list.id), window, cx)));
+    cx.run_until_parked();
+
+    // 1. List view section delete arms ConfirmDeleteTarget::Section without deleting in SQLite.
+    let more_sel: &'static str = Box::leak(format!("section-more-{}", section.id).into_boxed_str());
+    let more_pos = cx.debug_bounds(more_sel).unwrap().center();
+    cx.simulate_mouse_move(more_pos, None, Modifiers::default());
+    cx.simulate_click(more_pos, Modifiers::default());
+    cx.run_until_parked();
+    let del_sec_pos = cx.debug_bounds("delete-section").unwrap().center();
+    cx.simulate_click(del_sec_pos, Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.section_menu, None);
+        assert_eq!(v.confirm_delete, Some(ConfirmDeleteTarget::Section(section.id, "Backlog".to_owned())));
+    });
+    assert!(cx.debug_bounds("confirm-delete-modal").is_some());
+    assert_eq!(store.list_sections(Some(list.id)).unwrap().len(), 1);
+
+    // Escape cancels section delete without touching SQLite; confirming deletes it.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| assert!(v.confirm_delete.is_none()));
+    assert_eq!(store.list_sections(Some(list.id)).unwrap().len(), 1);
+
+    cx.simulate_mouse_move(more_pos, None, Modifiers::default());
+    cx.simulate_click(more_pos, Modifiers::default());
+    cx.run_until_parked();
+    let del_sec_pos = cx.debug_bounds("delete-section").unwrap().center();
+    cx.simulate_click(del_sec_pos, Modifiers::default());
+    cx.run_until_parked();
+    let modal_bounds = cx.debug_bounds("confirm-delete-modal").unwrap();
+    let confirm_pos = point(modal_bounds.center().x + px(120.), modal_bounds.center().y + px(38.));
+    cx.simulate_click(confirm_pos, Modifiers::default());
+    cx.run_until_parked();
+    assert!(store.list_sections(Some(list.id)).unwrap().is_empty());
+
+    // 2. Task template delete closes template popover, arms ConfirmDeleteTarget::Template,
+    //    supports Escape cancel, and deletes + bumps DataVersion on confirm.
+    let tpl_row_sel: &'static str = Box::leak(format!("template-{}", template.id).into_boxed_str());
+    let tpl_del_sel: &'static str = Box::leak(format!("delete-template-{}", template.id).into_boxed_str());
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.cached_templates = v.store.templates().unwrap_or_default();
+            v.templates_open = true;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let tpl_center = cx.debug_bounds(tpl_row_sel).unwrap().center();
+    cx.simulate_mouse_move(tpl_center, None, Modifiers::default());
+    cx.run_until_parked();
+    let tpl_del_pos = cx.debug_bounds(tpl_del_sel).unwrap().center();
+    cx.simulate_click(tpl_del_pos, Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(!v.templates_open);
+        assert_eq!(v.confirm_delete, Some(ConfirmDeleteTarget::Template(template.id, "Standup".to_owned())));
+    });
+    assert_eq!(store.templates().unwrap().len(), 1);
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| assert!(v.confirm_delete.is_none()));
+    assert_eq!(store.templates().unwrap().len(), 1);
+
+    let other = cx.update(|_, cx| {
+        let other = cx.new(|_| ());
+        crate::data_version::data_changed(other.entity_id(), cx);
+        other
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.templates_open = true;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_mouse_move(tpl_center, None, Modifiers::default());
+    cx.run_until_parked();
+    let tpl_del_pos = cx.debug_bounds(tpl_del_sel).unwrap().center();
+    cx.simulate_click(tpl_del_pos, Modifiers::default());
+    cx.run_until_parked();
+    let modal_bounds = cx.debug_bounds("confirm-delete-modal").unwrap();
+    let confirm_pos = point(modal_bounds.center().x + px(120.), modal_bounds.center().y + px(38.));
+    cx.simulate_click(confirm_pos, Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |v, cx| {
+        assert!(v.confirm_delete.is_none());
+        assert!(v.cached_templates.is_empty());
+        assert!(crate::data_version::changed_elsewhere(other.entity_id(), cx));
+    });
+    assert!(store.templates().unwrap().is_empty());
+
+    // 3. Switching to View::Summary focuses SummaryView's focus_handle.
+    cx.update(|window, cx| view.update(cx, |v, cx| v.select_view(View::Summary, window, cx)));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(view.read(cx).summary.read(cx).focus_handle(cx).is_focused(window));
+    });
+}

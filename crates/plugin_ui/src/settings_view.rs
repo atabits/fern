@@ -113,6 +113,7 @@ pub struct PluginSettingsView {
     script_running: bool,
     script_run_seq: u64,
     script_result: Option<ScriptRunResult>,
+    confirm_delete_script: Option<(String, String)>,
 
     // Browse tab state
     registries: Vec<RegistrySource>,
@@ -211,6 +212,7 @@ impl PluginSettingsView {
             script_running: false,
             script_run_seq: 0,
             script_result: None,
+            confirm_delete_script: None,
             registries,
             catalog_items: Vec::new(),
             registry_errors: Vec::new(),
@@ -250,6 +252,13 @@ impl PluginSettingsView {
     }
 
     #[cfg(test)]
+    pub(crate) fn confirm_delete_script_for_test(&self) -> Option<(&str, &str)> {
+        self.confirm_delete_script
+            .as_ref()
+            .map(|(id, name)| (id.as_str(), name.as_str()))
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_cached_inputs_for(&self, plugin_id: &str) -> bool {
         self.setting_inputs.keys().any(|(p, _)| p == plugin_id)
             || self.secret_inputs.keys().any(|(p, _)| p == plugin_id)
@@ -268,11 +277,15 @@ impl PluginSettingsView {
 
     /// Handles an Escape press inside [`PluginSettingsView`].
     ///
-    /// Dismisses transient UI in priority order (`pending_permission_modal` -> open `Select`
-    /// popover -> `active_plugin_page`) and returns `true` if handled so the parent Settings
-    /// window stays open.
+    /// Dismisses transient UI in priority order (`pending_permission_modal` ->
+    /// `confirm_delete_script` -> open `Select` popover -> `active_plugin_page`) and returns
+    /// `true` if handled so the parent Settings window stays open.
     pub fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
         if self.pending_permission_modal.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        if self.confirm_delete_script.take().is_some() {
             cx.notify();
             return true;
         }
@@ -294,6 +307,7 @@ impl PluginSettingsView {
         view_id: String,
         cx: &mut Context<Self>,
     ) {
+        self.confirm_delete_script = None;
         if let Some(prev) = self.active_plugin_page.take() {
             prev.view.update(cx, |v, cx| v.unmount(cx));
         }
@@ -318,8 +332,12 @@ impl PluginSettingsView {
     }
 
     pub fn close_plugin_page(&mut self, cx: &mut Context<Self>) {
+        let mut changed = self.confirm_delete_script.take().is_some();
         if let Some(prev) = self.active_plugin_page.take() {
             prev.view.update(cx, |v, cx| v.unmount(cx));
+            changed = true;
+        }
+        if changed {
             cx.notify();
         }
     }
@@ -330,6 +348,7 @@ impl PluginSettingsView {
         }
         self.close_plugin_page(cx);
         self.tab = tab;
+        self.confirm_delete_script = None;
         self.open_select_setting = None;
         if tab == PluginSettingsTab::Scripts {
             self.scripts = self.store.user_scripts().unwrap_or_default();
@@ -1319,6 +1338,11 @@ impl Render for PluginSettingsView {
                 .children(permission_modal);
         }
 
+        let delete_script_modal = self
+            .confirm_delete_script
+            .as_ref()
+            .map(|(_, name)| self.render_delete_script_modal(name, cx));
+
         let tabs = SegmentedTabs::new()
             .tab(
                 SegmentedTab::new("plugins-tab-installed", strings.plugins_installed)
@@ -1415,6 +1439,7 @@ impl Render for PluginSettingsView {
                 .track_scroll(&self.scroll_handle)
                 .size_full(),
             )
+            .children(delete_script_modal)
             .children(permission_modal)
     }
 }

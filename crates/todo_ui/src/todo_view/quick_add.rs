@@ -69,6 +69,7 @@ impl TodoView {
             })
             .children(templates.iter().cloned().map(|template| {
                 let id = template.id;
+                let template_title = template.title.clone();
                 let group = SharedString::from(format!("template-{id}"));
                 let tags = (!template.tags.is_empty())
                     .then(|| template.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "));
@@ -76,6 +77,7 @@ impl TodoView {
                 h_flex()
                     .id(group.clone())
                     .group(group.clone())
+                    .when(cfg!(test), |el| el.debug_selector(move || format!("template-{id}")))
                     .h(px(34.))
                     .px_2()
                     .gap_2()
@@ -90,21 +92,24 @@ impl TodoView {
                             .child(Label::new(checklist.to_string()).size(LabelSize::XSmall).color(Color::Muted))
                     })
                     .child(
-                        div().opacity(if crate::touch::active() { 1. } else { 0. }).group_hover(group, |s| s.opacity(1.)).child(
-                            IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
-                                .size(px(20.))
-                                .icon_size(IconSize::XSmall)
-                                .icon_color(Color::Muted)
-                                .hover_icon_color(Color::Error)
-                                .tooltip(Tooltip::text(strings.delete))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    let result = this.store.delete_template(id);
-                                    this.check(result);
-                                    this.cached_templates = this.store.templates().unwrap_or_default();
-                                    cx.notify();
-                                })),
-                        ),
+                        div()
+                            .opacity(if crate::touch::active() { 1. } else { 0. })
+                            .group_hover(group, |s| s.opacity(1.))
+                            .when(cfg!(test), |el| el.debug_selector(move || format!("delete-template-{id}")))
+                            .child(
+                                IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
+                                    .size(px(20.))
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .hover_icon_color(Color::Error)
+                                    .tooltip(Tooltip::text(strings.delete))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.templates_open = false;
+                                        this.confirm_delete = Some(ConfirmDeleteTarget::Template(id, template_title.clone()));
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.add_from_template(id, cx)))
             }))

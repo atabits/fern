@@ -30,7 +30,6 @@ pub(super) enum RecordMenu {
 impl FocusView {
     pub(super) fn set_record_menu(&mut self, menu: Option<RecordMenu>, cx: &mut Context<Self>) {
         self.record_menu = menu;
-        self.delete_all_armed = false;
         cx.notify();
     }
 
@@ -157,19 +156,7 @@ impl FocusView {
             eprintln!("failed to delete the focus record: {err:#}");
         }
         self.reload(cx);
-    }
-
-    fn delete_all(&mut self, cx: &mut Context<Self>) {
-        if !self.delete_all_armed {
-            self.delete_all_armed = true;
-            cx.notify();
-            return;
-        }
-        if let Err(err) = self.store.delete_all_focus_sessions() {
-            eprintln!("failed to delete the focus records: {err:#}");
-        }
-        self.set_record_menu(None, cx);
-        self.reload(cx);
+        desktop_common::data_version::data_changed(cx.entity_id(), cx);
     }
 
     fn export(&mut self, cx: &mut Context<Self>) {
@@ -997,7 +984,7 @@ impl FocusView {
                     .into_any_element()
             }
             RecordMenu::Batch => div().into_any_element(),
-            // As the original's: 178 px wide (wider when a label needs it), a row every 34 px, Delete All in red only once armed.
+            // As the original's: 178 px wide (wider when a label needs it), a row every 34 px.
             RecordMenu::More => popover(cx)
                 .min_w(px(178.))
                 .on_mouse_down_out(close)
@@ -1020,14 +1007,19 @@ impl FocusView {
                         .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
                 )
                 .child(
-                    ListItem::new("focus-delete-all")
-                        .height(px(34.))
-                        .start_slot(Icon::new(IconName::Trash).color(if self.delete_all_armed { Color::Error } else { Color::Muted }))
+                    div()
+                        .when(cfg!(test), |el| el.debug_selector(|| "focus-delete-all-item".to_owned()))
                         .child(
-                            Label::new(if self.delete_all_armed { strings.delete_all_confirm } else { strings.delete_all })
-                                .color(if self.delete_all_armed { Color::Error } else { Color::Default }),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.delete_all(cx))),
+                            ListItem::new("focus-delete-all")
+                                .height(px(34.))
+                                .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                                .child(Label::new(strings.delete_all).color(Color::Error))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.record_menu = None;
+                                    this.confirm_delete_all = true;
+                                    cx.notify();
+                                })),
+                        ),
                 )
                 .into_any_element(),
             RecordMenu::Add => {

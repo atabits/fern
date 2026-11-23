@@ -221,8 +221,7 @@ pub struct FocusView {
     timer_draft: Option<TimerDraft>,
     timer_menu: Option<Id>,
     confirm_delete_timer: Option<(Id, String)>,
-    /// "Delete All" asks for a second click.
-    delete_all_armed: bool,
+    confirm_delete_all: bool,
     /// The records ticked in Batch Management, its filters and the filter whose menu is open.
     batch: HashSet<Id>,
     confirm_batch_delete: bool,
@@ -304,7 +303,7 @@ impl FocusView {
             timer_draft: None,
             timer_menu: None,
             confirm_delete_timer: None,
-            delete_all_armed: false,
+            confirm_delete_all: false,
             batch: HashSet::new(),
             confirm_batch_delete: false,
             batch_filter: Default::default(),
@@ -878,6 +877,7 @@ impl FocusView {
                     && this.picker.is_none()
                     && !this.finish_prompt
                     && !this.confirm_batch_delete
+                    && !this.confirm_delete_all
                     && this.confirm_delete_timer.is_none()
                     && this.review_window.is_none()
                 {
@@ -916,6 +916,10 @@ impl FocusView {
             cx.notify();
             return true;
         }
+        if std::mem::take(&mut self.confirm_delete_all) {
+            cx.notify();
+            return true;
+        }
         if self.confirm_delete_timer.take().is_some() {
             cx.notify();
             return true;
@@ -937,7 +941,6 @@ impl FocusView {
             || self.timer_draft.take().is_some()
             || self.picker.take().is_some()
         {
-            self.delete_all_armed = false;
             cx.notify();
             true
         } else if self.finish_prompt {
@@ -1212,11 +1215,15 @@ impl FocusView {
                         div()
                             .relative()
                             .child(
-                                IconButton::new("record-more", IconName::Ellipsis)
-                                    .tooltip(Tooltip::text(strings.more))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_record_menu(Some(RecordMenu::More), cx)
-                                    })),
+                                div()
+                                    .when(cfg!(test), |el| el.debug_selector(|| "focus-record-more".to_owned()))
+                                    .child(
+                                        IconButton::new("record-more", IconName::Ellipsis)
+                                            .tooltip(Tooltip::text(strings.more))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_record_menu(Some(RecordMenu::More), cx)
+                                            })),
+                                    ),
                             )
                             .when_some(self.record_menu.filter(|m| *m == RecordMenu::More), |el, menu| {
                                 el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(menu, cx)))
@@ -1346,6 +1353,37 @@ impl FocusView {
                     .child(Label::new(*label).size(size).color(if selected { Color::Default } else { Color::Muted }))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_stopwatch_mode(i == 1, cx)))
             }))
+            .into_any_element()
+    }
+
+    pub(super) fn render_confirm_delete_all(&self, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        div()
+            .absolute()
+            .inset_0()
+            .when(cfg!(test), |el| {
+                el.debug_selector(|| "focus-delete-all-modal".to_owned())
+            })
+            .child(
+                ConfirmDialog::new("focus-delete-all", strings.delete_all)
+                    .width(px(360.))
+                    .description(strings.focus_batch_delete_message)
+                    .cancel_label(strings.cancel)
+                    .confirm_label(strings.delete)
+                    .destructive(true)
+                    .on_cancel(cx.listener(|this, _, _, cx| {
+                        this.confirm_delete_all = false;
+                        cx.notify();
+                    }))
+                    .on_confirm(cx.listener(|this, _, _, cx| {
+                        this.confirm_delete_all = false;
+                        if let Err(err) = this.store.delete_all_focus_sessions() {
+                            eprintln!("failed to delete the focus records: {err:#}");
+                        }
+                        this.reload(cx);
+                        desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                    })),
+            )
             .into_any_element()
     }
 
@@ -1666,6 +1704,7 @@ impl Render for FocusView {
                         })),
                 )
             })
+            .when(self.confirm_delete_all, |el| el.child(self.render_confirm_delete_all(cx)))
             .when_some(self.confirm_delete_timer.clone(), |el, (id, name)| {
                 let strings = i18n::t(cx);
                 el.child(

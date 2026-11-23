@@ -8,7 +8,7 @@ use chrono::{Local, NaiveDate};
 use fern_core::markdown::{self, Format};
 use fern_core::summary::{Field, GroupKey, Grouping, Period, StatusFilter, SummaryGroup, SummaryOptions, summarize};
 use fern_core::{List, Priority, Store, Task};
-use gpui::{ClipboardItem, Entity, Focusable as _, FontWeight};
+use gpui::{ClipboardItem, Entity, FocusHandle, Focusable as _, FontWeight};
 use ui::prelude::*;
 use ui::Tooltip;
 use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
@@ -48,6 +48,7 @@ struct CachedSummary {
 
 pub struct SummaryView {
     store: Rc<Store>,
+    focus_handle: FocusHandle,
     options: SummaryOptions,
     menu: Option<Menu>,
     /// "Copied" shows on the button after a copy.
@@ -210,12 +211,19 @@ pub fn report(groups: &[SummaryGroup], options: &SummaryOptions, lists: &[List],
     Report { heading, groups }
 }
 
+impl gpui::Focusable for SummaryView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl SummaryView {
-    pub fn new(store: Rc<Store>) -> Self {
+    pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
         // The original keeps the Summary's choices; so does Fern, in the settings table.
         let options = store.summary_options().unwrap_or_default();
         Self {
             store,
+            focus_handle: cx.focus_handle(),
             options,
             menu: None,
             copied: false,
@@ -688,6 +696,9 @@ impl SummaryView {
                         if !keep_open {
                             this.set_menu(None, cx);
                         }
+                        if this.pending_options.is_some() {
+                            window.focus(&this.focus_handle, cx);
+                        }
                     }))
             });
             PopoverAttachment::new(
@@ -773,16 +784,20 @@ impl SummaryView {
                                             .icon_color(Color::Muted)
                                             .hover_icon_color(Color::Error)
                                             .tooltip(Tooltip::text(strings.delete))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                            .on_click(cx.listener(move |this, _, window, cx| {
                                                 cx.stop_propagation();
                                                 this.confirm_delete_template = Some((id, template_name.clone()));
+                                                window.focus(&this.focus_handle, cx);
                                                 cx.notify();
                                             })),
                                     ),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 let options = options.clone();
                                 this.update(cx, |o| *o = options);
+                                if this.pending_options.is_some() {
+                                    window.focus(&this.focus_handle, cx);
+                                }
                             }))
                     }))
                     .child(
@@ -1165,7 +1180,12 @@ impl SummaryView {
                     .cursor_pointer()
                     .child(div().flex_1().child(Label::new(strings.summary_next_period).weight(FontWeight::SEMIBOLD)))
                     .child(Switch::new().toggle_state(options.next_period))
-                    .on_click(cx.listener(|this, _, _, cx| this.update(cx, |o| o.next_period = !o.next_period))),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.update(cx, |o| o.next_period = !o.next_period);
+                        if this.pending_options.is_some() {
+                            window.focus(&this.focus_handle, cx);
+                        }
+                    })),
             );
 
         v_flex()
@@ -1244,6 +1264,7 @@ impl Render for SummaryView {
         h_flex()
             .relative()
             .size_full()
+            .track_focus(&self.focus_handle)
             .items_start()
             .on_action(cx.listener(|this, _: &md::DismissTransient, _, cx| {
                 if !this.dismiss_transient(cx) {
@@ -1264,14 +1285,19 @@ impl Render for SummaryView {
                             .child(div().flex_1().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(strings.summary))
                             .when(has_manual_edits, |el| {
                                 el.child(
-                                    Button::new("summary-reset-edits", strings.habit_reset)
-                                        .variant(ButtonVariant::Ghost)
-                                        .size(ButtonSize::Sm)
-                                        .icon(IconName::RotateCcw)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pending_options = Some(this.options.clone());
-                                            cx.notify();
-                                        })),
+                                    div()
+                                        .when(cfg!(test), |el| el.debug_selector(|| "summary-reset-edits".to_owned()))
+                                        .child(
+                                            Button::new("summary-reset-edits", strings.habit_reset)
+                                                .variant(ButtonVariant::Ghost)
+                                                .size(ButtonSize::Sm)
+                                                .icon(IconName::RotateCcw)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.pending_options = Some(this.options.clone());
+                                                    window.focus(&this.focus_handle, cx);
+                                                    cx.notify();
+                                                })),
+                                        ),
                                 )
                             }),
                     )
@@ -1500,7 +1526,7 @@ mod tests {
         let t1 = store.add_task("First shipped task").unwrap();
         store.set_completed(t1.id, true).unwrap();
 
-        let (view, cx) = cx.add_window_view(|_, _| SummaryView::new(store.clone()));
+        let (view, cx) = cx.add_window_view(|_, cx| SummaryView::new(store.clone(), cx));
         cx.run_until_parked();
 
         // Initial render builds cache once.
@@ -1551,7 +1577,7 @@ mod tests {
         let t1 = store.add_task("Alpha task").unwrap();
         store.set_completed(t1.id, true).unwrap();
 
-        let (view, cx) = cx.add_window_view(|_, _| SummaryView::new(store.clone()));
+        let (view, cx) = cx.add_window_view(|_, cx| SummaryView::new(store.clone(), cx));
         cx.run_until_parked();
 
         // Enter edit mode, make NO edits, and exit edit mode.
@@ -1595,7 +1621,7 @@ mod tests {
             cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
         });
         let store = Rc::new(Store::open_in_memory().unwrap());
-        let (view, cx) = cx.add_window_view(|_, _| SummaryView::new(store));
+        let (view, cx) = cx.add_window_view(|_, cx| SummaryView::new(store, cx));
         cx.run_until_parked();
 
         view.update(cx, |v, cx| v.copy_text("first".into(), cx));
@@ -1630,7 +1656,7 @@ mod tests {
         let t1 = store.add_task("Initial done").unwrap();
         store.set_completed(t1.id, true).unwrap();
 
-        let (view, cx) = cx.add_window_view(|_, _| SummaryView::new(store.clone()));
+        let (view, cx) = cx.add_window_view(|_, cx| SummaryView::new(store.clone(), cx));
         cx.run_until_parked();
         view.read_with(cx, |v, _| assert_eq!(v.rebuild_count, 1));
 
@@ -1671,8 +1697,18 @@ mod tests {
         let store = Rc::new(Store::open_in_memory().unwrap());
         let template = store.save_summary_template("Weekly Review", &SummaryOptions::default()).unwrap();
 
-        let (view, cx) = cx.add_window_view(|_, _| SummaryView::new(store.clone()));
+        let (view, cx) = cx.add_window_view(|_, cx| SummaryView::new(store.clone(), cx));
         cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        // Start with the markdown editor focused so we verify opening confirmation dialogs
+        // moves focus back onto SummaryView's focus_handle for Escape dismissal.
+        view.update_in(cx, |v, window, cx| {
+            v.toggle_editing(window, cx);
+            let editor = v.editor.as_ref().unwrap().clone();
+            editor.update(cx, |input, cx| input.set_text("# Manual Edit".to_owned(), cx));
+            assert!(editor.focus_handle(cx).is_focused(window));
+        });
         cx.run_until_parked();
 
         // Hover template chip to reveal the delete button, then click delete -> opens ConfirmDialog only.
@@ -1691,8 +1727,11 @@ mod tests {
         assert!(cx.debug_bounds("summary-template-delete-modal").is_some());
         assert_eq!(store.summary_templates().unwrap().len(), 1, "template must remain in SQLite before confirmation");
 
-        // Escape / dismiss_transient cancels without deleting.
-        view.update(cx, |v, cx| assert!(v.dismiss_transient(cx)));
+        // Escape / DismissTransient reaches SummaryView::dismiss_transient and cancels without deleting.
+        cx.update(|window, cx| {
+            assert!(view.read(cx).focus_handle(cx).is_focused(window));
+            window.dispatch_action(Box::new(md::DismissTransient), cx);
+        });
         cx.run_until_parked();
         view.read_with(cx, |v, _| assert!(v.confirm_delete_template.is_none()));
         assert!(cx.debug_bounds("summary-template-delete-modal").is_none());
@@ -1704,7 +1743,7 @@ mod tests {
         cx.simulate_click(delete_btn, gpui::Modifiers::default());
         cx.run_until_parked();
         let modal_bounds = cx.debug_bounds("summary-template-delete-modal").unwrap();
-        let confirm_btn = gpui::point(modal_bounds.center().x + px(120.), modal_bounds.center().y + px(34.));
+        let confirm_btn = gpui::point(modal_bounds.center().x + px(120.), modal_bounds.center().y + px(38.));
         cx.simulate_click(confirm_btn, gpui::Modifiers::default());
         cx.run_until_parked();
 
@@ -1713,5 +1752,22 @@ mod tests {
             assert!(v.cache.as_ref().unwrap().templates.is_empty());
         });
         assert!(store.summary_templates().unwrap().is_empty());
+
+        // Clicking Reset with editor focused moves focus to SummaryView so Escape dismisses pending_options.
+        cx.update(|window, cx| {
+            let editor = view.read(cx).editor.as_ref().unwrap().clone();
+            window.focus(&editor.focus_handle(cx), cx);
+            assert!(editor.focus_handle(cx).is_focused(window));
+        });
+        let reset_btn = cx.debug_bounds("summary-reset-edits").unwrap().center();
+        cx.simulate_click(reset_btn, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(view.read(cx).pending_options.is_some());
+            assert!(view.read(cx).focus_handle(cx).is_focused(window));
+            window.dispatch_action(Box::new(md::DismissTransient), cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| assert!(v.pending_options.is_none()));
     }
 }

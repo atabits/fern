@@ -277,10 +277,10 @@ impl TodoView {
         let switching = self.view != view;
         self.set_view(view, cx);
         if switching {
-            if self.view == View::Horizons {
-                window.focus(&self.horizons.focus_handle(cx), cx);
-            } else if self.view != View::Summary {
-                window.focus(&self.list_focus, cx);
+            match self.view {
+                View::Horizons => window.focus(&self.horizons.focus_handle(cx), cx),
+                View::Summary => window.focus(&self.summary.focus_handle(cx), cx),
+                _ => window.focus(&self.list_focus, cx),
             }
         }
     }

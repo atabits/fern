@@ -11,7 +11,7 @@ use plugins::registry::RegistryClient;
 use plugins::{Permission, PermissionApprovalStatus, PluginStatus, RegistrySource};
 use theme::ActiveTheme as _;
 use ui::prelude::*;
-use ui::{Button, ButtonVariant, Color, Icon, IconSize, Label, LabelSize, Modal};
+use ui::{Button, ButtonVariant, Color, ConfirmDialog, Icon, IconSize, Label, LabelSize, Modal};
 use uuid::Uuid;
 
 use super::PluginSettingsView;
@@ -464,6 +464,37 @@ impl PluginSettingsView {
                                 this.approve_pending_permissions(cx);
                             })),
                     ),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn render_delete_script_modal(
+        &self,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let strings = i18n::t(cx);
+        div()
+            .absolute()
+            .inset_0()
+            .when(cfg!(test), |el| {
+                el.debug_selector(|| "plugin-script-delete-modal".to_owned())
+            })
+            .child(
+                ConfirmDialog::new("plugin-script-delete", strings.confirm_delete_script)
+                    .width(px(340.))
+                    .description(name.to_owned())
+                    .cancel_label(strings.cancel)
+                    .confirm_label(strings.delete)
+                    .destructive(true)
+                    .on_cancel(cx.listener(|this, _, _, cx| {
+                        this.confirm_delete_script = None;
+                        cx.notify();
+                    }))
+                    .on_confirm(cx.listener(|this, _, _, cx| {
+                        this.confirm_delete_script = None;
+                        this.delete_current_script(cx);
+                    })),
             )
             .into_any_element()
     }

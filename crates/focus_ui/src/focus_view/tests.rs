@@ -269,3 +269,80 @@ fn timer_delete_requires_confirmation_and_supports_escape_and_confirm(cx: &mut g
     assert!(store.focus_timers(false).unwrap().is_empty());
     assert!(view.read_with(cx, |v, _| v.timers.is_empty()));
 }
+
+#[gpui::test]
+fn delete_all_requires_confirmation_and_record_delete_bumps_data_version(cx: &mut gpui::TestAppContext) {
+    use gpui::{AppContext, Modifiers, size};
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+    });
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let now = now_ms();
+    let s1 = store.add_focus_session(None, "First session", now - 900_000, now - 600_000).unwrap();
+    store.add_focus_session(None, "Second session", now - 300_000, now).unwrap();
+
+    let (view, cx) = cx.add_window_view(|_, cx| FocusView::new(store.clone(), cx));
+    cx.simulate_resize(size(px(1000.), px(700.)));
+    let other = cx.update(|window, cx| {
+        window.focus(&view.read(cx).focus_handle(cx), cx);
+        let other = cx.new(|_| ());
+        desktop_common::data_version::data_changed(other.entity_id(), cx);
+        other
+    });
+    cx.run_until_parked();
+
+    // Deleting a single record bumps DataVersion.
+    view.update(cx, |v, cx| v.delete_record(s1.id, cx));
+    cx.run_until_parked();
+    assert_eq!(store.focus_sessions().unwrap().len(), 1);
+    assert!(cx.update(|_, cx| desktop_common::data_version::changed_elsewhere(other.entity_id(), cx)));
+
+    // Reset DataVersion marker, then open records "More" menu -> "Delete All".
+    cx.update(|_, cx| desktop_common::data_version::data_changed(other.entity_id(), cx));
+    let more_pos = cx.debug_bounds("focus-record-more").unwrap().center();
+    cx.simulate_click(more_pos, Modifiers::default());
+    cx.run_until_parked();
+    let delete_all_pos = cx.debug_bounds("focus-delete-all-item").unwrap().center();
+    cx.simulate_click(delete_all_pos, Modifiers::default());
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert!(v.record_menu.is_none());
+        assert!(v.confirm_delete_all);
+    });
+    assert!(cx.debug_bounds("focus-delete-all-modal").is_some());
+    assert_eq!(store.focus_sessions().unwrap().len(), 1, "sessions must remain before confirmation");
+
+    // Space hotkey must not start a timer while confirmation dialog is open.
+    cx.simulate_keystrokes("space");
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, _| !v.is_running()));
+
+    // Escape / DismissTransient cancels without deleting.
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(crate::actions::DismissTransient), cx);
+    });
+    cx.run_until_parked();
+    assert!(!view.read_with(cx, |v, _| v.confirm_delete_all));
+    assert!(cx.debug_bounds("focus-delete-all-modal").is_none());
+    assert_eq!(store.focus_sessions().unwrap().len(), 1);
+
+    // Re-trigger Delete All and confirm -> deletes all sessions and bumps DataVersion.
+    cx.simulate_click(more_pos, Modifiers::default());
+    cx.run_until_parked();
+    let delete_all_pos = cx.debug_bounds("focus-delete-all-item").unwrap().center();
+    cx.simulate_click(delete_all_pos, Modifiers::default());
+    cx.run_until_parked();
+    let modal_bounds = cx.debug_bounds("focus-delete-all-modal").unwrap();
+    let confirm_pos = gpui::point(modal_bounds.center().x + px(125.), modal_bounds.center().y + px(38.));
+    cx.simulate_click(confirm_pos, Modifiers::default());
+    cx.run_until_parked();
+
+    assert!(!view.read_with(cx, |v, _| v.confirm_delete_all));
+    assert!(cx.debug_bounds("focus-delete-all-modal").is_none());
+    assert!(store.focus_sessions().unwrap().is_empty());
+    assert!(view.read_with(cx, |v, _| v.sessions.is_empty()));
+    assert!(cx.update(|_, cx| desktop_common::data_version::changed_elsewhere(other.entity_id(), cx)));
+}

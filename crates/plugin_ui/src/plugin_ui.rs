@@ -1620,4 +1620,96 @@ mod tests {
             PluginHost::shutdown(cx);
         });
     }
+
+    #[gpui::test]
+    fn user_script_delete_requires_confirmation_and_escape_cancels(cx: &mut TestAppContext) {
+        let _tmp = setup_host(cx);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        store
+            .save_user_script(&UserScript {
+                id: "s-del".to_owned(),
+                name: "Daily Cleanup".to_owned(),
+                enabled: true,
+                trigger_kind: "manual".to_owned(),
+                trigger_arg: String::new(),
+                permissions: r#"["tasks:read"]"#.to_owned(),
+                code: "return 1;".to_owned(),
+                updated_at: 100,
+            })
+            .unwrap();
+
+        let (settings, cx) =
+            cx.add_window_view(|_, cx| PluginSettingsView::new(Rc::clone(&store), cx));
+        cx.simulate_resize(size(px(900.), px(820.)));
+        cx.update(|_, cx| {
+            settings.update(cx, |view, cx| view.set_tab(PluginSettingsTab::Scripts, cx));
+        });
+        cx.run_until_parked();
+
+        // Clicking Delete arms confirmation without deleting from SQLite.
+        let delete_btn = cx
+            .debug_bounds("plugin-script-delete-btn")
+            .expect("script delete button bounds")
+            .center();
+        cx.simulate_click(delete_btn, Modifiers::default());
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert_eq!(
+                settings.read(cx).confirm_delete_script_for_test(),
+                Some(("s-del", "Daily Cleanup")),
+                "clicking Delete must arm confirmation dialog"
+            );
+        });
+        assert!(
+            cx.debug_bounds("plugin-script-delete-modal").is_some(),
+            "ConfirmDialog must render when delete is armed"
+        );
+        assert_eq!(
+            store.user_scripts().unwrap().len(),
+            1,
+            "script must stay in SQLite before confirmation"
+        );
+
+        // Escape dismisses confirmation cleanly without deleting.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert!(
+                settings.read(cx).confirm_delete_script_for_test().is_none(),
+                "Escape must clear pending script delete confirmation"
+            );
+        });
+        assert!(cx.debug_bounds("plugin-script-delete-modal").is_none());
+        assert_eq!(store.user_scripts().unwrap().len(), 1);
+
+        // Re-arm and click Confirm -> deletes from SQLite.
+        let delete_btn = cx
+            .debug_bounds("plugin-script-delete-btn")
+            .expect("script delete button bounds")
+            .center();
+        cx.simulate_click(delete_btn, Modifiers::default());
+        cx.run_until_parked();
+
+        let modal_bounds = cx
+            .debug_bounds("plugin-script-delete-modal")
+            .expect("delete confirmation modal bounds");
+        let confirm_btn = point(
+            modal_bounds.center().x + px(120.),
+            modal_bounds.center().y + px(38.),
+        );
+        cx.simulate_click(confirm_btn, Modifiers::default());
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert!(settings.read(cx).confirm_delete_script_for_test().is_none());
+            PluginHost::shutdown(cx);
+        });
+        assert!(cx.debug_bounds("plugin-script-delete-modal").is_none());
+        assert!(
+            store.user_scripts().unwrap().is_empty(),
+            "confirming dialog must delete the script from SQLite"
+        );
+    }
 }

@@ -288,6 +288,8 @@ pub static EN: Strings = Strings {
     confirm_delete_countdown: "Delete this countdown?",
     confirm_delete_timer: "Delete this timer?",
     confirm_delete_summary_template: "Delete this summary template?",
+    confirm_delete_task_template: "Delete this template?",
+    confirm_delete_script: "Delete this script?",
     unit_letters: ["Y", "M", "D"],
     countdown_date: None,
     dotted_dates: false,

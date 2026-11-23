@@ -97,6 +97,7 @@ pub(super) enum ConfirmDeleteTarget {
     Tag(String),
     Filter(Id, String),
     Section(Id, String),
+    Template(Id, String),
     PurgeTask(Id, String),
     BatchPurge(usize),
 }
@@ -333,7 +334,7 @@ impl TodoView {
         cx: &mut Context<Self>,
     ) -> Self {
         let strings = i18n::t(cx);
-        let summary = cx.new(|_| crate::summary_view::SummaryView::new(store.clone()));
+        let summary = cx.new(|cx| crate::summary_view::SummaryView::new(store.clone(), cx));
         let horizons = cx.new(|cx| crate::horizons_view::HorizonsView::new(store.clone(), window, cx));
         cx.subscribe_in(&horizons, window, |_this, _, event: &crate::horizons_view::HorizonsEvent, window, cx| {
             match event {

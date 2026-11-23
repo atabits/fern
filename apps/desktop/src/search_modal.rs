@@ -642,11 +642,32 @@ impl SearchModal {
 
     fn highlighted(&self, text: &str, query: &str, cx: &App) -> StyledText {
         let highlight = HighlightStyle {
-            background_color: Some(cx.theme().status().warning.opacity(0.45)),
+            color: Some(cx.theme().colors().text_accent),
+            font_weight: Some(FontWeight::SEMIBOLD),
+            background_color: Some(cx.theme().colors().accent.opacity(0.18)),
             ..Default::default()
         };
         StyledText::new(text.to_owned())
             .with_highlights(task_rows::match_ranges(text, query).into_iter().map(|range| (range, highlight)))
+    }
+
+    fn strip_markdown_inline(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while !rest.is_empty() {
+            if let Some(after) = rest
+                .strip_prefix("**")
+                .or_else(|| rest.strip_prefix("__"))
+                .or_else(|| rest.strip_prefix("~~"))
+                .or_else(|| rest.strip_prefix('`'))
+            {
+                rest = after;
+            } else if let Some(ch) = rest.chars().next() {
+                out.push(ch);
+                rest = &rest[ch.len_utf8()..];
+            }
+        }
+        out
     }
 
     fn group_heading(label: &'static str) -> impl IntoElement {
@@ -742,7 +763,10 @@ impl Render for SearchModal {
                         .then(|| task_rows::horizon_badge(task, today, strings))
                         .flatten();
                     let title_matches = !task_rows::match_ranges(&task.title, &query).is_empty();
-                    let note = (!title_matches).then(|| task_rows::snippet(&task.notes, &query, 30)).flatten();
+                    let note = (!title_matches)
+                        .then(|| task_rows::snippet(&task.notes, &query, 30))
+                        .flatten()
+                        .map(|snippet| Self::strip_markdown_inline(&snippet));
                     let location_match = task
                         .location
                         .as_deref()
@@ -788,6 +812,7 @@ impl Render for SearchModal {
                                         .min_w_0()
                                         .truncate()
                                         .text_size(px(13.))
+                                        .line_height(px(17.))
                                         .when(task.is_completed(), |el| el.text_color(theme.colors().text_muted).line_through())
                                         .child(self.highlighted(&task.title, &query, cx)),
                                 )
@@ -825,6 +850,7 @@ impl Render for SearchModal {
                                     .pl(px(22.))
                                     .truncate()
                                     .text_size(px(12.))
+                                    .line_height(px(15.))
                                     .text_color(theme.colors().text_muted)
                                     .child(self.highlighted(&note, &query, cx)),
                             )
@@ -841,6 +867,7 @@ impl Render for SearchModal {
                                             .min_w_0()
                                             .truncate()
                                             .text_size(px(12.))
+                                            .line_height(px(15.))
                                             .text_color(theme.colors().text_muted)
                                             .child(self.highlighted(&loc, &query, cx)),
                                     ),
@@ -866,7 +893,7 @@ impl Render for SearchModal {
                         .height(px(30.))
                         .toggle_state(is_selected)
                         .start_slot(desktop_common::habit_helpers::avatar(habit, px(18.), cx))
-                        .child(div().text_size(px(13.)).child(self.highlighted(&habit.name, &query, cx)))
+                        .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&habit.name, &query, cx)))
                         .when(habit.archived, |item| {
                             item.end_slot(Label::new(strings.habit_archived).size(LabelSize::XSmall).color(Color::Muted))
                         })
@@ -888,7 +915,7 @@ impl Render for SearchModal {
                         .height(px(30.))
                         .toggle_state(is_selected)
                         .start_slot(Icon::new(IconName::Tag).color(lists_panel::color(t.color.as_deref(), cx)))
-                        .child(div().text_size(px(13.)).child(self.highlighted(&t.name, &query, cx)))
+                        .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&t.name, &query, cx)))
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenView(view.clone()))))
                         .into_any_element()
                 })
@@ -914,7 +941,7 @@ impl Render for SearchModal {
                         .height(px(30.))
                         .toggle_state(is_selected)
                         .start_slot(start)
-                        .child(div().text_size(px(13.)).child(self.highlighted(&l.name, &query, cx)))
+                        .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&l.name, &query, cx)))
                         .when(l.archived, |item| {
                             item.end_slot(Label::new(strings.habit_archived).size(LabelSize::XSmall).color(Color::Muted))
                         })
@@ -940,7 +967,7 @@ impl Render for SearchModal {
                     .height(px(30.))
                     .toggle_state(is_selected)
                     .start_slot(Icon::new(IconName::Code).color(Color::Accent))
-                    .child(div().text_size(px(13.)).child(self.highlighted(&cmd.title, &query, cx)))
+                    .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&cmd.title, &query, cx)))
                     .end_slot(Label::new(cmd.plugin_name.clone()).size(LabelSize::XSmall).color(Color::Muted))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(SearchEvent::RunPluginCommand {
@@ -976,7 +1003,7 @@ impl Render for SearchModal {
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .child(div().text_size(px(13.)).child(self.highlighted(&hit.title, &query, cx)))
+                            .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&hit.title, &query, cx)))
                             .when_some(hit.subtitle.clone(), |el, sub| {
                                 el.child(Label::new(sub).size(LabelSize::XSmall).color(Color::Muted).truncate())
                             }),
@@ -1401,5 +1428,13 @@ mod tests {
             modal.update(cx, |m, cx| m.emit_close(SearchEvent::Dismissed, cx));
             assert!(cx.global::<PluginBus>().search_hits.is_empty());
         });
+    }
+
+    #[test]
+    fn strip_markdown_inline_removes_markers_without_breaking_plain_text() {
+        assert_eq!(
+            SearchModal::strip_markdown_inline("Check **Markdown**, __under__, `code`, ~~old~~ & foo_bar * 2"),
+            "Check Markdown, under, code, old & foo_bar * 2"
+        );
     }
 }

@@ -32,51 +32,15 @@ fn frame(
     height: f32,
     cx: &App,
 ) -> AnyElement {
-    let theme = cx.theme().clone();
-    let button = |id: &'static str, label: &'static str, primary: bool| {
-        let clickable = !primary || enabled;
-        div()
-            .id(id)
-            .w(px(100.))
-            .h(px(30.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(6.))
-            .when(clickable, |el| el.cursor_pointer())
-            .when(primary, |el| {
-                el.bg(theme.colors().accent.opacity(if enabled { 1. } else { 0.5 }))
-                    .when(enabled, |el| el.hover(|s| s.opacity(0.9)))
-                    .child(Label::new(label).color(Color::OnAccent))
-            })
-            .when(!primary, |el| {
-                el.border_1()
-                    .border_color(theme.colors().border)
-                    .hover(|s| s.bg(theme.colors().element_hover))
-                    .child(Label::new(label))
-            })
-    };
-    div()
-        .absolute()
-        .inset_0()
-        .pr(px(50.))
-        .pb(px(86.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(gpui::black().opacity(0.35))
-        .occlude()
+    Modal::new(id)
+        .width(px(381.))
+        .height(px(height))
+        .padding(px(0.))
+        .gap(px(0.))
         .child(
             v_flex()
-                .id(id)
-                .w(px(381.))
-                .h(px(height))
+                .size_full()
                 .px(px(20.))
-                .rounded(px(10.))
-                .bg(theme.colors().elevated_surface_background)
-                .border_1()
-                .border_color(theme.colors().border)
-                .shadow_lg()
                 .child(
                     h_flex()
                         .h(px(56.))
@@ -95,8 +59,17 @@ fn frame(
                         .pb(px(18.))
                         .justify_end()
                         .gap(px(10.))
-                        .child(button("tag-dialog-close", i18n::t(cx).close, false).on_click(on_close))
-                        .child(button("tag-dialog-primary", primary, true).on_click(on_primary)),
+                        .child(
+                            Button::new("tag-dialog-close", i18n::t(cx).close)
+                                .variant(ButtonVariant::Secondary)
+                                .on_click(on_close),
+                        )
+                        .child(
+                            Button::new("tag-dialog-primary", primary)
+                                .variant(ButtonVariant::Primary)
+                                .disabled(!enabled)
+                                .on_click(on_primary),
+                        ),
                 ),
         )
         .into_any_element()

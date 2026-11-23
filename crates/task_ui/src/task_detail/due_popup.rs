@@ -572,12 +572,14 @@ impl TaskDetail {
                         IconButton::new("prev-month", IconName::ChevronLeft)
                             .size(px(22.))
                             .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("←"))
                             .on_click(cx.listener(|this, _, _, cx| this.shift_month(-1, cx))),
                     )
                     .child(
                         IconButton::new("this-month", IconName::Circle)
                             .size(px(22.))
                             .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text(strings.this_month))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let today = Local::now().date_naive();
                                 this.update_draft(cx, |d| d.month = calendar::month_start(today))
@@ -587,6 +589,7 @@ impl TaskDetail {
                         IconButton::new("next-month", IconName::ChevronRight)
                             .size(px(22.))
                             .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("→"))
                             .on_click(cx.listener(|this, _, _, cx| this.shift_month(1, cx))),
                     ),
             )

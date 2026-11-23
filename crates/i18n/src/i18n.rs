@@ -133,6 +133,8 @@ pub struct Strings {
     pub habit_goal: &'static str,
     pub habit_frequency: &'static str,
     pub habit_section: &'static str,
+    pub habit_checked_in: &'static str,
+    pub habit_start_anytime: &'static str,
     pub focus_add_record: &'static str,
     pub focus_batch_delete_title: &'static str,
     pub focus_batch_delete_message: &'static str,
@@ -489,7 +491,7 @@ pub struct Strings {
     pub reload_keymap: &'static str,
     pub keymap_errors: &'static str,
     /// Labels of `keymap::SHORTCUT_SPECS`, in order.
-    pub shortcut_labels: [&'static str; 56],
+    pub shortcut_labels: [&'static str; 60],
     /// Section titles in Settings → Shortcuts: General, Global, New Task, Quick Add, Edit Task,
     /// Navigation, Switch Views, Focus, Sticky Note.
     pub shortcut_groups: [&'static str; 9],
@@ -760,6 +762,7 @@ pub struct Strings {
     // Task list.
     pub add_task: &'static str,
     pub no_tasks: &'static str,
+    pub empty_tasks_hint: &'static str,
     pub free_day: &'static str,
     pub free_day_hint: &'static str,
     pub no_completed_tasks: &'static str,
@@ -1273,6 +1276,21 @@ pub struct Strings {
     pub plugins_view_error_title: &'static str,
     pub plugins_commands: &'static str,
     pub plugins_secret_placeholder: &'static str,
+    pub plugin_status_active: &'static str,
+    pub plugin_status_idle: &'static str,
+    pub plugin_status_broken: &'static str,
+    pub plugin_status_error: &'static str,
+    pub plugin_clear_secret: &'static str,
+    pub plugin_no_logs: &'static str,
+    pub plugin_trigger_arg: &'static str,
+    pub plugin_code_label: &'static str,
+    pub plugin_run_ok: &'static str,
+    pub plugin_run_err: &'static str,
+    pub plugin_loading: &'static str,
+    pub plugin_trigger_manual: &'static str,
+    pub plugin_trigger_command: &'static str,
+    pub plugin_trigger_event: &'static str,
+    pub plugin_trigger_interval: &'static str,
     // Life Clock.
     pub section_life_clock: &'static str,
     pub life_clock_months: [&'static str; 12],
@@ -1386,6 +1404,8 @@ pub static EN: Strings = Strings {
     habit_goal: "Goal",
     habit_frequency: "Frequency",
     habit_section: "Section",
+    habit_checked_in: "Checked in",
+    habit_start_anytime: "Not set",
     focus_add_record: "Add Focus Record",
     focus_batch_delete_title: "Delete Focus Records",
     focus_batch_delete_message: "Focus records cannot be restored once deleted. Are you sure you want to delete them?",
@@ -1709,21 +1729,22 @@ pub static EN: Strings = Strings {
         // New Task (10..16)
         "Add task", "Add subtask", "Toggle all groups", "Expand / Collapse all subtasks",
         "Next task", "Previous task",
-        // Edit Task (16..29)
+        // Edit Task (16..30)
         "Complete task", "Pin task", "Delete task", "Set due date", "Clear due date",
         "Set today", "Set tomorrow", "Set next week",
         "Set No Priority", "Set Low Priority", "Set Medium Priority", "Set High Priority",
-        "Open as Sticky Note",
-        // Navigation (29..39)
+        "Open as Sticky Note", "Set When (Things)",
+        // Navigation (30..42)
         "Toggle sidebar", "Go to \"Settings\"", "Go to \"All\"", "Go to \"Inbox\"",
         "Go to \"Today\"", "Go to \"Tomorrow\"", "Go to \"Next 7 Days\"",
         "Go to \"Completed\"", "Go to \"Won't Do\"", "Go to \"Trash\"",
-        // Switch Views (39..48)
+        "Go to \"Horizons\"", "Go to \"Summary\"",
+        // Switch Views (42..52)
         "List view", "Kanban view", "Timeline view",
-        "Day view", "Week view", "Month view", "Year view", "Agenda view", "Jump to Today",
-        // Focus (48..50)
+        "Day view", "Week view", "Month view", "Year view", "Agenda view", "Multi-day view", "Jump to Today",
+        // Focus (52..54)
         "Resume / Pause", "Start / End",
-        // Sticky Note (50..56)
+        // Sticky Note (54..60)
         "Pin", "Color", "Expand / Collapse", "Align to top", "Align to left", "Align to right",
     ],
     shortcut_groups: [
@@ -2020,6 +2041,7 @@ pub static EN: Strings = Strings {
 
     add_task: "Add task",
     no_tasks: "No Tasks",
+    empty_tasks_hint: "Press N or use the bar above to add a task",
     free_day: "You have a free day",
     free_day_hint: "Take it easy",
     no_completed_tasks: "No completed tasks",
@@ -2495,6 +2517,21 @@ pub static EN: Strings = Strings {
     plugins_view_error_title: "Plugin view failed to render",
     plugins_commands: "Plugin Commands",
     plugins_secret_placeholder: "Saved securely in vault (enter to replace)",
+    plugin_status_active: "Active",
+    plugin_status_idle: "Idle",
+    plugin_status_broken: "Circuit Broken",
+    plugin_status_error: "Error",
+    plugin_clear_secret: "Clear secret",
+    plugin_no_logs: "No log entries yet.",
+    plugin_trigger_arg: "Trigger Arg",
+    plugin_code_label: "JavaScript Code",
+    plugin_run_ok: "Success",
+    plugin_run_err: "Failed",
+    plugin_loading: "Loading…",
+    plugin_trigger_manual: "Manual",
+    plugin_trigger_command: "Command",
+    plugin_trigger_event: "Event",
+    plugin_trigger_interval: "Interval",
     section_life_clock: "Life Clock",
     life_clock_months: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
     life_clock_you_are: "You are",
@@ -2611,6 +2648,8 @@ pub static ZH_CN: Strings = Strings {
     habit_goal: "目标",
     habit_frequency: "频率",
     habit_section: "分组",
+    habit_checked_in: "已打卡",
+    habit_start_anytime: "未设置",
     focus_add_record: "新增专注记录",
     focus_batch_delete_title: "删除专注记录",
     focus_batch_delete_message: "专注记录删除后无法恢复，确定要删除吗？",
@@ -2933,21 +2972,22 @@ pub static ZH_CN: Strings = Strings {
         // New Task (10..16)
         "添加任务", "添加子任务", "展开 / 折叠所有分组", "展开 / 折叠所有子任务",
         "下一个任务", "上一个任务",
-        // Edit Task (16..29)
+        // Edit Task (16..30)
         "完成任务", "置顶任务", "删除任务", "设置日期", "清除日期",
         "设为今天", "设为明天", "设为下周",
         "设为无优先级", "设为低优先级", "设为中优先级", "设为高优先级",
-        "以桌面便签打开",
-        // Navigation (29..39)
+        "以桌面便签打开", "设置「何时」(Things)",
+        // Navigation (30..42)
         "切换侧边栏", "前往「设置」", "前往「所有」", "前往「收集箱」",
         "前往「今天」", "前往「明天」", "前往「最近 7 天」",
         "前往「已完成」", "前往「已放弃」", "前往「垃圾桶」",
-        // Switch Views (39..48)
+        "前往「时间视野」", "前往「汇总」",
+        // Switch Views (42..52)
         "列表视图", "看板视图", "时间轴视图",
-        "日视图", "周视图", "月视图", "年视图", "日程视图", "回到今天",
-        // Focus (48..50)
+        "日视图", "周视图", "月视图", "年视图", "日程视图", "多天视图", "回到今天",
+        // Focus (52..54)
         "继续 / 暂停", "开始 / 结束",
-        // Sticky Note (50..56)
+        // Sticky Note (54..60)
         "置顶", "颜色", "展开 / 折叠", "顶部对齐", "靠左对齐", "靠右对齐",
     ],
     shortcut_groups: [
@@ -3188,7 +3228,7 @@ pub static ZH_CN: Strings = Strings {
         ("时间视野", "在一屏全景中规划今日、本周、本月、今年与人生目标。"),
     ],
     sync_server: "服务端地址",
-    sync_token: "令牌 Token",
+    sync_token: "同步令牌",
     sync_passphrase: "加密口令",
     sync_passphrase_placeholder: "可选 — 端到端加密同步数据",
     sync_passphrase_hint: "可选端到端加密。请在每台设备输入相同口令，任务、笔记与附件将在离开本机前加密。更改口令将触发全量重新同步。",
@@ -3243,6 +3283,7 @@ pub static ZH_CN: Strings = Strings {
     no_actions: "无操作",
     add_task: "新增任务",
     no_tasks: "暂无任务",
+    empty_tasks_hint: "按 N 或在上方输入框添加任务",
     free_day: "今天无事可做",
     free_day_hint: "好好放松一下",
     no_completed_tasks: "暂无已完成任务",
@@ -3663,7 +3704,7 @@ pub static ZH_CN: Strings = Strings {
     things_empty_someday: "「某天」列表为空",
     things_empty_logbook: "暂无已完成事项",
     things_empty_project: "此项目中暂无任务",
-    things_empty_area: "此区域中暂无任务",
+    things_empty_area: "此领域中暂无任务",
     things_drop_evening_hint: "将任务拖到此处以安排到今晚",
     things_date_placeholder: "YYYY-MM-DD",
     things_complete_project: "完成项目",
@@ -3716,6 +3757,21 @@ pub static ZH_CN: Strings = Strings {
     plugins_view_error_title: "插件视图渲染失败",
     plugins_commands: "插件命令",
     plugins_secret_placeholder: "已安全保存在密钥库（输入新值以替换）",
+    plugin_status_active: "运行中",
+    plugin_status_idle: "空闲",
+    plugin_status_broken: "已熔断",
+    plugin_status_error: "错误",
+    plugin_clear_secret: "清除密钥",
+    plugin_no_logs: "暂无日志。",
+    plugin_trigger_arg: "触发参数",
+    plugin_code_label: "JavaScript 代码",
+    plugin_run_ok: "成功",
+    plugin_run_err: "失败",
+    plugin_loading: "加载中…",
+    plugin_trigger_manual: "手动",
+    plugin_trigger_command: "命令",
+    plugin_trigger_event: "事件",
+    plugin_trigger_interval: "定时",
     section_life_clock: "时间流",
     life_clock_months: ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"],
     life_clock_you_are: "你已经",
@@ -3832,6 +3888,8 @@ pub static RU: Strings = Strings {
     habit_goal: "Цель",
     habit_frequency: "Частота",
     habit_section: "Раздел",
+    habit_checked_in: "Выполнено",
+    habit_start_anytime: "Не указана",
     focus_add_record: "Добавить запись",
     focus_batch_delete_title: "Удалить записи фокуса",
     focus_batch_delete_message: "Записи фокуса нельзя будет восстановить после удаления. Вы уверены, что хотите их удалить?",
@@ -4070,13 +4128,13 @@ pub static RU: Strings = Strings {
     countdown_new: "Новый отсчёт",
     countdown_edit: "Изменить отсчёт",
     countdown_name: "Название",
-    countdown_days_until: "Дней до",
+    countdown_days_until: "До",
     countdown_days_since: "Дней с",
     countdown_switch_hint: "Нажмите на дату, чтобы сменить формат.",
     countdown_empty: "Пока нет отсчётов",
     confirm_delete_countdown: "Удалить этот обратный отсчёт?",
     unit_letters: ["л", "мес", "д"],
-    // As the Russian original: "Дней до 1 янв 2027 г.".
+    // As the Russian original: "До 1 янв 2027 г.".
     countdown_date: Some("{d} {mon} {yyyy} г."),
     dotted_dates: true,
     year_first_dates: false,
@@ -4087,9 +4145,9 @@ pub static RU: Strings = Strings {
     search_placeholder: "Поиск",
     search_hint: "Просто введите ключевые слова для поиска.",
     nothing_found: "Ничего не найдено",
-    search_filter_task: "Задача",
+    search_filter_task: "Задачи",
     search_filter_tag: "Метки",
-    search_filter_list: "Список",
+    search_filter_list: "Списки",
     view_more: "Показать все",
     language: "Язык",
 
@@ -4152,34 +4210,35 @@ pub static RU: Strings = Strings {
     keymap_errors: "Ошибки в keymap.json",
     shortcut_labels: [
         // General (0..10)
-        "Синхронизация", "Отмена", "Отменить", "Восстановить", "Печать", "Распечатать подробности",
+        "Синхронизация", "Закрыть / отмена", "Отменить", "Повторить", "Печать", "Распечатать подробности",
         "Открыть поиск и команды", "Горячие клавиши", "Свернуть окно", "Выйти",
         // New Task (10..16)
         "Добавить задачу", "Добавить подзадачу", "Переключить все группы",
         "Развернуть / свернуть все подзадачи", "Следующая задача", "Предыдущая задача",
-        // Edit Task (16..29)
+        // Edit Task (16..30)
         "Завершить задачу", "Закрепить задачу", "Удалить задачу", "Установить срок", "Очистить срок",
         "На сегодня", "На завтра", "На следующую неделю",
         "Установить без приоритета", "Установить низкий приоритет", "Установить средний приоритет",
-        "Установить высокий приоритет", "Открыть как заметку",
-        // Navigation (29..39)
+        "Установить высокий приоритет", "Открыть как заметку", "Указать «Когда» (Things)",
+        // Navigation (30..42)
         "Показать / скрыть боковую панель", "Перейти к «Настройки»", "Перейти к «Все»",
         "Перейти к «Входящие»", "Перейти к «Сегодня»", "Перейти к «Завтра»",
         "Перейти к «Следующие 7 дней»", "Перейти к «Выполнено»",
         "Перейти к «Не будет выполнено»", "Перейти к «Корзина»",
-        // Switch Views (39..48)
-        "Списковый вид", "Вид канбана", "Вид таймлайна",
-        "Ежедневный просмотр", "Еженедельный просмотр", "Месячный просмотр",
-        "Годовой просмотр", "Просмотр повестки дня", "Вернуться к сегодняшнему дню",
-        // Focus (48..50)
+        "Перейти к «Горизонты»", "Перейти к «Сводка»",
+        // Switch Views (42..52)
+        "Список", "Канбан", "Таймлайн",
+        "День", "Неделя", "Месяц",
+        "Год", "Повестка", "Несколько дней", "Вернуться к сегодняшнему дню",
+        // Focus (52..54)
         "Продолжить / Пауза", "Начать / Закончить",
-        // Sticky Note (50..56)
+        // Sticky Note (54..60)
         "Закрепить", "Цвет", "Развернуть / Свернуть",
         "Выравнивание по верхнему краю", "Выравнивание по левому краю", "Выравнивание по правому краю",
     ],
     shortcut_groups: [
         "Общие",
-        "Глобальное действие",
+        "Глобальные действия",
         "Новая задача",
         "Быстрое добавление задачи",
         "Редактирование задачи",
@@ -4192,7 +4251,7 @@ pub static RU: Strings = Strings {
         Some("Нажмите на сочетание, чтобы изменить его. Общие сочетания требуют Ctrl, Alt, Win или F1–F12; одиночные клавиши и аккорды задаются в keymap.json."),
         Some("Работают даже в фоновом режиме. Требуют Ctrl, Alt или Win + букву, цифру, Space или F1–F12."),
         None,
-        Some("Для быстрого добавления деталей, таких как дата, приоритет, тег и список, в поле задачи можно ввести эти символы."),
+        Some("Для быстрого добавления деталей, таких как дата, приоритет, метка и список, в поле задачи можно ввести эти символы."),
         Some("Эти быстрые клавиши работают только тогда, когда выбрана задача."),
         Some("Лёгкий доступ к разделам, настройкам и многому другому."),
         Some("Легко переключаться между видами в списке и календаре."),
@@ -4224,7 +4283,7 @@ pub static RU: Strings = Strings {
     quick_add_help: [
         ("Установить срок выполнения задачи", "завтра 9:00, пт, каждый день"),
         ("Установить приоритет для задачи", "!1 !2 !3, !!!, !высокий"),
-        ("Установить тег для задачи", "#метка"),
+        ("Установить метку для задачи", "#метка"),
         ("Добавить задачу в определённый список", "~список, ^список"),
     ],
     undo: "Отменить",
@@ -4471,6 +4530,7 @@ pub static RU: Strings = Strings {
 
     add_task: "Добавить задачу",
     no_tasks: "Нет задач",
+    empty_tasks_hint: "Нажмите N или введите задачу в поле выше",
     free_day: "Свободный день",
     free_day_hint: "Можно отдохнуть",
     no_completed_tasks: "Выполненных задач нет",
@@ -4485,8 +4545,7 @@ pub static RU: Strings = Strings {
     group_overdue: "Просрочено",
     group_later: "Позже",
     group_no_date: "Без даты",
-    // As the original writes this group, though it says «Метки» elsewhere.
-    group_no_tags: "Без тегов",
+    group_no_tags: "Без меток",
 
     select_task: "Выбери задачу, чтобы увидеть подробности",
     notes_placeholder: "Напиши что-нибудь",
@@ -4576,7 +4635,7 @@ pub static RU: Strings = Strings {
     start_week_on: "Начало недели",
     time_format: "Формат времени",
     date_format: "Формат даты",
-    show_week_numbers: "Показывать номера недель (W)",
+    show_week_numbers: "Показывать номера недель (Н)",
     show_countdown_mode: "Режим обратного отсчёта",
     time_formats: ["24 часа (13:00)", "12 часов (1:00 PM)"],
     week_start_names: ["Понедельник", "Воскресенье", "Суббота"],
@@ -4715,7 +4774,7 @@ pub static RU: Strings = Strings {
     matrix_add_placeholder: "Что вы хотите сделать?",
     matrix_saved_elsewhere: "Задача сохранена в «{destination}».",
     matrix_unavailable_list: "Недоступный список",
-    matrix_unavailable_tag: "Недоступный тег",
+    matrix_unavailable_tag: "Недоступная метка",
     matrix_apply_date_template: "Применить шаблон по датам",
     matrix_reset_manual_order: "Сбросить ручной порядок",
     matrix_already_in_quadrant: "Задача уже в этом квадранте",
@@ -4841,7 +4900,7 @@ pub static RU: Strings = Strings {
     cal_provider_outlook: "Outlook",
     cal_provider_nextcloud: "Nextcloud",
     cal_provider_fastmail: "Fastmail",
-    cal_username: "Пользователь / Email",
+    cal_username: "Пользователь / Эл. почта",
     cal_password: "Пароль / Токен",
     cal_discover: "Найти",
     cal_writable: "Разрешить запись (двусторонняя синхр.)",
@@ -4855,7 +4914,7 @@ pub static RU: Strings = Strings {
     secondary_timezone_none: "Нет",
     secondary_timezone_hint: "Вторая шкала часов рядом с местным временем",
     timeline_show_weekends: "Показывать выходные",
-    kanban_workflow: "Workflow-канбан",
+    kanban_workflow: "Канбан-поток",
     kanban_workflow_hint: "Три колонки статуса: К выполнению, В работе, Выполнено",
     col_todo: "К выполнению",
     matrix_profile: "Профиль матрицы",
@@ -4895,7 +4954,7 @@ pub static RU: Strings = Strings {
     things_empty_someday: "Список «Когда-нибудь» пуст",
     things_empty_logbook: "Журнал пока пуст",
     things_empty_project: "В этом проекте нет задач",
-    things_empty_area: "В этой области нет задач",
+    things_empty_area: "В этой сфере нет задач",
     things_drop_evening_hint: "Перетащите задачи сюда для «Сегодня вечером»",
     things_date_placeholder: "ГГГГ-ММ-ДД",
     things_complete_project: "Завершить проект",
@@ -4948,6 +5007,21 @@ pub static RU: Strings = Strings {
     plugins_view_error_title: "Ошибка отображения плагина",
     plugins_commands: "Команды плагинов",
     plugins_secret_placeholder: "Сохранено в хранилище (введите для замены)",
+    plugin_status_active: "Активен",
+    plugin_status_idle: "Ожидание",
+    plugin_status_broken: "Остановлен",
+    plugin_status_error: "Ошибка",
+    plugin_clear_secret: "Удалить секрет",
+    plugin_no_logs: "Логов пока нет.",
+    plugin_trigger_arg: "Аргумент триггера",
+    plugin_code_label: "Код JavaScript",
+    plugin_run_ok: "Успех",
+    plugin_run_err: "Ошибка",
+    plugin_loading: "Загрузка…",
+    plugin_trigger_manual: "Вручную",
+    plugin_trigger_command: "Команда",
+    plugin_trigger_event: "Событие",
+    plugin_trigger_interval: "По расписанию",
     section_life_clock: "Ход времени",
     life_clock_months: ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"],
     life_clock_you_are: "Вам уже",

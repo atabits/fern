@@ -11,7 +11,7 @@ use chrono::{Datelike, Local, NaiveDate};
 use fern_core::stats::Bucket;
 use fern_core::{FocusSession, Id, Store, Task, View, focus_stats};
 use gpui::{Entity, Focusable as _, FontWeight, ScrollHandle, Task as GpuiTask};
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Modal, Placement, PopoverAttachment, popover};
 use ui::prelude::*;
 
 use crate::focus_timer::{
@@ -108,6 +108,14 @@ fn localized_duration_parts(
         .into_iter()
         .map(|(n, u)| (n, Some(duration_unit_label(u, strings))))
         .collect()
+}
+
+pub(super) fn format_minutes(minutes: i64, strings: &Strings) -> String {
+    match (minutes / 60, minutes % 60) {
+        (0, m) => format!("{m}{}", strings.duration_min_short),
+        (h, 0) => format!("{h}{}", strings.duration_hour_short),
+        (h, m) => format!("{h}{} {m}{}", strings.duration_hour_short, strings.duration_min_short),
+    }
 }
 
 fn now_ms() -> i64 {
@@ -780,7 +788,7 @@ impl FocusView {
             .hover(|s| s.bg(theme.colors().ghost_element_hover))
             .child(icon_avatar(timer.icon.as_deref(), timer.color.as_deref(), &timer.name, px(26.), cx))
             .child(div().flex_1().min_w_0().child(Label::new(timer.name.clone()).truncate()))
-            .child(Label::new(strings.format_minutes(today_minutes)).size(LabelSize::Small).color(Color::Muted))
+            .child(Label::new(format_minutes(today_minutes, strings)).size(LabelSize::Small).color(Color::Muted))
             .child(
                 div()
                     .relative()
@@ -923,13 +931,22 @@ impl FocusView {
             cx.notify();
             return true;
         }
+        if self.batch_custom.take().is_some() || self.batch_menu.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        if self.timer_draft.as_mut().is_some_and(|draft| draft.icon_tab.take().is_some()) {
+            cx.notify();
+            return true;
+        }
+        if self.open_record.is_some() {
+            self.close_record(cx);
+            return true;
+        }
         if self.record_menu.take().is_some()
             || self.timer_menu.take().is_some()
             || self.timer_draft.take().is_some()
             || self.picker.take().is_some()
-            || self.open_record.take().is_some()
-            || self.batch_menu.take().is_some()
-            || self.batch_custom.take().is_some()
         {
             self.delete_all_armed = false;
             cx.notify();
@@ -1284,7 +1301,7 @@ impl FocusView {
                                 el.child(Label::new(session.note.clone()).size(LabelSize::Small).color(Color::Muted).truncate())
                             }),
                     )
-                    .child(Label::new(strings.format_minutes(session.minutes())).size(LabelSize::XSmall).color(Color::Muted))
+                    .child(Label::new(format_minutes(session.minutes(), strings)).size(LabelSize::XSmall).color(Color::Muted))
                     .child(
                         div().opacity(if crate::touch::active() { 1. } else { 0. }).group_hover(group, |s| s.opacity(1.)).child(
                             IconButton::new(SharedString::from(format!("delete-record-{session_id}")), IconName::X)
@@ -1707,7 +1724,7 @@ impl FocusView {
                     .child(div().flex_1().h(px(1.)).bg(theme.colors().border_variant))
             }))
             .children(fern_core::focus::day_blocks(&self.sessions, today).into_iter().filter(|(_, to, _)| *to > first * 60).enumerate().map(|(i, (from, to, session))| {
-                let dur = strings.format_minutes(to.saturating_sub(from) as i64);
+                let dur = format_minutes(to.saturating_sub(from) as i64, strings);
                 let tip = format!("{} · {:02}:{:02}–{:02}:{:02} ({dur})", session.title, from / 60, from % 60, to / 60, to % 60);
                 div()
                     .id(SharedString::from(format!("focus-page-block-{i}")))
@@ -1834,9 +1851,9 @@ impl Render for FocusView {
                                         format!("{task_sessions}/{n} {}", strings.pomo_unit)
                                     }
                                     Some(fern_core::Estimate::Minutes(n)) => {
-                                        format!("{}/{}", strings.format_minutes(task_minutes), strings.format_minutes(n as i64))
+                                        format!("{}/{}", format_minutes(task_minutes, strings), format_minutes(n as i64, strings))
                                     }
-                                    None => strings.format_minutes(today_minutes),
+                                    None => format_minutes(today_minutes, strings),
                                 })
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),

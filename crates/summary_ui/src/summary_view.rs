@@ -60,6 +60,8 @@ pub struct SummaryView {
     cache_dirty: bool,
     /// Lazily registers global `DataVersion` and `CurrentLocale` observers on first context access.
     observers_registered: bool,
+    /// Whether this view is currently visible; hidden views defer `cx.notify()` until shown.
+    active: bool,
     #[cfg(test)]
     rebuild_count: usize,
     /// Where "Save as → Image" wrote the picture, or why it could not.
@@ -219,6 +221,7 @@ impl SummaryView {
             cache: None,
             cache_dirty: true,
             observers_registered: false,
+            active: true,
             #[cfg(test)]
             rebuild_count: 0,
             saved: None,
@@ -237,6 +240,22 @@ impl SummaryView {
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.invalidate_cache(cx);
+    }
+
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+        if active
+            && (self.cache_dirty
+                || self
+                    .cache
+                    .as_ref()
+                    .is_none_or(|c| c.today != Local::now().date_naive()))
+        {
+            cx.notify();
+        }
     }
 
     fn ensure_observers(&mut self, cx: &mut Context<Self>) {
@@ -262,7 +281,9 @@ impl SummaryView {
             self.editor = None;
             self.editor_initial.clear();
         }
-        cx.notify();
+        if self.active {
+            cx.notify();
+        }
     }
 
     fn refresh_templates(&mut self, cx: &mut Context<Self>) {
@@ -756,10 +777,26 @@ impl SummaryView {
                             }))
                     }))
                     .child(
-                        IconButton::new("add-summary-template", IconName::Plus)
-                            .size(px(26.))
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text(strings.summary_save_template))
+                        h_flex()
+                            .id("add-summary-template")
+                            .h(px(26.))
+                            .justify_center()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.surface_background)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(colors.element_hover))
+                            .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
+                            .when(templates.is_empty(), |el| {
+                                el.px_2()
+                                    .gap_1()
+                                    .child(Label::new(strings.summary_save_template).size(LabelSize::Small))
+                            })
+                            .when(!templates.is_empty(), |el| {
+                                el.w(px(26.))
+                                    .tooltip(Tooltip::text(strings.summary_save_template))
+                            })
                             .on_click(cx.listener(|this, _, window, cx| this.start_template(window, cx))),
                     ),
             )
@@ -1566,5 +1603,48 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(1100));
         cx.run_until_parked();
         view.read_with(cx, |v, _| assert!(!v.copied));
+    }
+
+    #[gpui::test]
+    fn hidden_summary_view_defers_notify_and_rebuilds_when_activated(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let t1 = store.add_task("Initial done").unwrap();
+        store.set_completed(t1.id, true).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, _| SummaryView::new(store.clone()));
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| assert_eq!(v.rebuild_count, 1));
+
+        // Hide SummaryView, then emit external DataVersion change -> marks dirty without rebuilding.
+        view.update(cx, |v, cx| v.set_active(false, cx));
+        let t2 = store.add_task("Added while hidden").unwrap();
+        store.set_completed(t2.id, true).unwrap();
+        let other = cx.update(|_, cx| cx.new(|_| ()));
+        cx.update(|_, cx| desktop_common::data_version::data_changed(other.entity_id(), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            assert!(v.cache_dirty);
+            assert_eq!(v.rebuild_count, 1);
+        });
+
+        // Re-activating refreshes once and picks up the new task.
+        view.update(cx, |v, cx| v.set_active(true, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            assert!(!v.cache_dirty);
+            assert_eq!(v.rebuild_count, 2);
+            assert!(v.cache.as_ref().unwrap().report.markdown().contains("Added while hidden"));
+        });
+
+        // Toggling off and back on with no changes avoids redundant rebuilds.
+        view.update(cx, |v, cx| v.set_active(false, cx));
+        view.update(cx, |v, cx| v.set_active(true, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| assert_eq!(v.rebuild_count, 2));
     }
 }

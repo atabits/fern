@@ -142,9 +142,8 @@ impl RenderOnce for Button {
         let error = theme.status().error;
 
         let (text_color, icon_color) = match self.variant {
-            ButtonVariant::Primary | ButtonVariant::Destructive => {
-                (Color::OnAccent, Color::IconOnAccent)
-            }
+            ButtonVariant::Primary => (Color::OnAccent, Color::IconOnAccent),
+            ButtonVariant::Destructive => (Color::OnError, Color::OnError),
             ButtonVariant::Secondary | ButtonVariant::Ghost => (Color::Default, Color::Icon),
         };
 

@@ -112,41 +112,15 @@ impl CalendarView {
                         .gap_3()
                         .child(div().w(px(72.)).flex_none().child(Label::new(strings.range_all_day).size(LabelSize::Small).color(Color::Muted)))
                         .child(div().size(px(10.)).flex_none().rounded_full().bg(theme.colors().element_hover))
-                        // Empty-day banner using theme tokens so light, dark, and custom themes stay crisp.
-                        .child({
-                            let banner_start = theme.colors().surface_background.blend(
-                                theme.colors().accent.opacity(if theme.is_dark() { 0.14 } else { 0.10 }),
-                            );
-                            let banner_end = theme.colors().surface_background.blend(
-                                theme.status().info.opacity(if theme.is_dark() { 0.24 } else { 0.22 }),
-                            );
-                            let sun_top = theme.status().warning.opacity(if theme.is_dark() { 0.72 } else { 0.85 });
-                            let sun_bottom = theme.status().warning;
-                            h_flex()
+                        .child(
+                            div()
                                 .flex_1()
-                                .h(px(64.))
-                                .px_5()
                                 .rounded(px(8.))
                                 .border_1()
                                 .border_color(theme.colors().border_variant)
-                                .bg(gpui::linear_gradient(
-                                    90.,
-                                    gpui::linear_color_stop(banner_start, 0.),
-                                    gpui::linear_color_stop(banner_end, 1.),
-                                ))
-                                .child(div().flex_1().child(Label::new(strings.no_tasks_today).color(Color::Default)))
-                                .child(
-                                    div()
-                                        .size(px(44.))
-                                        .mr(px(80.))
-                                        .rounded_full()
-                                        .bg(gpui::linear_gradient(
-                                            180.,
-                                            gpui::linear_color_stop(sun_top, 0.),
-                                            gpui::linear_color_stop(sun_bottom, 1.),
-                                        )),
-                                )
-                        })
+                                .bg(theme.colors().surface_background)
+                                .child(EmptyState::new(IconName::CalendarCheck, strings.no_tasks_today)),
+                        )
                         .into_any_element(),
                 ]
             } else {
@@ -288,7 +262,20 @@ impl CalendarView {
                 .pb_6()
                 // The original's agenda: 185 px in from the left, up to 1030 px wide, each day 100 px
                 // apart.
-                .child(v_flex().pt(px(14.)).max_w(px(1030.)).children(rows)),
+                .child(
+                    v_flex()
+                        .pt(px(14.))
+                        .max_w(px(1030.))
+                        .when(rows.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .w_full()
+                                    .py_10()
+                                    .child(EmptyState::new(IconName::CalendarCheck, strings.no_tasks_scheduled)),
+                            )
+                        })
+                        .children(rows),
+                ),
         )
         .flex_1()
         .min_h_0()

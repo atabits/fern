@@ -96,6 +96,7 @@ pub struct ThemeColors {
 #[derive(Clone, Debug)]
 pub struct StatusColors {
     pub error: Hsla,
+    pub on_error: Hsla,
     pub warning: Hsla,
     pub info: Hsla,
     pub success: Hsla,
@@ -294,11 +295,15 @@ impl Theme {
                 icon_on_accent: foreground_on(&[accent], 3.),
                 text_selection: accent.opacity(if dark { 0.34 } else { 0.25 }),
             },
-            status: StatusColors {
-                error: rgb(if dark { 0xe5484d } else { 0xe13e39 }).into(),
-                warning: rgb(0xfaa80c).into(),
-                info: rgb(0x4772fa).into(),
-                success: rgb(if dark { 0x22c55e } else { 0x2f9e44 }).into(),
+            status: {
+                let error: Hsla = rgb(if dark { 0xe5484d } else { 0xe13e39 }).into();
+                StatusColors {
+                    error,
+                    on_error: foreground_on(&[error], 3.),
+                    warning: rgb(if dark { 0xfaa80c } else { 0xb45309 }).into(),
+                    info: rgb(0x4772fa).into(),
+                    success: rgb(if dark { 0x22c55e } else { 0x2f9e44 }).into(),
+                }
             },
         }
     }
@@ -324,7 +329,8 @@ pub(crate) fn contrast(a: Hsla, b: Hsla) -> f32 {
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
-pub(crate) fn foreground_on(stops: &[Hsla], target: f32) -> Hsla {
+/// Picks an accessible foreground ink (`white()` or dark ink) meeting `target` contrast across `stops`.
+pub fn foreground_on(stops: &[Hsla], target: f32) -> Hsla {
     let minimum = |ink| stops.iter().map(|&stop| contrast(ink, stop)).fold(f32::INFINITY, f32::min);
     let dark = rgb(0x191919).into();
     if minimum(white()) >= target {
@@ -429,5 +435,23 @@ mod tests {
         assert_eq!(dark.colors().sidebar_icon_muted, white().opacity(0.40));
         assert_eq!(ThemePreset::resolve(true, Some("dark")).id, "night");
         assert_eq!(ThemePreset::resolve(false, Some("missing")).id, "grey");
+    }
+
+    #[test]
+    fn status_colors_meet_contrast_across_presets() {
+        for preset in LIGHT_PRESETS.iter().chain(&DARK_PRESETS) {
+            let theme = Theme::from_preset(preset);
+            let status = theme.status();
+            assert!(
+                contrast(status.on_error, status.error) >= 3.0,
+                "on_error contrast too low for {}",
+                preset.id
+            );
+            assert!(
+                contrast(status.warning, theme.colors().background) >= 4.5,
+                "warning contrast too low for {}",
+                preset.id
+            );
+        }
     }
 }

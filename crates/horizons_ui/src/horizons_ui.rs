@@ -2000,29 +2000,35 @@ impl HorizonsView {
         let locale = i18n::locale(cx);
         let prompt_text = prompts::prompt_for(locale, self.prompt_index);
 
-        div()
-            .id("horizons-prompt")
-            .debug_selector(|| "horizons-prompt".to_owned())
-            .absolute()
-            .bottom(px(14.))
-            .right(px(18.))
-            .max_w(px(230.))
-            .px(px(8.))
-            .py(px(4.))
-            .rounded(px(6.))
-            .bg(colors.background.opacity(0.88))
-            .text_size(px(11.))
-            .line_height(px(15.5))
-            .text_color(colors.text_muted.opacity(0.72))
-            .cursor_pointer()
-            .hover(|s| s.text_color(colors.text).bg(colors.ghost_element_hover.opacity(0.75)))
-            .tooltip(Tooltip::text(strings.horizons_prompt_hint))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.prompt_index = (this.prompt_index + 1) % prompts::PROMPT_COUNT;
-                cx.notify();
-            }))
-            .child(prompt_text)
+        h_flex()
+            .flex_none()
+            .w_full()
+            .justify_end()
+            .px_4()
+            .py_1()
+            .border_t_1()
+            .border_color(colors.border_variant)
+            .child(
+                div()
+                    .id("horizons-prompt")
+                    .debug_selector(|| "horizons-prompt".to_owned())
+                    .max_w_full()
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(6.))
+                    .text_size(px(11.))
+                    .line_height(px(15.5))
+                    .text_color(colors.text_muted.opacity(0.72))
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(colors.text).bg(colors.ghost_element_hover.opacity(0.75)))
+                    .tooltip(Tooltip::text(strings.horizons_prompt_hint))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.prompt_index = (this.prompt_index + 1) % prompts::PROMPT_COUNT;
+                        cx.notify();
+                    }))
+                    .child(prompt_text),
+            )
             .into_any_element()
     }
 }
@@ -2044,7 +2050,9 @@ impl Render for HorizonsView {
             .bg(colors.background)
             .text_color(colors.text)
             .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
-                this.dismiss_transient(window, cx);
+                if !this.dismiss_transient(window, cx) {
+                    cx.propagate();
+                }
             }))
             .on_action(cx.listener(|_this, _: &Search, _, cx| {
                 cx.emit(HorizonsEvent::OpenSearch);
@@ -2074,7 +2082,7 @@ impl Render for HorizonsView {
             }))
             .child(self.render_top_strip(today, cx))
             .child(self.render_main_canvas(today, cx))
-            .when(self.detail_task.is_none() && self.show_prompt, |el| {
+            .when(self.show_prompt, |el| {
                 el.child(self.render_reflection_prompt(cx))
             })
             .when_some(self.detail_task, |el, task_id| {

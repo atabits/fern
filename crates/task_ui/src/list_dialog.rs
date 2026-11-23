@@ -187,6 +187,14 @@ impl ListDialog {
         cx.notify();
     }
 
+    pub fn dismiss_nested(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.new_folder.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
     /// For the dev state: opens one of the dropdowns.
     #[cfg(debug_assertions)]
     pub fn dev_open(&mut self, what: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -511,29 +519,6 @@ impl Render for ListDialog {
                 .on_click(cx.listener(move |this, _, _, cx| this.update(cx, |this| this.layout = value)))
         };
         let can_save = !self.name.read(cx).text().trim().is_empty();
-        let button = |id: &'static str, label: &'static str, primary: bool| {
-            let enabled = !primary || can_save;
-            div()
-                .id(id)
-                .h(px(30.))
-                .px_4()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.))
-                .when(enabled, |el| el.cursor_pointer())
-                .when(primary, |el| {
-                    el.bg(theme.colors().accent.opacity(if can_save { 1. } else { 0.5 }))
-                        .when(can_save, |el| el.hover(|s| s.opacity(0.9)))
-                        .child(Label::new(label).color(Color::OnAccent))
-                })
-                .when(!primary, |el| {
-                    el.border_1()
-                        .border_color(theme.colors().border)
-                        .hover(|s| s.bg(theme.colors().element_hover))
-                        .child(Label::new(label))
-                })
-        };
         let icon_cell = div()
             .relative()
             .child(
@@ -609,46 +594,46 @@ impl Render for ListDialog {
                     .pb(px(17.))
                     .justify_end()
                     .gap(px(12.))
-                    .child(button("list-dialog-cancel", strings.cancel, false).on_click(cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Closed))))
                     .child(
-                        button("list-dialog-save", if self.editing.is_some() { strings.save } else { strings.add }, true)
-                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                        Button::new("list-dialog-cancel", strings.cancel)
+                            .variant(ButtonVariant::Secondary)
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Closed))),
+                    )
+                    .child(
+                        Button::new(
+                            "list-dialog-save",
+                            if self.editing.is_some() { strings.save } else { strings.add },
+                        )
+                        .variant(ButtonVariant::Primary)
+                        .disabled(!can_save)
+                        .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
                     ),
             );
 
-        // The original's dialog: 742 × 423 over a dimmed background, centered on the window
-        // (the view starts after the 50 px sections bar) and 43 px above the middle, as there.
         div()
             .absolute()
             .inset_0()
-            .pr(px(50.))
-            .pb(px(86.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::black().opacity(0.35))
-            .occlude()
             .child(
-                h_flex()
-                    .id("list-dialog")
-                    .relative()
-                    .w(px(742.))
-                    .h(px(423.))
-                    .rounded(px(10.))
+                Modal::new("list-dialog")
+                    .width(px(742.))
+                    .height(px(423.))
+                    .padding(px(0.))
+                    .gap(px(0.))
                     .overflow_hidden()
-                    .bg(theme.colors().elevated_surface_background)
-                    .border_1()
-                    .border_color(theme.colors().border)
-                    .shadow_lg()
-                    .child(form)
-                    .child(div().flex_1().h_full().child(self.render_preview(cx)))
                     .child(
-                        div().absolute().top(px(14.)).right(px(14.)).child(
-                            IconButton::new("list-dialog-x", IconName::X)
-                                .icon_color(Color::Muted)
-                                .tooltip(ui::Tooltip::text(strings.close))
-                                .on_click(cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Closed))),
-                        ),
+                        h_flex()
+                            .relative()
+                            .size_full()
+                            .child(form)
+                            .child(div().flex_1().h_full().child(self.render_preview(cx)))
+                            .child(
+                                div().absolute().top(px(14.)).right(px(14.)).child(
+                                    IconButton::new("list-dialog-x", IconName::X)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(ui::Tooltip::text(strings.close))
+                                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Closed))),
+                                ),
+                            ),
                     ),
             )
             .children(self.new_folder.clone())
@@ -714,50 +699,15 @@ impl Render for FolderDialog {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let empty = self.name.read(cx).text().trim().is_empty();
-        let button = |id: &'static str, label: &'static str, primary: bool| {
-            let enabled = !primary || !empty;
-            div()
-                .id(id)
-                .w(px(100.))
-                .h(px(30.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.))
-                .when(enabled, |el| el.cursor_pointer())
-                .when(primary, |el| {
-                    el.bg(theme.colors().accent.opacity(if empty { 0.5 } else { 1. }))
-                        .when(!empty, |el| el.hover(|s| s.opacity(0.9)))
-                        .child(Label::new(label).color(Color::OnAccent))
-                })
-                .when(!primary, |el| {
-                    el.border_1()
-                        .border_color(theme.colors().border)
-                        .hover(|s| s.bg(theme.colors().element_hover))
-                        .child(Label::new(label))
-                })
-        };
-        // 441 × 181, as the original's, where the list dialog is (see there).
-        div()
-            .absolute()
-            .inset_0()
-            .pr(px(50.))
-            .pb(px(86.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .occlude()
+        Modal::new("folder-dialog")
+            .width(px(441.))
+            .height(px(181.))
+            .padding(px(0.))
+            .gap(px(0.))
             .child(
                 v_flex()
-                    .id("folder-dialog")
-                    .w(px(441.))
-                    .h(px(181.))
+                    .size_full()
                     .px(px(20.))
-                    .rounded(px(10.))
-                    .bg(theme.colors().elevated_surface_background)
-                    .border_1()
-                    .border_color(theme.colors().border)
-                    .shadow_lg()
                     .child(
                         h_flex()
                             .h(px(56.))
@@ -795,8 +745,17 @@ impl Render for FolderDialog {
                             .pb(px(18.))
                             .justify_end()
                             .gap(px(10.))
-                            .child(button("folder-dialog-close", strings.close, false).on_click(cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Closed))))
-                            .child(button("folder-dialog-save", strings.save, true).on_click(cx.listener(|this, _, _, cx| this.save(cx)))),
+                            .child(
+                                Button::new("folder-dialog-close", strings.close)
+                                    .variant(ButtonVariant::Secondary)
+                                    .on_click(cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Closed))),
+                            )
+                            .child(
+                                Button::new("folder-dialog-save", strings.save)
+                                    .variant(ButtonVariant::Primary)
+                                    .disabled(empty)
+                                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                            ),
                     ),
             )
     }

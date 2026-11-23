@@ -95,6 +95,8 @@ pub struct TaskDetail {
     format_bar: bool,
     format_headings: bool,
     copied_feedback: bool,
+    copied_reset: Option<gpui::Task<()>>,
+    word_count: usize,
     /// The "…" menu's Start Focus side menu, while hovered open.
     focus_submenu: bool,
     title: Entity<TextInput>,
@@ -199,6 +201,7 @@ impl TaskDetail {
                     return;
                 }
                 let text = input.read(cx).text().to_owned();
+                this.word_count = fern_core::markdown::count_words(&text);
                 if this.edit_draft(cx, |task, _| task.notes = text.clone()) { return; }
                 this.save(cx, |store, id| store.set_notes(id, &text));
             }),
@@ -249,6 +252,8 @@ impl TaskDetail {
             format_bar: false,
             format_headings: false,
             copied_feedback: false,
+            copied_reset: None,
+            word_count: 0,
             title,
             notes,
             tag_input,
@@ -427,6 +432,7 @@ impl TaskDetail {
                 (t.title.clone(), t.notes.clone(), t.location.clone().unwrap_or_default())
             });
         self.title.update(cx, |input, cx| input.set_text(title, cx));
+        self.word_count = fern_core::markdown::count_words(&notes);
         self.notes.update(cx, |input, cx| input.set_text(notes, cx));
         self.location_open = !location.is_empty();
         self.location_input.update(cx, |input, cx| input.set_text(location, cx));
@@ -438,6 +444,7 @@ impl TaskDetail {
         self.format_headings = false;
         self.focus_submenu = false;
         self.copied_feedback = false;
+        self.copied_reset = None;
         self.session.task = task;
         self.session.popup = None;
         self.editor_window.popup_return_focus = None;
@@ -517,15 +524,15 @@ impl TaskDetail {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         self.copied_feedback = true;
         cx.notify();
-        cx.spawn(async move |this, cx| {
+        self.copied_reset = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
             this.update(cx, |this, cx| {
                 this.copied_feedback = false;
+                this.copied_reset = None;
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        }));
     }
 
     fn toggle_markdown_check(&mut self, line_index: usize, cx: &mut Context<Self>) {
@@ -539,6 +546,7 @@ impl TaskDetail {
         if checked {
             desktop_common::sound::play_complete(&self.session.store);
         }
+        self.word_count = fern_core::markdown::count_words(&updated);
         self.notes.update(cx, |input, cx| input.set_text(updated.clone(), cx));
         if self.edit_draft(cx, |task, _| task.notes = updated.clone()) {
             return;
@@ -881,6 +889,7 @@ impl TaskDetail {
                 }
                 let old_notes = self.session.task.as_ref().map(|t| t.notes.as_str());
                 if old_notes != Some(task.notes.as_str()) && self.notes.read(cx).text() != task.notes {
+                    self.word_count = fern_core::markdown::count_words(&task.notes);
                     self.notes.update(cx, |input, cx| input.set_text(task.notes.clone(), cx));
                 }
                 let old_loc = self.session.task.as_ref().and_then(|t| t.location.as_deref());
@@ -2456,15 +2465,12 @@ impl Render for TaskDetail {
                                     .child(Label::new(list_name).color(muted)),
                             ))
                             .child(div().flex_1())
-                            .when(!sticky, |bar| {
-                                let words = fern_core::markdown::count_words(self.notes.read(cx).text());
-                                bar.when(words > 0, |bar| {
-                                    bar.child(
-                                        Label::new(strings.word_count.replace("{n}", &words.to_string()))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                })
+                            .when(!sticky && self.word_count > 0, |bar| {
+                                bar.child(
+                                    Label::new(strings.word_count.replace("{n}", &self.word_count.to_string()))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
                             })
                         } else {
                             bar.when(sticky, |bar| bar.child(
@@ -2515,15 +2521,12 @@ impl Render for TaskDetail {
                                         .child(Label::new(strings.summary_copied).size(LabelSize::XSmall).color(Color::Accent)),
                                 )
                             })
-                            .when(!sticky, |bar| {
-                                let words = fern_core::markdown::count_words(self.notes.read(cx).text());
-                                bar.when(words > 0, |bar| {
-                                    bar.child(
-                                        Label::new(strings.word_count.replace("{n}", &words.to_string()))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                })
+                            .when(!sticky && self.word_count > 0, |bar| {
+                                bar.child(
+                                    Label::new(strings.word_count.replace("{n}", &self.word_count.to_string()))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
                             })
                             .when(!sticky && self.session.draft.is_none(), |bar| bar.child(
                                 IconButton::new("format", IconName::Baseline)

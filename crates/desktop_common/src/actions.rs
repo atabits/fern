@@ -19,6 +19,8 @@ actions!(
         ShowCompleted,
         ShowWontDo,
         ShowTrash,
+        GoToHorizons,
+        GoToSummary,
         PrintList,
         PrintDetail,
         ShowShortcuts,
@@ -31,7 +33,7 @@ actions!(
 actions!(settings, [DismissSettings]);
 actions!(task_detail, [SaveDraft]);
 
-actions!(calendar, [DayView, WeekView, MonthView, YearView, AgendaView, PreviousPeriod, NextPeriod, PreviousYear, NextYear, CalendarToday, PrintYear]);
+actions!(calendar, [DayView, WeekView, MonthView, YearView, AgendaView, MultiDayMode, PreviousPeriod, NextPeriod, PreviousYear, NextYear, CalendarToday, PrintYear]);
 
 actions!(
     task_list,

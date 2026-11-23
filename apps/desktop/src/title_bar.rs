@@ -280,7 +280,7 @@ fn window_button(
     let (resting, hover_fg, hover_bg, active_bg): (Hsla, Hsla, Hsla, Hsla) =
         if caption_appearance == Some(theme::Appearance::Light) {
             (
-                if active { rgb(0x1f1f1f).into() } else { rgb(0x7a7a7a).into() },
+                if active { rgb(0x1f1f1f).into() } else { rgb(0x5c5c5c).into() },
                 if close { gpui::white() } else { rgb(0x111111).into() },
                 gpui::black().opacity(0.08),
                 gpui::black().opacity(0.14),

@@ -468,6 +468,7 @@ pub fn render_expanded_card<V: 'static>(
                         .size(px(20.))
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(strings.delete))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             delete_act(this, CardAction::DeleteChecklistItem(item_id), window, cx);
                         })),

@@ -211,7 +211,7 @@ impl TodoView {
         }
         cx.notify();
     }
-    fn set_filter_preview(&mut self, preview: bool, cx: &mut Context<Self>) {
+    pub(super) fn set_filter_preview(&mut self, preview: bool, cx: &mut Context<Self>) {
         if let Some(edit) = self.filter_edit.as_mut() {
             if preview {
                 if let Err(error) = edit.snapshot(cx) {
@@ -276,7 +276,7 @@ impl TodoView {
             cx.notify();
         }
     }
-    fn render_filter_preview(&self, edit: &FilterEdit, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_filter_preview(&self, edit: &FilterEdit, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Self::today();
@@ -399,63 +399,34 @@ impl TodoView {
                 );
             }
         }
-        let button = |id: &'static str, label: &'static str, primary: bool| {
-            div()
-                .id(id)
-                .debug_selector(|| id.to_owned())
-                .px_4()
-                .h(px(30.))
-                .flex()
-                .items_center()
-                .rounded(px(6.))
-                .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
-                .when(!primary, |el| {
-                    el.border_1()
-                        .border_color(theme.colors().border)
-                        .hover(|s| s.bg(theme.colors().element_hover))
-                })
-                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
-        };
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::black().opacity(0.35))
+        Modal::new("filter-preview-dialog")
+            .width(px(560.))
+            .padding(px(16.))
+            .gap(px(8.))
             .child(
-                v_flex()
-                    .id("filter-preview-dialog")
-                    .w(px(560.).min(window.viewport_size().width - px(32.)))
-                    .p_4()
+                h_flex()
+                    .justify_center()
+                    .child(Label::new(strings.filter_preview).weight(FontWeight::SEMIBOLD)),
+            )
+            .child(v_scroll("filter-preview-tasks-scroll", body).max_h(px(420.)))
+            .child(
+                h_flex()
                     .gap_2()
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(theme.colors().border)
-                    .bg(theme.colors().elevated_surface_background)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .pt_2()
+                    .justify_end()
                     .child(
-                        h_flex()
-                            .justify_center()
-                            .child(Label::new(strings.filter_preview).weight(FontWeight::SEMIBOLD)),
+                        Button::new("filter-preview-cancel", strings.cancel)
+                            .variant(ButtonVariant::Secondary)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_filter_preview(false, cx)
+                            })),
                     )
-                    .child(v_scroll("filter-preview-tasks-scroll", body).max_h(px(420.)))
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .pt_2()
-                            .justify_end()
+                        div()
+                            .debug_selector(|| "filter-preview-save".to_owned())
                             .child(
-                                button("filter-preview-cancel", strings.cancel, false).on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.set_filter_preview(false, cx)
-                                    }),
-                                ),
-                            )
-                            .child(
-                                button("filter-preview-save", strings.save, true)
+                                Button::new("filter-preview-save", strings.save)
+                                    .variant(ButtonVariant::Primary)
                                     .on_click(cx.listener(|this, _, window, cx| this.save_filter(window, cx))),
                             ),
                     ),
@@ -861,7 +832,6 @@ impl TodoView {
             return self.render_filter_preview(edit, window, cx);
         }
         let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
         let advanced = edit.draft.rules.advanced;
         let mut body = v_flex()
             .id("filter-conditions")
@@ -923,125 +893,103 @@ impl TodoView {
                     .into_any_element(),
             )
         });
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::black().opacity(0.35))
+        Modal::new("filter-dialog")
+            .width(px(600.))
+            .padding(px(16.))
+            .gap(px(12.))
             .child(
-                v_flex()
-                    .id("filter-dialog")
-                    .w(px(600.).min(window.viewport_size().width - px(32.)))
-                    .p_4()
-                    .gap_3()
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(theme.colors().border)
-                    .bg(theme.colors().elevated_surface_background)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                h_flex()
                     .child(
-                        h_flex()
-                            .child(
-                                div().flex_1().child(
-                                    Label::new(if edit.is_new {
-                                        strings.add_filter
-                                    } else {
-                                        strings.edit_filter
-                                    })
-                                    .weight(FontWeight::SEMIBOLD),
-                                ),
-                            )
-                            .child(
-                                IconButton::new("filter-dialog-x", IconName::X)
-                                    .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text(strings.close))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.filter_edit = None;
-                                        cx.notify();
-                                    })),
-                            ),
+                        div().flex_1().child(
+                            Label::new(if edit.is_new {
+                                strings.add_filter
+                            } else {
+                                strings.edit_filter
+                            })
+                            .weight(FontWeight::SEMIBOLD),
+                        ),
                     )
                     .child(
-                        h_flex()
-                            .justify_center()
-                            .gap_2()
-                            .children([false, true].map(|mode| {
-                                chip(
-                                    format!("filter-mode-{mode}"),
-                                    strings.filter_modes[mode as usize],
-                                    advanced == mode,
-                                    cx,
+                        IconButton::new("filter-dialog-x", IconName::X)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(strings.close))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.filter_edit = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .justify_center()
+                    .gap_2()
+                    .children([false, true].map(|mode| {
+                        chip(
+                            format!("filter-mode-{mode}"),
+                            strings.filter_modes[mode as usize],
+                            advanced == mode,
+                            cx,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, _, cx| this.set_filter_advanced(mode, cx),
+                        ))
+                    })),
+            )
+            .child(input_field(edit.name.clone(), cx))
+            .child(
+                v_scroll("filter-conditions-scroll", body)
+                    .min_h_0()
+                    .max_h((window.viewport_size().height - px(240.)).max(px(120.))),
+            )
+            .when_some(edit.error, |el, error| {
+                el.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        chip("filter-preview", strings.filter_preview, false, cx).on_click(
+                            cx.listener(|this, _, _, cx| this.set_filter_preview(true, cx)),
+                        ),
+                    )
+                    .when(advanced, |el| {
+                        el.child(
+                            div()
+                                .relative()
+                                .child(
+                                    chip(
+                                        "filter-examples",
+                                        strings.filter_examples,
+                                        false,
+                                        cx,
+                                    )
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            if let Some(edit) = this.filter_edit.as_mut() {
+                                                edit.examples_open = !edit.examples_open;
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ),
                                 )
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| this.set_filter_advanced(mode, cx),
-                                ))
+                                .children(examples),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("filter-close", strings.close)
+                            .variant(ButtonVariant::Secondary)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.filter_edit = None;
+                                cx.notify();
                             })),
                     )
-                    .child(input_field(edit.name.clone(), cx))
                     .child(
-                        v_scroll("filter-conditions-scroll", body)
-                            .min_h_0()
-                            .max_h((window.viewport_size().height - px(240.)).max(px(120.))),
-                    )
-                    .when_some(edit.error, |el, error| {
-                        el.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
-                    })
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                chip("filter-preview", strings.filter_preview, false, cx).on_click(
-                                    cx.listener(|this, _, _, cx| this.set_filter_preview(true, cx)),
-                                ),
-                            )
-                            .when(advanced, |el| {
-                                el.child(
-                                    div()
-                                        .relative()
-                                        .child(
-                                            chip(
-                                                "filter-examples",
-                                                strings.filter_examples,
-                                                false,
-                                                cx,
-                                            )
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| {
-                                                    if let Some(edit) = this.filter_edit.as_mut() {
-                                                        edit.examples_open = !edit.examples_open;
-                                                    }
-                                                    cx.notify();
-                                                }),
-                                            ),
-                                        )
-                                        .children(examples),
-                                )
-                            })
-                            .child(div().flex_1())
-                            .child(chip("filter-close", strings.close, false, cx).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.filter_edit = None;
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(
-                                div()
-                                    .id("filter-save")
-                                    .min_h(px(28.))
-                                    .px_3()
-                                    .py_1()
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(6.))
-                                    .bg(theme.colors().accent)
-                                    .hover(|s| s.opacity(0.9))
-                                    .cursor_pointer()
-                                    .child(Label::new(strings.save).size(LabelSize::Small).color(Color::OnAccent))
-                                    .on_click(cx.listener(|this, _, window, cx| this.save_filter(window, cx))),
-                            ),
+                        Button::new("filter-save", strings.save)
+                            .variant(ButtonVariant::Primary)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, window, cx| this.save_filter(window, cx))),
                     ),
             )
             .into_any_element()

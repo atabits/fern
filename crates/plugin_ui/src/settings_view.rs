@@ -11,7 +11,7 @@ use desktop_common::data_version::data_changed;
 use desktop_common::text_input::{Changed, Mode, Submitted, TextInput};
 use fern_core::Store;
 use fern_core::plugin_store::{PluginState, UserScript};
-use fern_i18n::{self as i18n, Locale};
+use fern_i18n as i18n;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, Context, ElementId, Entity, FocusHandle, Focusable, FontWeight,
@@ -1565,8 +1565,6 @@ impl PluginSettingsView {
 
     fn render_installed_tab(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let locale = i18n::locale(cx);
-        let ex = ExtraLabels::for_locale(locale);
         let theme = cx.theme().clone();
         let colors = theme.colors();
 
@@ -1688,7 +1686,7 @@ impl PluginSettingsView {
         } else {
             plugins
                 .iter()
-                .map(|info| self.render_plugin_card(info, &ex, &theme, cx))
+                .map(|info| self.render_plugin_card(info, &theme, cx))
                 .collect()
         };
 
@@ -1704,7 +1702,6 @@ impl PluginSettingsView {
     fn render_plugin_card(
         &mut self,
         info: &PluginInfo,
-        ex: &ExtraLabels,
         theme: &theme::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1714,14 +1711,16 @@ impl PluginSettingsView {
         let pid = info.manifest.id.clone();
 
         let (status_label, status_color) = match &info.status {
-            PluginStatus::Active => (ex.status_active, status_colors.success),
-            PluginStatus::Idle => (ex.status_idle, status_colors.info),
+            PluginStatus::Active => (strings.plugin_status_active, status_colors.success),
+            PluginStatus::Idle => (strings.plugin_status_idle, status_colors.info),
             PluginStatus::Disabled => (strings.plugins_disabled, colors.text_muted),
             PluginStatus::NeedsApproval { .. } => {
                 (strings.plugins_permissions_approve, status_colors.warning)
             }
-            PluginStatus::CircuitBroken { .. } => (ex.status_broken, status_colors.error),
-            PluginStatus::Error(_) => (ex.status_error, status_colors.error),
+            PluginStatus::CircuitBroken { .. } => {
+                (strings.plugin_status_broken, status_colors.error)
+            }
+            PluginStatus::Error(_) => (strings.plugin_status_error, status_colors.error),
         };
 
         let metrics_text = strings
@@ -2031,12 +2030,12 @@ impl PluginSettingsView {
         );
 
         if settings_open && has_settings {
-            let form = self.render_plugin_settings_form(info, ex, cx);
+            let form = self.render_plugin_settings_form(info, cx);
             card = card.child(Divider::horizontal()).child(form);
         }
 
         if logs_open {
-            let logs_panel = self.render_plugin_logs_panel(&pid, ex, theme, cx);
+            let logs_panel = self.render_plugin_logs_panel(&pid, theme, cx);
             card = card.child(Divider::horizontal()).child(logs_panel);
         }
 
@@ -2046,7 +2045,6 @@ impl PluginSettingsView {
     fn render_plugin_settings_form(
         &mut self,
         info: &PluginInfo,
-        ex: &ExtraLabels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let strings = i18n::t(cx);
@@ -2403,7 +2401,7 @@ impl PluginSettingsView {
                                     )
                                     .size(px(28.))
                                     .disabled(secret_busy)
-                                    .tooltip(Tooltip::text(ex.clear_secret))
+                                    .tooltip(Tooltip::text(strings.plugin_clear_secret))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.delete_secret_setting(
                                             pid_del.clone(),
@@ -2426,7 +2424,6 @@ impl PluginSettingsView {
     fn render_plugin_logs_panel(
         &self,
         plugin_id: &str,
-        ex: &ExtraLabels,
         theme: &theme::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2485,7 +2482,7 @@ impl PluginSettingsView {
             )
             .child(render_log_entries_box(
                 logs,
-                ex.no_logs,
+                strings.plugin_no_logs,
                 colors,
                 theme.status(),
             ))
@@ -2494,7 +2491,6 @@ impl PluginSettingsView {
 
     fn render_scripts_tab(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let ex = ExtraLabels::for_locale(i18n::locale(cx));
         let theme = cx.theme().clone();
         let colors = theme.colors();
 
@@ -2527,7 +2523,10 @@ impl PluginSettingsView {
                     .end_slot(
                         h_flex()
                             .gap_2()
-                            .child(Chip::new(script.trigger_kind.clone(), colors.accent))
+                            .child(Chip::new(
+                                trigger_kind_label(&script.trigger_kind, strings),
+                                colors.accent,
+                            ))
                             .child(
                                 div()
                                     .id(ElementId::Name(SharedString::from(format!(
@@ -2569,7 +2568,7 @@ impl PluginSettingsView {
             trigger_tabs = trigger_tabs.tab(
                 SegmentedTab::new(
                     ElementId::Name(SharedString::from(format!("script-trig-{trig}"))),
-                    trig,
+                    trigger_kind_label(trig, strings),
                 )
                 .toggle_state(self.script_trigger_kind == trig)
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -2645,7 +2644,11 @@ impl PluginSettingsView {
                             h_flex()
                                 .gap_2()
                                 .child(Chip::new(
-                                    if res.ok { ex.run_ok } else { ex.run_err },
+                                    if res.ok {
+                                        strings.plugin_run_ok
+                                    } else {
+                                        strings.plugin_run_err
+                                    },
                                     status_color,
                                 ))
                                 .child(
@@ -2677,7 +2680,7 @@ impl PluginSettingsView {
                 })
                 .child(render_log_entries_box(
                     &res.logs,
-                    ex.no_logs,
+                    strings.plugin_no_logs,
                     colors,
                     theme.status(),
                 ))
@@ -2766,7 +2769,10 @@ impl PluginSettingsView {
                                 .child(
                                     div()
                                         .w(px(110.))
-                                        .child(Label::new(ex.trigger_arg).size(LabelSize::Small)),
+                                        .child(
+                                            Label::new(strings.plugin_trigger_arg)
+                                                .size(LabelSize::Small),
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -2798,7 +2804,7 @@ impl PluginSettingsView {
                         v_flex()
                             .gap_1()
                             .child(
-                                Label::new(ex.code_label)
+                                Label::new(strings.plugin_code_label)
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
                             )
@@ -2866,7 +2872,6 @@ impl PluginSettingsView {
 
     fn render_browse_tab(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let ex = ExtraLabels::for_locale(i18n::locale(cx));
         let theme = cx.theme().clone();
         let colors = theme.colors();
 
@@ -3043,7 +3048,7 @@ impl PluginSettingsView {
                     .child(EmptyState::new(
                         IconName::Search,
                         if self.browse_loading {
-                            ex.loading
+                            strings.plugin_loading
                         } else {
                             strings.nothing_found
                         },
@@ -3731,62 +3736,12 @@ fn format_timestamp(ms: i64) -> String {
     }
 }
 
-struct ExtraLabels {
-    status_active: &'static str,
-    status_idle: &'static str,
-    status_broken: &'static str,
-    status_error: &'static str,
-    clear_secret: &'static str,
-    no_logs: &'static str,
-    trigger_arg: &'static str,
-    code_label: &'static str,
-    run_ok: &'static str,
-    run_err: &'static str,
-    loading: &'static str,
-}
-
-impl ExtraLabels {
-    fn for_locale(locale: Locale) -> Self {
-        match locale {
-            Locale::En => Self {
-                status_active: "Active",
-                status_idle: "Idle",
-                status_broken: "Circuit Broken",
-                status_error: "Error",
-                clear_secret: "Clear secret",
-                no_logs: "No log entries yet.",
-                trigger_arg: "Trigger Arg",
-                code_label: "JavaScript Code",
-                run_ok: "Success",
-                run_err: "Failed",
-                loading: "Loading…",
-            },
-            Locale::Ru => Self {
-                status_active: "Активен",
-                status_idle: "Ожидание",
-                status_broken: "Остановлен",
-                status_error: "Ошибка",
-                clear_secret: "Удалить секрет",
-                no_logs: "Логов пока нет.",
-                trigger_arg: "Аргумент триггера",
-                code_label: "Код JavaScript",
-                run_ok: "Успех",
-                run_err: "Ошибка",
-                loading: "Загрузка…",
-            },
-            Locale::ZhCn => Self {
-                status_active: "运行中",
-                status_idle: "空闲",
-                status_broken: "已熔断",
-                status_error: "错误",
-                clear_secret: "清除密钥",
-                no_logs: "暂无日志。",
-                trigger_arg: "触发参数",
-                code_label: "JavaScript 代码",
-                run_ok: "成功",
-                run_err: "失败",
-                loading: "加载中…",
-            },
-        }
+fn trigger_kind_label(kind: &str, strings: &i18n::Strings) -> SharedString {
+    match kind {
+        "manual" => strings.plugin_trigger_manual.into(),
+        "command" => strings.plugin_trigger_command.into(),
+        "event" => strings.plugin_trigger_event.into(),
+        "interval" => strings.plugin_trigger_interval.into(),
+        other => other.to_owned().into(),
     }
 }

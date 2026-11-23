@@ -22,7 +22,9 @@ pub struct Modal {
     id: ElementId,
     width: Option<Pixels>,
     max_width: Option<Pixels>,
+    height: Option<Pixels>,
     max_height: Option<Pixels>,
+    overflow_hidden: bool,
     padding: Pixels,
     gap: Pixels,
     on_dismiss: Option<ClickHandler>,
@@ -35,7 +37,9 @@ impl Modal {
             id: id.into(),
             width: None,
             max_width: None,
+            height: None,
             max_height: None,
+            overflow_hidden: false,
             padding: DEFAULT_PADDING,
             gap: DEFAULT_GAP,
             on_dismiss: None,
@@ -55,9 +59,21 @@ impl Modal {
         self
     }
 
+    /// Sets an explicit height for the modal card.
+    pub fn height(mut self, height: Pixels) -> Self {
+        self.height = Some(height);
+        self
+    }
+
     /// Sets the maximum height for the modal card.
     pub fn max_height(mut self, max_height: Pixels) -> Self {
         self.max_height = Some(max_height);
+        self
+    }
+
+    /// Clips overflowing child content inside the modal card's rounded bounds.
+    pub fn overflow_hidden(mut self) -> Self {
+        self.overflow_hidden = true;
         self
     }
 
@@ -91,7 +107,9 @@ impl ParentElement for Modal {
 
 impl RenderOnce for Modal {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let colors = cx.theme().colors();
+        let theme = cx.theme();
+        let colors = theme.colors();
+        let scrim_opacity = if theme.is_dark() { 0.50 } else { 0.35 };
         let card_id: ElementId = (self.id.clone(), "card").into();
 
         let card = crate::v_flex()
@@ -109,7 +127,9 @@ impl RenderOnce for Modal {
                 (None, Some(mw)) => el.w_full().max_w(mw),
                 (None, None) => el.w(DEFAULT_WIDTH).max_w_full(),
             })
+            .when_some(self.height, |el, h| el.h(h))
             .when_some(self.max_height, |el, mh| el.max_h(mh))
+            .when(self.overflow_hidden, |el| el.overflow_hidden())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(|_, _, cx| cx.stop_propagation())
             .children(self.children);
@@ -122,7 +142,7 @@ impl RenderOnce for Modal {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::black().opacity(0.35))
+            .bg(gpui::black().opacity(scrim_opacity))
             .occlude()
             .when_some(self.on_dismiss, |el, handler| el.on_click(handler))
             .child(card)

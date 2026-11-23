@@ -34,6 +34,14 @@ pub fn countdown_color(color: Option<&str>, cx: &App) -> gpui::Hsla {
 /// A countdown's round icon: its emoji on its color, or the kind's icon.
 pub fn badge(countdown: &Countdown, color: gpui::Hsla, cx: &App) -> gpui::Div {
     let fill = parse_color(countdown.color.as_deref());
+    let (bg, icon_color) = match fill {
+        Some(c) => {
+            let bg = c.opacity(0.75);
+            let blended = cx.theme().colors().surface_background.blend(bg);
+            (bg, theme::foreground_on(&[blended], 3.))
+        }
+        None => (color.opacity(0.25), color),
+    };
     // The original's 24 px round icon beside the name.
     div()
         .size(px(24.))
@@ -41,13 +49,13 @@ pub fn badge(countdown: &Countdown, color: gpui::Hsla, cx: &App) -> gpui::Div {
         .items_center()
         .justify_center()
         .rounded_full()
-        .bg(fill.map_or(color.opacity(0.25), |c| c.opacity(0.6)))
+        .bg(bg)
         .map(|el| match &countdown.icon {
             Some(icon) => el.text_size(px(14.)).child(icon.clone()),
             None => el.child(
                 Icon::new(kind_icon(countdown.kind))
                     .size(IconSize::Small)
-                    .color(Color::Custom(if fill.is_some() { cx.theme().colors().text } else { color })),
+                    .color(Color::Custom(icon_color)),
             ),
         })
 }

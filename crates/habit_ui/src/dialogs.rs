@@ -636,17 +636,3 @@ impl HabitView {
             .into_any_element()
     }
 }
-
-pub(crate) fn modal_backdrop(id: &'static str, content: AnyElement) -> AnyElement {
-    div()
-        .id(id)
-        .absolute()
-        .inset_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(gpui::black().opacity(0.35))
-        .occlude()
-        .child(content)
-        .into_any_element()
-}

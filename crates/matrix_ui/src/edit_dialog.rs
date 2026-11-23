@@ -191,7 +191,7 @@ impl MatrixView {
                                     .justify_center()
                                     .rounded_full()
                                     .bg(color)
-                                    .text_color(theme.colors().on_accent)
+                                    .text_color(theme::foreground_on(&[color], 3.))
                                     .text_size(px(8.))
                                     .font_weight(FontWeight::BOLD)
                                     .child(numeral),
@@ -203,6 +203,7 @@ impl MatrixView {
                                     .child(
                                         IconButton::new("matrix-name-emoji", IconName::Smile)
                                             .icon_size(IconSize::Small)
+                                            .tooltip(Tooltip::text(strings.habit_icon_tabs[1]))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.emoji_picker_open = !this.emoji_picker_open;
                                                 cx.notify();

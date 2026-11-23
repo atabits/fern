@@ -1,7 +1,8 @@
 //! The Countdown section, matched to TickTick's: filter tabs and a grid of cards showing the time
 //! until (or since) a date; clicking the numbers switches between Y/M/D and plain days.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use chrono::{Datelike, Local, NaiveDate};
@@ -9,7 +10,7 @@ use fern_core::countdown::{DatePart, days_in_month, with_date_part};
 use fern_core::{Countdown, CountdownKind, DateFormat, Id, Store};
 use gpui::{Entity, Focusable as _, FontWeight, ScrollHandle, Subscription};
 use ui::prelude::*;
-use ui::{ConfirmDialog, EmptyState, Placement, PopoverAttachment, popover};
+use ui::{Button, ButtonSize, ButtonVariant, ConfirmDialog, EmptyState, Modal, Placement, PopoverAttachment, popover};
 
 use desktop_common::data_version::{DataVersion, changed_elsewhere, data_changed};
 use desktop_common::{actions, calendar, colors as lists_panel, layout, paths::attachments_dir, touch};
@@ -226,6 +227,8 @@ pub struct CountdownView {
     show_archived: bool,
     /// Cached value of `HIDE_GROUP_SETTING` (loaded in `reload`, never queried during `render`).
     hide_group: bool,
+    /// Resolved on-disk background image paths, refreshed in `reload` so `render_card` performs zero `stat()` calls.
+    resolved_backgrounds: HashMap<Id, PathBuf>,
     active: bool,
     dirty: bool,
 }
@@ -268,6 +271,7 @@ impl CountdownView {
             header_menu: false,
             show_archived: false,
             hide_group: false,
+            resolved_backgrounds: HashMap::new(),
             active: true,
             dirty: false,
         };
@@ -307,6 +311,18 @@ impl CountdownView {
             .flatten()
             .as_deref()
             == Some("1");
+        self.resolved_backgrounds = match attachments_dir() {
+            Ok(dir) => self
+                .countdowns
+                .iter()
+                .filter_map(|c| {
+                    let name = c.background.as_ref()?;
+                    let path = dir.join(name);
+                    path.exists().then_some((c.id, path))
+                })
+                .collect(),
+            Err(_) => HashMap::new(),
+        };
         cx.notify();
     }
 
@@ -629,11 +645,7 @@ impl CountdownView {
         let id = countdown.id;
         let group = SharedString::from(format!("countdown-{id}"));
         let Face { color, numbers, subtitle } = face(countdown, today, self.days_only.contains(&id), cx);
-        let background: Option<std::path::PathBuf> = countdown
-            .background
-            .as_ref()
-            .and_then(|name| attachments_dir().ok().map(|dir| dir.join(name)))
-            .filter(|path| path.exists());
+        let background: Option<PathBuf> = self.resolved_backgrounds.get(&id).cloned();
         let has_picture = background.is_some();
 
         v_flex()
@@ -667,7 +679,7 @@ impl CountdownView {
                         div()
                             .text_size(px(16.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .when(has_picture, |el| el.text_color(theme.colors().on_accent))
+                            .when(has_picture, |el| el.text_color(gpui::white()))
                             .child(countdown.name.clone()),
                     ),
             )
@@ -685,7 +697,7 @@ impl CountdownView {
                     }))
                     .child(numbers),
             )
-            .child(div().text_size(px(12.)).when(has_picture, |el| el.text_color(theme.colors().on_accent.opacity(0.85))).when(!has_picture, |el| el.text_color(theme.colors().text_muted)).child(subtitle))
+            .child(div().text_size(px(12.)).when(has_picture, |el| el.text_color(gpui::white().opacity(0.85))).when(!has_picture, |el| el.text_color(theme.colors().text_muted)).child(subtitle))
             // The original's pin, beside the "…": a pinned card stays first and shows it.
             .child({
                 let pinned = countdown.pinned_at.is_some();
@@ -720,6 +732,7 @@ impl CountdownView {
                         IconButton::new(SharedString::from(format!("countdown-more-{id}")), IconName::Ellipsis)
                             .size(px(22.))
                             .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(strings.more))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.card_menu = if this.card_menu == Some(id) { None } else { Some(id) };
@@ -1018,20 +1031,6 @@ impl CountdownView {
             let field = |input: Entity<TextInput>| {
                 h_flex().w(px(100.)).h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().element_hover).child(input)
             };
-            let small_button = |id: &'static str, label: &'static str, primary: bool| {
-                div()
-                    .id(id)
-                    .flex_1()
-                    .h(px(28.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
-                    .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
-                    .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
-            };
             v_flex()
                 .gap_2()
                 .p_1()
@@ -1061,8 +1060,24 @@ impl CountdownView {
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(small_button("countdown-custom-cancel", strings.cancel, false).on_click(set(Box::new(|d| d.custom = None))))
-                        .child(small_button("countdown-custom-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| this.confirm_custom_reminder(cx)))),
+                        .child(
+                            div().flex_1().child(
+                                Button::new("countdown-custom-cancel", strings.cancel)
+                                    .variant(ButtonVariant::Secondary)
+                                    .size(ButtonSize::Sm)
+                                    .full_width()
+                                    .on_click(set(Box::new(|d| d.custom = None))),
+                            ),
+                        )
+                        .child(
+                            div().flex_1().child(
+                                Button::new("countdown-custom-ok", strings.ok)
+                                    .variant(ButtonVariant::Primary)
+                                    .size(ButtonSize::Sm)
+                                    .full_width()
+                                    .on_click(cx.listener(|this, _, _, cx| this.confirm_custom_reminder(cx))),
+                            ),
+                        ),
                 )
                 .into_any_element()
         });
@@ -1122,17 +1137,9 @@ impl CountdownView {
             )
             .child(
                 h_flex().pt_1().justify_end().child(
-                    div()
-                        .id("countdown-reminder-ok")
-                        .w(px(100.))
-                        .h(px(28.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .bg(theme.colors().accent)
-                        .child(Label::new(strings.ok).size(LabelSize::Small).color(Color::OnAccent))
+                    Button::new("countdown-reminder-ok", strings.ok)
+                        .variant(ButtonVariant::Primary)
+                        .size(ButtonSize::Sm)
                         .on_click(set(Box::new(|d| d.open = None))),
                 ),
             )
@@ -1325,21 +1332,6 @@ impl CountdownView {
                         .child(icon_menu),
                 ))
             });
-        let button = |id: &'static str, label: &'static str, primary: bool| {
-            div()
-                .id(id)
-                .debug_selector(move || id.to_owned())
-                .w(px(100.))
-                .h(px(30.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.))
-                .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
-                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
-        };
         let show_age = draft.show_age;
         let presets = (open == Some(DraftRow::Presets)).then(|| {
             PopoverAttachment::new(
@@ -1385,10 +1377,10 @@ impl CountdownView {
             )
         });
 
-        popover(cx)
-            .w(px(430.))
-            .p_4()
-            .gap_2()
+        Modal::new("countdown-modal")
+            .width(px(430.))
+            .padding(px(16.))
+            .gap(px(8.))
             .child(
                 h_flex()
                     .child(div().flex_1().child(Label::new(if draft.editing.is_some() { strings.countdown_edit } else { strings.countdown_new }).weight(FontWeight::BOLD)))
@@ -1463,10 +1455,15 @@ impl CountdownView {
                             .on_click(cx.listener(|this, _, _, cx| this.choose_background(cx))),
                     )
                     .when(draft.background.is_some(), |el| {
-                        el.child(IconButton::new("countdown-background-clear", IconName::X).icon_color(Color::Muted).on_click(set(Box::new(|d| {
-                            d.background = None;
-                            d.new_background = None;
-                        }))))
+                        el.child(
+                            IconButton::new("countdown-background-clear", IconName::X)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text(strings.clear))
+                                .on_click(set(Box::new(|d| {
+                                    d.background = None;
+                                    d.new_background = None;
+                                }))),
+                        )
                     })
                     .into_any_element(),
             ))
@@ -1488,11 +1485,21 @@ impl CountdownView {
                     .pt_2()
                     .gap(px(10.))
                     .justify_end()
-                    .child(button("countdown-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
-                        this.draft = None;
-                        cx.notify();
-                    })))
-                    .child(button("countdown-save", strings.save, true).on_click(cx.listener(|this, _, _, cx| this.save_draft(cx)))),
+                    .child(
+                        Button::new("countdown-cancel", strings.cancel)
+                            .variant(ButtonVariant::Secondary)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.draft = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div().debug_selector(|| "countdown-save".to_owned()).child(
+                            Button::new("countdown-save", strings.save)
+                                .variant(ButtonVariant::Primary)
+                                .on_click(cx.listener(|this, _, _, cx| this.save_draft(cx))),
+                        ),
+                    ),
             )
             .into_any_element()
     }
@@ -1542,18 +1549,7 @@ impl Render for CountdownView {
             .collect();
         let cards: Vec<AnyElement> = shown.iter().map(|c| self.render_card(c, cx)).collect();
         // The add / edit dialog over a dimmed background, as the original shows it.
-        let modal = self.draft.is_some().then(|| {
-            div()
-                .id("countdown-modal")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(gpui::black().opacity(0.35))
-                .occlude()
-                .child(self.render_draft(window, cx))
-        });
+        let modal = self.draft.is_some().then(|| self.render_draft(window, cx));
 
         v_flex()
             .relative()

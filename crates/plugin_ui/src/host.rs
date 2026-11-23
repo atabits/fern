@@ -778,18 +778,38 @@ impl PluginHost {
         }
     }
 
-    /// Starts an active-window hot-reload poller that pauses when no Fern window is focused.
+    /// Starts an active-window hot-reload poller that pauses when no Fern window is focused,
+    /// and stops completely when zero plugins are installed.
     pub fn start_hot_reload_poller(cx: &mut App) {
         let Some(host) = cx.try_global::<Self>() else {
             return;
         };
-        if host.safe_mode || host.manager.is_none() || host.hot_reload_started {
+        if host.safe_mode || host.manager.is_none() {
+            return;
+        }
+        if !host.hot_reload_enabled {
+            cx.update_global::<Self, _>(|host, _| {
+                host.hot_reload_enabled = true;
+            });
+        }
+        Self::ensure_hot_reload_poller(cx);
+    }
+
+    fn ensure_hot_reload_poller(cx: &mut App) {
+        let Some(host) = cx.try_global::<Self>() else {
+            return;
+        };
+        if !host.hot_reload_enabled
+            || host.safe_mode
+            || host.manager.is_none()
+            || host.hot_reload_started
+            || host.plugins.is_empty()
+        {
             return;
         }
         let signal = Arc::clone(&host.wake_signal);
         cx.update_global::<Self, _>(|host, _| {
             host.hot_reload_started = true;
-            host.hot_reload_enabled = true;
         });
 
         cx.spawn(async move |cx| {
@@ -815,7 +835,7 @@ impl PluginHost {
                     let Some(host) = cx.try_global::<PluginHost>() else {
                         return PollState::Stop;
                     };
-                    if !host.hot_reload_enabled || host.safe_mode {
+                    if !host.hot_reload_enabled || host.safe_mode || host.plugins.is_empty() {
                         return PollState::Stop;
                     }
                     let Some(mgr) = host.manager.clone() else {
@@ -1744,6 +1764,7 @@ fn apply_host_update(update: HostUpdate, cx: &mut App) {
                     let sig = theme_contribution_signature(&plugins);
                     sync_plugin_themes_async(plugins, sig, cx);
                 }
+                PluginHost::ensure_hot_reload_poller(cx);
             }
         }
         HostUpdate::ViewRendered(payload) => {
@@ -1847,6 +1868,7 @@ fn apply_registry_changed(infos: Vec<PluginInfo>, cx: &mut App) {
     if should_sync_themes {
         sync_plugin_themes_async(infos, next_theme_sig, cx);
     }
+    PluginHost::ensure_hot_reload_poller(cx);
 }
 
 fn sync_bus_contributions(plugins: &[PluginInfo], cx: &mut App) {
@@ -2128,4 +2150,83 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fern_i18n::{CurrentLocale, Locale};
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn hot_reload_poller_stays_stopped_with_zero_plugins_and_toggles_with_registry(
+        cx: &mut TestAppContext,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugins_dir = tmp.path().join("plugins");
+        let cache_dir = plugins_dir.join(".registry-cache");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(CurrentLocale(Locale::En));
+            PluginHost::init(
+                PluginHostConfig {
+                    plugins_dir: plugins_dir.clone(),
+                    registry_cache_dir: cache_dir,
+                    db_path: None,
+                    secrets_vault_path: tmp.path().join("secrets.vault"),
+                    secrets_key_path: tmp.path().join("secrets.key"),
+                    safe_mode: false,
+                    locale: "en".to_owned(),
+                    theme_appearance: "light".to_owned(),
+                    hot_reload: true,
+                },
+                cx,
+            )
+            .unwrap();
+            let host = PluginHost::global(cx).unwrap();
+            assert!(host.plugins().is_empty());
+            assert!(host.hot_reload_enabled);
+            assert!(!host.hot_reload_started);
+            PluginHost::start_hot_reload_poller(cx);
+            assert!(!PluginHost::global(cx).unwrap().hot_reload_started);
+        });
+
+        let plugin_dir = plugins_dir.join("com.test.poller");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "id": "com.test.poller",
+                "name": "Poller Test",
+                "version": "1.0.0",
+                "api_version": 1,
+                "entry": "index.js",
+                "permissions": []
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(plugin_dir.join("index.js"), "export function activate() {}").unwrap();
+
+        cx.update(PluginHost::reload_all_async);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let host = PluginHost::global(cx).unwrap();
+            assert_eq!(host.plugins().len(), 1);
+            assert!(host.hot_reload_started);
+        });
+
+        std::fs::remove_dir_all(&plugin_dir).unwrap();
+        cx.update(PluginHost::reload_all_async);
+        cx.run_until_parked();
+        cx.executor().advance_clock(HOT_RELOAD_POLL_INTERVAL);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let host = PluginHost::global(cx).unwrap();
+            assert!(host.plugins().is_empty());
+            assert!(!host.hot_reload_started);
+            PluginHost::shutdown(cx);
+        });
+    }
 }

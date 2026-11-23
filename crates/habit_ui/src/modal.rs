@@ -6,7 +6,7 @@ use fern_core::habit::{
 };
 use gpui::{Entity, Focusable as _, FontWeight};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Modal, Placement, PopoverAttachment, popover};
 
 use desktop_common::text_input::{Cancelled, Mode, Submitted, TextInput};
 use desktop_common::{calendar, colors as lists_panel};
@@ -511,7 +511,7 @@ impl HabitView {
         let start_label = edit
             .start_date
             .map(|d| desktop_common::calendar::format_date(d, strings))
-            .unwrap_or_else(|| strings.habit_forever.to_owned());
+            .unwrap_or_else(|| strings.habit_start_anytime.to_owned());
         let goal_days_label = edit
             .goal_days
             .map(|n| format!("{n} {}", day_unit_str(n as i64, strings)))
@@ -519,17 +519,9 @@ impl HabitView {
 
         let can_save = !edit.name.read(cx).text().trim().is_empty();
 
-        v_flex()
-            .id("habit-edit-dialog")
-            .w(px(470.))
-            .max_h(px(640.))
-            .rounded(px(10.))
-            .border_1()
-            .border_color(theme.colors().border)
-            .bg(theme.colors().elevated_surface_background)
-            .shadow_lg()
-            .p_5()
-            .gap(px(12.))
+        Modal::new("habit-modal")
+            .width(px(470.))
+            .max_height(px(640.))
             .child(
                 h_flex()
                     .justify_between()

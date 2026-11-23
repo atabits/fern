@@ -1041,9 +1041,11 @@ impl TodoView {
         });
     }
 
-    fn sync_horizons_active(&self, cx: &mut Context<Self>) {
-        let active = self.active && self.view == View::Horizons;
-        self.horizons.update(cx, |horizons, cx| horizons.set_active(active, cx));
+    fn sync_subview_active(&self, cx: &mut Context<Self>) {
+        let horizons_active = self.active && self.view == View::Horizons;
+        self.horizons.update(cx, |horizons, cx| horizons.set_active(horizons_active, cx));
+        let summary_active = self.active && matches!(self.view, View::Summary);
+        self.summary.update(cx, |summary, cx| summary.set_active(summary_active, cx));
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
@@ -1052,7 +1054,7 @@ impl TodoView {
             self.dirty = false;
             self.reload_inner(false, false, cx);
         } else {
-            self.sync_horizons_active(cx);
+            self.sync_subview_active(cx);
         }
     }
 
@@ -1117,7 +1119,7 @@ impl TodoView {
             self.view = View::Today;
             switched = true;
         }
-        self.sync_horizons_active(cx);
+        self.sync_subview_active(cx);
         self.sync_input_placeholder(cx);
         self.completing.retain(|id, pending| {
             pending.view == self.view && !cx.reduce_motion()
@@ -2127,33 +2129,53 @@ impl TodoView {
             return true;
         }
 
+        // Close active confirmations and nested/modal dialogs one layer at a time before menus.
+        if std::mem::take(&mut self.confirm_empty_trash)
+            || self.confirm_delete.take().is_some()
+            || self.batch_add_pending.take().is_some()
+        {
+            cx.notify();
+            return true;
+        }
+        if self.folder_dialog.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        if let Some(dialog) = &self.list_dialog
+            && dialog.update(cx, |d, cx| d.dismiss_nested(cx))
+        {
+            return true;
+        }
+        if self.filter_edit.as_ref().is_some_and(|edit| edit.preview) {
+            self.set_filter_preview(false, cx);
+            return true;
+        }
+        if self.list_dialog.take().is_some()
+            || self.tag_dialog.take().is_some()
+            || self.merge_dialog.take().is_some()
+            || self.filter_edit.take().is_some()
+            || self.view_options.take().is_some()
+        {
+            cx.notify();
+            return true;
+        }
+
         // These menus don't move keyboard focus when opened from the list.
-        let dismissed_menu = [
-            self.context_menu.take().is_some(),
-            self.habit_menu.take().is_some(),
-            self.list_menu.take().is_some(),
-            self.closed_menu.take().is_some(),
-            self.batch_menu.take().is_some(),
-            self.column_menu.take().is_some(),
-            self.section_menu.take().is_some(),
-            self.view_options.take().is_some(),
-            self.filter_edit.take().is_some(),
-            self.list_dialog.take().is_some(),
-            self.folder_dialog.take().is_some(),
-            self.tag_dialog.take().is_some(),
-            self.merge_dialog.take().is_some(),
-            self.suggestions_open.take().is_some(),
-            std::mem::take(&mut self.header_menu_open),
-            std::mem::take(&mut self.confirm_empty_trash),
-            self.confirm_delete.take().is_some(),
-            self.batch_add_pending.take().is_some(),
-            std::mem::take(&mut self.postpone_menu),
-            std::mem::take(&mut self.scale_menu_open),
-            std::mem::take(&mut self.templates_open),
-            std::mem::take(&mut self.input_box_open),
-            std::mem::take(&mut self.add_menu_open),
-            self.add_date_month.take().is_some(),
-        ].into_iter().any(|was_open| was_open);
+        let dismissed_menu = self.context_menu.take().is_some()
+            || self.habit_menu.take().is_some()
+            || self.list_menu.take().is_some()
+            || self.closed_menu.take().is_some()
+            || self.batch_menu.take().is_some()
+            || self.column_menu.take().is_some()
+            || self.section_menu.take().is_some()
+            || self.suggestions_open.take().is_some()
+            || std::mem::take(&mut self.header_menu_open)
+            || std::mem::take(&mut self.postpone_menu)
+            || std::mem::take(&mut self.scale_menu_open)
+            || std::mem::take(&mut self.templates_open)
+            || std::mem::take(&mut self.input_box_open)
+            || std::mem::take(&mut self.add_menu_open)
+            || self.add_date_month.take().is_some();
         if dismissed_menu {
             self.context_side = None;
             self.add_list_side = false;
@@ -2196,8 +2218,19 @@ impl TodoView {
             self.clear_multi_selection(cx);
             return true;
         }
-        self.detail.read(cx).has_popup()
+        if self.detail.read(cx).has_popup()
             && self.detail.update(cx, |detail, cx| detail.dismiss_popup(window, cx))
+        {
+            return true;
+        }
+        if self.uses_popup_details() && (self.selected.is_some() || self.list_activity.is_some()) {
+            self.selected = None;
+            self.list_activity = None;
+            window.focus(&self.list_focus, cx);
+            cx.notify();
+            return true;
+        }
+        false
     }
 
 
@@ -2700,28 +2733,47 @@ impl TodoView {
     }
 
     fn render_empty_state(&self, strings: &'static Strings, _theme: &theme::Theme, _px_fallback: Pixels) -> AnyElement {
+        let can_add = !self.is_read_only_view() && !matches!(self.view, View::Day(_) | View::Summary | View::Horizons);
+        let input = self.input.clone();
+        let with_cta = |state: EmptyState| -> EmptyState {
+            if can_add && (!self.kanban || self.timeline) {
+                state.action("empty-add-task", strings.add_task, move |_, window, cx| {
+                    window.focus(&input.focus_handle(cx), cx);
+                })
+            } else {
+                state
+            }
+        };
         match &self.view {
             View::Day(_) => EmptyState::new(IconName::CalendarCheck, strings.free_day_hint)
                 .title(strings.free_day)
                 .into_any_element(),
-            View::Tomorrow => EmptyState::new(IconName::Map, strings.plan_ahead)
-                .title(strings.no_tasks_tomorrow)
-                .into_any_element(),
+            View::Tomorrow => with_cta(
+                EmptyState::new(IconName::Map, strings.plan_ahead)
+                    .title(strings.no_tasks_tomorrow),
+            )
+            .into_any_element(),
+            View::Completed => EmptyState::new(IconName::SquareCheck, strings.no_completed_tasks).into_any_element(),
+            View::WontDo => EmptyState::new(IconName::SquareX, strings.no_wont_do).into_any_element(),
+            View::Trash => EmptyState::new(IconName::Trash, strings.trash_is_empty).into_any_element(),
+            View::Search(query) if query.trim().is_empty() => {
+                EmptyState::new(IconName::Search, strings.search_hint).into_any_element()
+            }
+            View::Search(_) => EmptyState::new(IconName::Search, strings.nothing_found).into_any_element(),
             other => {
-                let (icon, message) = match other {
+                let (icon, title) = match other {
                     View::Inbox => (IconName::Inbox, strings.no_tasks),
-                    View::Today => (IconName::Sun, strings.no_tasks),
+                    View::Today => (IconName::Sun, strings.no_tasks_today),
                     View::Next7Days => (IconName::CalendarDays, strings.no_tasks),
-                    View::Completed => (IconName::SquareCheck, strings.no_completed_tasks),
-                    View::WontDo => (IconName::SquareX, strings.no_wont_do),
-                    View::Trash => (IconName::Trash, strings.trash_is_empty),
-                    View::Search(query) if query.trim().is_empty() => (IconName::Search, strings.search_hint),
-                    View::Search(_) => (IconName::Search, strings.nothing_found),
                     View::Tag(_) => (IconName::Tag, strings.no_tasks),
                     View::Filter(_) => (IconName::Layers, strings.no_tasks),
                     _ => (IconName::ListChecks, strings.no_tasks),
                 };
-                EmptyState::new(icon, message).into_any_element()
+                if can_add {
+                    with_cta(EmptyState::new(icon, strings.empty_tasks_hint).title(title)).into_any_element()
+                } else {
+                    EmptyState::new(icon, title).into_any_element()
+                }
             }
         }
     }
@@ -4713,32 +4765,25 @@ impl Render for TodoView {
                     if multi || (self.selected.is_none() && self.list_activity.is_none()) {
                         return el.child(list);
                     }
+                    let popup_height = (window.viewport_size().height * 0.8)
+                        .min((window.viewport_size().height - px(32.)).max(px(200.)));
                     return el.child(list).child(
-                        div()
-                            .id("detail-popup")
-                            .absolute()
-                            .inset_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(gpui::black().opacity(0.35))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                        Modal::new("detail-popup")
+                            .width(px(detail_width))
+                            .height(popup_height)
+                            .padding(px(0.))
+                            .gap(px(0.))
+                            .overflow_hidden()
+                            .on_dismiss(cx.listener(|this, _, window, cx| {
                                 this.selected = None;
                                 this.list_activity = None;
+                                window.focus(&this.list_focus, cx);
                                 cx.notify();
                             }))
                             .child(
                                 div()
-                                    .id("detail-popup-card")
-                                    .w(px(detail_width))
-                                    .h(gpui::relative(0.8))
-                                    .rounded(px(10.))
-                                    .overflow_hidden()
-                                    .border_1()
-                                    .border_color(theme.colors().border)
+                                    .size_full()
                                     .bg(theme.colors().background)
-                                    .shadow_lg()
-                                    .on_click(|_, _, cx| cx.stop_propagation())
                                     .map(|el| match self.list_activity.clone() {
                                         Some(entries) => el.child(self.render_list_activity(&entries, false, cx)),
                                         None => el.child(self.detail.clone()),

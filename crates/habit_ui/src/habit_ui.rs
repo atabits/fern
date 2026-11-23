@@ -1888,9 +1888,7 @@ impl Render for HabitView {
                 cx,
             ));
 
-        let edit_modal = self.editing.as_ref().map(|edit| {
-            dialogs::modal_backdrop("habit-modal", self.render_edit_modal(edit, cx))
-        });
+        let edit_modal = self.editing.as_ref().map(|edit| self.render_edit_modal(edit, cx));
         let log_modal = self.log_modal.as_ref().map(|m| self.render_log_modal(m, cx));
         let amount_modal = self.amount_modal.as_ref().map(|m| self.render_amount_modal(m, cx));
         let confirm_modal = self.confirm.as_ref().map(|c| self.render_confirm_modal(c, cx));

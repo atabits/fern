@@ -42,6 +42,7 @@ pub use desktop_common::data_version::{DataVersion, changed_elsewhere, data_chan
 /// The note's size when it opens.
 const WIDTH: f32 = 240.;
 const HEIGHT: f32 = 212.;
+const BOUNDS_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn display_title(text: &str, cx: &App) -> SharedString {
     let text = text.trim();
@@ -164,6 +165,8 @@ pub struct StickyNote {
     compact: bool,
     expanded_height: Pixels,
     last_bounds: Bounds<Pixels>,
+    pending_bounds: Option<Bounds<Pixels>>,
+    save_bounds_task: Option<gpui::Task<()>>,
 }
 
 impl StickyNote {
@@ -225,6 +228,8 @@ impl StickyNote {
             compact: note.compact,
             expanded_height: if note.compact { note.expanded_height() } else { initial_bounds.size.height.max(px(MIN_EXPANDED_HEIGHT)) },
             last_bounds: initial_bounds,
+            pending_bounds: None,
+            save_bounds_task: None,
         };
         this.show(note.task, window, cx);
         this.remember_bounds(initial_bounds, cx);
@@ -249,10 +254,20 @@ impl StickyNote {
             }
             self.expanded_height = viewport.height.max(px(MIN_EXPANDED_HEIGHT));
         }
-        self.remember(window, cx);
+        self.pending_bounds = Some(window.window_bounds().get_bounds());
+        self.save_bounds_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(BOUNDS_SAVE_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| {
+                this.save_bounds_task = None;
+                if let Some(bounds) = this.pending_bounds.take() {
+                    this.remember_bounds(bounds, cx);
+                }
+            });
+        }));
     }
 
     fn toggle_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_bounds_task.take();
         self.pinned = !self.pinned;
         set_topmost(window, self.pinned);
         self.remember(window, cx);
@@ -261,6 +276,7 @@ impl StickyNote {
 
     fn align_edge(&mut self, edge: ScreenEdge, window: &mut Window, cx: &mut Context<Self>) {
         align_to_edge(window, edge);
+        self.save_bounds_task.take();
         self.remember(window, cx);
     }
 
@@ -278,6 +294,7 @@ impl StickyNote {
         sizing::set_compact(window, self.compact);
         let height = if self.compact { px(COMPACT_HEIGHT) } else { self.expanded_height };
         window.resize(size(window.viewport_size().width, height));
+        self.save_bounds_task.take();
         self.remember(window, cx);
         cx.notify();
     }
@@ -364,6 +381,8 @@ impl StickyNote {
     }
 
     fn remember(&mut self, window: &Window, cx: &App) {
+        self.save_bounds_task.take();
+        self.pending_bounds = None;
         self.remember_bounds(window.window_bounds().get_bounds(), cx);
     }
 
@@ -381,6 +400,10 @@ impl StickyNote {
     }
 
     fn forget(&mut self, cx: &mut App) {
+        self.save_bounds_task.take();
+        if let Some(bounds) = self.pending_bounds.take() {
+            self.remember_bounds(bounds, cx);
+        }
         self.close_palette(cx);
         self.opening_detail_popup = false;
         if let Some(popup) = self.detail_popup.take() {
@@ -1323,5 +1346,47 @@ mod tests {
             assert_eq!(saved[0].task, task.id);
             assert!(!saved[0].open, "close_and_forget must mark the sticky note closed");
         });
+    }
+
+    #[gpui::test]
+    fn bounds_changed_debounces_persistence_and_flushes_on_pin_and_forget(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Debounced bounds").unwrap();
+        cx.update(theme::init);
+        let (note, cx) = cx.add_window_view(|window, cx| new_note(store.clone(), task.id, window, cx));
+        let initial_width = sticky_windows::load(&store)[0].width;
+
+        cx.simulate_resize(size(px(300.), px(250.)));
+        cx.executor().advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        cx.simulate_resize(size(px(350.), px(280.)));
+        cx.executor().advance_clock(std::time::Duration::from_millis(150));
+        cx.run_until_parked();
+        assert_eq!(
+            sticky_windows::load(&store)[0].width,
+            initial_width,
+            "rapid resizes must stay debounced until 250ms after the last change"
+        );
+
+        cx.executor().advance_clock(std::time::Duration::from_millis(120));
+        cx.run_until_parked();
+        let saved = sticky_windows::load(&store);
+        assert_eq!(saved[0].width, 350.);
+        assert_eq!(saved[0].height, 280.);
+        note.read_with(cx, |n, _| assert!(n.save_bounds_task.is_none()));
+
+        cx.simulate_resize(size(px(380.), px(300.)));
+        cx.update(|window, cx| note.update(cx, |n, cx| n.toggle_pin(window, cx)));
+        let saved = sticky_windows::load(&store);
+        assert!(saved[0].pinned);
+        assert_eq!(saved[0].width, 380.);
+        note.read_with(cx, |n, _| assert!(n.save_bounds_task.is_none()));
+
+        cx.simulate_resize(size(px(400.), px(310.)));
+        cx.update(|_, cx| note.update(cx, |n, cx| n.forget(cx)));
+        let saved = sticky_windows::load(&store);
+        assert!(!saved[0].open);
+        assert_eq!(saved[0].width, 400.);
+        note.read_with(cx, |n, _| assert!(n.save_bounds_task.is_none()));
     }
 }

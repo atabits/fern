@@ -682,11 +682,9 @@ impl TodoView {
                 .when(no_undated, |el| {
                     el.child(
                         div()
-                            .pt_6()
+                            .pt_4()
                             .px_2()
-                            .flex()
-                            .justify_center()
-                            .child(Label::new(strings.no_tasks).size(LabelSize::Small).color(Color::Muted)),
+                            .child(EmptyState::new(IconName::CalendarCheck, strings.no_tasks).max_width(px(180.))),
                     )
                 })
                 .children(items),

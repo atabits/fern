@@ -955,32 +955,37 @@ impl CalendarView {
             .child(Label::new(calendar::format_date(date, strings)).weight(FontWeight::SEMIBOLD))
             .when(empty, |el| {
                 el.child(
-                    Label::new(strings.no_tasks_scheduled)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    div()
+                        .w_full()
+                        .child(
+                            EmptyState::new(IconName::CalendarDays, strings.no_tasks_scheduled)
+                                .max_width(px(280.)),
+                        ),
                 )
             })
-            .child(
-                v_scroll(
-                    "year-day-items-scroll",
-                    v_flex()
-                        .id("year-day-items")
-                        .gap_0p5()
-                        .children(
-                            tasks
-                                .into_iter()
-                                .map(|task| self.task_bar(task, Some(date), cx).h(px(22.))),
-                        )
-                        .children(
-                            events
-                                .into_iter()
-                                .map(|event| self.event_bar(event, date, cx)),
-                        )
-                        .children(extras),
+            .when(!empty, |el| {
+                el.child(
+                    v_scroll(
+                        "year-day-items-scroll",
+                        v_flex()
+                            .id("year-day-items")
+                            .gap_0p5()
+                            .children(
+                                tasks
+                                    .into_iter()
+                                    .map(|task| self.task_bar(task, Some(date), cx).h(px(22.))),
+                            )
+                            .children(
+                                events
+                                    .into_iter()
+                                    .map(|event| self.event_bar(event, date, cx)),
+                            )
+                            .children(extras),
+                    )
+                    .max_h(px(220.))
+                    .compact(),
                 )
-                .max_h(px(220.))
-                .compact(),
-            )
+            })
             .into_any_element()
     }
 }

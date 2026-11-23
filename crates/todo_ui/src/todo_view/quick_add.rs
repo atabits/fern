@@ -645,6 +645,7 @@ impl TodoView {
             .size(px(24.))
             .icon_size(IconSize::Small)
             .icon_color(if picked { Color::Accent } else { Color::Muted })
+            .tooltip(Tooltip::text(strings.due_date))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.add_date_month = match this.add_date_month {
                     Some(_) => None,
@@ -977,8 +978,20 @@ impl TodoView {
                 h_flex()
                     .px_1()
                     .child(div().flex_1().child(Label::new(crate::calendar::month_title(month, strings)).size(LabelSize::Small)))
-                    .child(IconButton::new("add-date-prev", IconName::ChevronLeft).size(px(22.)).icon_size(IconSize::XSmall).on_click(shift(-1)))
-                    .child(IconButton::new("add-date-next", IconName::ChevronRight).size(px(22.)).icon_size(IconSize::XSmall).on_click(shift(1))),
+                    .child(
+                        IconButton::new("add-date-prev", IconName::ChevronLeft)
+                            .size(px(22.))
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("←"))
+                            .on_click(shift(-1)),
+                    )
+                    .child(
+                        IconButton::new("add-date-next", IconName::ChevronRight)
+                            .size(px(22.))
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("→"))
+                            .on_click(shift(1)),
+                    ),
             )
             .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).map(|day| {
                 div().flex_1().flex().justify_center().child(Label::new(day).size(LabelSize::XSmall).color(Color::Muted))
@@ -1281,7 +1294,12 @@ impl TodoView {
             .child(
                 h_flex()
                     .child(div().flex_1().child(Label::new(strings.input_box_setting).weight(FontWeight::SEMIBOLD)))
-                    .child(IconButton::new("input-box-close", IconName::X).size(px(22.)).icon_size(IconSize::Small).on_click(
+                    .child(
+                        IconButton::new("input-box-close", IconName::X)
+                            .size(px(22.))
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(strings.close))
+                            .on_click(
                         cx.listener(|this, _, _, cx| {
                             this.input_box_open = false;
                             cx.notify();
@@ -1348,10 +1366,29 @@ impl TodoView {
                     .gap_1()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(date_button)
-                    .child(IconButton::new("add-priority", IconName::Flag).size(px(24.)).icon_size(IconSize::Small).icon_color(priority_color).on_click(open_menu(false)))
-                    .child(IconButton::new("add-list", IconName::Inbox).size(px(24.)).icon_size(IconSize::Small).on_click(open_menu(true)))
+                    .child(
+                        IconButton::new("add-priority", IconName::Flag)
+                            .size(px(24.))
+                            .icon_size(IconSize::Small)
+                            .icon_color(priority_color)
+                            .tooltip(Tooltip::text(strings.summary_priority))
+                            .on_click(open_menu(false)),
+                    )
+                    .child(
+                        IconButton::new("add-list", IconName::Inbox)
+                            .size(px(24.))
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(strings.move_to))
+                            .on_click(open_menu(true)),
+                    )
                     .child(self.add_field_popovers(
-                        div().relative().child(IconButton::new("add-more", IconName::Ellipsis).size(px(24.)).icon_size(IconSize::Small).on_click(open_menu(false))),
+                        div().relative().child(
+                            IconButton::new("add-more", IconName::Ellipsis)
+                                .size(px(24.))
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text(strings.more))
+                                .on_click(open_menu(false)),
+                        ),
                         strings,
                         cx,
                     ))

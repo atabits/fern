@@ -528,6 +528,7 @@ fn backspace_edits_text_and_modified_delete_trashes_the_selected_task(cx: &mut T
 
 #[gpui::test]
 fn switching_views_selects_the_first_visible_row_and_syncs_details(cx: &mut TestAppContext) {
+    let _horizons_read = HORIZONS_FLAG_LOCK.read().unwrap_or_else(|e| e.into_inner());
     let store = Rc::new(Store::open_in_memory().unwrap());
     let l1 = store.create_list("L1").unwrap();
     let l2 = store.create_list("L2").unwrap();

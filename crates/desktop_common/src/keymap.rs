@@ -73,6 +73,8 @@ pub const USER_KEYMAP_TEMPLATE: &str = r#"// Fern user keymap — overrides the 
 //   fern::ShowCompleted         Go to "Completed"
 //   fern::ShowWontDo            Go to "Won't Do"
 //   fern::ShowTrash             Go to "Trash"
+//   fern::GoToHorizons          Go to "Horizons"
+//   fern::GoToSummary           Go to "Summary"
 //   fern::PrintList             Print the current task list (or calendar year)
 //   fern::PrintDetail           Print the selected task's details
 //   fern::ShowShortcuts         Open Settings → Shortcuts
@@ -111,12 +113,13 @@ pub const USER_KEYMAP_TEMPLATE: &str = r#"// Fern user keymap — overrides the 
 //   task_list::Undo                     Undo the last task action
 //   task_list::Redo                     Redo the last undone task action
 //
-// Calendar (context: "Calendar" / "CalendarYear"):
+// Calendar (context: "Calendar" / "Calendar && !TextInput" / "CalendarYear"):
 //   calendar::DayView           Switch calendar to Day view
 //   calendar::WeekView          Switch calendar to Week view
 //   calendar::MonthView         Switch calendar to Month view
 //   calendar::YearView          Switch calendar to Year view
 //   calendar::AgendaView        Switch calendar to Agenda view
+//   calendar::MultiDayMode      Switch calendar to Multi-Day view
 //   calendar::PreviousPeriod    Navigate to previous day / week / month
 //   calendar::NextPeriod        Navigate to next day / week / month
 //   calendar::PreviousYear      Navigate to previous year (CalendarYear)
@@ -124,7 +127,7 @@ pub const USER_KEYMAP_TEMPLATE: &str = r#"// Fern user keymap — overrides the 
 //   calendar::CalendarToday     Jump back to Today
 //   calendar::PrintYear         Print the Year view (CalendarYear)
 //
-// Focus Timer (context: app-wide / "Focus" / "FocusMini"):
+// Focus Timer (context: app-wide / "Focus && !TextInput" / "FocusMini"):
 //   focus::TogglePause          Pause or resume the active timer (or start next)
 //   focus::StartStop            Start a focus session or end the running one
 //
@@ -136,13 +139,13 @@ pub const USER_KEYMAP_TEMPLATE: &str = r#"// Fern user keymap — overrides the 
 //   sticky::AlignLeft           Snap window to the left edge of the screen (Windows)
 //   sticky::AlignRight          Snap window to the right edge of the screen (Windows)
 //
-// Habits (context: "Habits"):
+// Habits (context: "Habits", or "Habits && !TextInput" for bare keys):
 //   habits::SelectNextHabit       Select the next habit
 //   habits::SelectPreviousHabit   Select the previous habit
 //   habits::CheckInSelectedHabit  Toggle check-in for the selected habit
 //   habits::NewHabit              Open the New Habit dialog
 //
-// Eisenhower Matrix (context: "Matrix"):
+// Eisenhower Matrix (context: "Matrix", or "Matrix && !TextInput" for bare keys):
 //   matrix::SelectNextMatrixTask      Select the next task in the matrix
 //   matrix::SelectPreviousMatrixTask  Select the previous task in the matrix
 //   matrix::ToggleMatrixTask          Complete / reopen the selected matrix task
@@ -155,7 +158,7 @@ pub const USER_KEYMAP_TEMPLATE: &str = r#"// Fern user keymap — overrides the 
 //   markdown::NumberedList, markdown::Link, markdown::Code, markdown::Quote
 //
 // Drafts & Dialogs:
-//   things::OpenWhen            Open the When schedule picker for the active task (context: "ThingsView")
+//   things::OpenWhen            Open the When schedule picker for the active task (context: "ThingsView && !TextInput")
 //   task_detail::SaveDraft      Save the active draft (context: "TaskDraft")
 //   settings::DismissSettings   Dismiss popup or close Settings (context: "Settings")
 //
@@ -192,7 +195,7 @@ pub struct ShortcutSpec {
     pub allow_unmodified: bool,
 }
 
-pub const SHORTCUT_COUNT: usize = 56;
+pub const SHORTCUT_COUNT: usize = 60;
 
 /// All customizable in-app shortcuts in Settings → Shortcuts, matching `i18n::Strings::shortcut_labels` 1:1.
 pub const SHORTCUT_SPECS: [ShortcutSpec; SHORTCUT_COUNT] = [
@@ -210,25 +213,26 @@ pub const SHORTCUT_SPECS: [ShortcutSpec; SHORTCUT_COUNT] = [
     // New Task (10..16)
     ShortcutSpec { action: "fern::NewTask", section: ShortcutSection::NewTask, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
     ShortcutSpec { action: "task_list::AddSubtask", section: ShortcutSection::NewTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "task_list::ToggleAllGroups", section: ShortcutSection::NewTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "task_list::ToggleAllSubtasks", section: ShortcutSection::NewTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "task_list::SelectNext", section: ShortcutSection::NewTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "task_list::SelectPrevious", section: ShortcutSection::NewTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    // Edit Task (16..29)
-    ShortcutSpec { action: "task_list::ToggleComplete", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "task_list::PinTask", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::ToggleAllGroups", section: ShortcutSection::NewTask, context: Some("TaskList && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::ToggleAllSubtasks", section: ShortcutSection::NewTask, context: Some("TaskList && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::SelectNext", section: ShortcutSection::NewTask, context: Some("TaskList && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::SelectPrevious", section: ShortcutSection::NewTask, context: Some("TaskList && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    // Edit Task (16..30)
+    ShortcutSpec { action: "task_list::ToggleComplete", section: ShortcutSection::EditTask, context: Some("TaskList && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::PinTask", section: ShortcutSection::EditTask, context: Some("TaskList && !TextInput"), fixed_chord: None, allow_unmodified: true },
     ShortcutSpec { action: "task_list::DeleteTask", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "task_list::SetDate", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "task_list::ClearDate", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "task_list::SetToday", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "task_list::SetTomorrow", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "task_list::SetNextWeek", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::SetDate", section: ShortcutSection::EditTask, context: Some("TaskList && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::ClearDate", section: ShortcutSection::EditTask, context: Some("TaskList && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::SetToday", section: ShortcutSection::EditTask, context: Some("TaskList && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::SetTomorrow", section: ShortcutSection::EditTask, context: Some("TaskList && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::SetNextWeek", section: ShortcutSection::EditTask, context: Some("TaskList && !TextInput"), fixed_chord: None, allow_unmodified: true },
     ShortcutSpec { action: "task_list::PriorityNone", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
     ShortcutSpec { action: "task_list::PriorityLow", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
     ShortcutSpec { action: "task_list::PriorityMedium", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
     ShortcutSpec { action: "task_list::PriorityHigh", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "task_list::OpenAsSticky", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
-    // Navigation (29..39)
+    ShortcutSpec { action: "task_list::OpenAsSticky", section: ShortcutSection::EditTask, context: Some("TaskList && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "things::OpenWhen", section: ShortcutSection::EditTask, context: Some("ThingsView && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    // Navigation (30..42)
     ShortcutSpec { action: "fern::ToggleSidebar", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
     ShortcutSpec { action: "fern::OpenSettings", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g s")), allow_unmodified: false },
     ShortcutSpec { action: "fern::ShowAll", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g a")), allow_unmodified: false },
@@ -239,20 +243,23 @@ pub const SHORTCUT_SPECS: [ShortcutSpec; SHORTCUT_COUNT] = [
     ShortcutSpec { action: "fern::ShowCompleted", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g c")), allow_unmodified: false },
     ShortcutSpec { action: "fern::ShowWontDo", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g w")), allow_unmodified: false },
     ShortcutSpec { action: "fern::ShowTrash", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g g")), allow_unmodified: false },
-    // Switch Views (39..48)
-    ShortcutSpec { action: "task_list::ViewList", section: ShortcutSection::SwitchView, context: Some("TaskList"), fixed_chord: Some(("TaskList && !TextInput", "v l")), allow_unmodified: true },
-    ShortcutSpec { action: "task_list::ViewKanban", section: ShortcutSection::SwitchView, context: Some("TaskList"), fixed_chord: Some(("TaskList && !TextInput", "v k")), allow_unmodified: true },
-    ShortcutSpec { action: "task_list::ViewTimeline", section: ShortcutSection::SwitchView, context: Some("TaskList"), fixed_chord: Some(("TaskList && !TextInput", "v t")), allow_unmodified: true },
-    ShortcutSpec { action: "calendar::DayView", section: ShortcutSection::SwitchView, context: Some("Calendar"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "calendar::WeekView", section: ShortcutSection::SwitchView, context: Some("Calendar"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "calendar::MonthView", section: ShortcutSection::SwitchView, context: Some("Calendar"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "calendar::YearView", section: ShortcutSection::SwitchView, context: Some("Calendar"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "calendar::AgendaView", section: ShortcutSection::SwitchView, context: Some("Calendar"), fixed_chord: None, allow_unmodified: true },
-    ShortcutSpec { action: "calendar::CalendarToday", section: ShortcutSection::SwitchView, context: Some("Calendar"), fixed_chord: None, allow_unmodified: true },
-    // Focus (48..50)
-    ShortcutSpec { action: "focus::TogglePause", section: ShortcutSection::Focus, context: None, fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "fern::GoToHorizons", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g h")), allow_unmodified: false },
+    ShortcutSpec { action: "fern::GoToSummary", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g u")), allow_unmodified: false },
+    // Switch Views (42..52)
+    ShortcutSpec { action: "task_list::ViewList", section: ShortcutSection::SwitchView, context: Some("TaskList && !TextInput"), fixed_chord: Some(("TaskList && !TextInput", "v l")), allow_unmodified: true },
+    ShortcutSpec { action: "task_list::ViewKanban", section: ShortcutSection::SwitchView, context: Some("TaskList && !TextInput"), fixed_chord: Some(("TaskList && !TextInput", "v k")), allow_unmodified: true },
+    ShortcutSpec { action: "task_list::ViewTimeline", section: ShortcutSection::SwitchView, context: Some("TaskList && !TextInput"), fixed_chord: Some(("TaskList && !TextInput", "v t")), allow_unmodified: true },
+    ShortcutSpec { action: "calendar::DayView", section: ShortcutSection::SwitchView, context: Some("Calendar && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "calendar::WeekView", section: ShortcutSection::SwitchView, context: Some("Calendar && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "calendar::MonthView", section: ShortcutSection::SwitchView, context: Some("Calendar && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "calendar::YearView", section: ShortcutSection::SwitchView, context: Some("Calendar && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "calendar::AgendaView", section: ShortcutSection::SwitchView, context: Some("Calendar && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "calendar::MultiDayMode", section: ShortcutSection::SwitchView, context: Some("Calendar && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "calendar::CalendarToday", section: ShortcutSection::SwitchView, context: Some("Calendar && !TextInput"), fixed_chord: None, allow_unmodified: true },
+    // Focus (52..54)
+    ShortcutSpec { action: "focus::TogglePause", section: ShortcutSection::Focus, context: Some("Focus && !TextInput"), fixed_chord: None, allow_unmodified: true },
     ShortcutSpec { action: "focus::StartStop", section: ShortcutSection::Focus, context: None, fixed_chord: None, allow_unmodified: false },
-    // Sticky Note (50..56)
+    // Sticky Note (54..60)
     ShortcutSpec { action: "sticky::TogglePin", section: ShortcutSection::StickyNote, context: Some("StickyNote"), fixed_chord: None, allow_unmodified: true },
     ShortcutSpec { action: "sticky::ToggleColor", section: ShortcutSection::StickyNote, context: Some("StickyNote"), fixed_chord: None, allow_unmodified: true },
     ShortcutSpec { action: "sticky::ToggleCollapse", section: ShortcutSection::StickyNote, context: Some("StickyNote"), fixed_chord: None, allow_unmodified: true },
@@ -1142,7 +1149,7 @@ mod tests {
                 }
             },
             {
-                "context": "TaskList",
+                "context": "TaskList && !TextInput",
                 "bindings": {
                     "space": null
                 }
@@ -1391,7 +1398,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn things_view_secondary_s_opens_when_without_breaking_workspace_sync_now(
+    fn things_view_s_opens_when_without_shadowing_workspace_sync_now(
         cx: &mut TestAppContext,
     ) {
         use std::sync::{
@@ -1406,7 +1413,7 @@ mod tests {
         struct Harness {
             workspace_focus: FocusHandle,
             things_focus: FocusHandle,
-            propagate_when: bool,
+            text_focus: FocusHandle,
             when_hits: Arc<AtomicUsize>,
             sync_hits: Arc<AtomicUsize>,
         }
@@ -1415,7 +1422,6 @@ mod tests {
             fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
                 let when_hits = Arc::clone(&self.when_hits);
                 let sync_hits = Arc::clone(&self.sync_hits);
-                let propagate_when = self.propagate_when;
                 div()
                     .key_context("Workspace")
                     .track_focus(&self.workspace_focus)
@@ -1426,12 +1432,10 @@ mod tests {
                         div()
                             .key_context("ThingsView")
                             .track_focus(&self.things_focus)
-                            .on_action(move |_: &crate::actions::OpenWhen, _, cx| {
+                            .on_action(move |_: &crate::actions::OpenWhen, _, _| {
                                 when_hits.fetch_add(1, Ordering::SeqCst);
-                                if propagate_when {
-                                    cx.propagate();
-                                }
-                            }),
+                            })
+                            .child(div().key_context("TextInput").track_focus(&self.text_focus)),
                     )
             }
         }
@@ -1446,39 +1450,41 @@ mod tests {
         let (view, wcx) = cx.add_window_view(|_, cx| Harness {
             workspace_focus: cx.focus_handle(),
             things_focus: cx.focus_handle(),
-            propagate_when: false,
+            text_focus: cx.focus_handle(),
             when_hits: Arc::clone(&when_hits),
             sync_hits: Arc::clone(&sync_hits),
         });
 
-        // 1. Inside ThingsView, secondary-s dispatches things::OpenWhen (NOT fern::SyncNow).
+        // 1. Inside ThingsView (outside TextInput), `s` dispatches things::OpenWhen.
         wcx.update(|window, cx| {
             let handle = view.read(cx).things_focus.clone();
             handle.focus(window, cx);
         });
-        wcx.simulate_keystrokes("secondary-s");
+        wcx.simulate_keystrokes("s");
         assert_eq!(when_hits.load(Ordering::SeqCst), 1);
         assert_eq!(sync_hits.load(Ordering::SeqCst), 0);
 
-        // 2. When ThingsView propagates OpenWhen (e.g. no task active), Workspace SyncNow runs.
-        wcx.update(|_, cx| {
-            view.update(cx, |this, cx| {
-                this.propagate_when = true;
-                cx.notify();
-            });
-        });
-        wcx.run_until_parked();
+        // 2. Inside ThingsView, secondary-s dispatches Workspace SyncNow directly (not shadowed).
         wcx.simulate_keystrokes("secondary-s");
-        assert_eq!(when_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(when_hits.load(Ordering::SeqCst), 1);
         assert_eq!(sync_hits.load(Ordering::SeqCst), 1);
 
-        // 3. Outside ThingsView (focus on Workspace), secondary-s dispatches fern::SyncNow directly.
+        // 3. Inside a TextInput within ThingsView, `s` does not trigger things::OpenWhen.
+        wcx.update(|window, cx| {
+            let handle = view.read(cx).text_focus.clone();
+            handle.focus(window, cx);
+        });
+        wcx.simulate_keystrokes("s");
+        assert_eq!(when_hits.load(Ordering::SeqCst), 1);
+
+        // 4. Outside ThingsView (focus on Workspace), `s` does not trigger OpenWhen and secondary-s triggers SyncNow.
         wcx.update(|window, cx| {
             let handle = view.read(cx).workspace_focus.clone();
             handle.focus(window, cx);
         });
+        wcx.simulate_keystrokes("s");
+        assert_eq!(when_hits.load(Ordering::SeqCst), 1);
         wcx.simulate_keystrokes("secondary-s");
-        assert_eq!(when_hits.load(Ordering::SeqCst), 2);
         assert_eq!(sync_hits.load(Ordering::SeqCst), 2);
     }
 }

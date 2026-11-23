@@ -11,7 +11,7 @@ use task_ui::drag::DraggedTask;
 use ui::prelude::*;
 use ui::{
     Button, ButtonSize, ButtonVariant, Divider, Donut, Icon, IconButton, IconName, IconSize, Label,
-    LabelSize, ListItem, Placement, PopoverAttachment, popover, v_scroll,
+    LabelSize, ListItem, Placement, PopoverAttachment, Tooltip, popover, v_scroll,
 };
 
 pub const SIDEBAR_WIDTH: f32 = 228.;
@@ -248,6 +248,11 @@ pub fn render_sidebar<V: 'static>(
                         .size(px(18.))
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(if collapsed {
+                            strings.habit_expand
+                        } else {
+                            strings.habit_collapse
+                        }))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             on_toggle(this, SidebarAction::ToggleArea(folder_id), window, cx);
@@ -270,6 +275,7 @@ pub fn render_sidebar<V: 'static>(
                 .size(px(20.))
                 .icon_size(IconSize::XSmall)
                 .icon_color(Color::Muted)
+                .tooltip(Tooltip::text(strings.things_new_project))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     on_new_proj(this, SidebarAction::NewProject(Some(folder_id)), window, cx);

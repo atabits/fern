@@ -17,6 +17,7 @@
       "secondary-2": "fern::ShowToday",
       "secondary-3": "fern::ShowTomorrow",
       "secondary-4": "fern::ShowNext7Days",
+      "secondary-p": "fern::PrintList",
       "secondary-alt-p": "fern::PrintDetail",
       "secondary-/": "fern::ShowShortcuts",
       "secondary-,": "fern::OpenSettings"
@@ -34,13 +35,15 @@
       "g n": "fern::ShowNext7Days",
       "g c": "fern::ShowCompleted",
       "g w": "fern::ShowWontDo",
-      "g g": "fern::ShowTrash"
+      "g g": "fern::ShowTrash",
+      "g h": "fern::GoToHorizons",
+      "g u": "fern::GoToSummary"
     }
   },
   {
-    "context": "ThingsView",
+    "context": "ThingsView && !TextInput",
     "bindings": {
-      "secondary-s": "things::OpenWhen"
+      "s": "things::OpenWhen"
     }
   },
   {
@@ -48,22 +51,12 @@
     "bindings": {
       "v l": "task_list::ViewList",
       "v k": "task_list::ViewKanban",
-      "v t": "task_list::ViewTimeline"
-    }
-  },
-  {
-    "context": "TaskList",
-    "bindings": {
+      "v t": "task_list::ViewTimeline",
       "down": "task_list::SelectNext",
       "j": "task_list::SelectNext",
       "up": "task_list::SelectPrevious",
       "k": "task_list::SelectPrevious",
-      "secondary-a": "task_list::SelectAllTasks",
-      "shift-down": "task_list::ExtendSelectionNext",
-      "shift-up": "task_list::ExtendSelectionPrevious",
       "space": "task_list::ToggleComplete",
-      "secondary-backspace": "task_list::DeleteTask",
-      "secondary-delete": "task_list::DeleteTask",
       "tab m": "task_list::ToggleComplete",
       "tab p": "task_list::PinTask",
       "tab d": "task_list::SetDate",
@@ -71,7 +64,17 @@
       "tab 1": "task_list::SetToday",
       "tab 2": "task_list::SetTomorrow",
       "tab 3": "task_list::SetNextWeek",
-      "tab e": "task_list::ToggleAllSubtasks",
+      "tab e": "task_list::ToggleAllSubtasks"
+    }
+  },
+  {
+    "context": "TaskList",
+    "bindings": {
+      "secondary-a": "task_list::SelectAllTasks",
+      "shift-down": "task_list::ExtendSelectionNext",
+      "shift-up": "task_list::ExtendSelectionPrevious",
+      "secondary-backspace": "task_list::DeleteTask",
+      "secondary-delete": "task_list::DeleteTask",
       "shift-enter": "task_list::AddSubtask",
       "secondary-z": "task_list::Undo",
       "secondary-shift-z": "task_list::Redo",
@@ -83,9 +86,8 @@
     }
   },
   {
-    "context": "Calendar",
+    "context": "Calendar && !TextInput",
     "bindings": {
-      "secondary-n": "fern::NewTask",
       "d": "calendar::DayView",
       "1": "calendar::DayView",
       "w": "calendar::WeekView",
@@ -96,9 +98,16 @@
       "4": "calendar::YearView",
       "a": "calendar::AgendaView",
       "5": "calendar::AgendaView",
+      "r": "calendar::MultiDayMode",
       "t": "calendar::CalendarToday",
       "left": "calendar::PreviousPeriod",
       "right": "calendar::NextPeriod"
+    }
+  },
+  {
+    "context": "Calendar",
+    "bindings": {
+      "secondary-n": "fern::NewTask"
     }
   },
   {
@@ -108,13 +117,18 @@
     }
   },
   {
-    "context": "CalendarYear",
+    "context": "CalendarYear && !TextInput",
     "bindings": {
       "up": "calendar::PreviousYear",
       "left": "calendar::PreviousYear",
       "down": "calendar::NextYear",
       "right": "calendar::NextYear",
-      "t": "calendar::CalendarToday",
+      "t": "calendar::CalendarToday"
+    }
+  },
+  {
+    "context": "CalendarYear",
+    "bindings": {
       "secondary-p": "calendar::PrintYear"
     }
   },
@@ -135,27 +149,43 @@
     }
   },
   {
-    "context": "Habits",
+    "context": "Habits && !TextInput",
     "bindings": {
       "down": "habits::SelectNextHabit",
       "j": "habits::SelectNextHabit",
       "up": "habits::SelectPreviousHabit",
       "k": "habits::SelectPreviousHabit",
-      "space": "habits::CheckInSelectedHabit",
+      "space": "habits::CheckInSelectedHabit"
+    }
+  },
+  {
+    "context": "Habits",
+    "bindings": {
       "secondary-n": "habits::NewHabit"
     }
   },
   {
-    "context": "Matrix",
+    "context": "Matrix && !TextInput",
     "bindings": {
       "down": "matrix::SelectNextMatrixTask",
       "j": "matrix::SelectNextMatrixTask",
       "up": "matrix::SelectPreviousMatrixTask",
       "k": "matrix::SelectPreviousMatrixTask",
       "space": "matrix::ToggleMatrixTask",
-      "enter": "matrix::OpenMatrixTask",
+      "enter": "matrix::OpenMatrixTask"
+    }
+  },
+  {
+    "context": "Matrix",
+    "bindings": {
       "secondary-backspace": "matrix::DeleteMatrixTask",
       "secondary-delete": "matrix::DeleteMatrixTask"
+    }
+  },
+  {
+    "context": "Focus && !TextInput",
+    "bindings": {
+      "space": "focus::TogglePause"
     }
   },
   {

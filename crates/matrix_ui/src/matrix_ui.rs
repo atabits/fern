@@ -1001,6 +1001,20 @@ impl MatrixView {
         }
     }
 
+    /// Contrast-safe quadrant header title color (vibrant on Dark, darkened WCAG AA on Light).
+    pub(crate) fn quadrant_text_color(quadrant: usize, dark: bool) -> Hsla {
+        if dark {
+            Self::quadrant_color(quadrant)
+        } else {
+            match quadrant {
+                0 => gpui::rgb(0xD93842).into(),
+                1 => gpui::rgb(0xB45309).into(),
+                2 => gpui::rgb(0x2F58D6).into(),
+                _ => gpui::rgb(0x047857).into(),
+            }
+        }
+    }
+
     /// Applies full cross-quadrant drop adjustments (priority, date, list, tag, kind) and surfaces
     /// feedback toasts when already matching or unsupported.
     fn drop_on(&mut self, id: Id, quadrant: usize, cx: &mut Context<Self>) {
@@ -1655,7 +1669,7 @@ impl MatrixView {
                                         .icon_size(IconSize::Small)
                                         .icon_color(task_rows::priority_color(p, cx.theme()).map(Color::Custom).unwrap_or(Color::Muted))
                                         .toggle_state(active)
-                                        .tip(tip, ui::TipSide::Above)
+                                        .tooltip(Tooltip::text(tip))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.task_menu = None;
                                             let _ = this.store.set_priority(id, p);
@@ -1868,7 +1882,7 @@ impl MatrixView {
                             .justify_center()
                             .rounded_full()
                             .bg(color)
-                            .text_color(theme.colors().on_accent)
+                            .text_color(theme::foreground_on(&[color], 3.))
                             .text_size(px(8.))
                             .font_weight(FontWeight::BOLD)
                             .child(numeral),
@@ -1882,7 +1896,7 @@ impl MatrixView {
                                     Label::new(title)
                                         .size(LabelSize::Small)
                                         .weight(FontWeight::SEMIBOLD)
-                                        .color(Color::Custom(color))
+                                        .color(Color::Custom(Self::quadrant_text_color(quadrant, theme.is_dark())))
                                         .truncate(),
                                 )
                                 .when(cache.open_count > 0, |el| {
@@ -1994,7 +2008,7 @@ impl MatrixView {
 }
 
 impl Render for MatrixView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Local::now().date_naive();
@@ -2005,35 +2019,21 @@ impl Render for MatrixView {
             .as_ref()
             .map(|(q, rule)| self.render_edit_modal(*q, rule, cx));
         let task_ctx = self.task_menu.map(|(id, pos)| self.render_task_context_menu(id, pos, cx));
+        let max_detail_h = window.viewport_size().height * 0.85;
         let floating_detail = self.detail_task.and(self.detail.clone()).map(|detail| {
-            div()
-                .id("matrix-detail-backdrop")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(gpui::black().opacity(0.25))
-                .occlude()
-                .child(
-                    div()
-                        .id("matrix-detail-card")
-                        .w(px(460.))
-                        .h(px(560.))
-                        .max_h(gpui::relative(0.85))
-                        .rounded(px(12.))
-                        .border_1()
-                        .border_color(theme.colors().border)
-                        .bg(theme.colors().elevated_surface_background)
-                        .shadow_lg()
-                        .overflow_hidden()
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            if this.detail.as_ref().is_none_or(|d| !d.read(cx).has_popup()) {
-                                this.close_detail_card(cx);
-                            }
-                        }))
-                        .child(detail),
-                )
+            Modal::new("matrix-detail-backdrop")
+                .width(px(460.))
+                .height(px(560.))
+                .max_height(max_detail_h)
+                .padding(px(0.))
+                .gap(px(0.))
+                .overflow_hidden()
+                .on_dismiss(cx.listener(|this, _, _, cx| {
+                    if this.detail.as_ref().is_none_or(|d| !d.read(cx).has_popup()) {
+                        this.close_detail_card(cx);
+                    }
+                }))
+                .child(detail)
                 .into_any_element()
         });
 
@@ -2284,7 +2284,7 @@ impl Render for MatrixView {
                         .child(div().flex_1().min_w_0().child(Label::new(message).color(color)))
                         .child(
                             IconButton::new("matrix-dismiss-add-notice", IconName::X)
-                                .tip(strings.close, ui::TipSide::Above)
+                                .tooltip(Tooltip::text(strings.close))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.notice = None;
                                     cx.notify();

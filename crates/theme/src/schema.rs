@@ -359,7 +359,11 @@ struct StatusColorsRefinement {
 
 impl StatusColorsRefinement {
     fn apply_to(self, status: &mut StatusColors) {
+        let error_overridden = self.error.is_some();
         apply_refinement_fields!(status, self, error, warning, info, success);
+        if error_overridden {
+            status.on_error = foreground_on(&[status.error], 3.);
+        }
     }
 }
 

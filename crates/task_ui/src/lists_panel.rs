@@ -246,7 +246,7 @@ pub fn render(
                         let more_group = SharedString::from(format!("smart-more-{id}"));
                         el.child(
                             div()
-                                .id("smart-more")
+                                .id(more_group.clone())
                                 .group(more_group.clone())
                                 .absolute()
                                 .right(px(10.))
@@ -1081,6 +1081,7 @@ pub fn render(
                 .track_scroll(scroll_handle)
                 .inset(px(6.))
                 .color(colors.list_text)
+                .pb_2()
                 .flex_1()
                 .min_h_0(),
         )
@@ -1227,7 +1228,8 @@ fn mini_calendar(
         .group("mini-calendar")
         .relative()
         .flex_none()
+        .bg(colors.lists_background)
         // GPUI paints borders after children. Put the border on the body beneath the tab.
-        .child(body.py_2().px_2().border_t_1().border_color(colors.border_variant))
+        .child(body.py_2().px_2().border_t_1().border_color(colors.border))
         .child(tab)
 }

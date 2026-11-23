@@ -331,6 +331,7 @@ pub fn render(
         .unwrap_or_default();
     let colors = cx.theme().colors().clone();
     let error_color = cx.theme().status().error;
+    let on_error_color = cx.theme().status().on_error;
     let strings = i18n::t(cx);
     let active_drag = cx.has_active_drag();
     let dragging = dragging.filter(|_| active_drag);
@@ -548,7 +549,7 @@ pub fn render(
                             .justify_center()
                             .rounded_full()
                             .bg(error_color)
-                            .text_color(gpui::white())
+                            .text_color(on_error_color)
                             .text_size(px(9.))
                             .font_weight(gpui::FontWeight::BOLD)
                             .child(if bell.unread > 99 { "99+".to_owned() } else { bell.unread.to_string() }),

@@ -69,7 +69,7 @@ impl FocusView {
     }
 
     /// Closes the dialog, keeping what was written in the note.
-    fn close_record(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_record(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.open_record.take() {
             let note = self.record_note.read(cx).text().to_owned();
             if let Err(err) = self.store.set_focus_note(id, &note) {
@@ -94,74 +94,59 @@ impl FocusView {
             crate::calendar::format_time(session.end_local(), strings)
         );
         Some(
-            div()
-                .absolute()
-                .inset_0()
-                .occlude()
-                .bg(gpui::black().opacity(0.35))
-                .flex()
-                .items_center()
-                .justify_center()
+            Modal::new("focus-record-modal")
+                .width(px(420.))
+                .padding(px(16.))
+                .gap(px(8.))
+                .on_dismiss(cx.listener(|this, _, _, cx| this.close_record(cx)))
                 .child(
-                    v_flex()
-                        .w(px(420.))
-                        .p_4()
-                        .gap_2()
-                        .rounded(px(10.))
-                        .bg(theme.colors().elevated_surface_background)
-                        .border_1()
-                        .border_color(theme.colors().border)
-                        .shadow_lg()
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_record(cx)))
+                    h_flex()
+                        .child(div().flex_1().child(Label::new(strings.focus_record).weight(FontWeight::SEMIBOLD)))
                         .child(
-                            h_flex()
-                                .child(div().flex_1().child(Label::new(strings.focus_record).weight(FontWeight::SEMIBOLD)))
-                                .child(
-                                    IconButton::new("close-record", IconName::X)
-                                        .tooltip(Tooltip::text(strings.close))
-                                        .on_click(cx.listener(|this, _, _, cx| this.close_record(cx))),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Icon::new(if session.stopwatch { IconName::Timer } else { IconName::CircleDot }).color(Color::Accent),
-                                )
-                                .child(Label::new(session.title.clone()).truncate()),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(Icon::new(IconName::CalendarDays).size(IconSize::Small).color(Color::Muted))
-                                .child(Label::new(when).size(LabelSize::Small).color(Color::Muted)),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(Icon::new(IconName::Clock).size(IconSize::Small).color(Color::Muted))
-                                .child(Label::new(strings.format_minutes(session.minutes())).size(LabelSize::Small).color(Color::Muted)),
-                        )
-                        .child(
-                            div()
-                                .min_h(px(110.))
-                                .p_2()
-                                .rounded(px(6.))
-                                .bg(theme.colors().surface_background)
-                                .child(self.record_note.clone()),
-                        )
-                        .child(
-                            h_flex().justify_end().child(
-                                IconButton::new("delete-open-record", IconName::Trash)
-                                    .icon_color(Color::Muted)
-                                    .hover_icon_color(Color::Error)
-                                    .tooltip(Tooltip::text(strings.delete))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.open_record = None;
-                                        this.delete_record(id, cx);
-                                    })),
-                            ),
+                            IconButton::new("close-record", IconName::X)
+                                .tooltip(Tooltip::text(strings.close))
+                                .on_click(cx.listener(|this, _, _, cx| this.close_record(cx))),
                         ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Icon::new(if session.stopwatch { IconName::Timer } else { IconName::CircleDot }).color(Color::Accent),
+                        )
+                        .child(Label::new(session.title.clone()).truncate()),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Icon::new(IconName::CalendarDays).size(IconSize::Small).color(Color::Muted))
+                        .child(Label::new(when).size(LabelSize::Small).color(Color::Muted)),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Icon::new(IconName::Clock).size(IconSize::Small).color(Color::Muted))
+                        .child(Label::new(format_minutes(session.minutes(), strings)).size(LabelSize::Small).color(Color::Muted)),
+                )
+                .child(
+                    div()
+                        .min_h(px(110.))
+                        .p_2()
+                        .rounded(px(6.))
+                        .bg(theme.colors().surface_background)
+                        .child(self.record_note.clone()),
+                )
+                .child(
+                    h_flex().justify_end().child(
+                        IconButton::new("delete-open-record", IconName::Trash)
+                            .icon_color(Color::Muted)
+                            .hover_icon_color(Color::Error)
+                            .tooltip(Tooltip::text(strings.delete))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_record = None;
+                                this.delete_record(id, cx);
+                            })),
+                    ),
                 )
                 .into_any_element(),
         )
@@ -295,26 +280,13 @@ impl FocusView {
     /// Batch Management or Add Timer, as the original shows them: in the middle of the view
     /// over a dimmed background.
     pub(super) fn render_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let dialog = if let Some(draft) = self.timer_draft.as_ref() {
-            self.render_timer_draft(draft, cx)
+        if let Some(draft) = self.timer_draft.as_ref() {
+            Some(self.render_timer_draft(draft, cx))
         } else if self.record_menu == Some(RecordMenu::Batch) {
-            self.render_batch(cx)
+            Some(self.render_batch(cx))
         } else {
-            return None;
-        };
-        Some(
-            div()
-                .id("focus-modal")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(gpui::black().opacity(0.35))
-                .occlude()
-                .child(dialog)
-                .into_any_element(),
-        )
+            None
+        }
     }
 
     fn render_batch(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -349,7 +321,7 @@ impl FocusView {
                 (0, Some((first, last)), _) if filter.date == 7 => {
                     format!("{} - {}", crate::task_rows::short_date(first, strings), crate::task_rows::short_date(last, strings)).into()
                 }
-                (1, _, Some((least, most))) => format!("{}–{}", strings.format_minutes(least), strings.format_minutes(most)).into(),
+                (1, _, Some((least, most))) => format!("{}–{}", format_minutes(least, strings), format_minutes(most, strings)).into(),
                 _ if current[which as usize] == 0 => strings.batch_filters[which as usize].into(),
                 _ => choices[which as usize][current[which as usize]].into(),
             };
@@ -461,7 +433,7 @@ impl FocusView {
                                 .child(Label::new(span).size(LabelSize::XSmall).color(Color::Muted))
                                 .child(Label::new(session.title.clone()).size(LabelSize::Small).truncate()),
                         )
-                        .child(Label::new(strings.format_minutes(session.minutes())).size(LabelSize::XSmall).color(Color::Muted))
+                        .child(Label::new(format_minutes(session.minutes(), strings)).size(LabelSize::XSmall).color(Color::Muted))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if !this.batch.remove(&id) {
                                 this.batch.insert(id);
@@ -473,11 +445,11 @@ impl FocusView {
             }
         }
         // A dialog in the middle of the window, closed with its ×, as in the original.
-        popover(cx)
-            .w(px(440.))
-            .max_h(px(560.))
-            .p_4()
-            .gap_2()
+        Modal::new("focus-modal")
+            .width(px(440.))
+            .max_height(px(560.))
+            .padding(px(16.))
+            .gap(px(8.))
             .child(
                 h_flex()
                     .child(
@@ -490,9 +462,13 @@ impl FocusView {
                             .weight(FontWeight::SEMIBOLD),
                         ),
                     )
-                    .child(IconButton::new("batch-close", IconName::X).size(px(22.)).icon_size(IconSize::Small).on_click(
-                        cx.listener(|this, _, _, cx| this.set_record_menu(None, cx)),
-                    )),
+                    .child(
+                        IconButton::new("batch-close", IconName::X)
+                            .size(px(22.))
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(strings.close))
+                            .on_click(cx.listener(|this, _, _, cx| this.set_record_menu(None, cx))),
+                    ),
             )
             .child(filters)
             .child(v_scroll("batch-list-scroll", v_flex().id("batch-list").children(rows)).flex_1().min_h_0())
@@ -621,16 +597,19 @@ impl FocusView {
             this.timer_draft = None;
             cx.notify();
         });
-        popover(cx)
-            .w(px(442.))
-            .px(px(20.))
-            .pt(px(16.))
-            .pb(px(16.))
+        Modal::new("focus-modal")
+            .width(px(442.))
+            .padding(px(20.))
             .gap(px(14.))
             .child(
                 h_flex()
                     .child(div().flex_1().child(Label::new(if draft.new { strings.add_timer } else { strings.edit_timer }).weight(FontWeight::BOLD)))
-                    .child(IconButton::new("timer-x", IconName::X).icon_color(Color::Muted).on_click(close)),
+                    .child(
+                        IconButton::new("timer-x", IconName::X)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(strings.close))
+                            .on_click(close),
+                    ),
             )
             .child(
                 h_flex()
@@ -934,11 +913,13 @@ impl FocusView {
                         .child(div().flex_1().child(Label::new(label).size(LabelSize::Small)))
                         .child(
                             IconButton::new(SharedString::from(format!("{id}-less")), IconName::Minus)
+                                .tooltip(Tooltip::text(format!("-1 {}", strings.duration_min_short)))
                                 .on_click(cx.listener(move |this, _, _, cx| this.set_minutes(setting, -1, cx))),
                         )
                         .child(div().min_w(px(28.)).flex().justify_center().child(Label::new(self.minutes(setting).to_string())))
                         .child(
                             IconButton::new(SharedString::from(format!("{id}-more")), IconName::Plus)
+                                .tooltip(Tooltip::text(format!("+1 {}", strings.duration_min_short)))
                                 .on_click(cx.listener(move |this, _, _, cx| this.set_minutes(setting, 1, cx))),
                         )
                         .child(Label::new(strings.minutes).size(LabelSize::XSmall).color(Color::Muted))
@@ -958,18 +939,20 @@ impl FocusView {
                         let value = if goal == 0 {
                             strings.focus_goal_off.to_owned()
                         } else {
-                            strings.format_minutes(goal)
+                            format_minutes(goal, strings)
                         };
                         h_flex()
                             .gap_2()
                             .child(div().flex_1().child(Label::new(strings.focus_daily_goal).size(LabelSize::Small)))
                             .child(
                                 IconButton::new("daily-goal-less", IconName::Minus)
+                                    .tooltip(Tooltip::text(format!("-15 {}", strings.duration_min_short)))
                                     .on_click(cx.listener(|this, _, _, cx| this.set_minutes(DAILY_GOAL_SETTING, -15, cx))),
                             )
                             .child(div().min_w(px(44.)).flex().justify_center().child(Label::new(value).size(LabelSize::Small)))
                             .child(
                                 IconButton::new("daily-goal-more", IconName::Plus)
+                                    .tooltip(Tooltip::text(format!("+15 {}", strings.duration_min_short)))
                                     .on_click(cx.listener(|this, _, _, cx| this.set_minutes(DAILY_GOAL_SETTING, 15, cx))),
                             )
                     })
@@ -1013,7 +996,7 @@ impl FocusView {
                     .child(self.render_automation(cx))
                     .into_any_element()
             }
-            RecordMenu::Batch => self.render_batch(cx),
+            RecordMenu::Batch => div().into_any_element(),
             // As the original's: 178 px wide (wider when a label needs it), a row every 34 px, Delete All in red only once armed.
             RecordMenu::More => popover(cx)
                 .min_w(px(178.))
@@ -1063,15 +1046,23 @@ impl FocusView {
                         h_flex()
                             .gap_2()
                             .child(div().flex_1().child(Label::new(strings.focus_record_minutes).size(LabelSize::Small)))
-                            .child(IconButton::new("record-shorter", IconName::Minus).on_click(cx.listener(|this, _, _, cx| {
-                                this.add_minutes = (this.add_minutes - 5).max(5);
-                                cx.notify();
-                            })))
-                            .child(Label::new(strings.format_minutes(self.add_minutes)).size(LabelSize::Small))
-                            .child(IconButton::new("record-longer", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
-                                this.add_minutes = (this.add_minutes + 5).min(12 * 60);
-                                cx.notify();
-                            }))),
+                            .child(
+                                IconButton::new("record-shorter", IconName::Minus)
+                                    .tooltip(Tooltip::text(format!("-5 {}", strings.duration_min_short)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.add_minutes = (this.add_minutes - 5).max(5);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(Label::new(format_minutes(self.add_minutes, strings)).size(LabelSize::Small))
+                            .child(
+                                IconButton::new("record-longer", IconName::Plus)
+                                    .tooltip(Tooltip::text(format!("+5 {}", strings.duration_min_short)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.add_minutes = (this.add_minutes + 5).min(12 * 60);
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                     .child(
                         div()

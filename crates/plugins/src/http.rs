@@ -856,16 +856,60 @@ mod tests {
         let seen_b = Arc::new(Mutex::new(String::new()));
         let seen_a_final = Arc::new(Mutex::new(String::new()));
 
+        fn read_request(sock: &mut std::net::TcpStream) -> String {
+            let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+            let mut data = Vec::with_capacity(1024);
+            let mut buf = [0u8; 1024];
+            let mut header_end = None;
+            let mut content_len = 0usize;
+            loop {
+                match sock.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        data.extend_from_slice(&buf[..n]);
+                        if header_end.is_none()
+                            && let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            let end = pos + 4;
+                            header_end = Some(end);
+                            let headers = String::from_utf8_lossy(&data[..end]);
+                            content_len = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (k, v) = line.split_once(':')?;
+                                    k.trim()
+                                        .eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                        }
+                        if let Some(end) = header_end
+                            && data.len() >= end + content_len
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&data).into_owned()
+        }
+
+        fn send_response(sock: &mut std::net::TcpStream, bytes: &[u8]) {
+            let _ = sock.write_all(bytes);
+            let _ = sock.flush();
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+        }
+
         let seen_b_c = Arc::clone(&seen_b);
         let srv_b = thread::spawn(move || {
             if let Ok((mut sock, _)) = listener_b.accept() {
-                let mut buf = [0u8; 4096];
-                let n = sock.read(&mut buf).unwrap_or(0);
-                *seen_b_c.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+                *seen_b_c.lock().unwrap() = read_request(&mut sock);
                 let resp = format!(
                     "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{addr_a}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 );
-                let _ = sock.write_all(resp.as_bytes());
+                send_response(&mut sock, resp.as_bytes());
             }
         });
 
@@ -875,17 +919,16 @@ mod tests {
                 let Ok((mut sock, _)) = listener_a.accept() else {
                     break;
                 };
-                let mut buf = [0u8; 4096];
-                let n = sock.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let req = read_request(&mut sock);
                 if req.starts_with("POST /start") {
                     let resp = format!(
                         "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{addr_b}/bounce\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     );
-                    let _ = sock.write_all(resp.as_bytes());
+                    send_response(&mut sock, resp.as_bytes());
                 } else if req.starts_with("POST /final") || req.starts_with("GET /final") {
                     *seen_a_final_c.lock().unwrap() = req;
-                    let _ = sock.write_all(
+                    send_response(
+                        &mut sock,
                         b"HTTP/1.1 200 OK\r\nX-Echo: secret-token-xyz\r\nContent-Length: 23\r\nConnection: close\r\n\r\nechoed=secret-token-xyz",
                     );
                 } else if req.starts_with("GET /binary-clean") {
@@ -894,21 +937,23 @@ mod tests {
                         "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         bin_body.len()
                     );
-                    let _ = sock.write_all(hdr.as_bytes());
-                    let _ = sock.write_all(bin_body);
+                    let mut out = hdr.into_bytes();
+                    out.extend_from_slice(bin_body);
+                    send_response(&mut sock, &out);
                 } else if req.starts_with("GET /binary-leak") {
                     let leak_body: &[u8] = b"\xff\xfesecret-token-xyz";
                     let hdr = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         leak_body.len()
                     );
-                    let _ = sock.write_all(hdr.as_bytes());
-                    let _ = sock.write_all(leak_body);
+                    let mut out = hdr.into_bytes();
+                    out.extend_from_slice(leak_body);
+                    send_response(&mut sock, &out);
                 } else if req.starts_with("GET /no-redir") {
                     let resp = format!(
                         "HTTP/1.1 302 Found\r\nLocation: http://{addr_a}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     );
-                    let _ = sock.write_all(resp.as_bytes());
+                    send_response(&mut sock, resp.as_bytes());
                 }
             }
         });

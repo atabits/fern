@@ -107,7 +107,7 @@ impl TodoView {
                             .justify_center()
                             .rounded_full()
                             .bg(color)
-                            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Custom(theme.colors().background))),
+                            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Custom(theme::foreground_on(&[color], 3.)))),
                     )
                     .child(
                         v_flex()
@@ -389,38 +389,27 @@ impl TodoView {
                 .on_click(cx.listener(move |this, _, _, cx| this.save_preferences(|p| p.popup_details = over, cx)))
         };
         let section = || v_flex().p_4().gap_1().rounded(px(8.)).bg(theme.colors().surface_background);
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::black().opacity(0.35))
-            .occlude()
+        Modal::new("view-options")
+            .width(px(440.))
+            .padding(px(20.))
+            .gap(px(12.))
+            .on_dismiss(cx.listener(|this, _, _, cx| {
+                this.view_options = None;
+                cx.notify();
+            }))
             .child(
-                v_flex()
-                    .id("view-options")
-                    .w(px(440.))
-                    .p_5()
-                    .gap_3()
-                    .rounded(px(10.))
-                    .bg(theme.colors().elevated_surface_background)
-                    .border_1()
-                    .border_color(theme.colors().border)
-                    .shadow_lg()
+                h_flex()
+                    .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.view_options))
                     .child(
-                        h_flex()
-                            .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.view_options))
-                            .child(
-                                IconButton::new("view-options-x", IconName::X)
-                                    .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text(strings.close))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.view_options = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
+                        IconButton::new("view-options-x", IconName::X)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(strings.close))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view_options = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
                     .child(
                         h_flex()
                             .h(px(48.))
@@ -589,8 +578,7 @@ impl TodoView {
                                     .child(layout("layout-side", strings.side_peek, false, cx))
                                     .child(layout("layout-popup", strings.pop_up, true, cx)),
                             ),
-                    ),
-            )
+                    )
             .into_any_element()
     }
 

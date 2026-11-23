@@ -618,11 +618,10 @@ impl TodoView {
                     )
                     .child(
                         div()
-                            .id("batch-clear-tip")
                             .debug_selector(|| "batch-clear".to_owned())
-                            .tooltip(Tooltip::text(strings.clear_selection))
                             .child(
                                 IconButton::new("batch-clear", IconName::X)
+                                    .tooltip(Tooltip::text(strings.clear_selection))
                                     .on_click(cx.listener(|this, _, _, cx| this.clear_multi_selection(cx))),
                             ),
                     ),
@@ -672,10 +671,10 @@ impl TodoView {
         let all_in_progress = !selected_tasks.is_empty() && selected_tasks.iter().all(|t| t.is_in_progress());
         let today = Self::today();
         let bar_btn = |id: &'static str, icon: IconName, tip: &'static str, tint: Color| {
-            div()
-                .id(id)
+            IconButton::new(id, icon)
+                .icon_size(IconSize::Small)
+                .icon_color(tint)
                 .tooltip(Tooltip::text(tip))
-                .child(IconButton::new(SharedString::from(format!("{id}-btn")), icon).icon_size(IconSize::Small).icon_color(tint))
         };
 
         div()

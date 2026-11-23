@@ -136,12 +136,12 @@ impl HabitView {
                             if amt > 0.0 {
                                 format!("{date_label} · {}/{} {}", format_amount(amt), format_amount(goal.amount), goal.unit).into()
                             } else if checked.contains(&date) {
-                                format!("{date_label} · {}", strings.completed).into()
+                                format!("{date_label} · {}", strings.habit_checked_in).into()
                             } else {
                                 date_label.into()
                             }
                         } else if checked.contains(&date) {
-                            format!("{date_label} · {}", strings.completed).into()
+                            format!("{date_label} · {}", strings.habit_checked_in).into()
                         } else if record.is_some_and(|r| r.is_undone()) {
                             format!("{date_label} · {}", strings.habit_unachieved).into()
                         } else {
@@ -242,7 +242,7 @@ impl HabitView {
                                             }),
                                     )
                                     .child(
-                                        Label::new(if done_today { strings.completed } else { strings.check_in })
+                                        Label::new(if done_today { strings.habit_checked_in } else { strings.check_in })
                                             .size(LabelSize::XSmall)
                                             .weight(FontWeight::MEDIUM)
                                             .color(if done_today {

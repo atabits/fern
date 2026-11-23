@@ -301,7 +301,7 @@ impl FocusView {
                             strings.stats_from_yesterday.replace(
                                 "{n}",
                                 &format!(
-                                    "{}{}{}{}",
+                                    "{}{} {}{}",
                                     minutes_change.abs() / 60,
                                     strings.duration_hour_short,
                                     minutes_change.abs() % 60,
@@ -366,14 +366,14 @@ impl FocusView {
                     )),
             )
             .child(
-                Label::new(strings.stats_daily_average.replace("{t}", &strings.format_minutes(average)))
+                Label::new(strings.stats_daily_average.replace("{t}", &format_minutes(average, strings)))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
             // As the original's, the week as a curve.
             .child({
                 let trend_labels: Vec<String> = crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|d| (*d).to_owned()).collect();
-                let trend_tips: Vec<String> = trend_labels.iter().zip(&week).map(|(l, v)| format!("{l} · {}", strings.format_minutes(*v))).collect();
+                let trend_tips: Vec<String> = trend_labels.iter().zip(&week).map(|(l, v)| format!("{l} · {}", format_minutes(*v, strings))).collect();
                 line_chart("focus-trends", &week, trend_labels, trend_tips, CHART, true, cx)
             });
 
@@ -437,7 +437,7 @@ impl FocusView {
                                             "{weekday} · {}–{} ({})",
                                             fmt_min(i64::from(*from)),
                                             fmt_min(i64::from(*to)),
-                                            strings.format_minutes(i64::from(to.saturating_sub(*from)))
+                                            format_minutes(i64::from(to.saturating_sub(*from)), strings)
                                         );
                                         div()
                                             .id(SharedString::from(format!("focus-timeline-{day}-{idx}")))
@@ -484,7 +484,7 @@ impl FocusView {
                 hours
                     .iter()
                     .enumerate()
-                    .map(|(h, m)| format!("{} · {}", crate::calendar::format_hour(h as u32, strings), strings.format_minutes(*m)))
+                    .map(|(h, m)| format!("{} · {}", crate::calendar::format_hour(h as u32, strings), format_minutes(*m, strings)))
                     .collect(),
                 most,
             ));
@@ -548,7 +548,7 @@ impl FocusView {
                                 .when(index < in_year, |el| {
                                     let day = first + chrono::Duration::days(index as i64);
                                     let mins = year_days[index];
-                                    let tip = format!("{} · {}", crate::calendar::format_date(day, strings), strings.format_minutes(mins));
+                                    let tip = format!("{} · {}", crate::calendar::format_date(day, strings), format_minutes(mins, strings));
                                     el.bg(shade(mins)).tooltip(Tooltip::text(tip))
                                 })
                         }))
@@ -834,7 +834,7 @@ impl FocusView {
                                 .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(if total == 0 {
                                     strings.stats_no_data.to_owned()
                                 } else {
-                                    strings.format_minutes(total)
+                                    format_minutes(total, strings)
                                 }))
                                 .when(total > 0, |el| el.child(Label::new(strings.focus).size(LabelSize::XSmall).color(Color::Muted))),
                         ),
@@ -843,7 +843,7 @@ impl FocusView {
                         h_flex()
                             .gap_2()
                             .child(div().size(px(8.)).rounded_full().bg(color))
-                            .child(Label::new(strings.format_minutes(minutes)).size(LabelSize::Small))
+                            .child(Label::new(format_minutes(minutes, strings)).size(LabelSize::Small))
                             .child(Label::new(name).size(LabelSize::Small).color(Color::Muted).truncate())
                     }))),
             )
@@ -962,7 +962,7 @@ impl FocusView {
                 .map(|(l, v)| {
                     let formatted = match curve {
                         1 => format!("{v}%"),
-                        3 => strings.format_minutes(*v),
+                        3 => format_minutes(*v, strings),
                         _ => v.to_string(),
                     };
                     format!("{l} · {formatted}")

@@ -442,6 +442,9 @@ impl TodoView {
                             let completed = task.is_completed();
                             let read_only = self.is_task_read_only(&task);
                             let tint = self.timeline_bar_color(&task, &theme);
+                            let fill_alpha = if completed { 0.3 } else { 0.75 };
+                            let effective_bg = theme.colors().background.blend(tint.opacity(fill_alpha));
+                            let bar_fg = theme::foreground_on(&[effective_bg], 3.8);
                             let handle_title: SharedString = task.title.clone().into();
                             let dragged = DraggedTask { id, title: handle_title.clone() };
                             let span_start = task.due_date.unwrap_or(today);
@@ -516,6 +519,7 @@ impl TodoView {
                                             .child(
                                                 Checkbox::new(SharedString::from(format!("timeline-check-{i}-{id}")))
                                                     .size(px(12.))
+                                                    .tint(Some(bar_fg))
                                                     .toggle_state(completed)
                                                     .in_progress(task.is_in_progress())
                                                     .dismissed(task.is_wont_do())
@@ -529,14 +533,14 @@ impl TodoView {
                                     )
                                 })
                                 .when_some(sec_time_label, |el, tz_txt| {
-                                    el.child(Label::new(tz_txt).size(LabelSize::XSmall).color(Color::Muted))
+                                    el.child(Label::new(tz_txt).size(LabelSize::XSmall).color(Color::Custom(bar_fg.opacity(0.8))))
                                 })
                                 .child(
                                     div()
                                         .flex_1()
                                         .min_w_0()
                                         .when(completed, |el| el.line_through())
-                                        .child(Label::new(task.title).truncate()),
+                                        .child(Label::new(task.title).color(Color::Custom(bar_fg)).truncate()),
                                 );
                             h_flex()
                                 .id(SharedString::from(format!("timeline-{i}-{id}")))
@@ -550,7 +554,7 @@ impl TodoView {
                                     h_flex()
                                         .size_full()
                                         .rounded(px(8.))
-                                        .bg(tint.opacity(if completed { 0.3 } else { 0.75 }))
+                                        .bg(tint.opacity(fill_alpha))
                                         .child(resize_handle(ResizeEdge::Start))
                                         .child(middle)
                                         .child(resize_handle(ResizeEdge::End)),

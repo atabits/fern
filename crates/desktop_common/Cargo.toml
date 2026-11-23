@@ -24,7 +24,6 @@ serde_json.workspace = true
 theme.workspace = true
 ui.workspace = true
 unicode-segmentation.workspace = true
-ureq.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 futures.workspace = true
@@ -41,7 +40,5 @@ x11rb.workspace = true
 
 [dev-dependencies]
 assets.workspace = true
-fern_server = { path = "../../apps/server" }
 gpui = { workspace = true, features = ["test-support"] }
-tiny_http.workspace = true
 uuid.workspace = true

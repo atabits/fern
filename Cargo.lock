@@ -740,6 +740,7 @@ dependencies = [
  "assets",
  "chrono",
  "desktop_common",
+ "desktop_sync",
  "fern_core",
  "fern_i18n",
  "gpui",
@@ -1361,7 +1362,6 @@ dependencies = [
  "dispatch2",
  "fern_core",
  "fern_i18n",
- "fern_server",
  "futures",
  "gpui",
  "objc2 0.6.5",
@@ -1371,13 +1371,29 @@ dependencies = [
  "serde",
  "serde_json",
  "theme",
- "tiny_http",
  "ui",
  "unicode-segmentation",
- "ureq",
  "uuid",
  "windows 0.62.2",
  "x11rb",
+]
+
+[[package]]
+name = "desktop_sync"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "assets",
+ "chrono",
+ "desktop_common",
+ "fern_core",
+ "fern_i18n",
+ "fern_server",
+ "gpui",
+ "serde_json",
+ "tiny_http",
+ "ureq",
+ "uuid",
 ]
 
 [[package]]
@@ -1731,6 +1747,7 @@ dependencies = [
  "chrono",
  "countdown_ui",
  "desktop_common",
+ "desktop_sync",
  "dispatch2",
  "fern_core",
  "fern_i18n",

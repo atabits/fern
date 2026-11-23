@@ -8,8 +8,9 @@ pub(crate) use desktop_common::data_version;
 #[cfg(test)]
 pub(crate) use desktop_common::keymap;
 pub(crate) use desktop_common::{
-    actions, calendar, sticky_opener, subscriptions, text_input, touch, undo,
+    actions, calendar, sticky_opener, text_input, touch, undo,
 };
+pub(crate) use desktop_sync::subscriptions;
 pub(crate) use fern_i18n as i18n;
 pub(crate) use task_ui::{drag, lists_panel, print, task_detail, task_menu, task_rows};
 

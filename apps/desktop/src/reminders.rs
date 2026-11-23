@@ -357,6 +357,78 @@ struct ToastWait {
 }
 
 #[cfg(windows)]
+const FERN_TOAST_AUMID: &str = "Fern.Tasks";
+#[cfg(windows)]
+const POWERSHELL_TOAST_AUMID: &str =
+    r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe";
+
+#[cfg(any(windows, test))]
+fn encode_reg_sz(value: &str) -> Vec<u8> {
+    value
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(windows)]
+fn register_windows_toast_aumid() -> bool {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+        RegCreateKeyExW, RegSetValueExW,
+    };
+    use windows::core::HSTRING;
+
+    struct RegKeyGuard(HKEY);
+    impl Drop for RegKeyGuard {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = RegCloseKey(self.0);
+                }
+            }
+        }
+    }
+
+    let subkey = HSTRING::from(format!(r"Software\Classes\AppUserModelId\{FERN_TOAST_AUMID}"));
+    let mut key = HKEY::default();
+    let create_err = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            &subkey,
+            None,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+    };
+    if create_err != ERROR_SUCCESS {
+        return false;
+    }
+    let _guard = RegKeyGuard(key);
+    let value_name = HSTRING::from("DisplayName");
+    let data = encode_reg_sz("Fern");
+    let set_err = unsafe { RegSetValueExW(key, &value_name, None, REG_SZ, Some(&data)) };
+    set_err == ERROR_SUCCESS
+}
+
+#[cfg(windows)]
+fn ensure_windows_toast_aumid() -> &'static str {
+    static REGISTERED_AUMID: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    REGISTERED_AUMID.get_or_init(|| {
+        if register_windows_toast_aumid() {
+            FERN_TOAST_AUMID
+        } else {
+            POWERSHELL_TOAST_AUMID
+        }
+    })
+}
+
+#[cfg(windows)]
 fn show_windows_toast(
     title: &str,
     body: &str,
@@ -388,9 +460,16 @@ fn show_windows_toast(
     doc.LoadXml(&HSTRING::from(xml))?;
     let toast = ToastNotification::CreateToastNotification(&doc)?;
 
-    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
-        r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe",
-    ))?;
+    let aumid = ensure_windows_toast_aumid();
+    let notifier = match ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(aumid)) {
+        Ok(notifier) => notifier,
+        Err(_) if aumid != POWERSHELL_TOAST_AUMID => {
+            ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
+                POWERSHELL_TOAST_AUMID,
+            ))?
+        }
+        Err(err) => return Err(err),
+    };
 
     let Some(ToastWait { tx, done_tx, done_rx, _slot }) = wait else {
         // Fire-and-forget (e.g. daily summary or waiter cap reached): show and exit immediately.
@@ -1522,5 +1601,17 @@ mod tests {
         assert!(is_target_still_open(&store, Target::Habit(h3.id), today));
         store.delete_habit(h3.id).unwrap();
         assert!(!is_target_still_open(&store, Target::Habit(h3.id), today));
+    }
+
+    #[test]
+    fn reg_sz_encodes_nul_terminated_utf16() {
+        let encoded = encode_reg_sz("Fern");
+        let (chunks, remainder) = encoded.as_chunks::<2>();
+        assert!(remainder.is_empty());
+        let units: Vec<u16> = chunks
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair))
+            .collect();
+        assert_eq!(units, [b'F' as u16, b'e' as u16, b'r' as u16, b'n' as u16, 0]);
     }
 }

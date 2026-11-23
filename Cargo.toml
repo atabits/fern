@@ -6,6 +6,7 @@ members = [
     "crates/core",
     "crates/countdown_ui",
     "crates/desktop_common",
+    "crates/desktop_sync",
     "crates/focus_ui",
     "crates/habit_ui",
     "crates/horizons_ui",
@@ -43,6 +44,7 @@ assets = { path = "crates/assets" }
 calendar_ui = { path = "crates/calendar_ui" }
 countdown_ui = { path = "crates/countdown_ui" }
 desktop_common = { path = "crates/desktop_common" }
+desktop_sync = { path = "crates/desktop_sync" }
 fern_core = { path = "crates/core" }
 fern_i18n = { path = "crates/i18n" }
 focus_ui = { path = "crates/focus_ui" }
@@ -161,6 +163,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input_Pointer",
     "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

@@ -1,8 +1,7 @@
 //! Syncing with the user's own `fern-server`: the request and the answer travel as JSON over
 //! HTTP(S); what they hold is the store's business (`fern_core::sync`).
 
-use chrono::NaiveDateTime;
-use fern_core::attachment::{AttachmentTooLarge, MAX_ATTACHMENT_BYTES, check_attachment_size, save_download};
+use fern_core::attachment::{MAX_ATTACHMENT_BYTES, check_attachment_size, save_download};
 use fern_core::e2ee::{self, E2eeError, E2eeKey};
 use fern_core::sync::{
     IncompatibleProtocol, MAX_FILE_KEY_BYTES, MIN_SYNC_PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION,
@@ -12,16 +11,9 @@ use std::io::Read as _;
 use std::path::Path;
 use std::time::Duration;
 
-/// How the last sync went, for the sidebar's sync button.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub enum SyncStatus {
-    /// No server set.
-    #[default]
-    Off,
-    Running,
-    Done(NaiveDateTime),
-    Failed(String),
-}
+pub use desktop_common::sync_types::{
+    SyncStatus, attachment_error, is_e2ee_error, is_incompatible_protocol,
+};
 
 /// How often the app syncs even without local changes, to fetch other devices' changes.
 pub const PULL_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
@@ -38,26 +30,6 @@ const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
 
 fn sync_agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder().timeout_global(Some(timeout)).build().into()
-}
-
-/// Returns the underlying [`IncompatibleProtocol`] error if `err` (or its source chain) represents
-/// a sync protocol version mismatch.
-pub fn is_incompatible_protocol(err: &anyhow::Error) -> Option<&IncompatibleProtocol> {
-    err.chain().find_map(|cause| cause.downcast_ref::<IncompatibleProtocol>())
-}
-
-/// Returns the underlying [`E2eeError`] if `err` (or its source chain) represents a client-side
-/// end-to-end encryption error.
-pub fn is_e2ee_error(err: &anyhow::Error) -> Option<&E2eeError> {
-    err.chain().find_map(|cause| cause.downcast_ref::<E2eeError>())
-}
-
-pub fn attachment_error(error: &anyhow::Error, strings: &fern_i18n::Strings) -> String {
-    if error.is::<AttachmentTooLarge>() {
-        strings.attachment_size_limit.replace("{limit}", &(MAX_ATTACHMENT_BYTES / (1024 * 1024)).to_string())
-    } else {
-        format!("{error:#}")
-    }
 }
 
 /// Sends one sync request and returns the server's answer. Blocking: run it off the UI thread.
@@ -83,9 +55,9 @@ fn post_with_limit(
     {
         Ok(response) => response,
         Err(err) => {
-            crate::diagnostics::log_event(
+            desktop_common::diagnostics::log_event(
                 "sync",
-                crate::diagnostics::redact_sensitive(&format!("POST /sync failed: {err}")),
+                desktop_common::diagnostics::redact_sensitive(&format!("POST /sync failed: {err}")),
             );
             return Err(err.into());
         }
@@ -116,7 +88,7 @@ fn post_with_limit(
             server,
             min_server,
         };
-        crate::diagnostics::log_event("sync", format!("protocol mismatch (HTTP 426): {mismatch}"));
+        desktop_common::diagnostics::log_event("sync", format!("protocol mismatch (HTTP 426): {mismatch}"));
         return Err(anyhow::Error::new(mismatch));
     }
 
@@ -138,9 +110,9 @@ fn post_with_limit(
                 }
             }
         };
-        crate::diagnostics::log_event(
+        desktop_common::diagnostics::log_event(
             "sync",
-            crate::diagnostics::redact_sensitive(&format!("POST /sync error: {detail}")),
+            desktop_common::diagnostics::redact_sensitive(&format!("POST /sync error: {detail}")),
         );
         anyhow::bail!("{detail}");
     }
@@ -153,9 +125,9 @@ fn post_with_limit(
     {
         Ok(text) => text,
         Err(err) => {
-            crate::diagnostics::log_event(
+            desktop_common::diagnostics::log_event(
                 "sync",
-                crate::diagnostics::redact_sensitive(&format!("POST /sync body read error: {err}")),
+                desktop_common::diagnostics::redact_sensitive(&format!("POST /sync body read error: {err}")),
             );
             return Err(err.into());
         }
@@ -163,9 +135,9 @@ fn post_with_limit(
     match serde_json::from_str(&text) {
         Ok(value) => Ok(value),
         Err(err) => {
-            crate::diagnostics::log_event(
+            desktop_common::diagnostics::log_event(
                 "sync",
-                crate::diagnostics::redact_sensitive(&format!("POST /sync invalid JSON: {err}")),
+                desktop_common::diagnostics::redact_sensitive(&format!("POST /sync invalid JSON: {err}")),
             );
             Err(err.into())
         }
@@ -225,16 +197,16 @@ fn delete_remote_files_with_agent(agent: &ureq::Agent, config: &SyncConfig, name
             Ok(resp) => {
                 let code = resp.status().as_u16();
                 if !resp.status().is_success() && code != 404 && code != 405 {
-                    crate::diagnostics::log_event(
+                    desktop_common::diagnostics::log_event(
                         "sync",
                         format!("DELETE /files returned HTTP {code}"),
                     );
                 }
             }
             Err(err) => {
-                crate::diagnostics::log_event(
+                desktop_common::diagnostics::log_event(
                     "sync",
-                    crate::diagnostics::redact_sensitive(&format!("DELETE /files failed: {err}")),
+                    desktop_common::diagnostics::redact_sensitive(&format!("DELETE /files failed: {err}")),
                 );
             }
         }
@@ -257,7 +229,7 @@ fn transfer_files_with_agent(
         match E2eeKey::from_passphrase(&config.passphrase) {
             Ok(key) => Some(key),
             Err(err) => {
-                crate::diagnostics::log_event("sync", format!("E2EE key derivation failed: {err}"));
+                desktop_common::diagnostics::log_event("sync", format!("E2EE key derivation failed: {err}"));
                 for name in upload.iter().chain(download.iter()) {
                     outcome.failed.push((name.clone(), anyhow::Error::new(err.clone())));
                 }
@@ -284,9 +256,9 @@ fn transfer_files_with_agent(
         match sent {
             Ok(()) => outcome.synced.push(name.clone()),
             Err(err) => {
-                crate::diagnostics::log_event(
+                desktop_common::diagnostics::log_event(
                     "sync",
-                    crate::diagnostics::redact_sensitive(&format!("attachment upload failed: {err:#}")),
+                    desktop_common::diagnostics::redact_sensitive(&format!("attachment upload failed: {err:#}")),
                 );
                 outcome.failed.push((name.clone(), err));
             }
@@ -308,9 +280,9 @@ fn transfer_files_with_agent(
                 outcome.synced.push(name.clone());
             }
             Err(err) => {
-                crate::diagnostics::log_event(
+                desktop_common::diagnostics::log_event(
                     "sync",
-                    crate::diagnostics::redact_sensitive(&format!("attachment download failed: {err:#}")),
+                    desktop_common::diagnostics::redact_sensitive(&format!("attachment download failed: {err:#}")),
                 );
                 outcome.failed.push((name.clone(), err));
             }
@@ -362,6 +334,7 @@ fn download_file(agent: &ureq::Agent, files_url: &str, auth: &str, name: &str) -
 #[cfg(test)]
 mod tests {
     use fern_core::Store;
+    use fern_core::attachment::AttachmentTooLarge;
 
     use super::*;
 

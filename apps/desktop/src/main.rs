@@ -8,8 +8,9 @@ mod app_view;
 mod dev_state;
 
 pub(crate) use desktop_common::{
-    actions, calendar, export, keymap, portable, subscriptions, sync, text_input, touch,
+    actions, calendar, export, keymap, portable, text_input, touch,
 };
+pub(crate) use desktop_sync::{subscriptions, sync};
 pub(crate) use desktop_common::paths::{
     DAILY_BACKUPS, attachments_dir, backups_dir, data_dir, pending_restore_path, scratch_dir,
 };

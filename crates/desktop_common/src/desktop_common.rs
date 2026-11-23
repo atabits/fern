@@ -19,8 +19,12 @@ pub mod sound;
 pub mod sticky_opener;
 pub mod sticky_settings;
 pub mod sticky_windows;
-pub mod subscriptions;
-pub mod sync;
+pub mod sync_types;
+pub mod sync {
+    pub use crate::sync_types::{
+        SyncStatus, attachment_error, is_e2ee_error, is_incompatible_protocol,
+    };
+}
 pub mod task_ops;
 pub mod text_input;
 pub mod touch;

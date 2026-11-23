@@ -16,6 +16,7 @@ assets.workspace = true
 calendar_ui.workspace = true
 countdown_ui.workspace = true
 desktop_common.workspace = true
+desktop_sync.workspace = true
 fern_core.workspace = true
 fern_i18n.workspace = true
 focus_ui.workspace = true

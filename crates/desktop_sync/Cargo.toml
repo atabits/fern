@@ -1,0 +1,28 @@
+[package]
+name = "desktop_sync"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/desktop_sync.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+desktop_common.workspace = true
+fern_core.workspace = true
+fern_i18n.workspace = true
+gpui.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+assets.workspace = true
+fern_server = { path = "../../apps/server" }
+gpui = { workspace = true, features = ["test-support"] }
+tiny_http.workspace = true
+uuid.workspace = true

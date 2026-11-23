@@ -217,9 +217,9 @@ impl Theme {
             ),
         };
         let (avatar_background, avatar_icon) = if dark {
-            (rgb(0x323232).into(), rgb(0x6e6e6e).into())
+            (rgb(0x323232).into(), rgb(0xa1a1aa).into())
         } else {
-            (rgb(0xefefef).into(), rgb(0xb8b8b8).into())
+            (rgb(0xefefef).into(), rgb(0x52525b).into())
         };
         let text_muted = background.blend(ink.opacity(if dark { 0.60 } else { 0.62 }));
         let list_ink: Hsla = rgb(preset.list_ink).into();

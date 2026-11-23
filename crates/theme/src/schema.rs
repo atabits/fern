@@ -826,7 +826,7 @@ fn refine_theme(content: &ThemeContent, author: Option<&str>) -> (Theme, Vec<Str
             theme.colors.sidebar_icon_bottom = ink.opacity(0.40);
             theme.colors.avatar_background =
                 panel.blend(ink.opacity(if dark { 0.08 } else { 0.07 }));
-            theme.colors.avatar_icon = panel.blend(ink.opacity(if dark { 0.48 } else { 0.42 }));
+            theme.colors.avatar_icon = panel.blend(ink.opacity(0.64));
             theme.colors.list_text = theme.colors.text;
             theme.colors.list_text_muted = ink.opacity(if dark { 0.50 } else { 0.55 });
             theme.colors.list_count = ink.opacity(if dark { 0.45 } else { 0.50 });

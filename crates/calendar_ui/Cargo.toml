@@ -13,6 +13,7 @@ path = "src/calendar_ui.rs"
 [dependencies]
 chrono.workspace = true
 desktop_common.workspace = true
+desktop_sync.workspace = true
 fern_core.workspace = true
 fern_i18n.workspace = true
 gpui.workspace = true

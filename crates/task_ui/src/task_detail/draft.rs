@@ -1,6 +1,6 @@
 //! The same detail editor operates on an unsaved task before committing it to Store.
 use super::*;
-use fern_core::{ParsedTask, Recognition, TaskDraft, parse_quick_add_on_day, parse_quick_add_with};
+use fern_core::{ParsedTask, Recognition, TaskDraft, parse_quick_add_on_day, parse_quick_add_with_horizons};
 
 pub(super) struct NewTask {
     pub checklist: Vec<ChecklistItem>,
@@ -26,7 +26,13 @@ impl NewTask {
         let mut recognition = self.recognition;
         recognition.dates &= !self.date_changed;
         if self.recognize_date {
-            parse_quick_add_with(text, today, &names, recognition)
+            parse_quick_add_with_horizons(
+                text,
+                today,
+                &names,
+                recognition,
+                calendar::horizons_enabled(),
+            )
         } else {
             parse_quick_add_on_day(text, task.due_date.unwrap_or(today), &names, recognition)
         }
@@ -50,6 +56,11 @@ impl NewTask {
             due.time = parsed.due_time.or(task.due_time);
             due.repeat = parsed.repeat.clone().or_else(|| task.repeat.clone());
             due.month = calendar::month_start(due.date.unwrap_or(today));
+            due.horizon = if due.date.is_some() {
+                None
+            } else {
+                parsed.horizon.or(task.horizon)
+            };
         }
         if due.date.is_none() {
             due.reminders.clear();
@@ -143,6 +154,7 @@ impl TaskDetail {
             estimate: None,
             start_date: None,
             schedule_bucket: fern_core::ScheduleBucket::None,
+            horizon: None,
             created_at: chrono::Utc::now().timestamp_millis(),
         };
         self.show(Some(task), cx);
@@ -234,15 +246,18 @@ impl TaskDetail {
         let result = self.commit_draft(cx);
         match result {
             Ok(id) => {
-                let draft = self.session.draft.as_mut().unwrap();
-                draft.finished = true;
-                draft.attachments.clear();
+                if let Some(draft) = self.session.draft.as_mut() {
+                    draft.finished = true;
+                    draft.attachments.clear();
+                }
                 cx.emit(DraftClosed(id));
                 true
             }
             Err(error) => {
                 eprintln!("failed to create task: {error:#}");
-                self.session.draft.as_mut().unwrap().save_failed = true;
+                if let Some(draft) = self.session.draft.as_mut() {
+                    draft.save_failed = true;
+                }
                 cx.notify();
                 false
             }
@@ -250,8 +265,9 @@ impl TaskDetail {
     }
 
     fn commit_draft(&mut self, cx: &App) -> anyhow::Result<Option<Id>> {
-        let draft = self.session.draft.as_ref().unwrap();
-        let task = self.session.task.as_ref().unwrap();
+        let (Some(draft), Some(task)) = (self.session.draft.as_ref(), self.session.task.as_ref()) else {
+            return Ok(None);
+        };
         let text = self.title.read(cx).text().trim();
         let notes = self.notes.read(cx).text();
         let mut checklist: Vec<_> = self
@@ -352,18 +368,22 @@ impl TaskDetail {
             constant_reminder,
             start_date: None,
             schedule_bucket: fern_core::ScheduleBucket::None,
+            horizon: if due.date.is_some() { None } else { due.horizon },
         };
         let top = !preferences.task_defaults.add_to_bottom;
-        let task = if draft.attachments.is_empty() {
+        let has_attachments = !draft.attachments.is_empty();
+        let task = if !has_attachments {
             self.session.store.create_task(fields, top)?
         } else {
             let dir = self.session
                 .attachments_dir
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("attachment directory unavailable"))?;
-            let attachments = &mut self.session.draft.as_mut().unwrap().attachments;
+            let Some(draft_mut) = self.session.draft.as_mut() else {
+                return Ok(None);
+            };
             self.session.store
-                .create_task_with_attachments(fields, top, attachments, dir)?
+                .create_task_with_attachments(fields, top, &mut draft_mut.attachments, dir)?
         };
         Ok(Some(task.id))
     }

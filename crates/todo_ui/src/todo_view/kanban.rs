@@ -448,6 +448,7 @@ impl TodoView {
             .flatten();
         let has_note_icon = details_line.is_none() && !task.notes.trim().is_empty();
         let due = task.due_date.map(|date| task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates));
+        let horizon_badge = task_rows::horizon_badge(task, today, strings);
         let has_reminders = !task.reminders.is_empty() && !settled_done;
         let has_location = task.location.as_deref().is_some_and(|l| !l.trim().is_empty());
         let checklist = task.checklist.filter(|_| !settled_done);
@@ -459,6 +460,7 @@ impl TodoView {
                 })
         });
         let has_tips_row = due.is_some()
+            || horizon_badge.is_some()
             || has_note_icon
             || has_location
             || task.repeat.is_some()
@@ -691,6 +693,21 @@ impl TodoView {
                                                     cx.stop_propagation();
                                                     this.save_preferences(|p| p.countdown_dates = !p.countdown_dates, cx);
                                                 })),
+                                        )
+                                    })
+                                    .when_some(horizon_badge, |el, (badge, past)| {
+                                        let (fg, bg, border) =
+                                            task_rows::horizon_badge_style(past, done || task.is_wont_do(), &theme);
+                                        el.child(
+                                            div()
+                                                .flex_none()
+                                                .px(px(5.))
+                                                .py(px(0.5))
+                                                .rounded(px(4.))
+                                                .bg(bg)
+                                                .border_1()
+                                                .border_color(border)
+                                                .child(Label::new(badge).size(LabelSize::XSmall).color(Color::Custom(fg))),
                                         )
                                     })
                                     .when(has_note_icon, |el| {
@@ -1638,7 +1655,7 @@ impl TodoView {
         let count = habits.len();
         let dark = theme.is_dark();
         let base_surface = theme.colors().elevated_surface_background;
-        let habit_border: Hsla = if dark { gpui::rgb(0x363636).into() } else { theme.colors().border_variant };
+        let habit_border = theme.colors().border_variant;
         let habit_hover = base_surface.blend(theme.colors().ghost_element_hover);
         let cards: Vec<AnyElement> = habits
             .into_iter()
@@ -1857,7 +1874,7 @@ impl TodoView {
                     el.child(
                         Icon::new(IconName::Pin)
                             .size(IconSize::XSmall)
-                            .color(Color::Custom(Hsla::from(gpui::rgb(0xFAA80C)))),
+                            .color(Color::Warning),
                     )
                 })
                 .child(Label::new(label).size(LabelSize::XSmall).weight(FontWeight::SEMIBOLD).color(Color::Muted))

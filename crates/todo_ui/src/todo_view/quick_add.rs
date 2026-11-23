@@ -19,6 +19,8 @@ pub(super) struct AddDraft {
     pub(super) files: Vec<std::path::PathBuf>,
     /// The end the picker's Duration tab set, with the start in `date` and `time`.
     pub(super) end: Option<(NaiveDate, Option<chrono::NaiveTime>)>,
+    /// Horizon bucket chosen from the quick-add date picker (mutually exclusive with `date`).
+    pub(super) horizon: Option<fern_core::Horizon>,
 }
 
 
@@ -169,7 +171,13 @@ impl TodoView {
         today: NaiveDate,
     ) -> (fern_core::TaskDraft, bool) {
         let list_names: Vec<String> = lists.iter().map(|l| l.name.clone()).collect();
-        let parsed = fern_core::parse_quick_add_with(input, today, &list_names, preferences.recognition);
+        let parsed = fern_core::parse_quick_add_with_horizons(
+            input,
+            today,
+            &list_names,
+            preferences.recognition,
+            crate::calendar::horizons_enabled(),
+        );
         let title = if parsed.title.is_empty() { input.trim() } else { parsed.title.as_str() };
         let view_due = match view {
             View::Today | View::Next7Days => Some(today),
@@ -180,11 +188,19 @@ impl TodoView {
         let defaults = &preferences.task_defaults;
         let from_picker = parsed.due_date.is_none() && draft.date.is_some();
         let due_time = if from_picker { draft.time } else { parsed.due_time };
-        let due_date = parsed
-            .due_date
-            .or(draft.date)
-            .or(view_due)
-            .or(defaults.date.map(|d| d.date(today)));
+        let explicit_due = parsed.due_date.or(draft.date).or(view_due);
+        let horizon = if explicit_due.is_none() {
+            parsed.horizon.or(draft.horizon)
+        } else {
+            None
+        };
+        let due_date = explicit_due.or_else(|| {
+            if horizon.is_some() {
+                None
+            } else {
+                defaults.date.map(|d| d.date(today))
+            }
+        });
         let (end_date, end_time) = if due_date.is_some() && from_picker {
             match draft.end {
                 Some((d, t)) => (Some(d), t),
@@ -271,6 +287,7 @@ impl TodoView {
                 repeat,
                 reminders,
                 tags,
+                horizon,
                 ..Default::default()
             },
             !defaults.add_to_bottom,
@@ -281,7 +298,13 @@ impl TodoView {
     pub(super) fn add_task_as(&self, input: &str, view: &View, draft: &AddDraft) -> anyhow::Result<Task> {
         let today = Self::today();
         let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
-        let parsed = fern_core::parse_quick_add_with(input, today, &list_names, self.preferences.recognition);
+        let parsed = fern_core::parse_quick_add_with_horizons(
+            input,
+            today,
+            &list_names,
+            self.preferences.recognition,
+            crate::calendar::horizons_enabled(),
+        );
         let title = if parsed.title.is_empty() { input.trim() } else { parsed.title.as_str() };
         let task = self.store.add_task_at(title, !self.preferences.task_defaults.add_to_bottom)?;
 
@@ -296,7 +319,20 @@ impl TodoView {
         // The date picker's time and reminders go with its date, not with a typed one.
         let from_picker = parsed.due_date.is_none() && draft.date.is_some();
         let due_time = if from_picker { draft.time } else { parsed.due_time };
-        if let Some(date) = parsed.due_date.or(draft.date).or(view_due).or(defaults.date.map(|d| d.date(today))) {
+        let explicit_due = parsed.due_date.or(draft.date).or(view_due);
+        let chosen_horizon = if explicit_due.is_none() {
+            parsed.horizon.or(draft.horizon)
+        } else {
+            None
+        };
+        let resolved_due = explicit_due.or_else(|| {
+            if chosen_horizon.is_some() {
+                None
+            } else {
+                defaults.date.map(|d| d.date(today))
+            }
+        });
+        if let Some(date) = resolved_due {
             self.store.set_due(task.id, Some(date), due_time)?;
             if from_picker && draft.end.is_some() {
                 self.store.set_due_end(task.id, draft.end)?;
@@ -310,6 +346,8 @@ impl TodoView {
                     }
                 }
             }
+        } else if let Some(horizon) = chosen_horizon {
+            self.store.set_horizon(task.id, Some(horizon))?;
         }
 
         let mut tags = parsed.tags;
@@ -367,14 +405,21 @@ impl TodoView {
         Ok(task)
     }
 
-    /// Highlights what quick add recognizes in the field and shows the recognized date.
+    /// Highlights what quick add recognizes in the field and shows the recognized date or horizon.
     pub(super) fn update_quick_add_hint(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text().to_owned();
         let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
-        let parsed = fern_core::parse_quick_add_with(&text, Self::today(), &list_names, self.preferences.recognition);
+        let parsed = fern_core::parse_quick_add_with_horizons(
+            &text,
+            Self::today(),
+            &list_names,
+            self.preferences.recognition,
+            crate::calendar::horizons_enabled(),
+        );
         let spans = parsed.spans.clone();
         self.input.update(cx, |input, cx| input.set_highlights(spans, cx));
         self.quick_add_due = parsed.due_date.map(|date| (date, parsed.due_time));
+        self.quick_add_horizon = if parsed.due_date.is_some() { None } else { parsed.horizon };
         self.quick_add_repeat = parsed.repeat.is_some();
         cx.notify();
     }
@@ -492,6 +537,7 @@ impl TodoView {
                                 let files = std::mem::take(&mut this.add_draft.files);
                                 this.attach_draft_files(task.id, files, cx);
                                 this.quick_add_due = None;
+                                this.quick_add_horizon = None;
                                 this.add_draft = AddDraft::default();
                                 input_to_clear = Some(this.input.clone());
                                 this.reload(cx);
@@ -512,6 +558,7 @@ impl TodoView {
                                 let files = std::mem::take(&mut this.add_draft.files);
                                 this.attach_draft_files(task.id, files, cx);
                                 this.quick_add_due = None;
+                                this.quick_add_horizon = None;
                                 this.add_draft = AddDraft::default();
                                 input_to_clear = Some(this.input.clone());
                                 this.reload(cx);
@@ -533,6 +580,7 @@ impl TodoView {
                                 let files = std::mem::take(&mut this.add_draft.files);
                                 this.attach_draft_files(task.id, files, cx);
                                 this.quick_add_due = None;
+                                this.quick_add_horizon = None;
                                 this.add_draft = AddDraft::default();
                                 input_to_clear = Some(this.input.clone());
                                 this.reload(cx);
@@ -552,6 +600,7 @@ impl TodoView {
         if self.add_task(text, cx).is_some() {
             self.input.update(cx, |input, cx| input.clear(window, cx));
             self.quick_add_due = None;
+            self.quick_add_horizon = None;
             self.add_draft = AddDraft::default();
             self.reload(cx);
         }
@@ -580,10 +629,18 @@ impl TodoView {
         self.quick_add_due.or(self.add_draft.date.map(|date| (date, self.add_draft.time)))
     }
 
+    /// The horizon the field shows when no concrete date is set.
+    pub(super) fn shown_add_horizon(&self) -> Option<fern_core::Horizon> {
+        if !crate::calendar::horizons_enabled() || self.shown_add_due().is_some() {
+            return None;
+        }
+        self.quick_add_horizon.or(self.add_draft.horizon)
+    }
+
     /// The field's calendar button, as in the original: it opens a date picker for the next task,
     /// placed under the button.
     pub(super) fn add_date_button(&self, placement: Placement, strings: &'static Strings, cx: &mut Context<Self>) -> Div {
-        let picked = self.add_draft.date.is_some();
+        let picked = self.add_draft.date.is_some() || self.add_draft.horizon.is_some();
         let button = IconButton::new("add-date", IconName::CalendarDays)
             .size(px(24.))
             .icon_size(IconSize::Small)
@@ -724,6 +781,7 @@ impl TodoView {
         let pick = |date: Option<NaiveDate>| {
             move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
                 this.add_draft.date = date;
+                this.add_draft.horizon = None;
                 if date.is_none() {
                     this.add_draft.time = None;
                     this.add_draft.reminders = None;
@@ -856,6 +914,65 @@ impl TodoView {
                     .child(quick("add-date-week", IconName::CalendarPlus, strings.next_week, d_week))
                     .child(quick("add-date-month", IconName::Moon, strings.next_month, d_month)),
             )
+            .when(crate::calendar::horizons_enabled(), |el| {
+                use fern_core::Horizon;
+                let week = Horizon::current_week(today);
+                let month = Horizon::current_month(today);
+                let quarter = Horizon::current_quarter(today);
+                let year = Horizon::current_year(today);
+                let q_short = format!("{}{}", strings.horizons_quarter_prefix, (today.month() - 1) / 3 + 1);
+                let chips = [
+                    ("week", crate::calendar::format_horizon_badge(week, strings), strings.horizon_this_week, week),
+                    ("month", crate::calendar::format_horizon_badge(month, strings), strings.horizon_this_month, month),
+                    ("quarter", q_short, strings.horizon_this_quarter, quarter),
+                    ("year", today.year().to_string(), strings.horizon_this_year, year),
+                    ("life", strings.horizons_life.to_owned(), strings.horizons_life, Horizon::Life),
+                ];
+                el.child(h_flex().gap(px(4.)).children(chips.into_iter().map(|(key, label, tip, h)| {
+                    let active = self.add_draft.horizon == Some(h);
+                    div()
+                        .id(SharedString::from(format!("add-horizon-{key}")))
+                        .debug_selector(move || format!("add-horizon-{key}"))
+                        .flex_1()
+                        .h(px(24.))
+                        .px(px(3.))
+                        .rounded(px(5.))
+                        .border_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .border_color(if active {
+                            theme.colors().accent.opacity(0.65)
+                        } else {
+                            theme.colors().border_variant
+                        })
+                        .bg(if active {
+                            theme.colors().accent.opacity(0.14)
+                        } else {
+                            theme.colors().background.opacity(0.5)
+                        })
+                        .when(!active, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                        .tooltip(Tooltip::text(tip))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let next = if this.add_draft.horizon == Some(h) { None } else { Some(h) };
+                            this.add_draft.horizon = next;
+                            if next.is_some() {
+                                this.add_draft.date = None;
+                                this.add_draft.time = None;
+                                this.add_draft.end = None;
+                                this.add_draft.reminders = None;
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            Label::new(label)
+                                .size(LabelSize::XSmall)
+                                .color(if active { Color::Accent } else { Color::Muted })
+                                .truncate(),
+                        )
+                })))
+            })
             .child(
                 h_flex()
                     .px_1()
@@ -1218,6 +1335,12 @@ impl TodoView {
                         None => label,
                     };
                     Label::new(label).size(LabelSize::Small).color(Color::Accent)
+                }),
+            ).children(
+                self.shown_add_horizon().map(|h| {
+                    Label::new(crate::calendar::format_horizon_badge(h, strings))
+                        .size(LabelSize::Small)
+                        .color(Color::Accent)
                 }),
             ))
             .child(

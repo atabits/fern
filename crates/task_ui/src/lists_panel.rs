@@ -43,6 +43,7 @@ pub fn title(view: &View, lists: &[List], filters: &[fern_core::SmartFilter], st
         View::Tag(name) => name.clone().into(),
         View::Search(_) => strings.section_search.into(),
         View::Filter(id) => filters.iter().find(|f| f.id == *id).map(|f| f.name.clone()).unwrap_or_default().into(),
+        View::Horizons => strings.section_horizons.into(),
         View::Summary => strings.summary.into(),
         View::Day(day) => calendar::format_date(*day, strings).into(),
     }
@@ -267,7 +268,7 @@ pub fn render(
             )
             .on_click(move |_, window, cx| on_select(view.clone(), window, cx));
         let selector_id = id.clone();
-        let accepts_task_drop = !matches!(drop_view, View::All | View::Summary | View::Filter(_) | View::Search(_))
+        let accepts_task_drop = !matches!(drop_view, View::All | View::Horizons | View::Summary | View::Filter(_) | View::Search(_))
             && !matches!(drop_view, View::List(list_id) if lists.iter().any(|l| l.id == list_id && l.archived));
         div()
             .id(SharedString::from(format!("drop-{id}")))
@@ -320,6 +321,7 @@ pub fn render(
             View::Today => Some(SmartList::Today),
             View::Tomorrow => Some(SmartList::Tomorrow),
             View::Next7Days => Some(SmartList::Next7Days),
+            View::Horizons => Some(SmartList::Horizons),
             View::Summary => Some(SmartList::Summary),
             _ => None,
         };
@@ -931,6 +933,13 @@ pub fn render(
                 strings.next_7_days_short,
                 IconName::CalendarRange,
                 Some(counts.next_7_days),
+            )),
+            SmartList::Horizons if crate::calendar::horizons_enabled() && shows(SmartList::Horizons, 1) => Some(draggable_smart(
+                SmartList::Horizons,
+                View::Horizons,
+                strings.section_horizons,
+                IconName::FernHorizons,
+                None,
             )),
             SmartList::Summary if shows(SmartList::Summary, 1) => Some(draggable_smart(
                 SmartList::Summary,

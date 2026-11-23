@@ -16,7 +16,8 @@ use desktop_common::text_input::{Changed, Mode, Submitted, TextInput};
 use desktop_common::{calendar, colors, completion_mark, data_version, layout, task_ops};
 pub use fern_core::things::{ProjectProgress, ThingsCounts, ThingsViewKind};
 use fern_core::{
-    ChecklistItem, Id, List, ListFolder, ListSection, ScheduleBucket, Store, Tag, Task, TaskDraft,
+    ChecklistItem, Horizon, Id, List, ListFolder, ListSection, ScheduleBucket, Store, Tag, Task,
+    TaskDraft,
 };
 use fern_i18n::{self as i18n, CurrentLocale, Strings};
 use gpui::{
@@ -118,6 +119,8 @@ pub struct ThingsView {
     folder_dialog: Option<Entity<FolderDialog>>,
     tag_dialog: Option<Entity<TagDialog>>,
     pending_complete: HashSet<Id>,
+    active: bool,
+    dirty: bool,
 }
 
 impl Focusable for ThingsView {
@@ -157,11 +160,13 @@ impl ThingsView {
             folder_dialog: None,
             tag_dialog: None,
             pending_complete: HashSet::new(),
+            active: true,
+            dirty: false,
         };
         this.reload(cx);
         cx.observe_global::<data_version::DataVersion>(|this, cx| {
             if data_version::changed_elsewhere(cx.entity_id(), cx) {
-                this.reload(cx);
+                this.sync_external(cx);
             }
         })
         .detach();
@@ -220,8 +225,18 @@ impl ThingsView {
             ThingsViewKind::Logbook
         } else if let Some(list_id) = task.list_id {
             ThingsViewKind::Project(list_id)
-        } else if task.schedule_bucket == ScheduleBucket::Someday {
+        } else if task.schedule_bucket == ScheduleBucket::Someday
+            || matches!(
+                task.horizon,
+                Some(Horizon::Year(_) | Horizon::Decade(_) | Horizon::Life)
+            )
+        {
             ThingsViewKind::Someday
+        } else if matches!(
+            task.horizon,
+            Some(Horizon::Week { .. } | Horizon::Month { .. } | Horizon::Quarter { .. })
+        ) {
+            ThingsViewKind::Anytime
         } else if task.start_date.is_some_and(|d| d <= today)
             || (task.start_date.is_none() && task.due_date.is_some_and(|d| d <= today))
         {
@@ -244,8 +259,25 @@ impl ThingsView {
         self.expand_task(id, window, cx);
     }
 
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.active = active;
+        if active && self.dirty {
+            self.dirty = false;
+            self.reload(cx);
+        }
+    }
+
+    pub fn sync_external(&mut self, cx: &mut Context<Self>) {
+        if self.active {
+            self.reload(cx);
+        } else {
+            self.dirty = true;
+        }
+    }
+
     /// Reloads cached queries from SQLite and synchronizes any open inline card or project notes.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.dirty = false;
         let today = Self::today();
         self.lists = self.store.lists().unwrap_or_default();
         self.list_names = self
@@ -418,7 +450,7 @@ impl ThingsView {
                     .map(|items| items.is_empty())
                     .unwrap_or(false);
             let untouched_meta = self.store.task(task_id).ok().flatten().is_some_and(|t| {
-                t.tags.is_empty() && t.due_date.is_none() && !t.is_closed()
+                t.tags.is_empty() && t.due_date.is_none() && t.horizon.is_none() && !t.is_closed()
             });
             if title_empty
                 && notes_empty
@@ -1063,6 +1095,7 @@ impl ThingsView {
                 month: initial_month,
                 start_date: task.start_date,
                 bucket: task.schedule_bucket,
+                horizon: task.horizon,
                 date_input,
             },
         ));
@@ -1077,7 +1110,17 @@ impl ThingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.store.set_task_schedule(task_id, start_date, bucket).is_ok() {
+        let cleared_horizon = if start_date.is_none() && bucket == ScheduleBucket::None {
+            self.store.set_horizon(task_id, None)
+        } else {
+            Ok(())
+        };
+        if cleared_horizon.is_ok()
+            && self
+                .store
+                .set_task_schedule(task_id, start_date, bucket)
+                .is_ok()
+        {
             self.mark_expanded_touched(task_id);
             data_version::data_changed(cx.entity_id(), cx);
             self.close_all_popovers();
@@ -1130,6 +1173,18 @@ impl ThingsView {
                 if let Some((_, state)) = &self.when_picker {
                     let task_id = state.task_id;
                     self.apply_when(task_id, start_date, bucket, window, cx);
+                }
+            }
+            WhenAction::SetHorizon(horizon) => {
+                if let Some((_, state)) = &self.when_picker {
+                    let task_id = state.task_id;
+                    if self.store.set_horizon(task_id, Some(horizon)).is_ok() {
+                        self.mark_expanded_touched(task_id);
+                        data_version::data_changed(cx.entity_id(), cx);
+                        self.close_all_popovers();
+                        self.reload(cx);
+                        self.restore_focus(window, cx);
+                    }
                 }
             }
             WhenAction::ShiftMonth(delta) => {
@@ -1249,6 +1304,7 @@ impl ThingsView {
                     DropDestination::Inbox => self
                         .store
                         .set_list(task_id, None)
+                        .and_then(|_| self.store.set_horizon(task_id, None))
                         .and_then(|_| {
                             self.store
                                 .set_task_schedule(task_id, None, ScheduleBucket::None)
@@ -4015,5 +4071,216 @@ mod tests {
             );
             PluginHooksGlobal::clear_global(cx);
         });
+    }
+
+    static HORIZONS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RestoreHorizonsEnabled;
+
+    impl Drop for RestoreHorizonsEnabled {
+        fn drop(&mut self) {
+            calendar::set_horizons_enabled(true);
+        }
+    }
+
+    #[gpui::test]
+    fn horizon_tasks_appear_in_anytime_and_someday_with_badges(cx: &mut TestAppContext) {
+        let _lock = HORIZONS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreHorizonsEnabled;
+        calendar::set_horizons_enabled(true);
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let today = ThingsView::today();
+
+        let t_week = store
+            .create_task(
+                TaskDraft {
+                    title: "Week milestone".into(),
+                    horizon: Some(Horizon::current_week(today)),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let t_month = store
+            .create_task(
+                TaskDraft {
+                    title: "Month milestone".into(),
+                    horizon: Some(Horizon::current_month(today)),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let t_quarter = store
+            .create_task(
+                TaskDraft {
+                    title: "Quarter milestone".into(),
+                    horizon: Some(Horizon::current_quarter(today)),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let t_year = store
+            .create_task(
+                TaskDraft {
+                    title: "Year milestone".into(),
+                    horizon: Some(Horizon::current_year(today)),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let t_decade = store
+            .create_task(
+                TaskDraft {
+                    title: "Decade milestone".into(),
+                    horizon: Some(Horizon::current_decade(today)),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let t_life = store
+            .create_task(
+                TaskDraft {
+                    title: "Life milestone".into(),
+                    horizon: Some(Horizon::Life),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+
+        setup_env(cx);
+        let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
+        cx.simulate_resize(size(px(960.), px(640.)));
+        cx.run_until_parked();
+
+        // Anytime shows Week/Month/Quarter horizon tasks with their horizon badges.
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.select_view(ThingsViewKind::Anytime, window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let ids: Vec<Id> = view.read(cx).tasks().iter().map(|t| t.id).collect();
+            assert!(ids.contains(&t_week.id));
+            assert!(ids.contains(&t_month.id));
+            assert!(ids.contains(&t_quarter.id));
+            assert!(!ids.contains(&t_year.id));
+            assert!(!ids.contains(&t_decade.id));
+            assert!(!ids.contains(&t_life.id));
+        });
+        for id in [t_week.id, t_month.id, t_quarter.id] {
+            let sel: &'static str = format!("things-horizon-chip-{id}").leak();
+            assert!(cx.debug_bounds(sel).is_some(), "expected horizon badge for {id} in Anytime");
+        }
+
+        // Someday shows Year/Decade/Life horizon tasks with their horizon badges.
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.select_view(ThingsViewKind::Someday, window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let ids: Vec<Id> = view.read(cx).tasks().iter().map(|t| t.id).collect();
+            assert!(ids.contains(&t_year.id));
+            assert!(ids.contains(&t_decade.id));
+            assert!(ids.contains(&t_life.id));
+            assert!(!ids.contains(&t_week.id));
+            assert!(!ids.contains(&t_month.id));
+            assert!(!ids.contains(&t_quarter.id));
+        });
+        for id in [t_year.id, t_decade.id, t_life.id] {
+            let sel: &'static str = format!("things-horizon-chip-{id}").leak();
+            assert!(cx.debug_bounds(sel).is_some(), "expected horizon badge for {id} in Someday");
+        }
+
+        // Disabling Horizons hides the horizon badge pills cleanly.
+        calendar::set_horizons_enabled(false);
+        cx.update(|_, cx| view.update(cx, |v, cx| v.reload(cx)));
+        cx.run_until_parked();
+        for id in [t_year.id, t_decade.id, t_life.id] {
+            let sel: &'static str = format!("things-horizon-chip-{id}").leak();
+            assert!(cx.debug_bounds(sel).is_none(), "horizon badge must hide when disabled");
+        }
+        calendar::set_horizons_enabled(true);
+    }
+
+    #[gpui::test]
+    fn when_picker_horizon_chips_gate_on_feature_flag_and_persist_horizon(cx: &mut TestAppContext) {
+        let _lock = HORIZONS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreHorizonsEnabled;
+        calendar::set_horizons_enabled(true);
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let today = ThingsView::today();
+        let task = store
+            .create_task(
+                TaskDraft {
+                    title: "Plan horizon".into(),
+                    start_date: Some(today),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+
+        setup_env(cx);
+        let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
+        cx.simulate_resize(size(px(960.), px(720.)));
+        cx.run_until_parked();
+
+        // Open WhenPicker on the expanded task -> all 4 Horizon chips render when enabled.
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.expand_task(task.id, window, cx);
+                v.handle_card_action(CardAction::TogglePopover(CardPopover::When), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("things-when-horizons").is_some());
+        assert!(cx.debug_bounds("when-horizon-week").is_some());
+        assert!(cx.debug_bounds("when-horizon-month").is_some());
+        assert!(cx.debug_bounds("when-horizon-year").is_some());
+        assert!(cx.debug_bounds("when-horizon-life").is_some());
+
+        // Clicking the Week chip persists Horizon::current_week(today) and clears start_date.
+        let week_pos = cx.debug_bounds("when-horizon-week").unwrap().center();
+        cx.simulate_click(week_pos, Modifiers::default());
+        cx.run_until_parked();
+        let after_week = store.task(task.id).unwrap().unwrap();
+        assert_eq!(after_week.horizon, Some(Horizon::current_week(today)));
+        assert_eq!(after_week.start_date, None);
+        assert_eq!(after_week.due_date, None);
+
+        // open_task navigates to Anytime and re-expands; clicking Life persists Horizon::Life.
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.open_task(task.id, window, cx);
+                v.handle_card_action(CardAction::TogglePopover(CardPopover::When), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(view.read(cx).view(), ThingsViewKind::Anytime));
+        let life_pos = cx.debug_bounds("when-horizon-life").unwrap().center();
+        cx.simulate_click(life_pos, Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(store.task(task.id).unwrap().unwrap().horizon, Some(Horizon::Life));
+
+        // Disabling Horizons hides the Horizon quick-pick row completely in WhenPicker.
+        calendar::set_horizons_enabled(false);
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.open_task(task.id, window, cx);
+                v.handle_card_action(CardAction::TogglePopover(CardPopover::When), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("things-when-popover").is_some());
+        assert!(cx.debug_bounds("things-when-horizons").is_none());
+        assert!(cx.debug_bounds("when-horizon-week").is_none());
+
+        calendar::set_horizons_enabled(true);
     }
 }

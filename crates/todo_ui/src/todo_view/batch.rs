@@ -130,7 +130,7 @@ impl TodoView {
     }
 
     pub(super) fn select_all_visible(&mut self, _: &SelectAllTasks, window: &mut Window, cx: &mut Context<Self>) {
-        if self.view == View::Summary || self.is_current_view_archived_list() {
+        if matches!(self.view, View::Summary | View::Horizons) || self.is_current_view_archived_list() {
             return;
         }
         window.focus(&self.list_focus, cx);

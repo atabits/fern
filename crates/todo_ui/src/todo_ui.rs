@@ -13,6 +13,7 @@ pub(crate) use desktop_common::{
     actions, calendar, completion_mark, resize, sticky_opener, sync, text_input, touch, undo,
 };
 pub(crate) use fern_i18n as i18n;
+pub(crate) use horizons_ui as horizons_view;
 pub(crate) use summary_ui as summary_view;
 pub(crate) use task_ui::{
     drag, due_picker, list_dialog, lists_panel, print, tag_dialog, task_detail, task_menu,

@@ -139,6 +139,8 @@ pub struct LifeClockView {
     _subscriptions: Vec<Subscription>,
     #[cfg(not(test))]
     tick_timer: Option<(u64, gpui::Task<()>)>,
+    active: bool,
+    dirty: bool,
 }
 
 impl EventEmitter<LifeClockEvent> for LifeClockView {}
@@ -174,7 +176,7 @@ impl LifeClockView {
 
         subscriptions.push(cx.observe_global::<DataVersion>(|this, cx| {
             if changed_elsewhere(cx.entity_id(), cx) {
-                this.reload(cx);
+                this.sync_external(cx);
             }
         }));
 
@@ -197,12 +199,31 @@ impl LifeClockView {
             _subscriptions: subscriptions,
             #[cfg(not(test))]
             tick_timer: None,
+            active: true,
+            dirty: false,
         };
         view.sync_date_inputs(cx);
         view
     }
 
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.active = active;
+        if active && self.dirty {
+            self.dirty = false;
+            self.reload(cx);
+        }
+    }
+
+    pub fn sync_external(&mut self, cx: &mut Context<Self>) {
+        if self.active {
+            self.reload(cx);
+        } else {
+            self.dirty = true;
+        }
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.dirty = false;
         let new_birth = load_birth_date(&self.store);
         let new_palette = load_palette_mode(&self.store);
         let birth_changed = self.birth_date != new_birth;

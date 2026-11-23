@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Local, NaiveDate};
 use fern_core::stats::{self, Bucket};
-use fern_core::{FocusSession, Id, Store, Task, View, focus_stats, format_minutes};
+use fern_core::{FocusSession, Id, Store, Task, View, focus_stats};
 use gpui::{Entity, Focusable as _, FontWeight, ScrollHandle, Task as GpuiTask};
 use ui::{Donut, Placement, PopoverAttachment, popover};
 use ui::prelude::*;
@@ -85,6 +85,23 @@ fn resolve_local_datetime<Tz: chrono::TimeZone>(
     mapped: chrono::LocalResult<chrono::DateTime<Tz>>,
 ) -> Option<i64> {
     mapped.earliest().map(|dt| dt.timestamp_millis())
+}
+
+fn duration_unit_label(unit: char, strings: &Strings) -> &'static str {
+    match unit {
+        'h' => strings.duration_hour_short,
+        _ => strings.duration_min_short,
+    }
+}
+
+fn localized_duration_parts(
+    parts: Vec<(i64, char)>,
+    strings: &Strings,
+) -> Vec<(i64, Option<&'static str>)> {
+    parts
+        .into_iter()
+        .map(|(n, u)| (n, Some(duration_unit_label(u, strings))))
+        .collect()
 }
 
 fn now_ms() -> i64 {
@@ -175,6 +192,8 @@ pub struct FocusView {
     /// The focus record whose dialog is open, and its note field.
     open_record: Option<Id>,
     record_note: Entity<TextInput>,
+    active: bool,
+    dirty: bool,
 }
 
 /// What the Statistics page shows: the Trends week, the Most Focused Time month and the year.
@@ -439,7 +458,7 @@ impl FocusView {
         let settings = FocusSettings::load(&store);
         cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
             if desktop_common::data_version::changed_elsewhere(cx.entity_id(), cx) {
-                this.reload(cx);
+                this.sync_external(cx);
             }
         })
         .detach();
@@ -481,12 +500,31 @@ impl FocusView {
             stats_scroll: ScrollHandle::new(),
             open_record: None,
             record_note: cx.new(|cx| TextInput::new(Mode::MultiLine, strings.focus_note_placeholder, cx)),
+            active: true,
+            dirty: false,
         };
         this.reload(cx);
         this
     }
 
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.active = active;
+        if active && self.dirty {
+            self.dirty = false;
+            self.reload(cx);
+        }
+    }
+
+    pub fn sync_external(&mut self, cx: &mut Context<Self>) {
+        if self.active || self.running_clock().is_some() {
+            self.reload(cx);
+        } else {
+            self.dirty = true;
+        }
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.dirty = false;
         let today = Local::now().date_naive();
         self.settings = FocusSettings::load(&self.store);
         self.tasks = self.store.tasks_in(&View::Today, today).unwrap_or_default();
@@ -993,7 +1031,7 @@ impl FocusView {
                             h_flex()
                                 .gap_2()
                                 .child(Icon::new(IconName::Clock).size(IconSize::Small).color(Color::Muted))
-                                .child(Label::new(format_minutes(session.minutes())).size(LabelSize::Small).color(Color::Muted)),
+                                .child(Label::new(strings.format_minutes(session.minutes())).size(LabelSize::Small).color(Color::Muted)),
                         )
                         .child(
                             div()
@@ -1202,7 +1240,7 @@ impl FocusView {
                 (0, Some((first, last)), _) if filter.date == 7 => {
                     format!("{} - {}", crate::task_rows::short_date(first, strings), crate::task_rows::short_date(last, strings)).into()
                 }
-                (1, _, Some((least, most))) => format!("{}–{}", format_minutes(least), format_minutes(most)).into(),
+                (1, _, Some((least, most))) => format!("{}–{}", strings.format_minutes(least), strings.format_minutes(most)).into(),
                 _ if current[which as usize] == 0 => strings.batch_filters[which as usize].into(),
                 _ => choices[which as usize][current[which as usize]].into(),
             };
@@ -1314,7 +1352,7 @@ impl FocusView {
                                 .child(Label::new(span).size(LabelSize::XSmall).color(Color::Muted))
                                 .child(Label::new(session.title.clone()).size(LabelSize::Small).truncate()),
                         )
-                        .child(Label::new(fern_core::format_minutes(session.minutes())).size(LabelSize::XSmall).color(Color::Muted))
+                        .child(Label::new(strings.format_minutes(session.minutes())).size(LabelSize::XSmall).color(Color::Muted))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if !this.batch.remove(&id) {
                                 this.batch.insert(id);
@@ -1777,7 +1815,7 @@ impl FocusView {
             .hover(|s| s.bg(theme.colors().ghost_element_hover))
             .child(icon_avatar(timer.icon.as_deref(), timer.color.as_deref(), &timer.name, px(26.), cx))
             .child(div().flex_1().min_w_0().child(Label::new(timer.name.clone()).truncate()))
-            .child(Label::new(format_minutes(today_minutes)).size(LabelSize::Small).color(Color::Muted))
+            .child(Label::new(strings.format_minutes(today_minutes)).size(LabelSize::Small).color(Color::Muted))
             .child(
                 div()
                     .relative()
@@ -1904,7 +1942,7 @@ impl FocusView {
                         let value = if goal == 0 {
                             strings.focus_goal_off.to_owned()
                         } else {
-                            fern_core::format_minutes(goal)
+                            strings.format_minutes(goal)
                         };
                         h_flex()
                             .gap_2()
@@ -2013,7 +2051,7 @@ impl FocusView {
                                 this.add_minutes = (this.add_minutes - 5).max(5);
                                 cx.notify();
                             })))
-                            .child(Label::new(format_minutes(self.add_minutes)).size(LabelSize::Small))
+                            .child(Label::new(strings.format_minutes(self.add_minutes)).size(LabelSize::Small))
                             .child(IconButton::new("record-longer", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
                                 this.add_minutes = (this.add_minutes + 5).min(12 * 60);
                                 cx.notify();
@@ -2188,8 +2226,8 @@ impl FocusView {
                         .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, forward))),
                 )
         };
-        // As the original's: numbers large with a duration's "h" and "m" small beside them.
-        let overview_item = |parts: Vec<(i64, Option<char>)>, label: &'static str, change: Option<(String, i64)>| {
+        // As the original's: numbers large with a duration's unit letters small beside them.
+        let overview_item = |parts: Vec<(i64, Option<&'static str>)>, label: &'static str, change: Option<(String, i64)>| {
             v_flex()
                 .flex_1()
                 .items_center()
@@ -2198,13 +2236,13 @@ impl FocusView {
                     h_flex()
                         .items_end()
                         .child(div().text_size(px(26.)).line_height(px(32.)).child(n.to_string()))
-                        .children(unit.map(|u| div().text_size(px(15.)).line_height(px(15.)).mb(px(5.)).mx_0p5().child(u.to_string())))
+                        .children(unit.map(|u| div().text_size(px(15.)).line_height(px(15.)).mb(px(5.)).mx_0p5().child(u)))
                 })))
                 .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
                 .children(change.map(|(text, delta): (String, i64)| change_line(text, delta)))
         };
         let rule = || div().w(px(1.)).h(px(38.)).flex_none().bg(theme.colors().border);
-        let full = |m: i64| fern_core::focus::duration_parts_full(m).into_iter().map(|(n, u)| (n, Some(u))).collect::<Vec<_>>();
+        let full = |m: i64| localized_duration_parts(fern_core::focus::duration_parts_full(m), strings);
         let overview = card()
             .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.focus_overview))
             .child(
@@ -2221,7 +2259,16 @@ impl FocusView {
                         full(stats.today_minutes),
                         strings.focus_today_focus,
                         Some((
-                            strings.stats_from_yesterday.replace("{n}", &format!("{}h{}m", minutes_change.abs() / 60, minutes_change.abs() % 60)),
+                            strings.stats_from_yesterday.replace(
+                                "{n}",
+                                &format!(
+                                    "{}{}{}{}",
+                                    minutes_change.abs() / 60,
+                                    strings.duration_hour_short,
+                                    minutes_change.abs() % 60,
+                                    strings.duration_min_short,
+                                ),
+                            ),
                             minutes_change,
                         )),
                     ))
@@ -2280,14 +2327,14 @@ impl FocusView {
                     )),
             )
             .child(
-                Label::new(strings.stats_daily_average.replace("{t}", &format_minutes(average)))
+                Label::new(strings.stats_daily_average.replace("{t}", &strings.format_minutes(average)))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
             // As the original's, the week as a curve.
             .child({
                 let trend_labels: Vec<String> = crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|d| (*d).to_owned()).collect();
-                let trend_tips: Vec<String> = trend_labels.iter().zip(&week).map(|(l, v)| format!("{l} · {}", format_minutes(*v))).collect();
+                let trend_tips: Vec<String> = trend_labels.iter().zip(&week).map(|(l, v)| format!("{l} · {}", strings.format_minutes(*v))).collect();
                 line_chart("focus-trends", &week, trend_labels, trend_tips, CHART, true, cx)
             });
 
@@ -2351,7 +2398,7 @@ impl FocusView {
                                             "{weekday} · {}–{} ({})",
                                             fmt_min(i64::from(*from)),
                                             fmt_min(i64::from(*to)),
-                                            format_minutes(i64::from(to.saturating_sub(*from)))
+                                            strings.format_minutes(i64::from(to.saturating_sub(*from)))
                                         );
                                         div()
                                             .id(SharedString::from(format!("focus-timeline-{day}-{idx}")))
@@ -2398,7 +2445,7 @@ impl FocusView {
                 hours
                     .iter()
                     .enumerate()
-                    .map(|(h, m)| format!("{} · {}", crate::calendar::format_hour(h as u32, strings), format_minutes(*m)))
+                    .map(|(h, m)| format!("{} · {}", crate::calendar::format_hour(h as u32, strings), strings.format_minutes(*m)))
                     .collect(),
                 most,
             ));
@@ -2422,7 +2469,15 @@ impl FocusView {
         let month_column = |month: u32| {
             NaiveDate::from_ymd_opt(page.year, month, 1).map_or(0, |d| (d - first).num_days() as usize / PER_COLUMN)
         };
-        let legend = [(0, "0m"), (1, "0-1h"), (60, "1h-3h"), (180, "3h-5h"), (300, ">5h")];
+        let h = strings.duration_hour_short;
+        let m = strings.duration_min_short;
+        let legend = [
+            (0, format!("0{m}")),
+            (1, format!("0-1{h}")),
+            (60, format!("1{h}-3{h}")),
+            (180, format!("3{h}-5{h}")),
+            (300, format!(">5{h}")),
+        ];
         let year_grid = card()
             .min_h(px(CARD_HEIGHT))
             .flex_1()
@@ -2454,7 +2509,7 @@ impl FocusView {
                                 .when(index < in_year, |el| {
                                     let day = first + chrono::Duration::days(index as i64);
                                     let mins = year_days[index];
-                                    let tip = format!("{} · {}", crate::calendar::format_date(day, strings), format_minutes(mins));
+                                    let tip = format!("{} · {}", crate::calendar::format_date(day, strings), strings.format_minutes(mins));
                                     el.bg(shade(mins)).tooltip(Tooltip::text(tip))
                                 })
                         }))
@@ -2738,7 +2793,7 @@ impl FocusView {
                                 .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(if total == 0 {
                                     strings.stats_no_data.to_owned()
                                 } else {
-                                    format_minutes(total)
+                                    strings.format_minutes(total)
                                 }))
                                 .when(total > 0, |el| el.child(Label::new(strings.focus).size(LabelSize::XSmall).color(Color::Muted))),
                         ),
@@ -2747,7 +2802,7 @@ impl FocusView {
                         h_flex()
                             .gap_2()
                             .child(div().size(px(8.)).rounded_full().bg(color))
-                            .child(Label::new(format_minutes(minutes)).size(LabelSize::Small))
+                            .child(Label::new(strings.format_minutes(minutes)).size(LabelSize::Small))
                             .child(Label::new(name).size(LabelSize::Small).color(Color::Muted).truncate())
                     }))),
             )
@@ -2769,8 +2824,8 @@ impl FocusView {
         let day_labels: Vec<String> =
             (0..7).map(|i| (start + chrono::Duration::days(i)).day().to_string()).collect();
         // The original's Overview: 30 px values over muted words, lines between the columns.
-        // A value as the original's: the numbers large, a duration's "h" and "m" small beside them.
-        let value = |parts: Vec<(i64, Option<char>)>, label: &'static str| {
+        // A value as the original's: the numbers large, a duration's unit letters small beside them.
+        let value = |parts: Vec<(i64, Option<&'static str>)>, label: &'static str| {
             v_flex()
                 .flex_1()
                 .min_w_0()
@@ -2780,12 +2835,12 @@ impl FocusView {
                     h_flex()
                         .items_end()
                         .child(div().text_size(px(30.)).line_height(px(36.)).child(n.to_string()))
-                        .children(unit.map(|u| div().text_size(px(16.)).line_height(px(16.)).mb(px(7.)).mx_0p5().child(u.to_string())))
+                        .children(unit.map(|u| div().text_size(px(16.)).line_height(px(16.)).mb(px(7.)).mx_0p5().child(u)))
                 })))
                 .child(Label::new(label).color(Color::Muted).truncate())
         };
         let count = |n: i64| vec![(n, None)];
-        let duration = |m: i64| fern_core::focus::duration_parts_full(m).into_iter().map(|(n, u)| (n, Some(u))).collect::<Vec<_>>();
+        let duration = |m: i64| localized_duration_parts(fern_core::focus::duration_parts_full(m), strings);
         let rule = || div().w(px(1.)).h(px(38.)).flex_none().bg(theme.colors().border);
         // The counts are semibold, their words regular, as in the original.
         let counts = [
@@ -2862,7 +2917,7 @@ impl FocusView {
                 .map(|(l, v)| {
                     let formatted = match curve {
                         1 => format!("{v}%"),
-                        3 => format_minutes(*v),
+                        3 => strings.format_minutes(*v),
                         _ => v.to_string(),
                     };
                     format!("{l} · {formatted}")
@@ -3515,9 +3570,9 @@ impl FocusView {
     fn render_overview(&self, strings: &Strings, cx: &App) -> impl IntoElement {
         let theme = cx.theme();
         let stats = focus_stats(&self.sessions, Local::now().date_naive());
-        // As the original's: the numbers large, their unit letters ("h", "m") small beside them,
+        // As the original's: the numbers large, their unit letters small beside them,
         // on the same baseline.
-        let card = |label: &'static str, parts: Vec<(i64, Option<char>)>| {
+        let card = |label: &'static str, parts: Vec<(i64, Option<&'static str>)>| {
             v_flex()
                 .flex_1()
                 .h(px(73.))
@@ -3532,12 +3587,12 @@ impl FocusView {
                         .items_end()
                         .child(div().text_size(px(26.)).line_height(px(32.)).font_weight(FontWeight::SEMIBOLD).child(number.to_string()))
                         .children(unit.map(|u| {
-                            div().text_size(px(14.)).line_height(px(14.)).mb(px(6.)).mx_0p5().font_weight(FontWeight::SEMIBOLD).child(u.to_string())
+                            div().text_size(px(14.)).line_height(px(14.)).mb(px(6.)).mx_0p5().font_weight(FontWeight::SEMIBOLD).child(u)
                         }))
                 })))
         };
         let daily_goal = self.minutes(DAILY_GOAL_SETTING);
-        let duration = |minutes: i64| fern_core::focus::duration_parts(minutes).into_iter().map(|(n, u)| (n, Some(u))).collect::<Vec<_>>();
+        let duration = |minutes: i64| localized_duration_parts(fern_core::focus::duration_parts(minutes), strings);
         let today_focus_card = {
             let parts = duration(stats.today_minutes);
             let pct = (daily_goal > 0).then(|| ((stats.today_minutes.max(0) * 100) / daily_goal).min(999));
@@ -3573,7 +3628,7 @@ impl FocusView {
                         .items_end()
                         .child(div().text_size(px(26.)).line_height(px(32.)).font_weight(FontWeight::SEMIBOLD).child(number.to_string()))
                         .children(unit.map(|u| {
-                            div().text_size(px(14.)).line_height(px(14.)).mb(px(6.)).mx_0p5().font_weight(FontWeight::SEMIBOLD).child(u.to_string())
+                            div().text_size(px(14.)).line_height(px(14.)).mb(px(6.)).mx_0p5().font_weight(FontWeight::SEMIBOLD).child(u)
                         }))
                 })))
                 .when(daily_goal > 0, |el| {
@@ -3720,7 +3775,7 @@ impl FocusView {
                                 el.child(Label::new(session.note.clone()).size(LabelSize::Small).color(Color::Muted).truncate())
                             }),
                     )
-                    .child(Label::new(format_minutes(session.minutes())).size(LabelSize::XSmall).color(Color::Muted))
+                    .child(Label::new(strings.format_minutes(session.minutes())).size(LabelSize::XSmall).color(Color::Muted))
                     .child(
                         div().opacity(if crate::touch::active() { 1. } else { 0. }).group_hover(group, |s| s.opacity(1.)).child(
                             IconButton::new(SharedString::from(format!("delete-record-{session_id}")), IconName::X)
@@ -4143,7 +4198,7 @@ impl FocusView {
                     .child(div().flex_1().h(px(1.)).bg(theme.colors().border_variant))
             }))
             .children(fern_core::focus::day_blocks(&self.sessions, today).into_iter().filter(|(_, to, _)| *to > first * 60).enumerate().map(|(i, (from, to, session))| {
-                let dur = format_minutes(to.saturating_sub(from) as i64);
+                let dur = strings.format_minutes(to.saturating_sub(from) as i64);
                 let tip = format!("{} · {:02}:{:02}–{:02}:{:02} ({dur})", session.title, from / 60, from % 60, to / 60, to % 60);
                 div()
                     .id(SharedString::from(format!("focus-page-block-{i}")))
@@ -4297,9 +4352,9 @@ impl Render for FocusView {
                                             .filter(|s| s.task_id == Some(task.id))
                                             .map(|s| (s.ended_at - s.started_at) / 60_000)
                                             .sum();
-                                        format!("{}/{}", format_minutes(done), format_minutes(n as i64))
+                                        format!("{}/{}", strings.format_minutes(done), strings.format_minutes(n as i64))
                                     }
-                                    None => format_minutes(focused.get(&task.id).copied().unwrap_or(0)),
+                                    None => strings.format_minutes(focused.get(&task.id).copied().unwrap_or(0)),
                                 })
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),

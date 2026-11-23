@@ -5,8 +5,8 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use chrono::{Duration, NaiveDate};
-use fern_core::{Id, Kind, List, Priority, Store, Task};
+use chrono::{Datelike, Duration, Local, NaiveDate};
+use fern_core::{Horizon, Id, Kind, List, Priority, Store, Task};
 use ui::prelude::*;
 use ui::{Divider, SubmenuItem, popover};
 
@@ -23,6 +23,8 @@ pub enum MenuAction {
     /// Completes a repeating task permanently without scheduling a next occurrence.
     CompleteForever,
     ClearDate,
+    /// Assigns or clears a time horizon bucket (Week, Month, Year, Life).
+    SetHorizon(Option<Horizon>),
     Priority(Priority),
     AddSubtask,
     LinkParent,
@@ -82,6 +84,7 @@ pub fn apply(store: &Store, task: &Task, action: MenuAction, today: NaiveDate) -
         MenuAction::SkipRecurrence => store.skip_recurrence(id),
         MenuAction::CompleteForever => store.complete_forever(id, today),
         MenuAction::ClearDate => store.set_due(id, None, None),
+        MenuAction::SetHorizon(horizon) => store.set_horizon(id, horizon),
         MenuAction::Priority(priority) => store.set_priority(id, priority),
         MenuAction::UnlinkParent => store.unlink_parent(id),
         MenuAction::Pin => store.set_pinned(id, task.pinned_at.is_none()),
@@ -161,6 +164,77 @@ pub fn render<V: 'static>(
             .tooltip(ui::Tooltip::text(tip))
             .on_click(on_click(&act, action, cx))
     }));
+    let horizon_section: Option<(AnyElement, AnyElement)> = crate::calendar::horizons_enabled().then(|| {
+        let today = Local::now().date_naive();
+        let week = Horizon::current_week(today);
+        let month = Horizon::current_month(today);
+        let year = Horizon::current_year(today);
+        let chips = [
+            ("week", crate::calendar::format_horizon_badge(week, strings), strings.horizon_this_week, week),
+            ("month", crate::calendar::format_horizon_badge(month, strings), strings.horizon_this_month, month),
+            ("year", today.year().to_string(), strings.horizon_this_year, year),
+            ("life", strings.horizons_life.to_owned(), strings.horizons_life, Horizon::Life),
+        ];
+        let row = h_flex()
+            .px_1()
+            .gap(px(3.))
+            .children(chips.into_iter().map(|(key, label, tip, horizon)| {
+                let selected = task.horizon == Some(horizon);
+                div()
+                    .id(SharedString::from(format!("task-menu-horizon-{key}")))
+                    .debug_selector(move || format!("task-menu-horizon-{key}"))
+                    .flex_1()
+                    .h(px(24.))
+                    .px(px(3.))
+                    .rounded(px(5.))
+                    .border_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .border_color(if selected {
+                        theme.colors().accent.opacity(0.65)
+                    } else {
+                        theme.colors().border_variant
+                    })
+                    .bg(if selected {
+                        theme.colors().element_selected
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .when(!selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                    .tooltip(ui::Tooltip::text(tip))
+                    .on_click(on_click(&act, MenuAction::SetHorizon(Some(horizon)), cx))
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::XSmall)
+                            .color(if selected { Color::Accent } else { Color::Muted })
+                            .truncate(),
+                    )
+            }))
+            .when(task.horizon.is_some(), |el| {
+                el.child(
+                    div()
+                        .id("task-menu-horizon-clear")
+                        .debug_selector(|| "task-menu-horizon-clear".to_owned())
+                        .size(px(24.))
+                        .flex_none()
+                        .rounded(px(5.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.colors().element_hover))
+                        .tooltip(ui::Tooltip::text(strings.horizons_clear_horizon))
+                        .on_click(on_click(&act, MenuAction::SetHorizon(None), cx))
+                        .child(Icon::new(IconName::X).size(IconSize::XSmall).color(Color::Muted)),
+                )
+            });
+        (
+            heading(strings.horizons_horizon_label).into_any_element(),
+            row.into_any_element(),
+        )
+    });
     let priority_row = h_flex().px_1().justify_between().children(
         [
             (Priority::High, strings.priority_high),
@@ -221,6 +295,10 @@ pub fn render<V: 'static>(
         .on_mouse_down_out(close)
         .child(heading(strings.filter_date))
         .child(closes_side("task-menu-dates", date_row.into_any_element(), cx))
+        .when_some(horizon_section, |el, (hdr, row)| {
+            el.child(hdr)
+                .child(closes_side("task-menu-horizons", row, cx))
+        })
         .child(heading(strings.filter_priority))
         .child(closes_side("task-menu-priorities", priority_row.into_any_element(), cx))
         .child(div().py_1().child(Divider::horizontal()))
@@ -377,6 +455,14 @@ mod tests {
         assert!(done.is_completed());
         assert!(done.repeat.is_none());
         assert_eq!(store.tasks()?.len(), before_count, "no next occurrence is spawned");
+
+        let goal = store.add_task("Horizon menu goal")?;
+        let week = Horizon::current_week(today);
+        apply(&store, &goal, MenuAction::SetHorizon(Some(week)), today).unwrap()?;
+        assert_eq!(store.task(goal.id)?.unwrap().horizon, Some(week));
+        assert_eq!(store.task(goal.id)?.unwrap().due_date, None);
+        apply(&store, &store.task(goal.id)?.unwrap(), MenuAction::SetHorizon(None), today).unwrap()?;
+        assert_eq!(store.task(goal.id)?.unwrap().horizon, None);
         Ok(())
     }
 }

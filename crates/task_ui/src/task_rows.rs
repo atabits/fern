@@ -230,12 +230,32 @@ pub fn grouped_rows_in(
     let key = |task: &Task| -> (i64, String) {
         match group {
             GroupBy::Date => match task.due_date {
-                Some(d) if d < today => (if overdue_last { 6 } else { 0 }, strings.group_overdue.to_owned()),
+                Some(d) if d < today => (if overdue_last { 12 } else { 0 }, strings.group_overdue.to_owned()),
                 Some(d) if d == today => (1, strings.today.to_owned()),
                 Some(d) if d == today + chrono::Duration::days(1) => (2, strings.tomorrow.to_owned()),
                 Some(d) if d <= today + chrono::Duration::days(7) => (3, strings.next_7_days.to_owned()),
                 Some(_) => (4, strings.group_later.to_owned()),
-                None => (5, strings.group_no_date.to_owned()),
+                None => match task.horizon.filter(|_| desktop_common::calendar::horizons_enabled()) {
+                    Some(h @ fern_core::Horizon::Week { .. }) if h <= fern_core::Horizon::current_week(today) => {
+                        let badge = desktop_common::calendar::format_horizon_badge(
+                            fern_core::Horizon::current_week(today),
+                            strings,
+                        );
+                        (5, format!("{} · {badge}", strings.horizon_this_week))
+                    }
+                    Some(h @ fern_core::Horizon::Month { .. }) if h <= fern_core::Horizon::current_month(today) => {
+                        (6, strings.horizon_this_month.to_owned())
+                    }
+                    Some(h @ fern_core::Horizon::Quarter { .. }) if h <= fern_core::Horizon::current_quarter(today) => {
+                        (7, strings.horizon_this_quarter.to_owned())
+                    }
+                    Some(h @ fern_core::Horizon::Year(_)) if h <= fern_core::Horizon::current_year(today) => {
+                        (8, strings.horizon_this_year.to_owned())
+                    }
+                    Some(fern_core::Horizon::Life) => (10, strings.horizons_life.to_owned()),
+                    Some(_) => (9, strings.horizon_future.to_owned()),
+                    None => (11, strings.group_no_date.to_owned()),
+                },
             },
             GroupBy::Created => {
                 let day = local_day(task.created_at).unwrap_or(today);
@@ -271,7 +291,7 @@ pub fn grouped_rows_in(
             GroupBy::Date => match order {
                 1 => Some(DropTarget::Due(Some(today))),
                 2 => Some(DropTarget::Due(Some(today + chrono::Duration::days(1)))),
-                5 => Some(DropTarget::Due(None)),
+                11 => Some(DropTarget::Due(None)),
                 _ => None,
             },
             GroupBy::Priority => Some(DropTarget::Priority(task.priority)),
@@ -561,6 +581,25 @@ pub fn next_days_rows(tasks: &[Task], today: NaiveDate, week_start: chrono::Week
         rows.push(Row::Day { label: next_days_header(day, today, week_start, strings), count: on_day.len(), drop: Some(DropTarget::Due(Some(day))) });
         rows.extend(on_day.into_iter().map(|t| task_row(t)));
     }
+    if desktop_common::calendar::horizons_enabled() {
+        let cur_week = fern_core::Horizon::current_week(today);
+        let week_goals: Vec<&&Task> = open
+            .iter()
+            .filter(|t| {
+                t.due_date.is_none()
+                    && matches!(t.horizon, Some(h @ fern_core::Horizon::Week { .. }) if h <= cur_week)
+            })
+            .collect();
+        if !week_goals.is_empty() {
+            let badge = desktop_common::calendar::format_horizon_badge(cur_week, strings);
+            rows.push(Row::Day {
+                label: format!("{} · {badge}", strings.horizon_this_week),
+                count: week_goals.len(),
+                drop: None,
+            });
+            rows.extend(week_goals.into_iter().map(|t| task_row(t)));
+        }
+    }
     if !done.is_empty() {
         rows.push(Row::Section { section: Section::Completed, count: done.len(), collapsed: false });
         rows.extend(done.into_iter().map(task_row));
@@ -638,6 +677,75 @@ pub fn row_due_label(date: NaiveDate, time: Option<NaiveTime>, today: NaiveDate,
     }
     let text = if days > 0 { strings.in_days.replace("{n}", &days.to_string()) } else { strings.days_ago.replace("{n}", &(-days).to_string()) };
     (text, days < 0)
+}
+
+/// Returns the subtle horizon badge label when a task has no exact due date and belongs
+/// to a time horizon bucket, so horizon tasks stay clearly labeled across classic task views.
+pub fn horizon_badge_label(task: &Task, strings: &Strings) -> Option<String> {
+    if task.due_date.is_some() {
+        return None;
+    }
+    task.horizon.map(|horizon| desktop_common::calendar::format_horizon_badge(horizon, strings))
+}
+
+/// Returns `(label, is_past)` when a task has no exact due date and belongs to a time horizon
+/// bucket, mirroring [`due_label`] so views can gently highlight past-period carryover tasks.
+pub fn horizon_badge(task: &Task, today: NaiveDate, strings: &Strings) -> Option<(String, bool)> {
+    if task.due_date.is_some() {
+        return None;
+    }
+    task.horizon.map(|horizon| {
+        (
+            desktop_common::calendar::format_horizon_badge(horizon, strings),
+            horizon.is_past_relative_to(today),
+        )
+    })
+}
+
+/// Returns `(label, is_past)` for a task row rendered under `group`.
+/// In [`GroupBy::Date`], past-period horizons (`h.is_past_relative_to(today)`) are always kept
+/// visible even though they roll into the current period bucket (e.g. an October task grouped
+/// under "This month" still displays `Oct`), while redundant current-period badges can be omitted.
+pub fn horizon_badge_for_group(
+    task: &Task,
+    group: GroupBy,
+    today: NaiveDate,
+    strings: &Strings,
+) -> Option<(String, bool)> {
+    if task.due_date.is_some() {
+        return None;
+    }
+    let horizon = task.horizon?;
+    let is_past = horizon.is_past_relative_to(today);
+    if group == GroupBy::Date && desktop_common::calendar::horizons_enabled() && !is_past {
+        let redundant_with_bucket = match horizon {
+            fern_core::Horizon::Week { .. } => horizon == fern_core::Horizon::current_week(today),
+            fern_core::Horizon::Month { .. } => horizon == fern_core::Horizon::current_month(today),
+            fern_core::Horizon::Quarter { .. } => horizon == fern_core::Horizon::current_quarter(today),
+            fern_core::Horizon::Year(_) => horizon == fern_core::Horizon::current_year(today),
+            fern_core::Horizon::Life => true,
+            fern_core::Horizon::Decade(_) => false,
+        };
+        if redundant_with_bucket {
+            return None;
+        }
+    }
+    Some((
+        desktop_common::calendar::format_horizon_badge(horizon, strings),
+        is_past,
+    ))
+}
+
+/// Foreground text/icon color, fill background, and subtle border color for a horizon badge.
+/// Open tasks with a past horizon receive a warm warning tint calmer than hard due-date overdue red.
+pub fn horizon_badge_style(past: bool, closed: bool, theme: &Theme) -> (Hsla, Hsla, Hsla) {
+    if past && !closed {
+        let warning = theme.status().warning;
+        (warning, warning.opacity(0.12), warning.opacity(0.32))
+    } else {
+        let colors = theme.colors();
+        (colors.text_muted, colors.element_hover.opacity(0.65), colors.border_variant)
+    }
 }
 
 /// Planned result of dropping a dragged task in the list view:
@@ -964,6 +1072,7 @@ mod tests {
             estimate: None,
             start_date: None,
             schedule_bucket: fern_core::ScheduleBucket::None,
+            horizon: None,
             created_at: 0,
         }
     }
@@ -1377,5 +1486,91 @@ mod tests {
         let plan = plan_task_drop(&rows, extra.id, deepest.id, true, 48.0, 220.0, 24.0, 20.0, true).unwrap();
         assert_eq!(plan.target_level, fern_core::MAX_SUBTASK_DEPTH);
         assert_eq!(plan.new_parent, Some(parent_of_deepest.id));
+    }
+
+    #[test]
+    fn horizon_badge_label_shows_only_when_undated_with_horizon() {
+        let mut t = task("Quarterly roadmap");
+        assert_eq!(horizon_badge_label(&t, &EN), None);
+
+        t.horizon = Some(fern_core::Horizon::Week { year: 2026, week: 48 });
+        assert_eq!(horizon_badge_label(&t, &EN).as_deref(), Some("W48"));
+        assert_eq!(horizon_badge_label(&t, &RU).as_deref(), Some("Н48"));
+
+        t.horizon = Some(fern_core::Horizon::Life);
+        assert_eq!(horizon_badge_label(&t, &RU).as_deref(), Some("Жизнь"));
+
+        // Exact due date takes precedence over horizon badge.
+        t.due_date = Some(d(2026, 11, 23));
+        assert_eq!(horizon_badge_label(&t, &EN), None);
+    }
+
+    #[test]
+    fn date_grouping_and_next_days_group_horizons_chronologically() {
+        let today = d(2026, 11, 23); // Mon of 2026-W48
+        let mut t_today = task("Today item");
+        t_today.due_date = Some(today);
+        let mut t_week = task("Week item");
+        t_week.horizon = Some(fern_core::Horizon::current_week(today));
+        let mut t_month = task("Month item");
+        t_month.horizon = Some(fern_core::Horizon::current_month(today));
+        let mut t_quarter = task("Quarter item");
+        t_quarter.horizon = Some(fern_core::Horizon::current_quarter(today));
+        let mut t_year = task("Year item");
+        t_year.horizon = Some(fern_core::Horizon::current_year(today));
+        let mut t_future = task("Next month item");
+        t_future.horizon = Some(fern_core::Horizon::current_month(today).shift(1));
+        let mut t_life = task("Life item");
+        t_life.horizon = Some(fern_core::Horizon::Life);
+        let t_nodate = task("Undated item");
+
+        let rows = grouped_rows(
+            &[
+                t_nodate,
+                t_life,
+                t_future,
+                t_year,
+                t_quarter,
+                t_month,
+                t_week.clone(),
+                t_today.clone(),
+            ],
+            GroupBy::Date,
+            today,
+            false,
+            &EN,
+        );
+        assert_eq!(
+            shape(&rows),
+            [
+                "## Today 1",
+                "Today item",
+                "## This week · W48 1",
+                "Week item",
+                "## This month 1",
+                "Month item",
+                "## This quarter 1",
+                "Quarter item",
+                "## This year 1",
+                "Year item",
+                "## Later horizons 1",
+                "Next month item",
+                "## Life 1",
+                "Life item",
+                "## No Date 1",
+                "Undated item",
+            ]
+        );
+
+        let next7 = next_days_rows(&[t_today, t_week], today, chrono::Weekday::Mon, &EN);
+        assert_eq!(
+            shape(&next7),
+            [
+                "## Monday, Today 1",
+                "Today item",
+                "## This week · W48 1",
+                "Week item",
+            ]
+        );
     }
 }

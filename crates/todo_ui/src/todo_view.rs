@@ -243,6 +243,7 @@ pub struct TodoView {
     preferences: fern_core::Preferences,
     /// The date quick add recognized in the field so far, shown at its end.
     quick_add_due: Option<(NaiveDate, Option<chrono::NaiveTime>)>,
+    quick_add_horizon: Option<fern_core::Horizon>,
     quick_add_repeat: bool,
     /// The mini calendar: expanded to a month, which month, and the days with open tasks.
     mini_expanded: bool,
@@ -261,6 +262,8 @@ pub struct TodoView {
     habit_menu: Option<(Id, gpui::Point<Pixels>)>,
     /// The Summary smart list's report.
     summary: Entity<crate::summary_view::SummaryView>,
+    /// The embedded TimeStripe-inspired Horizons planning view.
+    horizons: Entity<crate::horizons_view::HorizonsView>,
     /// The "Add Filter" / "Edit Filter" dialog, while it is open.
     filter_edit: Option<FilterEdit>,
     /// The "List Activities" panel, shown in place of the details while open.
@@ -302,12 +305,26 @@ pub struct TodoView {
     add_attachment_error: Option<String>,
     pending_complete: HashSet<Id>,
     submitting_task: bool,
+    active: bool,
+    dirty: bool,
 }
 
 impl TodoView {
     pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let strings = i18n::t(cx);
         let summary = cx.new(|_| crate::summary_view::SummaryView::new(store.clone()));
+        let horizons = cx.new(|cx| crate::horizons_view::HorizonsView::new(store.clone(), window, cx));
+        cx.subscribe_in(&horizons, window, |_this, _, event: &crate::horizons_view::HorizonsEvent, window, cx| {
+            match event {
+                crate::horizons_view::HorizonsEvent::StartFocus { task_id, title, stopwatch } => {
+                    cx.emit(StartFocus(*task_id, title.clone(), *stopwatch));
+                }
+                crate::horizons_view::HorizonsEvent::OpenSearch => {
+                    window.dispatch_action(Box::new(crate::actions::Search), cx);
+                }
+            }
+        })
+        .detach();
         let mini_expanded = store.setting("mini_expanded").ok().flatten().as_deref() == Some("1");
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx).intercept_multiline_paste());
         cx.subscribe_in(&input, window, |this, _, Submitted(text), window, cx| this.submit_new_task(text, window, cx))
@@ -359,10 +376,14 @@ impl TodoView {
         cx.observe_window_bounds(window, |this, window, cx| this.sync_viewport(window, cx))
             .detach();
 
-        // A change made in a sticky note shows here.
+        // A change made in a sticky note or another view shows here without re-broadcasting DataVersion.
         cx.observe_global::<crate::data_version::DataVersion>(|this, cx| {
             if crate::data_version::changed_elsewhere(cx.entity_id(), cx) {
-                this.reload(cx);
+                if this.active {
+                    this.reload_inner(false, false, cx);
+                } else {
+                    this.dirty = true;
+                }
             }
         })
         .detach();
@@ -533,6 +554,7 @@ impl TodoView {
             filters: Vec::new(),
             preferences: Default::default(),
             quick_add_due: None,
+            quick_add_horizon: None,
             quick_add_repeat: false,
             mini_expanded,
             mini_month: crate::calendar::month_start(Self::today()),
@@ -543,6 +565,7 @@ impl TodoView {
             cached_templates: Vec::new(),
             habit_menu: None,
             summary,
+            horizons,
             filter_edit: None,
             undo: None,
             redo: None,
@@ -559,6 +582,8 @@ impl TodoView {
             add_attachment_error: None,
             pending_complete: HashSet::new(),
             submitting_task: false,
+            active: true,
+            dirty: false,
         };
         this.reload_inner(false, false, cx);
         #[cfg(debug_assertions)]
@@ -589,7 +614,9 @@ impl TodoView {
                 Some(("view", "trash")) => self.set_view(View::Trash, cx),
                 Some(("view", "wontdo")) => self.set_view(View::WontDo, cx),
                 Some(("view", "today")) => self.set_view(View::Today, cx),
+                Some(("view", "horizons")) => self.set_view(View::Horizons, cx),
                 Some(("view", "summary")) => self.set_view(View::Summary, cx),
+                Some(("horizons-mode", spec)) => self.dev_horizons_mode(spec, cx),
                 Some(("view", "next7")) => self.set_view(View::Next7Days, cx),
                 Some(("view", "completed")) => self.set_view(View::Completed, cx),
                 Some(("view", name)) if name.starts_with('#') => self.set_view(View::Tag(name[1..].to_owned()), cx),
@@ -986,7 +1013,7 @@ impl TodoView {
     }
 
     fn default_task_for_view(&self, cx: &App) -> Option<Task> {
-        if self.view == View::Summary || self.uses_board_layout() || self.uses_popup_details() {
+        if matches!(self.view, View::Summary | View::Horizons) || self.uses_board_layout() || self.uses_popup_details() {
             return None;
         }
         self.rows(i18n::t(cx)).into_iter().find_map(|row| match row {
@@ -1005,11 +1032,42 @@ impl TodoView {
         });
     }
 
+    fn sync_horizons_active(&self, cx: &mut Context<Self>) {
+        let active = self.active && self.view == View::Horizons;
+        self.horizons.update(cx, |horizons, cx| horizons.set_active(active, cx));
+    }
+
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.active = active;
+        if active && self.dirty {
+            self.dirty = false;
+            self.reload_inner(false, false, cx);
+        } else {
+            self.sync_horizons_active(cx);
+        }
+    }
+
+    pub fn reload_external(&mut self, cx: &mut Context<Self>) {
+        self.dirty = false;
+        self.reload_inner(false, false, cx);
+        self.horizons.update(cx, |horizons, cx| horizons.sync_external(cx));
+    }
+
+    pub fn sync_external(&mut self, cx: &mut Context<Self>) {
+        if self.active {
+            self.reload_external(cx);
+        } else {
+            self.dirty = true;
+            self.horizons.update(cx, |horizons, cx| horizons.sync_external(cx));
+        }
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.reload_inner(false, true, cx);
     }
 
     pub(super) fn reload_inner(&mut self, mut switched: bool, notify_notes: bool, cx: &mut Context<Self>) {
+        self.dirty = false;
         // Sticky notes show data mutations, not view navigation.
         if notify_notes {
             crate::data_version::data_changed(cx.entity_id(), cx);
@@ -1045,6 +1103,12 @@ impl TodoView {
             self.view = View::Inbox;
             switched = true;
         }
+        // If Horizons was turned off in Settings -> Features, leave View::Horizons cleanly.
+        if !crate::calendar::horizons_enabled() && self.view == View::Horizons {
+            self.view = View::Today;
+            switched = true;
+        }
+        self.sync_horizons_active(cx);
         self.sync_input_placeholder(cx);
         self.completing.retain(|id, pending| {
             pending.view == self.view && !cx.reduce_motion()
@@ -1990,6 +2054,11 @@ impl TodoView {
         {
             return true;
         }
+        if self.view == View::Horizons
+            && self.horizons.update(cx, |horizons, cx| horizons.dismiss_transient(window, cx))
+        {
+            return true;
+        }
         if self.sort_menu.is_some() {
             self.close_sort_menu(window, cx);
             return true;
@@ -2291,9 +2360,18 @@ impl TodoView {
         self.sync_viewport(window, cx);
         let switching = self.view != view;
         self.set_view(view, cx);
-        if switching && self.view != View::Summary {
-            window.focus(&self.list_focus, cx);
+        if switching {
+            if self.view == View::Horizons {
+                window.focus(&self.horizons.focus_handle(cx), cx);
+            } else if self.view != View::Summary {
+                window.focus(&self.list_focus, cx);
+            }
         }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn dev_horizons_mode(&mut self, spec: &str, cx: &mut Context<Self>) {
+        self.horizons.update(cx, |h, cx| h.dev_select_mode(spec, cx));
     }
 
     pub fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
@@ -2960,7 +3038,7 @@ impl TodoView {
             View::WontDo => self.store.set_wont_do(id, true),
             View::Trash => self.store.delete_task(id),
             View::Day(day) => self.store.set_due(id, Some(*day), time),
-            View::All | View::Search(_) | View::Filter(_) | View::Summary => Ok(()),
+            View::All | View::Search(_) | View::Filter(_) | View::Horizons | View::Summary => Ok(()),
         };
         self.check(result);
         self.reload(cx);
@@ -3517,6 +3595,18 @@ impl TodoView {
                 task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates)
             }
         });
+        let badge_group = if closed_view
+            || done
+            || wont_do
+            || matches!(self.view, View::Trash | View::Search(_))
+        {
+            GroupBy::None
+        } else if self.view == View::Next7Days && self.group_by == GroupBy::Custom {
+            GroupBy::Date
+        } else {
+            self.group_by
+        };
+        let horizon_badge = task_rows::horizon_badge_for_group(task, badge_group, today, strings);
 
         let draggable = self.view != View::Trash && !read_only && title_input.is_none();
         let dragged = DraggedTask { id, title: task.title.clone().into() };
@@ -3738,6 +3828,24 @@ impl TodoView {
                                     .into_any_element()
                             }
                         })
+                    })
+                    .when_some(horizon_badge, |el, (badge, past)| {
+                        let (fg, bg, border) =
+                            task_rows::horizon_badge_style(past, done || wont_do || closed_view, &theme);
+                        el.when(task.repeat.is_some(), |el| {
+                            el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted))
+                        })
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .bg(bg)
+                                .border_1()
+                                .border_color(border)
+                                .child(Label::new(badge).size(LabelSize::XSmall).color(Color::Custom(fg))),
+                        )
                     })
                     // As the original's, a note with text shows a small page at the row's end.
                     .when(task.kind == fern_core::Kind::Note && !task.notes.trim().is_empty(), |el| {
@@ -4335,6 +4443,23 @@ impl Render for TodoView {
                             })
                             .child(Label::new(label).size(LabelSize::Small).color(Color::Accent))
                     }))
+                    .when(self.shown_add_due().is_none(), |el| {
+                        el.when_some(self.shown_add_horizon(), |el, h| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .py(px(1.))
+                                    .rounded(px(4.))
+                                    .bg(theme.colors().accent.opacity(0.12))
+                                    .child(
+                                        Label::new(crate::calendar::format_horizon_badge(h, strings))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Accent),
+                                    ),
+                            )
+                        })
+                    })
                     .when(self.shown_add_due().is_none() && (self.quick_add_repeat || self.add_draft.repeat.is_some()), |el| {
                         el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(Color::Accent))
                     })
@@ -4502,6 +4627,9 @@ impl Render for TodoView {
                 if self.view == View::Summary {
                     return el.child(div().flex_1().min_w_0().h_full().child(self.summary.clone()));
                 }
+                if self.view == View::Horizons {
+                    return el.child(div().flex_1().min_w_0().h_full().child(self.horizons.clone()));
+                }
                 let multi = self.is_multi_selecting();
                 // As in the original, the Timeline takes the whole width until a task is opened.
                 if (timeline_view || kanban_only) && (self.selected.is_none() || multi) && self.list_activity.is_none() {
@@ -4560,7 +4688,7 @@ impl Render for TodoView {
                 )
             })
             .when(
-                self.view != View::Summary
+                !matches!(self.view, View::Summary | View::Horizons)
                     && self.is_multi_selecting()
                     && (popup_details || ((timeline_view || kanban_only) && self.list_activity.is_none())),
                 |el| {

@@ -144,7 +144,7 @@ impl TodoView {
                 Field::ALL
                     .iter()
                     .position(|f| *f == c.value.field())
-                    .unwrap()
+                    .unwrap_or(Field::ALL.len())
             });
         }
         let name = Self::filter_input(draft.name.clone(), strings.filter_name, cx);
@@ -341,6 +341,7 @@ impl TodoView {
                 let due = task
                     .due_date
                     .map(|date| crate::task_rows::due_label(date, task.due_time, today, strings));
+                let horizon_badge = crate::task_rows::horizon_badge(task, today, strings);
                 body = body.child(
                     h_flex()
                         .h(px(34.))
@@ -379,7 +380,22 @@ impl TodoView {
                             } else {
                                 Color::Accent
                             })
-                        })),
+                        }))
+                        .when_some(horizon_badge, |el, (badge, past)| {
+                            let (fg, bg, border) =
+                                crate::task_rows::horizon_badge_style(past, task.is_closed(), &theme);
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(5.))
+                                    .py(px(0.5))
+                                    .rounded(px(4.))
+                                    .bg(bg)
+                                    .border_1()
+                                    .border_color(border)
+                                    .child(Label::new(badge).size(LabelSize::XSmall).color(Color::Custom(fg))),
+                            )
+                        }),
                 );
             }
         }

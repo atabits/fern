@@ -581,7 +581,7 @@ impl CalendarView {
         today: NaiveDate,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> Div {
         let size = self.year_size.unwrap_or_else(|| window.viewport_size());
         let layout = YearLayout::new(size, calendar::week_numbers());
         let now = cx.background_executor().now();
@@ -645,38 +645,53 @@ impl CalendarView {
         for year in visible_years.clone() {
             self.ensure_year_heatmap(year, today, cx);
         }
+        let displayed_year = self.month.year();
+        let year_goals = self.horizon_goals_for(fern_core::Horizon::Year(displayed_year), today, false);
+        let year_banner = self.render_horizon_goals_banner(
+            "calendar-year-goals-banner",
+            i18n::t(cx).calendar_year_goals,
+            displayed_year.to_string(),
+            year_goals,
+            cx,
+        );
         v_flex()
-            .id("calendar-year")
-            .debug_selector(|| "calendar-year".into())
-            .relative()
             .flex_1()
             .min_h_0()
-            .overflow_hidden()
-            .on_scroll_wheel(cx.listener(Self::scroll_year))
-            .child(measure.absolute().inset_0())
-            // Like the web's virtual month strip, only the pages intersecting the viewport
-            // exist. Their size stays fixed while their common vertical offset changes.
-            .children(visible_years.map(|year| {
-                let top = layout.page_height() * ((year - YEAR_RANGE.start()) as f32 - position);
+            .children(year_banner)
+            .child(
                 v_flex()
-                    .id(("calendar-year-page", year as usize))
-                    .debug_selector(move || format!("year-page-{year}"))
-                    .absolute()
-                    .top(top)
-                    .left_0()
-                    .w_full()
-                    .h(layout.page_height())
-                    .child(
-                        h_flex()
-                            .h(layout.year_heading_height)
-                            .flex_none()
-                            .px(layout.padding)
-                            .text_size(layout.heading_font * 1.2)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(year.to_string()),
-                    )
-                    .child(self.render_year_page(year, today, &layout, cx))
-            }))
+                    .id("calendar-year")
+                    .debug_selector(|| "calendar-year".into())
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .on_scroll_wheel(cx.listener(Self::scroll_year))
+                    .child(measure.absolute().inset_0())
+                    // Like the web's virtual month strip, only the pages intersecting the viewport
+                    // exist. Their size stays fixed while their common vertical offset changes.
+                    .children(visible_years.map(|year| {
+                        let top = layout.page_height() * ((year - YEAR_RANGE.start()) as f32 - position);
+                        v_flex()
+                            .id(("calendar-year-page", year as usize))
+                            .debug_selector(move || format!("year-page-{year}"))
+                            .absolute()
+                            .top(top)
+                            .left_0()
+                            .w_full()
+                            .h(layout.page_height())
+                            .child(
+                                h_flex()
+                                    .h(layout.year_heading_height)
+                                    .flex_none()
+                                    .px(layout.padding)
+                                    .text_size(layout.heading_font * 1.2)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(year.to_string()),
+                            )
+                            .child(self.render_year_page(year, today, &layout, cx))
+                    })),
+            )
     }
 
     fn render_year_page(

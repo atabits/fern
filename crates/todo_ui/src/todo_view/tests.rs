@@ -1900,3 +1900,135 @@ fn trash_delete_forever_requires_confirmation_and_supports_restore(cx: &mut Test
     assert!(cx.debug_bounds("confirm-delete-modal").is_none());
     assert!(store.task(to_purge.id).unwrap().is_none(), "confirming single delete forever purges task");
 }
+
+#[gpui::test]
+fn horizons_embedded_view_quick_add_due_picker_and_feature_toggle(cx: &mut TestAppContext) {
+    struct RestoreHorizonsEnabled;
+    impl Drop for RestoreHorizonsEnabled {
+        fn drop(&mut self) {
+            crate::calendar::set_horizons_enabled(true);
+        }
+    }
+    let _guard = RestoreHorizonsEnabled;
+    crate::calendar::set_horizons_enabled(true);
+
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let today = TodoView::today();
+    let cur_week = fern_core::Horizon::current_week(today);
+    let cur_month = fern_core::Horizon::current_month(today);
+
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    cx.simulate_resize(gpui::size(px(1280.), px(780.)));
+    cx.run_until_parked();
+
+    // 1. Quick Add parses natural-language horizon when Horizons are enabled.
+    let parsed_task = cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            let task = v
+                .add_task_as("Read 2 books this month", &View::Inbox, &AddDraft::default())
+                .unwrap();
+            v.reload(cx);
+            task
+        })
+    });
+    let saved = store.task(parsed_task.id).unwrap().unwrap();
+    assert_eq!(saved.title, "Read 2 books");
+    assert_eq!(saved.horizon, Some(cur_month));
+    assert_eq!(saved.due_date, None);
+
+    // 2. Unified Tasks sidebar shows Horizons entry; clicking it embeds HorizonsView beside the sidebar.
+    let horizons_nav = cx
+        .debug_bounds("lists-item-view-Horizons")
+        .expect("Horizons smart list must appear when horizons_enabled");
+    cx.simulate_click(horizons_nav.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.view.clone()), View::Horizons);
+    assert!(cx.debug_bounds("horizons-view").is_some());
+    assert!(cx.debug_bounds("horizons-top-strip").is_some());
+
+    // 3. dev_horizons_mode switches the embedded view cleanly to Weeks strip.
+    cx.update(|_, cx| view.update(cx, |v, cx| v.dev_horizons_mode("weeks", cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("horizons-pager-next").is_some());
+
+    // 4. Right-click menu SetHorizon updates task horizon cleanly.
+    let menu_task = store.add_task("Menu horizon task").unwrap();
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_view(View::Inbox, cx);
+            v.open_context_menu(menu_task.id, gpui::point(px(240.), px(240.)), false, window, cx);
+            v.context_action(
+                crate::task_menu::MenuAction::SetHorizon(Some(fern_core::Horizon::Life)),
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        store.task(menu_task.id).unwrap().unwrap().horizon,
+        Some(fern_core::Horizon::Life)
+    );
+
+    // 5. TaskDetail DuePicker shows horizon chips when enabled and persists selected horizon on OK.
+    let picker_task = store.add_task("Picker horizon task").unwrap();
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.reload(cx);
+            v.select(picker_task.id, cx);
+            v.detail.update(cx, |d, cx| d.open_due(cx));
+        });
+    });
+    cx.run_until_parked();
+    let week_chip = cx
+        .debug_bounds("due-horizon-week")
+        .expect("DuePicker must show horizon chips when horizons_enabled");
+    cx.simulate_click(week_chip.center(), Modifiers::default());
+    cx.run_until_parked();
+    let ok_btn = cx.debug_bounds("due-popup-ok").expect("due popup OK");
+    cx.simulate_click(ok_btn.center(), Modifiers::default());
+    cx.run_until_parked();
+    let after_picker = store.task(picker_task.id).unwrap().unwrap();
+    assert_eq!(after_picker.horizon, Some(cur_week));
+    assert_eq!(after_picker.due_date, None);
+
+    // 6. Disabling horizons_enabled hides sidebar entry, exits View::Horizons, hides DuePicker chips,
+    //    and makes Quick Add treat horizon words as plain text.
+    cx.update(|_, cx| view.update(cx, |v, cx| v.set_view(View::Horizons, cx)));
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.view.clone()), View::Horizons);
+
+    crate::calendar::set_horizons_enabled(false);
+    cx.update(|_, cx| view.update(cx, |v, cx| v.reload(cx)));
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |v, _| v.view.clone()), View::Today);
+    assert!(cx.debug_bounds("lists-item-view-Horizons").is_none());
+
+    let plain_task = cx.update(|_, cx| {
+        view.update(cx, |v, _| {
+            v.add_task_as("Read 2 books this month", &View::Inbox, &AddDraft::default())
+                .unwrap()
+        })
+    });
+    let saved_plain = store.task(plain_task.id).unwrap().unwrap();
+    assert_eq!(saved_plain.title, "Read 2 books this month");
+    assert_eq!(saved_plain.horizon, None);
+
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_view(View::Inbox, cx);
+            v.select(picker_task.id, cx);
+            v.detail.update(cx, |d, cx| d.open_due(cx));
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("due-horizon-week").is_none(),
+        "DuePicker must hide horizon chips when horizons_enabled is false"
+    );
+}

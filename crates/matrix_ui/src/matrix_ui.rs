@@ -238,6 +238,8 @@ pub struct MatrixView {
     confirm_delete_profile: Option<(Id, String)>,
     pending_complete: HashSet<Id>,
     submitting_quadrant_task: bool,
+    active: bool,
+    dirty: bool,
 }
 
 impl EventEmitter<OpenTask> for MatrixView {}
@@ -297,15 +299,33 @@ impl MatrixView {
             confirm_delete_profile: None,
             pending_complete: HashSet::new(),
             submitting_quadrant_task: false,
+            active: true,
+            dirty: false,
         };
         this.reload(cx);
         cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
             if desktop_common::data_version::changed_elsewhere(cx.entity_id(), cx) {
-                this.reload(cx);
+                this.sync_external(cx);
             }
         })
         .detach();
         this
+    }
+
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.active = active;
+        if active && self.dirty {
+            self.dirty = false;
+            self.reload(cx);
+        }
+    }
+
+    pub fn sync_external(&mut self, cx: &mut Context<Self>) {
+        if self.active {
+            self.reload(cx);
+        } else {
+            self.dirty = true;
+        }
     }
 
     fn profile_setting_key(&self, base: &str) -> String {
@@ -388,6 +408,7 @@ impl MatrixView {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.dirty = false;
         self.preferences = self.store.preferences().unwrap_or_default();
         self.show_completed = self
             .store
@@ -1341,6 +1362,12 @@ impl MatrixView {
         let due = task
             .due_date
             .map(|date| task_rows::row_due_label(date, task.due_time, today, strings, countdown_dates));
+        let badge_group = if completed {
+            GroupBy::None
+        } else {
+            self.views[quadrant].group
+        };
+        let horizon_badge = task_rows::horizon_badge_for_group(task, badge_group, today, strings);
         let has_notes = !is_note && !task.notes.trim().is_empty();
         let has_location = task.location.as_deref().is_some_and(|l| !l.trim().is_empty());
         let mut has_visible_children = false;
@@ -1536,6 +1563,21 @@ impl MatrixView {
                                     }
                                     cx.notify();
                                 })),
+                        )
+                    })
+                    .when_some(horizon_badge, |el, (badge, past)| {
+                        let (fg, bg, border) =
+                            task_rows::horizon_badge_style(past, completed || task.is_wont_do(), &theme);
+                        el.child(
+                            div()
+                                .flex_none()
+                                .px(px(5.))
+                                .py(px(0.5))
+                                .rounded(px(4.))
+                                .bg(bg)
+                                .border_1()
+                                .border_color(border)
+                                .child(Label::new(badge).size(LabelSize::XSmall).color(Color::Custom(fg))),
                         )
                     }),
             )

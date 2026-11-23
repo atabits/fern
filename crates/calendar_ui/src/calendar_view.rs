@@ -30,6 +30,7 @@ const TASKS_PER_DAY: usize = 5;
 const CALENDAR_HEADER_HEIGHT: f32 = 50.;
 const CALENDAR_SIDEBAR_WIDTH: f32 = 216.;
 const WEEKDAY_HEADER_HEIGHT: f32 = 22.;
+const HORIZON_BANNER_HEIGHT: f32 = 38.;
 const DAY_HEADER_HEIGHT: f32 = 26.;
 const DAY_ITEM_HEIGHT: f32 = 18.;
 const DAY_ITEM_GAP: f32 = 2.;
@@ -129,6 +130,8 @@ pub struct CalendarView {
     arrange: Option<usize>,
     arrange_collapsed: HashSet<(usize, String)>,
     undated: Vec<Task>,
+    /// Open non-deleted horizon tasks in the active calendar filter scope.
+    horizon_tasks: Vec<Task>,
     /// Cached lists and preferences (refreshed on `reload()`, never queried in `render()`).
     lists: Vec<fern_core::List>,
     preferences: fern_core::Preferences,
@@ -145,6 +148,8 @@ pub struct CalendarView {
     timed_resize: Option<TimedResize>,
     event_editor: Option<EventEditor>,
     pending_complete: HashSet<Id>,
+    active: bool,
+    dirty: bool,
 }
 
 struct ContextMenuState {
@@ -504,8 +509,11 @@ impl Default for CalendarFilter {
 
 impl CalendarFilter {
     fn single_list(&self) -> Option<Option<Id>> {
-        (!self.all && self.tags.is_empty() && self.lists.len() == 1)
-            .then(|| *self.lists.iter().next().unwrap())
+        if !self.all && self.tags.is_empty() && self.lists.len() == 1 {
+            self.lists.iter().next().copied()
+        } else {
+            None
+        }
     }
 
     fn matches(&self, task: &Task) -> bool {
@@ -633,7 +641,7 @@ impl CalendarView {
         .detach();
         cx.observe_global::<crate::data_version::DataVersion>(|this, cx| {
             if crate::data_version::changed_elsewhere(cx.entity_id(), cx) {
-                this.card_updated(cx);
+                this.sync_external(cx);
             }
         })
         .detach();
@@ -659,7 +667,7 @@ impl CalendarView {
             saved_hint: None,
             mode_menu_open: false,
             focus_handle: cx.focus_handle(),
-            multi_days: 1,
+            multi_days: 3,
             multi_weeks: 5,
             tasks: Vec::new(),
             agenda: Vec::new(),
@@ -683,6 +691,7 @@ impl CalendarView {
             arrange: None,
             arrange_collapsed: HashSet::new(),
             undated: Vec::new(),
+            horizon_tasks: Vec::new(),
             lists: Vec::new(),
             preferences: fern_core::Preferences::default(),
             list_colors: Default::default(),
@@ -696,9 +705,27 @@ impl CalendarView {
             timed_resize: None,
             event_editor: None,
             pending_complete: HashSet::new(),
+            active: true,
+            dirty: false,
         };
         this.reload(cx);
         this
+    }
+
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.active = active;
+        if active && self.dirty {
+            self.dirty = false;
+            self.card_updated(cx);
+        }
+    }
+
+    pub fn sync_external(&mut self, cx: &mut Context<Self>) {
+        if self.active {
+            self.card_updated(cx);
+        } else {
+            self.dirty = true;
+        }
     }
 
     /// The days on the hour axis: the anchor's week, the anchor, or several days from it.
@@ -1625,6 +1652,7 @@ impl CalendarView {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.dirty = false;
         self.year_heatmap.clear();
         self.options = self.store.calendar_options().unwrap_or_default();
         self.preferences = self.store.preferences().unwrap_or_default();
@@ -1705,8 +1733,12 @@ impl CalendarView {
             .collect();
         self.tasks.clear();
         self.undated.clear();
+        self.horizon_tasks.clear();
         let mut repeats_before_range = Vec::new();
         for task in all.into_iter().filter(|task| !task.is_deleted()) {
+            if !task.is_closed() && task.horizon.is_some() {
+                self.horizon_tasks.push(task.clone());
+            }
             let Some(due) = task.due_date else {
                 if !task.is_closed() && task.parent_id.is_none() {
                     self.undated.push(task);
@@ -1760,7 +1792,7 @@ impl CalendarView {
             return;
         }
         if self.mode == CalendarMode::Year {
-            let january = NaiveDate::from_ymd_opt(self.month.year() + delta, 1, 1).unwrap();
+            let january = NaiveDate::from_ymd_opt(self.month.year() + delta, 1, 1).unwrap_or(self.month);
             self.navigate_year(january, cx);
             return;
         }
@@ -1806,7 +1838,7 @@ impl CalendarView {
                     self.selected_day = None;
                     self.sidebar_month = None;
                 }
-                self.month = NaiveDate::from_ymd_opt(day.year(), 1, 1).unwrap();
+                self.month = NaiveDate::from_ymd_opt(day.year(), 1, 1).unwrap_or(self.month);
             }
             CalendarMode::MultiDay(days) => self.multi_days = days,
             CalendarMode::MultiWeek(weeks) => self.multi_weeks = weeks,
@@ -2371,7 +2403,7 @@ impl CalendarView {
         let today = Local::now().date_naive();
         if self.mode == CalendarMode::Year {
             self.anchor = calendar_year::clamp_year_day(today);
-            self.month = NaiveDate::from_ymd_opt(self.anchor.year(), 1, 1).unwrap();
+            self.month = NaiveDate::from_ymd_opt(self.anchor.year(), 1, 1).unwrap_or(self.month);
         } else {
             self.anchor = today;
             self.month = calendar::month_start(today);
@@ -2511,7 +2543,7 @@ impl CalendarView {
         }
         let day = if self.mode == CalendarMode::Year {
             let day = calendar_year::clamp_year_day(day);
-            self.month = NaiveDate::from_ymd_opt(day.year(), 1, 1).unwrap();
+            self.month = NaiveDate::from_ymd_opt(day.year(), 1, 1).unwrap_or(self.month);
             self.year_scroll = calendar_year::YearScroll::default();
             day
         } else {
@@ -3198,6 +3230,7 @@ impl CalendarView {
                     .collect();
                 v_flex()
                     .id(SharedString::from(format!("week-allday-{date}")))
+                    .debug_selector(move || format!("week-allday-{date}"))
                     .flex_1()
                     .min_w_0()
                     .self_stretch()
@@ -3270,7 +3303,10 @@ impl CalendarView {
             }
             label
         };
+        let now = Local::now().time();
         let now_color = theme.status().error;
+        let now_label_y = (week.contains(&today) && week_axis::unfolded(now))
+            .then(|| week_axis::offset(now) - 7.);
         let mut axis = v_flex().w(gutter).flex_none().child(
             div()
                 .h(px(week_axis::FOLDED_HEIGHT))
@@ -3286,6 +3322,8 @@ impl CalendarView {
                 .child(Label::new(format!("– {}", calendar::format_hour(7, strings))).size(LabelSize::XSmall).color(Color::Muted)),
         );
         for hour in week_axis::FIRST_HOUR..week_axis::LAST_HOUR {
+            let hour_y = week_axis::offset(NaiveTime::from_hms_opt(hour, 0, 0).unwrap_or_default()) + 2.;
+            let collides_with_now = now_label_y.is_some_and(|now_y| (hour_y - now_y).abs() < 16.);
             axis = axis.child(
                 h_flex()
                     .h(px(week_axis::HOUR_HEIGHT))
@@ -3302,7 +3340,9 @@ impl CalendarView {
                                 .child(Label::new(tz_hour_label(hour, tz)).size(LabelSize::XSmall).color(Color::Muted)),
                         )
                     })
-                    .child(div().flex_1().flex().justify_end().child(Label::new(hour_label(hour)).size(LabelSize::XSmall).color(Color::Muted))),
+                    .child(div().flex_1().flex().justify_end().when(!collides_with_now, |el| {
+                        el.child(Label::new(hour_label(hour)).size(LabelSize::XSmall).color(Color::Muted))
+                    })),
             );
         }
         axis = axis.child(
@@ -3462,12 +3502,12 @@ impl CalendarView {
                 .on_drop(cx.listener(move |this, event: &DraggedEvent, _, cx| this.move_event_to_day(event, date, cx)))
                 .children(hour_lines)
                 .children(timed_blocks)
-                // The original's red line at the current time, with a dot where it starts.
-                .when(date == today && week_axis::unfolded(Local::now().time()), |el| {
-                    let top = week_axis::offset(Local::now().time());
-                    el.child(div().absolute().top(px(top - 1.)).left_0().right_0().h(px(2.)).bg(now_color)).child(
-                        div().absolute().top(px(top - 4.)).left(px(-4.)).size(px(8.)).rounded_full().bg(now_color),
-                    )
+                // The original's red line at the current time, with a dot positioned cleanly inside
+                // the day column so it is never clipped or bisected by the vertical border.
+                .when(date == today && week_axis::unfolded(now), |el| {
+                    let top = week_axis::offset(now);
+                    el.child(div().absolute().top(px(top - 1.)).left(px(5.)).right_0().h(px(2.)).bg(now_color))
+                        .child(div().absolute().top(px(top - 4.)).left(px(1.)).size(px(8.)).rounded_full().bg(now_color))
                 })
         });
 
@@ -3487,12 +3527,11 @@ impl CalendarView {
                                 .items_start()
                                 .child(
                                     // The current time in red on the axis, as in the original.
-                                    div().relative().child(axis).when(week.contains(&today) && week_axis::unfolded(Local::now().time()), |el| {
-                                        let now = Local::now().time();
+                                    div().relative().child(axis).when_some(now_label_y, |el, top| {
                                         el.child(
                                             div()
                                                 .absolute()
-                                                .top(px(week_axis::offset(now) - 7.))
+                                                .top(px(top))
                                                 .right(px(4.))
                                                 .px_0p5()
                                                 .bg(theme.colors().background)
@@ -3869,12 +3908,239 @@ impl CalendarView {
             .child(self.mode_item(mode, label, cx).end_slot(count_controls))
     }
 
-    fn render_month_grid(&self, today: NaiveDate, window: &Window, cx: &mut Context<Self>) -> Div {
+    /// ISO week horizon for the currently displayed week in Week view.
+    fn displayed_week_horizon(&self) -> fern_core::Horizon {
+        let week = calendar::week_of(self.anchor);
+        let ref_day = week
+            .iter()
+            .find(|d| d.weekday() == chrono::Weekday::Thu)
+            .copied()
+            .unwrap_or(week[3]);
+        fern_core::Horizon::current_week(ref_day)
+    }
+
+    /// Collects open non-deleted tasks for `target`, plus unfinished past tasks of the same
+    /// granularity when `include_past_when_current` is true and `target` is the current period.
+    /// Returns `(task, is_rollover)` pairs with exact matches first, followed by past rollovers.
+    pub(super) fn horizon_goals_for(
+        &self,
+        target: fern_core::Horizon,
+        today: NaiveDate,
+        include_past_when_current: bool,
+    ) -> Vec<(&Task, bool)> {
+        if !calendar::horizons_enabled() {
+            return Vec::new();
+        }
+        let lists: &[fern_core::List] = if self.filter.all { &self.lists } else { &[] };
+        let (in_target, past_rollover) = fern_core::horizon::horizons_bucket_partition(
+            &self.horizon_tasks,
+            lists,
+            target,
+            today,
+            false,
+        );
+        let mut out: Vec<(&Task, bool)> = in_target.into_iter().map(|t| (t, false)).collect();
+        if include_past_when_current {
+            out.extend(past_rollover.into_iter().map(|t| (t, true)));
+        }
+        out
+    }
+
+    /// Renders a sleek, compact horizontal banner of horizon goals with draggable task chips.
+    pub(super) fn render_horizon_goals_banner(
+        &self,
+        banner_id: &'static str,
+        heading: &'static str,
+        badge: String,
+        goals: Vec<(&Task, bool)>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if goals.is_empty() {
+            return None;
+        }
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
+
+        let chips: Vec<AnyElement> = goals
+            .into_iter()
+            .map(|(task, is_rollover)| {
+                let id = task.id;
+                let title = if task.title.trim().is_empty() {
+                    strings.untitled.to_owned()
+                } else {
+                    task.title.clone()
+                };
+                let dragged = DraggedTask {
+                    id,
+                    title: title.clone().into(),
+                };
+                let origin_badge = is_rollover
+                    .then(|| task.horizon.map(|h| calendar::format_horizon_badge(h, strings)))
+                    .flatten();
+                let marker = if task.kind == fern_core::Kind::Note {
+                    Icon::new(IconName::FileText)
+                        .size(IconSize::XSmall)
+                        .color(Color::IconMuted)
+                        .into_any_element()
+                } else {
+                    div()
+                        .debug_selector(move || format!("calendar-horizon-check-{id}"))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            Checkbox::new(SharedString::from(format!("calendar-horizon-cb-{id}")))
+                                .size(px(12.))
+                                .toggle_state(task.is_completed())
+                                .in_progress(task.is_in_progress())
+                                .lines(task.checklist.is_some())
+                                .tint(task_rows::priority_color(task.priority, &theme))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_task_completed(id, true, cx);
+                                })),
+                        )
+                        .into_any_element()
+                };
+
+                h_flex()
+                    .id(SharedString::from(format!("calendar-horizon-chip-{id}")))
+                    .debug_selector(move || format!("calendar-horizon-chip-{id}"))
+                    .flex_none()
+                    .max_w(px(220.))
+                    .h(px(24.))
+                    .px_2()
+                    .gap_1p5()
+                    .rounded(px(6.))
+                    .bg(colors.surface_background)
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .hover(|s| s.bg(colors.element_hover).border_color(colors.border))
+                    .cursor_pointer()
+                    .tooltip(ui::Tooltip::text(format!(
+                        "{title} · {}",
+                        strings.calendar_drop_to_schedule
+                    )))
+                    .on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(OpenTask(id));
+                    }))
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_context(id, event.position, cx);
+                            window.focus(&this.focus_handle, cx);
+                        }),
+                    )
+                    .child(marker)
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(title)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Default)
+                                .truncate(),
+                        ),
+                    )
+                    .when_some(origin_badge, |el, origin| {
+                        let (fg, bg, _) = task_rows::horizon_badge_style(true, task.is_completed(), &theme);
+                        el.child(
+                            div()
+                                .flex_none()
+                                .px_1()
+                                .rounded(px(3.))
+                                .bg(bg)
+                                .child(
+                                    Label::new(origin)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Custom(fg)),
+                                ),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
+        let scroll_id = SharedString::from(format!("{banner_id}-scroll"));
+        let chips_id = SharedString::from(format!("{banner_id}-chips"));
+        let label_id = SharedString::from(format!("{banner_id}-label"));
+
+        Some(
+            h_flex()
+                .id(banner_id)
+                .debug_selector(move || banner_id.to_owned())
+                .flex_none()
+                .items_start()
+                .px_4()
+                .py(px(6.))
+                .gap_2p5()
+                .bg(colors.panel_background.opacity(0.55))
+                .border_y_1()
+                .border_color(colors.border_variant.opacity(0.75))
+                .child(
+                    h_flex()
+                        .id(label_id)
+                        .flex_none()
+                        .h(px(24.))
+                        .gap_1p5()
+                        .tooltip(ui::Tooltip::text(strings.calendar_drop_to_schedule))
+                        .child(
+                            Icon::new(IconName::FernHorizons)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(heading)
+                                .size(LabelSize::XSmall)
+                                .weight(FontWeight::MEDIUM)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            div()
+                                .px_1p5()
+                                .h(px(18.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(4.))
+                                .bg(colors.accent.opacity(0.12))
+                                .child(
+                                    Label::new(badge)
+                                        .size(LabelSize::XSmall)
+                                        .weight(FontWeight::MEDIUM)
+                                        .color(Color::Accent),
+                                ),
+                        ),
+                )
+                .child(
+                    v_scroll(
+                        scroll_id,
+                        div()
+                            .id(chips_id)
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_1p5()
+                            .children(chips),
+                    )
+                    .flex_1()
+                    .min_w_0()
+                    .max_h(px(62.))
+                    .compact(),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_month_grid(&self, today: NaiveDate, has_horizon_banner: bool, window: &Window, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors();
         let shown_weeks = self.month_grid_weeks();
+        let banner_height = if has_horizon_banner { HORIZON_BANNER_HEIGHT } else { 0. };
         let grid_height = window.viewport_size().height - crate::title_bar::header_inset()
             - crate::title_bar::frame_vertical_inset(window)
-            - px(CALENDAR_HEADER_HEIGHT + WEEKDAY_HEADER_HEIGHT + 1.);
+            - px(CALENDAR_HEADER_HEIGHT + WEEKDAY_HEADER_HEIGHT + banner_height + 1.);
         let slots = day_item_slots(grid_height / shown_weeks.len().max(1) as f32);
         v_flex()
             .flex_1()
@@ -4132,10 +4398,40 @@ impl Render for CalendarView {
             .as_deref()
             .and_then(|z| z.parse::<chrono_tz::Tz>().ok())
             .is_some();
+        let horizon_banner = match self.mode {
+            CalendarMode::Week => {
+                let target = self.displayed_week_horizon();
+                let goals = self.horizon_goals_for(target, today, true);
+                self.render_horizon_goals_banner(
+                    "calendar-week-goals-banner",
+                    strings.calendar_week_goals,
+                    calendar::format_horizon_badge(target, strings),
+                    goals,
+                    cx,
+                )
+            }
+            CalendarMode::Month => {
+                let target = fern_core::Horizon::Month {
+                    year: self.month.year(),
+                    month: self.month.month(),
+                };
+                let goals = self.horizon_goals_for(target, today, true);
+                self.render_horizon_goals_banner(
+                    "calendar-month-goals-banner",
+                    strings.calendar_month_goals,
+                    strings.months[self.month.month0() as usize].to_owned(),
+                    goals,
+                    cx,
+                )
+            }
+            _ => None,
+        };
+        let has_month_banner = self.mode == CalendarMode::Month && horizon_banner.is_some();
         let calendar = v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
+            .children(horizon_banner)
             .when(!matches!(self.mode, CalendarMode::Agenda | CalendarMode::Year), |el| el.child(
                 h_flex()
                     .flex_none()
@@ -4171,7 +4467,7 @@ impl Render for CalendarView {
             .map(|el| match self.mode {
                 CalendarMode::Agenda => el.child(self.render_agenda(today, cx)),
                 CalendarMode::Year => el.child(self.render_year(today, window, cx)),
-                CalendarMode::Month | CalendarMode::MultiWeek(_) => el.child(self.render_month_grid(today, window, cx)),
+                CalendarMode::Month | CalendarMode::MultiWeek(_) => el.child(self.render_month_grid(today, has_month_banner, window, cx)),
                 _ => el.child(self.render_week(today, cx)),
             });
         h_flex()
@@ -5394,5 +5690,208 @@ mod tests {
         assert_eq!(format_tz_utc_offset(d(2026, 10, 31), ny), "UTC-4");
         assert_eq!(format_tz_utc_offset(d(2026, 11, 1), ny), "UTC-5");
         assert_eq!(format_tz_utc_offset(d(2026, 11, 1), chrono_tz::Asia::Kolkata), "UTC+5:30");
+    }
+
+    static HORIZONS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RestoreHorizonsEnabled;
+
+    impl Drop for RestoreHorizonsEnabled {
+        fn drop(&mut self) {
+            calendar::set_horizons_enabled(true);
+        }
+    }
+
+    #[gpui::test]
+    fn horizon_goal_banners_render_in_week_month_year_and_respect_horizons_enabled(cx: &mut TestAppContext) {
+        let _lock = HORIZONS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreHorizonsEnabled;
+        calendar::set_horizons_enabled(true);
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let today = Local::now().date_naive();
+        let cur_week = fern_core::Horizon::current_week(today);
+        let past_week = cur_week.shift(-1);
+        let next_week = cur_week.shift(1);
+        let cur_month = fern_core::Horizon::current_month(today);
+        let past_month = cur_month.shift(-1);
+        let cur_year = fern_core::Horizon::current_year(today);
+
+        let week_goal = store.add_task("Ship week milestone").unwrap();
+        store.set_horizon(week_goal.id, Some(cur_week)).unwrap();
+
+        let past_week_goal = store.add_task("Carryover week goal").unwrap();
+        store.set_horizon(past_week_goal.id, Some(past_week)).unwrap();
+
+        let next_week_goal = store.add_task("Future week goal").unwrap();
+        store.set_horizon(next_week_goal.id, Some(next_week)).unwrap();
+
+        let done_week_goal = store.add_task("Finished week goal").unwrap();
+        store.set_horizon(done_week_goal.id, Some(cur_week)).unwrap();
+        store.set_completed(done_week_goal.id, true).unwrap();
+
+        let month_goal = store.add_task("Close month target").unwrap();
+        store.set_horizon(month_goal.id, Some(cur_month)).unwrap();
+
+        let past_month_goal = store.add_task("Carryover month goal").unwrap();
+        store.set_horizon(past_month_goal.id, Some(past_month)).unwrap();
+
+        let year_goal = store.add_task("Annual objective").unwrap();
+        store.set_horizon(year_goal.id, Some(cur_year)).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
+        cx.simulate_resize(size(px(1200.), px(720.)));
+        cx.run_until_parked();
+
+        let opened: Rc<std::cell::RefCell<Vec<Id>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let opened_sub = opened.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, OpenTask(id), _| {
+                opened_sub.borrow_mut().push(*id);
+            })
+            .detach();
+        });
+
+        let month_chip: &'static str = format!("calendar-horizon-chip-{}", month_goal.id).leak();
+        let past_month_chip: &'static str = format!("calendar-horizon-chip-{}", past_month_goal.id).leak();
+        let week_chip: &'static str = format!("calendar-horizon-chip-{}", week_goal.id).leak();
+        let past_week_chip: &'static str = format!("calendar-horizon-chip-{}", past_week_goal.id).leak();
+        let past_week_check: &'static str = format!("calendar-horizon-check-{}", past_week_goal.id).leak();
+        let next_week_chip: &'static str = format!("calendar-horizon-chip-{}", next_week_goal.id).leak();
+        let done_week_chip: &'static str = format!("calendar-horizon-chip-{}", done_week_goal.id).leak();
+        let year_chip: &'static str = format!("calendar-horizon-chip-{}", year_goal.id).leak();
+
+        // Month view: shows current month + past unfinished month goals only.
+        let month_banner = cx
+            .debug_bounds("calendar-month-goals-banner")
+            .expect("month goals banner renders when horizons enabled");
+        assert!(month_banner.size.height > px(0.));
+        assert!(cx.debug_bounds(month_chip).is_some());
+        assert!(cx.debug_bounds(past_month_chip).is_some());
+        assert!(cx.debug_bounds(week_chip).is_none());
+
+        // Navigating to next month hides past-month rollovers when no goals exist for that month.
+        cx.update(|_, cx| view.update(cx, |cal, cx| cal.shift(1, cx)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("calendar-month-goals-banner").is_none());
+        cx.update(|_, cx| view.update(cx, |cal, cx| cal.go_to_today(cx)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("calendar-month-goals-banner").is_some());
+
+        // Week view: shows current week + past unfinished week goals, excludes future & completed.
+        cx.update(|_, cx| view.update(cx, |cal, cx| cal.set_mode(CalendarMode::Week, cx)));
+        cx.run_until_parked();
+        let week_banner = cx
+            .debug_bounds("calendar-week-goals-banner")
+            .expect("week goals banner renders when horizons enabled");
+        assert!(week_banner.size.height > px(0.));
+        assert!(cx.debug_bounds(week_chip).is_some());
+        assert!(cx.debug_bounds(past_week_chip).is_some());
+        assert!(cx.debug_bounds(next_week_chip).is_none());
+        assert!(cx.debug_bounds(done_week_chip).is_none());
+
+        // Clicking mini checkbox completes task and removes it from the banner.
+        let check_pos = cx.debug_bounds(past_week_check).expect("week goal checkbox").center();
+        cx.simulate_click(check_pos, Modifiers::default());
+        cx.run_until_parked();
+        assert!(store.task(past_week_goal.id).unwrap().unwrap().is_completed());
+        assert!(cx.debug_bounds(past_week_chip).is_none());
+
+        // Clicking the goal chip emits OpenTask.
+        let chip_pos = cx.debug_bounds(week_chip).expect("week goal chip").center();
+        cx.simulate_click(chip_pos, Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(*opened.borrow(), vec![week_goal.id]);
+
+        // Year view: shows displayed year's goals cleanly in the Year header strip.
+        cx.update(|_, cx| view.update(cx, |cal, cx| cal.set_mode(CalendarMode::Year, cx)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("calendar-year-goals-banner").is_some());
+        assert!(cx.debug_bounds(year_chip).is_some());
+
+        // Disabling Horizons hides banners completely across Year, Month, and Week views.
+        calendar::set_horizons_enabled(false);
+        cx.update(|_, cx| view.update(cx, |cal, cx| cal.reload(cx)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("calendar-year-goals-banner").is_none());
+
+        cx.update(|_, cx| view.update(cx, |cal, cx| cal.set_mode(CalendarMode::Month, cx)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("calendar-month-goals-banner").is_none());
+
+        cx.update(|_, cx| view.update(cx, |cal, cx| cal.set_mode(CalendarMode::Week, cx)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("calendar-week-goals-banner").is_none());
+
+        calendar::set_horizons_enabled(true);
+    }
+
+    #[gpui::test]
+    fn dragging_horizon_goal_chip_onto_calendar_day_schedules_and_clears_horizon(cx: &mut TestAppContext) {
+        let _lock = HORIZONS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreHorizonsEnabled;
+        calendar::set_horizons_enabled(true);
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let today = Local::now().date_naive();
+        let cur_month = fern_core::Horizon::current_month(today);
+        let cur_week = fern_core::Horizon::current_week(today);
+
+        let month_goal = store.add_task("Drag month goal").unwrap();
+        store.set_horizon(month_goal.id, Some(cur_month)).unwrap();
+
+        let week_goal = store.add_task("Drag week goal").unwrap();
+        store.set_horizon(week_goal.id, Some(cur_week)).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
+        cx.simulate_resize(size(px(1200.), px(720.)));
+        cx.run_until_parked();
+
+        // Drag month goal chip onto today's day cell in Month view.
+        let modifiers = Modifiers::default();
+        let month_chip_sel: &'static str = format!("calendar-horizon-chip-{}", month_goal.id).leak();
+        let day_cell_sel: &'static str = format!("calendar-day-{today}").leak();
+        let chip_pos = cx.debug_bounds(month_chip_sel).expect("month goal chip").center();
+        let cell_pos = cx.debug_bounds(day_cell_sel).expect("today day cell").center();
+        cx.simulate_mouse_move(chip_pos, None, modifiers);
+        cx.simulate_mouse_down(chip_pos, MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(chip_pos.x + px(6.), chip_pos.y), Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_move(cell_pos, Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_up(cell_pos, MouseButton::Left, modifiers);
+        cx.run_until_parked();
+
+        let scheduled_month = store.task(month_goal.id).unwrap().unwrap();
+        assert_eq!(scheduled_month.due_date, Some(today));
+        assert_eq!(scheduled_month.horizon, None);
+        assert!(cx.debug_bounds("calendar-month-goals-banner").is_none());
+        let scheduled_bar: &'static str = format!("calendar-task-{}", month_goal.id).leak();
+        assert!(cx.debug_bounds(scheduled_bar).is_some());
+
+        // Drag week goal chip onto a day column in Week view.
+        cx.update(|_, cx| view.update(cx, |cal, cx| cal.set_mode(CalendarMode::Week, cx)));
+        cx.run_until_parked();
+        let week_chip_sel: &'static str = format!("calendar-horizon-chip-{}", week_goal.id).leak();
+        let week_day_sel: &'static str = format!("week-allday-{today}").leak();
+        let chip_pos = cx.debug_bounds(week_chip_sel).expect("week goal chip").center();
+        let col_pos = cx.debug_bounds(week_day_sel).expect("week day column").center();
+        cx.simulate_mouse_move(chip_pos, None, modifiers);
+        cx.simulate_mouse_down(chip_pos, MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(chip_pos.x + px(6.), chip_pos.y), Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_move(col_pos, Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_up(col_pos, MouseButton::Left, modifiers);
+        cx.run_until_parked();
+
+        let scheduled_week = store.task(week_goal.id).unwrap().unwrap();
+        assert_eq!(scheduled_week.due_date, Some(today));
+        assert_eq!(scheduled_week.horizon, None);
+        assert!(cx.debug_bounds("calendar-week-goals-banner").is_none());
     }
 }

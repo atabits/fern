@@ -18,6 +18,7 @@ desktop_common.workspace = true
 fern_core.workspace = true
 fern_i18n.workspace = true
 gpui.workspace = true
+horizons_ui.workspace = true
 summary_ui.workspace = true
 task_ui.workspace = true
 theme.workspace = true

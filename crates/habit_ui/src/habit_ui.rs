@@ -159,6 +159,8 @@ pub struct HabitView {
     cycles_modal: Option<CompletedCyclesModal>,
     export_message: Option<String>,
     detail_notice: Option<String>,
+    active: bool,
+    dirty: bool,
 }
 
 impl gpui::Focusable for HabitView {
@@ -186,7 +188,7 @@ impl HabitView {
 
         cx.observe_global::<DataVersion>(|this, cx| {
             if changed_elsewhere(cx.entity_id(), cx) {
-                this.reload(cx);
+                this.sync_external(cx);
             }
         })
         .detach();
@@ -226,9 +228,27 @@ impl HabitView {
             cycles_modal: None,
             export_message: None,
             detail_notice: None,
+            active: true,
+            dirty: false,
         };
         this.reload(cx);
         this
+    }
+
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.active = active;
+        if active && self.dirty {
+            self.dirty = false;
+            self.reload(cx);
+        }
+    }
+
+    pub fn sync_external(&mut self, cx: &mut Context<Self>) {
+        if self.active {
+            self.reload(cx);
+        } else {
+            self.dirty = true;
+        }
     }
 
     pub(crate) fn notify_data_changed(&self, cx: &mut Context<Self>) {
@@ -236,6 +256,7 @@ impl HabitView {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.dirty = false;
         self.habits = self.store.habits().unwrap_or_default();
         self.sections = self.store.habit_sections().unwrap_or_default();
         self.records = self.store.all_habit_checkins().unwrap_or_default();

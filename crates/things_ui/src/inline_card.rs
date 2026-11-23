@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
-use desktop_common::completion_mark;
+use desktop_common::{calendar, completion_mark};
 use desktop_common::text_input::TextInput;
 use fern_core::things::ThingsViewKind;
 use fern_core::{Id, List, ListFolder, ScheduleBucket, Tag, Task};
@@ -145,6 +145,33 @@ pub fn render_collapsed_row<V: 'static>(
                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
         })
     };
+
+    let horizon_chip = (calendar::horizons_enabled() && task.due_date.is_none())
+        .then(|| {
+            task.horizon.map(|h| {
+                let label = calendar::format_horizon_badge(h, strings);
+                let past = h.is_past_relative_to(props.today);
+                let (fg_hsla, bg_hsla, _) = task_rows::horizon_badge_style(past, closed, &theme);
+                let fg = if past && !closed { Color::Custom(fg_hsla) } else { Color::Muted };
+                let bg = if past && !closed { bg_hsla } else { colors.element_hover };
+                h_flex()
+                    .when(cfg!(test), |el| {
+                        el.debug_selector(move || format!("things-horizon-chip-{id}"))
+                    })
+                    .gap_1()
+                    .px_1p5()
+                    .h(px(18.))
+                    .rounded(px(5.))
+                    .bg(bg)
+                    .child(
+                        Icon::new(IconName::FernHorizons)
+                            .size(IconSize::XSmall)
+                            .color(fg),
+                    )
+                    .child(Label::new(label).size(LabelSize::XSmall).color(fg))
+            })
+        })
+        .flatten();
 
     let due_chip = task.due_date.map(|due| {
         let (label, overdue) = task_rows::due_label(due, task.due_time, props.today, strings);
@@ -313,6 +340,7 @@ pub fn render_collapsed_row<V: 'static>(
                 .gap_1p5()
                 .children(evening_chip)
                 .children(when_chip)
+                .children(horizon_chip)
                 .children(due_chip)
                 .children(project_chip)
                 .child(
@@ -377,15 +405,23 @@ pub fn render_expanded_card<V: 'static>(
     let act_close_pop = on_action.clone();
     let act_move_pick = on_action.clone();
 
+    let horizon_when = (calendar::horizons_enabled() && task.due_date.is_none())
+        .then_some(task.horizon)
+        .flatten();
     let when_label = when_picker::format_when_label(task, props.today, strings)
+        .or_else(|| horizon_when.map(|h| calendar::format_horizon_badge(h, strings)))
         .unwrap_or_else(|| strings.things_when.to_owned());
-    let has_when = task.start_date.is_some() || task.schedule_bucket != ScheduleBucket::None;
+    let has_when = task.start_date.is_some()
+        || task.schedule_bucket != ScheduleBucket::None
+        || horizon_when.is_some();
     let when_icon = match task.schedule_bucket {
         ScheduleBucket::Evening => IconName::Moon,
         ScheduleBucket::Someday => IconName::Archive,
         ScheduleBucket::None => {
             if task.start_date == Some(props.today) {
                 IconName::Sun
+            } else if task.start_date.is_none() && horizon_when.is_some() {
+                IconName::FernHorizons
             } else {
                 IconName::CalendarDays
             }
@@ -539,18 +575,24 @@ pub fn render_expanded_card<V: 'static>(
         )
     });
 
+    #[derive(Clone, Copy)]
+    enum PillTone {
+        Muted,
+        Accent,
+        Warning,
+        Error,
+    }
+
     let pill_button = |id: SharedString,
                        selector: Option<&'static str>,
                        icon: IconName,
                        label: String,
-                       highlighted: bool,
-                       error: bool| {
-        let text_color = if error {
-            Color::Error
-        } else if highlighted {
-            Color::Accent
-        } else {
-            Color::Muted
+                       tone: PillTone| {
+        let text_color = match tone {
+            PillTone::Error => Color::Error,
+            PillTone::Warning => Color::Warning,
+            PillTone::Accent => Color::Accent,
+            PillTone::Muted => Color::Muted,
         };
         h_flex()
             .id(id)
@@ -563,9 +605,10 @@ pub fn render_expanded_card<V: 'static>(
             .gap_1()
             .rounded(px(6.))
             .cursor_pointer()
-            .when(error, |el| el.bg(status.error.opacity(0.10)))
-            .when(!error && highlighted, |el| el.bg(colors.accent.opacity(0.10)))
-            .when(!error && !highlighted, |el| el.hover(|s| s.bg(colors.element_hover)))
+            .when(matches!(tone, PillTone::Error), |el| el.bg(status.error.opacity(0.10)))
+            .when(matches!(tone, PillTone::Warning), |el| el.bg(status.warning.opacity(0.12)))
+            .when(matches!(tone, PillTone::Accent), |el| el.bg(colors.accent.opacity(0.10)))
+            .when(matches!(tone, PillTone::Muted), |el| el.hover(|s| s.bg(colors.element_hover)))
             .child(
                 div()
                     .flex_none()
@@ -577,6 +620,30 @@ pub fn render_expanded_card<V: 'static>(
                     .color(text_color)
                     .truncate(),
             )
+    };
+
+    let when_past_horizon = !closed
+        && task.start_date.is_none()
+        && task.schedule_bucket == ScheduleBucket::None
+        && horizon_when.is_some_and(|h| h.is_past_relative_to(props.today));
+    let when_tone = if when_past_horizon {
+        PillTone::Warning
+    } else if has_when || state.active_popover == Some(CardPopover::When) {
+        PillTone::Accent
+    } else {
+        PillTone::Muted
+    };
+    let deadline_tone = if deadline_overdue {
+        PillTone::Error
+    } else if task.due_date.is_some() || state.active_popover == Some(CardPopover::Deadline) {
+        PillTone::Accent
+    } else {
+        PillTone::Muted
+    };
+    let move_tone = if state.active_popover == Some(CardPopover::Move) {
+        PillTone::Accent
+    } else {
+        PillTone::Muted
     };
 
     let focus_title = if task.title.trim().is_empty() {
@@ -706,8 +773,7 @@ pub fn render_expanded_card<V: 'static>(
                                         Some("things-card-when"),
                                         when_icon,
                                         when_label,
-                                        has_when || state.active_popover == Some(CardPopover::When),
-                                        false,
+                                        when_tone,
                                     )
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         act_when(this, CardAction::TogglePopover(CardPopover::When), window, cx);
@@ -726,8 +792,7 @@ pub fn render_expanded_card<V: 'static>(
                                         Some("things-card-deadline"),
                                         IconName::Flag,
                                         deadline_label,
-                                        task.due_date.is_some() || state.active_popover == Some(CardPopover::Deadline),
-                                        deadline_overdue,
+                                        deadline_tone,
                                     )
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         act_deadline(this, CardAction::TogglePopover(CardPopover::Deadline), window, cx);
@@ -773,8 +838,7 @@ pub fn render_expanded_card<V: 'static>(
                                         Some("things-card-move"),
                                         IconName::Folder,
                                         project_label,
-                                        state.active_popover == Some(CardPopover::Move),
-                                        false,
+                                        move_tone,
                                     )
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         act_move(this, CardAction::TogglePopover(CardPopover::Move), window, cx);

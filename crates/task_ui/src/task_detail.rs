@@ -1413,9 +1413,11 @@ impl TaskDetail {
                     || draft.end() != before.end() || draft.repeat != before.repeat
                     || draft.timezone != before.timezone || draft.is_floating != before.is_floating
                     || draft.constant_reminder != before.constant_reminder
+                    || draft.horizon != before.horizon
             });
             let reminders: Vec<i64> = if draft.date.is_some() { draft.reminders.clone() } else { Vec::new() };
             let constant = draft.constant_reminder && !reminders.is_empty();
+            let target_horizon = if draft.date.is_some() { None } else { draft.horizon };
             if !self.edit_draft(cx, |task, state| {
                 if changed {
                     task.due_date = draft.date;
@@ -1425,6 +1427,7 @@ impl TaskDetail {
                     task.repeat = draft.repeat.clone();
                     task.timezone = draft.timezone.clone();
                     task.is_floating = draft.is_floating;
+                    task.horizon = target_horizon;
                     state.date_changed = true;
                 }
                 task.reminders = reminders.clone();
@@ -1432,12 +1435,22 @@ impl TaskDetail {
                 state.reminders_changed = draft.reminders_changed;
             }) {
                 self.save(cx, |store, id| {
-                    store.set_due(id, draft.date, draft.time)?;
-                    store.set_due_end(id, draft.end())?;
-                    store.set_timezone(id, draft.timezone.as_deref(), draft.is_floating)?;
-                    store.set_reminders(id, &reminders)?;
-                    store.set_task_constant_reminder(id, constant)?;
-                    store.set_repeat(id, draft.repeat, today)
+                    if draft.date.is_some() {
+                        store.set_due(id, draft.date, draft.time)?;
+                        store.set_due_end(id, draft.end())?;
+                        store.set_timezone(id, draft.timezone.as_deref(), draft.is_floating)?;
+                        store.set_reminders(id, &reminders)?;
+                        store.set_task_constant_reminder(id, constant)?;
+                        store.set_repeat(id, draft.repeat, today)
+                    } else {
+                        store.set_due(id, None, None)?;
+                        store.set_due_end(id, None)?;
+                        store.set_timezone(id, None, false)?;
+                        store.set_reminders(id, &[])?;
+                        store.set_task_constant_reminder(id, false)?;
+                        store.set_horizon(id, target_horizon)?;
+                        store.set_repeat(id, draft.repeat, today)
+                    }
                 });
             } else {
                 self.refresh_draft_title(cx);
@@ -1446,13 +1459,14 @@ impl TaskDetail {
         self.dismiss_popup(window, cx);
     }
 
-    /// "Clear": removes the due date, time, timezone, reminders, and repeat.
+    /// "Clear": removes the due date, time, timezone, reminders, horizon, and repeat.
     fn clear_due(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.session.due_draft = None;
         let today = Local::now().date_naive();
         if !self.edit_draft(cx, |task, state| {
             task.due_date = None; task.due_time = None; task.end_date = None; task.end_time = None;
             task.timezone = None; task.is_floating = false; task.constant_reminder = false;
+            task.horizon = None;
             task.reminders.clear(); task.repeat = None; state.date_changed = true;
             state.reminders_changed = false;
         }) { self.save(cx, |store, id| {
@@ -1461,6 +1475,7 @@ impl TaskDetail {
             store.set_timezone(id, None, false)?;
             store.set_reminders(id, &[])?;
             store.set_task_constant_reminder(id, false)?;
+            store.set_horizon(id, None)?;
             store.set_repeat(id, None, today)
         }); } else {
             self.refresh_draft_title(cx);
@@ -1959,7 +1974,7 @@ impl TaskDetail {
                 cx.notify();
             }))
         };
-        let value = if draft.minutes { fern_core::format_minutes(draft.amount as i64) } else { draft.amount.to_string() };
+        let value = if draft.minutes { strings.format_minutes(draft.amount as i64) } else { draft.amount.to_string() };
         let button = |id: &'static str, label: &'static str, primary: bool| {
             div()
                 .id(id)
@@ -2017,7 +2032,7 @@ impl TaskDetail {
                             .map(|preset| {
                                 let selected = draft.amount == preset;
                                 let label = if draft.minutes {
-                                    fern_core::format_minutes(preset as i64)
+                                    strings.format_minutes(preset as i64)
                                 } else {
                                     preset.to_string()
                                 };
@@ -2960,6 +2975,63 @@ impl TaskDetail {
                     .child(quick("due-tomorrow", IconName::Sunrise, strings.tomorrow, d_tomorrow, cx))
                     .child(quick("due-week", IconName::CalendarPlus, strings.next_week, d_week, cx))
                     .child(quick("due-month", IconName::Moon, strings.next_month, d_month, cx));
+        let horizon_row: Option<AnyElement> = calendar::horizons_enabled().then(|| {
+            use fern_core::Horizon;
+            let week = Horizon::current_week(today);
+            let month = Horizon::current_month(today);
+            let quarter = Horizon::current_quarter(today);
+            let year = Horizon::current_year(today);
+            let q_short = format!("{}{}", strings.horizons_quarter_prefix, (today.month() - 1) / 3 + 1);
+            let chips = [
+                ("week", calendar::format_horizon_badge(week, strings), strings.horizon_this_week, week),
+                ("month", calendar::format_horizon_badge(month, strings), strings.horizon_this_month, month),
+                ("quarter", q_short, strings.horizon_this_quarter, quarter),
+                ("year", today.year().to_string(), strings.horizon_this_year, year),
+                ("life", strings.horizons_life.to_owned(), strings.horizons_life, Horizon::Life),
+            ];
+            h_flex()
+                .gap(px(4.))
+                .children(chips.into_iter().map(|(key, label, tip, h)| {
+                    let active = draft.horizon == Some(h);
+                    div()
+                        .id(SharedString::from(format!("due-horizon-{key}")))
+                        .debug_selector(move || format!("due-horizon-{key}"))
+                        .flex_1()
+                        .h(px(24.))
+                        .px(px(3.))
+                        .rounded(px(5.))
+                        .border_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .border_color(if active {
+                            theme.colors().accent.opacity(0.65)
+                        } else {
+                            theme.colors().border_variant
+                        })
+                        .bg(if active {
+                            theme.colors().accent.opacity(0.14)
+                        } else {
+                            theme.colors().background.opacity(0.5)
+                        })
+                        .when(!active, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                        .tooltip(Tooltip::text(tip))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_draft(cx, |d| {
+                                let next = if d.horizon == Some(h) { None } else { Some(h) };
+                                d.set_horizon(next);
+                            });
+                        }))
+                        .child(
+                            Label::new(label)
+                                .size(LabelSize::XSmall)
+                                .color(if active { Color::Accent } else { Color::Muted })
+                                .truncate(),
+                        )
+                }))
+                .into_any_element()
+        });
         let calendar_block = v_flex()
             .gap_2()
             .child(
@@ -3023,6 +3095,7 @@ impl TaskDetail {
             .map(|el| match draft.tab {
                 DueTab::Date => el
                     .child(quick_row)
+                    .when_some(horizon_row, |el, row| el.child(row))
                     .child(calendar_block)
                     .child(Divider::horizontal())
                     .child(row("due-time-row", IconName::Clock, time_label, draft.time.is_some(), DueMenu::Time, cx))
@@ -3869,7 +3942,7 @@ impl TaskDetail {
             .children(self.session.task.as_ref().and_then(|t| t.estimate).map(|estimate| {
                 let text = match estimate {
                     fern_core::Estimate::Pomos(n) => format!("{n} {}", strings.pomo_unit),
-                    fern_core::Estimate::Minutes(n) => fern_core::format_minutes(n as i64),
+                    fern_core::Estimate::Minutes(n) => strings.format_minutes(n as i64),
                 };
                 h_flex()
                     .id("estimate-chip")
@@ -4067,9 +4140,9 @@ impl Render for TaskDetail {
         let notes_focus_click = notes_focus.clone();
         let today = Local::now().date_naive();
         let preview = self.session.draft.as_ref().map(|_| self.due_preview(task, today));
-        let (date, time, repeats, tz_name, is_floating) = preview.as_ref().map_or(
-            (task.due_date, task.due_time, task.repeat.is_some(), task.timezone.as_deref(), task.is_floating),
-            |due| (due.date, due.time, due.repeat.is_some(), due.timezone.as_deref(), due.is_floating),
+        let (date, time, repeats, tz_name, is_floating, horizon) = preview.as_ref().map_or(
+            (task.due_date, task.due_time, task.repeat.is_some(), task.timezone.as_deref(), task.is_floating, task.horizon),
+            |due| (due.date, due.time, due.repeat.is_some(), due.timezone.as_deref(), due.is_floating, due.horizon),
         );
         let tz_suffix = if time.is_some() {
             due_picker::short_timezone_label(tz_name, is_floating, strings)
@@ -4077,8 +4150,8 @@ impl Render for TaskDetail {
             None
         };
         let kind = self.kind_preview(task);
-        let (due_text, due_color): (SharedString, Color) = match date {
-            Some(date) => {
+        let (due_text, due_color): (SharedString, Color) = match (date, horizon) {
+            (Some(date), _) => {
                 let (label, overdue) = task_rows::due_label(date, time, today, strings);
                 let label = match task.end_date {
                     Some(end) => due_picker::range_label(date, time, end, task.end_time, strings),
@@ -4095,8 +4168,27 @@ impl Render for TaskDetail {
                 }
                 (label.into(), if overdue && !done { Color::Error } else { Color::Accent })
             }
+            (None, Some(h)) => {
+                let label = calendar::format_horizon_badge(h, strings);
+                let is_past = h.is_past_relative_to(today);
+                let is_current = h != fern_core::Horizon::Life
+                    && h == fern_core::Horizon::current_for(h.granularity(), today);
+                let color = if is_past && !done {
+                    Color::Warning
+                } else if is_current && !done {
+                    Color::Accent
+                } else {
+                    muted
+                };
+                (label.into(), color)
+            }
             // A note, as the original's, offers a reminder rather than a due date.
-            None => ((if kind == Kind::Note { strings.set_reminder } else { strings.due_date }).into(), muted),
+            (None, None) => ((if kind == Kind::Note { strings.set_reminder } else { strings.due_date }).into(), muted),
+        };
+        let due_icon = if date.is_none() && horizon.is_some() {
+            IconName::FernHorizons
+        } else {
+            IconName::CalendarDays
         };
         let in_progress = task.is_in_progress();
         let read_only = self.is_read_only();
@@ -4156,12 +4248,12 @@ impl Render for TaskDetail {
                             .py_1()
                             .rounded(px(6.))
                             .opacity(0.75)
-                            .child(Icon::new(IconName::CalendarDays).color(due_color))
+                            .child(Icon::new(due_icon).color(due_color))
                             .child(Label::new(due_text.clone()).color(due_color))
                             .when(repeats, |el| el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(due_color)))
                             .into_any_element()
                     } else {
-                        label_button("due-date", IconName::CalendarDays, due_text.clone(), due_color, button_hover)
+                        label_button("due-date", due_icon, due_text.clone(), due_color, button_hover)
                             .debug_selector(|| "task-detail-due-date".into())
                             .when(repeats, |el| el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(due_color)))
                             .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::Due, window, cx)))

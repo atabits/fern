@@ -3,7 +3,7 @@
 
 use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Offset as _, TimeZone as _, Timelike, Utc};
 use fern_core::reminder::{ALL_DAY_OFFSETS, ALL_DAY_REMINDER_HOUR, TIMED_OFFSETS};
-use fern_core::{Frequency, Recurrence, Task};
+use fern_core::{Frequency, Horizon, Recurrence, Task};
 
 use crate::calendar;
 use crate::i18n::{Locale, Strings};
@@ -42,6 +42,7 @@ pub struct DueDraft {
     pub timezone: Option<String>,
     pub is_floating: bool,
     pub constant_reminder: bool,
+    pub horizon: Option<Horizon>,
 }
 
 /// The tabs of the due-date popover.
@@ -77,12 +78,26 @@ impl DueDraft {
             timezone: task.timezone.clone(),
             is_floating: task.is_floating,
             constant_reminder: task.constant_reminder,
+            horizon: task.horizon,
         }
+    }
+
+    /// Assigns a time horizon bucket and clears concrete date/duration fields for mutual exclusion.
+    pub fn set_horizon(&mut self, horizon: Option<Horizon>) {
+        self.horizon = horizon;
+        self.date = None;
+        self.time = None;
+        self.end_date = None;
+        self.end_time = None;
+        self.reminders.clear();
+        self.tab = DueTab::Date;
+        self.menu = None;
     }
 
     /// Switches to the Duration tab. Like the original, an empty draft starts at the next full
     /// hour and lasts the default duration (Settings → Task Default), an hour unless changed.
     pub fn start_duration(&mut self, now: NaiveDateTime, minutes: i64) {
+        self.horizon = None;
         self.tab = DueTab::Duration;
         self.menu = None;
         let had_date = self.date.is_some();
@@ -128,6 +143,7 @@ impl DueDraft {
 
     /// Picks a day for the start or the end; the end never goes before the start.
     pub fn pick_range_date(&mut self, date: NaiveDate) {
+        self.horizon = None;
         match self.range_field {
             Some(RangeField::EndDate) => self.end_date = Some(date.max(self.date.unwrap_or(date))),
             _ => {
@@ -172,6 +188,7 @@ impl DueDraft {
     }
 
     pub fn pick_date(&mut self, date: NaiveDate) {
+        self.horizon = None;
         self.date = Some(date);
         self.month = calendar::month_start(date);
     }
@@ -180,6 +197,7 @@ impl DueDraft {
     pub fn pick_time(&mut self, time: Option<NaiveTime>, today: NaiveDate) {
         self.time = time;
         if time.is_some() && self.date.is_none() {
+            self.horizon = None;
             self.date = Some(today);
         }
         self.menu = None;
@@ -195,6 +213,7 @@ impl DueDraft {
             self.reminders.sort();
         }
         if self.date.is_none() {
+            self.horizon = None;
             self.date = Some(today);
         }
     }
@@ -210,7 +229,7 @@ impl DueDraft {
     pub fn pick_repeat(&mut self, repeat: Option<Recurrence>, today: NaiveDate) {
         let repeats = repeat.is_some();
         self.repeat = repeat;
-        if repeats && self.date.is_none() {
+        if repeats && self.date.is_none() && self.horizon.is_none() {
             self.date = Some(today);
         }
         self.menu = None;
@@ -839,5 +858,42 @@ mod tests {
             quick_dates(monday)[2],
             fern_core::next_week_date(monday, calendar::week_start())
         );
+    }
+
+    #[test]
+    fn set_horizon_clears_concrete_dates_and_pick_date_clears_horizon() {
+        let today = d(2026, 11, 23);
+        let mut draft = DueDraft {
+            date: Some(today),
+            time: NaiveTime::from_hms_opt(11, 0, 0),
+            end_date: Some(today),
+            end_time: NaiveTime::from_hms_opt(11, 30, 0),
+            reminders: vec![15],
+            tab: DueTab::Duration,
+            menu: Some(DueMenu::Time),
+            ..Default::default()
+        };
+
+        let week = Horizon::current_week(today);
+        draft.set_horizon(Some(week));
+        assert_eq!(draft.horizon, Some(week));
+        assert_eq!(draft.date, None);
+        assert_eq!(draft.time, None);
+        assert_eq!(draft.end_date, None);
+        assert_eq!(draft.end_time, None);
+        assert!(draft.reminders.is_empty());
+        assert_eq!(draft.tab, DueTab::Date);
+        assert_eq!(draft.menu, None);
+
+        // Picking a concrete date clears horizon.
+        draft.pick_date(today);
+        assert_eq!(draft.date, Some(today));
+        assert_eq!(draft.horizon, None);
+
+        // Starting duration clears horizon too.
+        draft.set_horizon(Some(Horizon::Life));
+        draft.start_duration(today.and_hms_opt(10, 0, 0).unwrap(), 60);
+        assert_eq!(draft.horizon, None);
+        assert_eq!(draft.tab, DueTab::Duration);
     }
 }

@@ -3,7 +3,7 @@
 use chrono::{Datelike, Duration, NaiveDate};
 use desktop_common::calendar;
 use desktop_common::text_input::TextInput;
-use fern_core::{Id, ScheduleBucket, Task};
+use fern_core::{Horizon, Id, ScheduleBucket, Task};
 use fern_i18n::Strings;
 use gpui::{AnyElement, Context, Entity, FontWeight, Window, div, px};
 use task_ui::due_picker::{self, DueDraft};
@@ -27,6 +27,7 @@ pub struct WhenPickerState {
     pub month: NaiveDate,
     pub start_date: Option<NaiveDate>,
     pub bucket: ScheduleBucket,
+    pub horizon: Option<Horizon>,
     pub date_input: Entity<TextInput>,
 }
 
@@ -43,6 +44,7 @@ pub enum WhenAction {
         start_date: Option<NaiveDate>,
         bucket: ScheduleBucket,
     },
+    SetHorizon(Horizon),
     ShiftMonth(i32),
     Close,
 }
@@ -255,6 +257,11 @@ pub fn render_when_popover<V: 'static>(
         },
     );
 
+    let horizons_enabled = calendar::horizons_enabled();
+    let has_clearable_schedule = state.start_date.is_some()
+        || state.bucket != ScheduleBucket::None
+        || (horizons_enabled && state.horizon.is_some());
+
     let close_out = on_action.clone();
     let clear_action = on_action.clone();
 
@@ -325,7 +332,7 @@ pub fn render_when_popover<V: 'static>(
                 .child(div().flex_1().min_w_0().child(state.date_input.clone())),
         )
         .child(cal)
-        .when(state.start_date.is_some() || state.bucket != ScheduleBucket::None, |el| {
+        .when(has_clearable_schedule, |el| {
             el.child(div().my_0p5().child(Divider::horizontal())).child(
                 Button::new("when-clear", strings.things_clear_when)
                     .variant(ButtonVariant::Ghost)
@@ -345,6 +352,85 @@ pub fn render_when_popover<V: 'static>(
             )
         });
 
+    let horizons_footer = horizons_enabled.then(|| {
+        let horizon_action = on_action;
+        let week = Horizon::current_week(today);
+        let month = Horizon::current_month(today);
+        let year = Horizon::current_year(today);
+        let chips = [
+            ("week", week, strings.horizon_this_week),
+            ("month", month, strings.horizon_this_month),
+            ("year", year, strings.horizon_this_year),
+            ("life", Horizon::Life, strings.horizons_life),
+        ];
+        v_flex()
+            .id("things-when-horizons")
+            .when(cfg!(test), |el| {
+                el.debug_selector(|| "things-when-horizons".to_owned())
+            })
+            .pt_1p5()
+            .gap_1()
+            .child(Divider::horizontal())
+            .child(
+                h_flex()
+                    .px_1()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::FernHorizons)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(strings.horizons_horizon_label)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(h_flex().gap_1().children(chips.into_iter().map(|(key, horizon, tip)| {
+                let active = state.horizon == Some(horizon);
+                let label = calendar::format_horizon_badge(horizon, strings);
+                let on_action = horizon_action.clone();
+                div()
+                    .id(SharedString::from(format!("when-horizon-{key}")))
+                    .when(cfg!(test), |el| {
+                        el.debug_selector(move || format!("when-horizon-{key}"))
+                    })
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(26.))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if active {
+                        colors.accent.opacity(0.6)
+                    } else {
+                        colors.border_variant
+                    })
+                    .bg(if active {
+                        colors.accent.opacity(0.14)
+                    } else {
+                        colors.surface_background
+                    })
+                    .when(!active, |el| el.hover(|s| s.bg(colors.element_hover)))
+                    .cursor_pointer()
+                    .tooltip(Tooltip::text(tip))
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::XSmall)
+                            .color(if active { Color::Accent } else { Color::Default })
+                            .truncate(),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        on_action(this, WhenAction::SetHorizon(horizon), window, cx);
+                    }))
+            })))
+    });
+
+    let scroll_max_h = px(450.);
+
     popover(cx)
         .id("things-when-popover")
         .when(cfg!(test), |el| el.debug_selector(|| "things-when-popover".to_owned()))
@@ -354,7 +440,8 @@ pub fn render_when_popover<V: 'static>(
             cx.stop_propagation();
             close_out(this, WhenAction::Close, window, cx);
         }))
-        .child(v_scroll("things-when-scroll", body).max_h(px(360.)).compact())
+        .child(v_scroll("things-when-scroll", body).max_h(scroll_max_h).compact())
+        .children(horizons_footer)
         .into_any_element()
 }
 

@@ -226,6 +226,8 @@ pub struct CountdownView {
     show_archived: bool,
     /// Cached value of `HIDE_GROUP_SETTING` (loaded in `reload`, never queried during `render`).
     hide_group: bool,
+    active: bool,
+    dirty: bool,
 }
 
 /// Hides the kind tabs (the header "…" menu's Hide Group).
@@ -266,18 +268,37 @@ impl CountdownView {
             header_menu: false,
             show_archived: false,
             hide_group: false,
+            active: true,
+            dirty: false,
         };
         this.reload(cx);
         cx.observe_global::<DataVersion>(|this, cx| {
             if changed_elsewhere(cx.entity_id(), cx) {
-                this.reload(cx);
+                this.sync_external(cx);
             }
         })
         .detach();
         this
     }
 
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.active = active;
+        if active && self.dirty {
+            self.dirty = false;
+            self.reload(cx);
+        }
+    }
+
+    pub fn sync_external(&mut self, cx: &mut Context<Self>) {
+        if self.active {
+            self.reload(cx);
+        } else {
+            self.dirty = true;
+        }
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.dirty = false;
         self.countdowns = self.store.countdowns().unwrap_or_default();
         self.hide_group = self
             .store

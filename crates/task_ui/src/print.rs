@@ -124,7 +124,9 @@ pub fn year_html(
     use crate::calendar;
     let mut months = String::new();
     for month in 1..=12 {
-        let first = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+        let Some(first) = NaiveDate::from_ymd_opt(year, month, 1) else {
+            continue;
+        };
         let _ = write!(months, "<section><h2>{}</h2><table><thead><tr>", escape(strings.months[month as usize - 1]));
         if week_numbers {
             months.push_str("<th></th>");

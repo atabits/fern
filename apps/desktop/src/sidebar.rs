@@ -407,38 +407,33 @@ pub fn render(
             } else if section == Section::Pomodoro
                 && let Some((clock, paused)) = &focus_clock
             {
+                let pomo_color = if is_active || !*paused {
+                    colors.sidebar_icon
+                } else {
+                    colors.sidebar_icon_muted
+                };
                 v_flex()
                     .size(px(40.))
                     .items_center()
                     .justify_center()
                     .gap(px(1.))
                     .child(
-                        Icon::new(section.icon()).size(IconSize::Custom(px(20.))).color(
-                            if is_active {
-                                colors.sidebar_icon
-                            } else if *paused {
-                                colors.sidebar_icon_muted
-                            } else {
-                                colors.accent
-                            },
-                        ),
+                        Icon::new(section.icon())
+                            .size(IconSize::Custom(px(20.)))
+                            .color(pomo_color),
                     )
                     .child(
                         div()
                             .px(px(3.))
                             .rounded(px(3.))
-                            .bg(if *paused {
-                                colors.sidebar_icon_muted.opacity(0.18)
-                            } else {
-                                colors.accent.opacity(0.18)
-                            })
+                            .bg(colors.sidebar_icon.opacity(if *paused { 0.14 } else { 0.22 }))
                             .text_size(px(9.))
                             .line_height(px(11.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(if *paused {
                                 colors.sidebar_icon_muted
                             } else {
-                                colors.accent
+                                colors.sidebar_icon
                             })
                             .child(clock.clone()),
                     )

@@ -35,6 +35,8 @@ const TOAST_POLL_SLICE: Duration = Duration::from_secs(5);
 /// The setting with the last time reminders were checked, to find the ones missed in between.
 const CHECKED_AT: &str = "reminders_checked_at";
 const STAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
+/// Minimum interval between idle `CHECKED_AT` SQLite writes when no reminders fire.
+const CHECKED_AT_PERSIST_INTERVAL: chrono::Duration = chrono::Duration::minutes(10);
 
 #[cfg(any(not(target_os = "macos"), test))]
 static ACTIVE_WAITERS: AtomicUsize = AtomicUsize::new(0);
@@ -1038,14 +1040,69 @@ struct PollResult {
     settings: fern_core::Notifications,
     daily_titles: Option<Vec<String>>,
     notices: Vec<Notice>,
+    persisted_checked_at: bool,
 }
 
-fn poll_once(store: &Store, last: NaiveDateTime, now: NaiveDateTime) -> PollResult {
+fn should_persist_checked_at(
+    has_notices: bool,
+    has_daily: bool,
+    last_persisted: NaiveDateTime,
+    now: NaiveDateTime,
+) -> bool {
+    has_notices
+        || has_daily
+        || now.signed_duration_since(last_persisted) >= CHECKED_AT_PERSIST_INTERVAL
+        || now < last_persisted
+}
+
+fn is_target_still_open(store: &Store, target: Target, today: chrono::NaiveDate) -> bool {
+    match target {
+        Target::Task(id) => store
+            .task(id)
+            .ok()
+            .flatten()
+            .is_some_and(|t| !t.is_closed() && !t.is_deleted() && t.snoozed_until.is_none()),
+        Target::Habit(id) => {
+            let Some(habit) = store
+                .habits()
+                .ok()
+                .and_then(|habits| habits.into_iter().find(|h| h.id == id && !h.archived))
+            else {
+                return false;
+            };
+            if habit.is_skipped(today) {
+                return false;
+            }
+            !store.checkins(id).unwrap_or_default().contains(&today)
+        }
+        Target::Countdown(_) => true,
+    }
+}
+
+fn poll_once(
+    store: &Store,
+    last: NaiveDateTime,
+    last_persisted: NaiveDateTime,
+    now: NaiveDateTime,
+) -> PollResult {
     let settings = store.preferences().unwrap_or_default().notifications;
     let daily_titles = collect_daily_titles(store, settings, now);
     let notices = fired(store, last, now);
-    set_setting_with_retry(store, CHECKED_AT, &now.format(STAMP_FORMAT).to_string());
-    PollResult { settings, daily_titles, notices }
+    let persisted_checked_at = should_persist_checked_at(
+        !notices.is_empty(),
+        daily_titles.is_some(),
+        last_persisted,
+        now,
+    );
+    if persisted_checked_at {
+        set_setting_with_retry(store, CHECKED_AT, &now.format(STAMP_FORMAT).to_string());
+    }
+    PollResult {
+        settings,
+        daily_titles,
+        notices,
+        persisted_checked_at,
+    }
 }
 
 fn open_or_reuse_bg_store(bg_store: Option<Store>, db_path: &Path) -> Option<Store> {
@@ -1088,6 +1145,7 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
     cx.spawn(async move |this, cx| {
         let now = Local::now().naive_local();
         let mut last = now;
+        let mut last_persisted = now;
         let mut bg_store: Option<Store> = None;
 
         // Collect missed reminders off the UI thread when backed by an on-disk WAL DB.
@@ -1136,10 +1194,11 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
             let poll = if let Some(path) = db_path.clone() {
                 let taken_store = bg_store.take();
                 let prev = last;
+                let prev_persisted = last_persisted;
                 let (returned_store, poll) = cx
                     .background_spawn(async move {
                         let bg = open_or_reuse_bg_store(taken_store, &path);
-                        let poll = bg.as_ref().map(|s| poll_once(s, prev, now));
+                        let poll = bg.as_ref().map(|s| poll_once(s, prev, prev_persisted, now));
                         (bg, poll)
                     })
                     .await;
@@ -1149,9 +1208,12 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
                     None => continue,
                 }
             } else {
-                poll_once(&store, last, now)
+                poll_once(&store, last, last_persisted, now)
             };
             last = now;
+            if poll.persisted_checked_at {
+                last_persisted = now;
+            }
 
             if this.upgrade().is_none() {
                 break;
@@ -1228,21 +1290,18 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
                             if !active {
                                 break;
                             }
-                            if let Target::Task(id) = notice.target {
+                            if matches!(notice.target, Target::Task(_) | Target::Habit(_)) {
+                                let target = notice.target;
+                                let today = Local::now().date_naive();
                                 let still_open = if let Some(path) = repeat_db_path.clone() {
                                     cx.background_spawn(async move {
                                         Store::open(&path)
                                             .ok()
-                                            .and_then(|s| s.task(id).ok().flatten())
-                                            .is_some_and(|t| !t.is_closed() && !t.is_deleted() && t.snoozed_until.is_none())
+                                            .is_some_and(|s| is_target_still_open(&s, target, today))
                                     })
                                     .await
                                 } else {
-                                    store
-                                        .task(id)
-                                        .ok()
-                                        .flatten()
-                                        .is_some_and(|t| !t.is_closed() && !t.is_deleted() && t.snoozed_until.is_none())
+                                    is_target_still_open(&store, target, today)
                                 };
                                 if !still_open {
                                     break;
@@ -1383,5 +1442,85 @@ mod tests {
         apply_constant_override(&mut notices, true);
         assert!(notices[0].constant);
         assert_eq!(notice_to_json(&notices[0])["constant"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn idle_poll_skips_checked_at_write_until_interval_or_event() {
+        let store = Store::open_in_memory().unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let t0 = day.and_hms_opt(9, 0, 0).unwrap();
+        store.set_setting(CHECKED_AT, &t0.format(STAMP_FORMAT).to_string()).unwrap();
+
+        // 20 seconds later with no reminders: skips writing CHECKED_AT.
+        let t1 = t0 + chrono::Duration::seconds(20);
+        let idle_short = poll_once(&store, t0, t0, t1);
+        assert!(!idle_short.persisted_checked_at);
+        assert_eq!(
+            store.setting(CHECKED_AT).unwrap().as_deref(),
+            Some("2026-10-18T09:00:00")
+        );
+
+        // 9 minutes 59 seconds later: still skips idle write.
+        let t2 = t0 + chrono::Duration::seconds(599);
+        let idle_just_before = poll_once(&store, t1, t0, t2);
+        assert!(!idle_just_before.persisted_checked_at);
+        assert_eq!(
+            store.setting(CHECKED_AT).unwrap().as_deref(),
+            Some("2026-10-18T09:00:00")
+        );
+
+        // >= 10 minutes later: persists CHECKED_AT.
+        let t3 = t0 + chrono::Duration::minutes(10);
+        let idle_after_10m = poll_once(&store, t2, t0, t3);
+        assert!(idle_after_10m.persisted_checked_at);
+        assert_eq!(
+            store.setting(CHECKED_AT).unwrap().as_deref(),
+            Some("2026-10-18T09:10:00")
+        );
+
+        // Firing notice persists CHECKED_AT immediately even 60 seconds after last_persisted.
+        let task = store.add_task("Call bank").unwrap();
+        store
+            .set_due(
+                task.id,
+                Some(day),
+                Some(chrono::NaiveTime::from_hms_opt(9, 11, 0).unwrap()),
+            )
+            .unwrap();
+        store.set_reminders(task.id, &[0]).unwrap();
+        let t4 = t3 + chrono::Duration::seconds(60);
+        let with_notice = poll_once(&store, t3, t3, t4);
+        assert!(!with_notice.notices.is_empty());
+        assert!(with_notice.persisted_checked_at);
+        assert_eq!(
+            store.setting(CHECKED_AT).unwrap().as_deref(),
+            Some("2026-10-18T09:11:00")
+        );
+    }
+
+    #[test]
+    fn habit_repeat_guard_stops_when_checked_in_skipped_archived_or_deleted() {
+        let store = Store::open_in_memory().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+
+        let h1 = store.add_habit("Drink water").unwrap();
+        assert!(is_target_still_open(&store, Target::Habit(h1.id), today));
+        store.toggle_checkin(h1.id, today).unwrap();
+        assert!(!is_target_still_open(&store, Target::Habit(h1.id), today));
+        // Unchecking re-opens it, skipping closes it.
+        store.toggle_checkin(h1.id, today).unwrap();
+        assert!(is_target_still_open(&store, Target::Habit(h1.id), today));
+        store.skip_habit_date(h1.id, today).unwrap();
+        assert!(!is_target_still_open(&store, Target::Habit(h1.id), today));
+
+        let h2 = store.add_habit("Stretch").unwrap();
+        assert!(is_target_still_open(&store, Target::Habit(h2.id), today));
+        store.set_habit_archived(h2.id, true).unwrap();
+        assert!(!is_target_still_open(&store, Target::Habit(h2.id), today));
+
+        let h3 = store.add_habit("Journal").unwrap();
+        assert!(is_target_still_open(&store, Target::Habit(h3.id), today));
+        store.delete_habit(h3.id).unwrap();
+        assert!(!is_target_still_open(&store, Target::Habit(h3.id), today));
     }
 }

@@ -121,10 +121,13 @@ pub struct ThingsView {
     show_logged_in_project: bool,
     sidebar_scroll: ScrollHandle,
     list_scroll: ScrollHandle,
+    row_bounds: Rc<std::cell::RefCell<HashMap<Id, gpui::Bounds<Pixels>>>>,
     sidebar_add_menu: bool,
     bottom_move_open: bool,
     when_picker: Option<(PopoverAnchor, WhenPickerState)>,
+    when_date_error: bool,
     deadline_picker: Option<(PopoverAnchor, DeadlinePickerState)>,
+    pending_checklist_focus: Option<Id>,
     project_notes: Option<(Id, Entity<TextInput>, Subscription)>,
     list_dialog: Option<Entity<ListDialog>>,
     folder_dialog: Option<Entity<FolderDialog>>,
@@ -164,10 +167,13 @@ impl ThingsView {
             show_logged_in_project: false,
             sidebar_scroll: ScrollHandle::new(),
             list_scroll: ScrollHandle::new(),
+            row_bounds: Rc::new(std::cell::RefCell::new(HashMap::new())),
             sidebar_add_menu: false,
             bottom_move_open: false,
             when_picker: None,
+            when_date_error: false,
             deadline_picker: None,
+            pending_checklist_focus: None,
             project_notes: None,
             list_dialog: None,
             folder_dialog: None,
@@ -438,6 +444,7 @@ impl ThingsView {
     /// newly created empty tasks so accidental `+ New To-Do` clicks never leak `"Untitled"` rows.
     /// Returns `(was_expanded, did_reload)`.
     fn finish_expanded_card(&mut self, cx: &mut Context<Self>) -> (bool, bool) {
+        self.pending_checklist_focus = None;
         let Some(card) = self.expanded.take() else {
             return (false, false);
         };
@@ -489,7 +496,6 @@ impl ThingsView {
     }
 
     fn apply_task_deadline(&self, id: Id, date: Option<NaiveDate>) -> anyhow::Result<()> {
-        let today = Self::today();
         let existing = self
             .tasks
             .iter()
@@ -500,10 +506,6 @@ impl ThingsView {
             None => {
                 self.store.set_due(id, None, None)?;
                 self.store.set_due_end(id, None)?;
-                self.store.set_timezone(id, None, false)?;
-                self.store.set_reminders(id, &[])?;
-                self.store.set_task_constant_reminder(id, false)?;
-                self.store.set_repeat(id, None, today)?;
                 Ok(())
             }
             Some(new_date) => {
@@ -542,6 +544,7 @@ impl ThingsView {
         self.sidebar_add_menu = false;
         self.bottom_move_open = false;
         self.when_picker = None;
+        self.when_date_error = false;
         self.deadline_picker = None;
         if let Some(card) = &mut self.expanded {
             card.active_popover = None;
@@ -684,12 +687,23 @@ impl ThingsView {
                 data_version::data_changed(cx.entity_id(), cx);
             }
         });
+        let sub_submit = cx.subscribe(&input, move |this, _, _: &Submitted, cx| {
+            let Some(task_id) = this.expanded.as_ref().map(|c| c.task_id) else {
+                return;
+            };
+            if let Ok(created) = this.store.add_checklist_item(task_id, "", Some(item_id)) {
+                this.mark_expanded_touched(task_id);
+                this.pending_checklist_focus = Some(created.id);
+                data_version::data_changed(cx.entity_id(), cx);
+                this.reload(cx);
+            }
+        });
         ChecklistRowState {
             id: item_id,
             completed: item.completed,
             title_text: initial_title,
             input,
-            _subscriptions: vec![sub],
+            _subscriptions: vec![sub, sub_submit],
         }
     }
 
@@ -753,6 +767,7 @@ impl ThingsView {
                     if let Some(t) = this.tasks.iter_mut().find(|t| t.id == id) {
                         t.title = text;
                     }
+                    this.invalidate_groups();
                     data_version::data_changed(cx.entity_id(), cx);
                     cx.notify();
                 }
@@ -771,6 +786,7 @@ impl ThingsView {
                     if let Some(t) = this.tasks.iter_mut().find(|t| t.id == id) {
                         t.notes = text;
                     }
+                    this.invalidate_groups();
                     data_version::data_changed(cx.entity_id(), cx);
                     cx.notify();
                 }
@@ -931,6 +947,30 @@ impl ThingsView {
         }
     }
 
+    fn scroll_task_into_view(&self, task_id: Id) {
+        let viewport = self.list_scroll.bounds();
+        if viewport.size.height <= px(0.) {
+            return;
+        }
+        let Some(unscrolled) = self.row_bounds.borrow().get(&task_id).copied() else {
+            return;
+        };
+        let cur = self.list_scroll.offset();
+        let top = unscrolled.top() + cur.y;
+        let bottom = unscrolled.bottom() + cur.y;
+        let mut next_y = cur.y;
+        if top < viewport.top() {
+            next_y += viewport.top() - top;
+        } else if bottom > viewport.bottom() {
+            next_y += viewport.bottom() - bottom;
+        } else {
+            return;
+        }
+        let max_y = self.list_scroll.max_offset().y.max(px(0.));
+        self.list_scroll
+            .set_offset(gpui::point(cur.x, next_y.clamp(-max_y, px(0.))));
+    }
+
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         if self.visible_order.is_empty() {
             return;
@@ -953,6 +993,7 @@ impl ThingsView {
             }
         };
         self.selected_id = Some(next);
+        self.scroll_task_into_view(next);
         cx.notify();
     }
 
@@ -1086,10 +1127,27 @@ impl ThingsView {
             }
             ti
         });
-        cx.subscribe_in(&date_input, window, move |this, _, Submitted(text), window, cx| {
+        cx.subscribe(&date_input, |this, input, _: &Changed, cx| {
+            if this.when_date_error {
+                this.when_date_error = false;
+                input.update(cx, |ti, cx| ti.set_ink_override(None, None, None, cx));
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe_in(&date_input, window, move |this, input, Submitted(text), window, cx| {
             let strings = i18n::t(cx);
             if let Some(date) = calendar::parse_date(text, Self::today(), strings) {
+                this.when_date_error = false;
+                input.update(cx, |ti, cx| ti.set_ink_override(None, None, None, cx));
                 this.apply_when(task_id, Some(date), ScheduleBucket::None, window, cx);
+            } else {
+                this.when_date_error = true;
+                let err_color = cx.theme().status().error;
+                input.update(cx, |ti, cx| {
+                    ti.set_ink_override(Some(err_color), None, Some(err_color), cx);
+                });
+                cx.notify();
             }
         })
         .detach();
@@ -2460,6 +2518,53 @@ impl ThingsView {
             .into_any_element()
     }
 
+    fn render_when_popover_with_error(
+        &self,
+        state: &WhenPickerState,
+        today: NaiveDate,
+        strings: &'static Strings,
+        error_above: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pop = when_picker::render_when_popover(state, today, strings, cx, |this, act, window, cx| {
+            this.handle_when_action(act, window, cx);
+        });
+        if !self.when_date_error {
+            return pop;
+        }
+        let theme = cx.theme();
+        let colors = theme.colors();
+        let err_color = theme.status().error;
+        let error_banner = h_flex()
+            .when(cfg!(test), |el| {
+                el.debug_selector(|| "things-when-date-error".to_owned())
+            })
+            .w(px(244.))
+            .px_2p5()
+            .py_1p5()
+            .gap_1p5()
+            .rounded(px(8.))
+            .bg(colors.elevated_surface_background)
+            .border_1()
+            .border_color(err_color.opacity(0.65))
+            .shadow_md()
+            .occlude()
+            .child(Icon::new(IconName::CircleAlert).size(IconSize::XSmall).color(Color::Error))
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(strings.calendar_invalid_year_date)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error)
+                        .truncate(),
+                ),
+            );
+        if error_above {
+            v_flex().w(px(244.)).gap_1().child(error_banner).child(pop).into_any_element()
+        } else {
+            v_flex().w(px(244.)).gap_1().child(pop).child(error_banner).into_any_element()
+        }
+    }
+
     fn render_task_item(&self, task: &Task, today: NaiveDate, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         if let Some(card) = &self.expanded
             && card.task_id == task.id
@@ -2468,11 +2573,7 @@ impl ThingsView {
                 .when_picker
                 .as_ref()
                 .filter(|(a, s)| *a == PopoverAnchor::Card && s.task_id == task.id)
-                .map(|(_, state)| {
-                    when_picker::render_when_popover(state, today, strings, cx, |this, act, window, cx| {
-                        this.handle_when_action(act, window, cx);
-                    })
-                });
+                .map(|(_, state)| self.render_when_popover_with_error(state, today, strings, false, cx));
             let deadline_pop = self
                 .deadline_picker
                 .as_ref()
@@ -2521,6 +2622,7 @@ impl ThingsView {
         let accent = colors.accent;
         let groups = self.groups_rc(today, strings);
         let active_drag = cx.has_active_drag();
+        self.row_bounds.borrow_mut().clear();
 
         let logged_tasks: Vec<&Task> = match self.view {
             ThingsViewKind::Project(_) => {
@@ -2603,6 +2705,23 @@ impl ThingsView {
                 .iter()
                 .map(|t| self.render_task_item(t, today, strings, cx))
                 .collect();
+            let task_ids: Vec<Id> = group.tasks.iter().map(|t| t.id).collect();
+            let row_bounds = self.row_bounds.clone();
+            let list_scroll = self.list_scroll.clone();
+            let tasks_container = v_flex()
+                .children(rendered_tasks)
+                .on_children_prepainted(move |children_bounds, _, _| {
+                    let offset = list_scroll.offset();
+                    let mut map = row_bounds.borrow_mut();
+                    for (idx, task_id) in task_ids.iter().enumerate() {
+                        if let Some(bounds) = children_bounds.get(idx) {
+                            map.insert(
+                                *task_id,
+                                gpui::Bounds::new(bounds.origin - offset, bounds.size),
+                            );
+                        }
+                    }
+                });
 
             let empty_drop_slot = (group.tasks.is_empty() && show_when_empty).then(|| {
                 let slot_label = if is_evening_group {
@@ -2675,7 +2794,7 @@ impl ThingsView {
                         }))
                     })
                     .children(header)
-                    .children(rendered_tasks)
+                    .child(tasks_container)
                     .children(empty_drop_slot)
                     .into_any_element(),
             );
@@ -2753,11 +2872,7 @@ impl ThingsView {
             .when_picker
             .as_ref()
             .filter(|(a, _)| *a == PopoverAnchor::BottomBar)
-            .map(|(_, state)| {
-                when_picker::render_when_popover(state, today, strings, cx, |this, act, window, cx| {
-                    this.handle_when_action(act, window, cx);
-                })
-            });
+            .map(|(_, state)| self.render_when_popover_with_error(state, today, strings, true, cx));
 
         let (empty_icon, empty_msg) = self.empty_state_spec(strings);
         let default_target = self.default_drop_target_for_view();
@@ -2876,7 +2991,13 @@ impl ThingsView {
 }
 
 impl Render for ThingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(focus_id) = self.pending_checklist_focus.take()
+            && let Some(card) = &self.expanded
+            && let Some(row) = card.checklist_rows.iter().find(|r| r.id == focus_id)
+        {
+            window.focus(&row.input.focus_handle(cx), cx);
+        }
         let today = Self::today();
         let strings = i18n::t(cx);
         let colors = cx.theme().colors().clone();
@@ -2975,6 +3096,22 @@ impl Render for ThingsView {
                     "up" if !m.control && !m.alt && !m.platform => {
                         this.move_selection(-1, cx);
                         cx.stop_propagation();
+                    }
+                    "j" if !m.control && !m.alt && !m.platform && !m.shift => {
+                        this.move_selection(1, cx);
+                        cx.stop_propagation();
+                    }
+                    "k" if !m.control && !m.alt && !m.platform && !m.shift => {
+                        this.move_selection(-1, cx);
+                        cx.stop_propagation();
+                    }
+                    "delete" | "backspace" if !m.control && !m.alt && !m.platform => {
+                        if this.expanded.is_none()
+                            && let Some(id) = this.selected_id
+                        {
+                            this.delete_task(id, window, cx);
+                            cx.stop_propagation();
+                        }
                     }
                     "enter" if !m.control && !m.alt && !m.platform => {
                         if let Some(id) = this.selected_id.or_else(|| this.visible_order.first().copied()) {

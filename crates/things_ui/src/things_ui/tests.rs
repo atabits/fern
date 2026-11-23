@@ -879,6 +879,7 @@ fn when_focus_checklist_flush_drops_deadline_truncation_and_unicode_tags(
                 start_date: Some(today),
                 due_date: Some(today + Duration::days(2)),
                 end_date: Some(today + Duration::days(4)),
+                timezone: Some("America/New_York".into()),
                 reminders: vec![15],
                 constant_reminder: true,
                 repeat: Some(fern_core::Recurrence::new(fern_core::Frequency::Daily, 1)),
@@ -927,7 +928,8 @@ fn when_focus_checklist_flush_drops_deadline_truncation_and_unicode_tags(
     assert_eq!(after_when.title, "Original title", "When typing must not corrupt task title");
     assert_eq!(after_when.start_date, Some(target_date));
 
-    // Move Deadline past end_date -> end_date clamps; clear Deadline -> clears end_date/reminders/repeat.
+    // Move Deadline past end_date -> end_date clamps; clear Deadline -> clears due/end_date ONLY,
+    // preserving reminders, timezone, constant_reminder, and repeat.
     cx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.select_view(ThingsViewKind::Project(proj.id), window, cx);
@@ -948,7 +950,7 @@ fn when_focus_checklist_flush_drops_deadline_truncation_and_unicode_tags(
     let search_btn = cx.debug_bounds("things-header-search").unwrap();
     assert!(search_btn.right() <= px(760.));
 
-    // Clear Deadline -> clears end_date, reminders, constant_reminder, repeat.
+    // Clear Deadline -> clears due_date & end_date while preserving reminders, timezone, constant_reminder, repeat.
     cx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.open_deadline_picker(PopoverAnchor::Card, DeadlineTarget::Task(task.id), cx);
@@ -958,9 +960,10 @@ fn when_focus_checklist_flush_drops_deadline_truncation_and_unicode_tags(
     let cleared = store.task(task.id).unwrap().unwrap();
     assert_eq!(cleared.due_date, None);
     assert_eq!(cleared.end_date, None);
-    assert!(cleared.reminders.is_empty());
-    assert!(!cleared.constant_reminder);
-    assert_eq!(cleared.repeat, None);
+    assert_eq!(cleared.timezone.as_deref(), Some("America/New_York"));
+    assert_eq!(cleared.reminders, vec![15]);
+    assert!(cleared.constant_reminder);
+    assert!(cleared.repeat.is_some());
 
     // Unicode-aware tag toggle ("работа" removes "Работа").
     cx.update(|_, cx| {
@@ -1335,4 +1338,209 @@ fn when_picker_horizon_chips_gate_on_feature_flag_and_persist_horizon(cx: &mut T
     assert!(cx.debug_bounds("when-horizon-week").is_none());
 
     calendar::set_horizons_enabled(true);
+}
+
+#[gpui::test]
+fn keyboard_jk_scrolls_past_fold_and_delete_works_only_outside_editing(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let today = ThingsView::today();
+    let mut created_ids = Vec::new();
+    for i in 0..24 {
+        let task = store
+            .create_task(
+                TaskDraft {
+                    title: format!("Task {i}"),
+                    start_date: Some(today),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        created_ids.push(task.id);
+    }
+
+    setup_env_with_keymap(cx);
+    let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
+    cx.simulate_resize(size(px(960.), px(360.)));
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        let fh = view.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+    });
+
+    // Navigate down past the fold with `j`.
+    for _ in 0..15 {
+        cx.simulate_keystrokes("j");
+    }
+    cx.run_until_parked();
+
+    let (sel_id, scroll_y) = cx.update(|_, cx| {
+        let v = view.read(cx);
+        (v.selected_task(), v.list_scroll.offset().y)
+    });
+    assert_eq!(sel_id, Some(created_ids[14]));
+    assert!(scroll_y < px(0.), "list_scroll must scroll down when navigating past fold, got {scroll_y:?}");
+
+    let row_sel: &'static str = format!("things-row-{}", created_ids[14]).leak();
+    let row_bounds = cx.debug_bounds(row_sel).unwrap();
+    let list_bounds = cx.debug_bounds("things-main-list").unwrap();
+    assert!(row_bounds.bottom() <= list_bounds.bottom() + px(1.));
+    assert!(row_bounds.top() >= list_bounds.top() - px(1.));
+
+    // Navigate back up with `k` to the top.
+    for _ in 0..14 {
+        cx.simulate_keystrokes("k");
+    }
+    cx.run_until_parked();
+    let (top_sel, top_scroll_y) = cx.update(|_, cx| {
+        let v = view.read(cx);
+        (v.selected_task(), v.list_scroll.offset().y)
+    });
+    assert_eq!(top_sel, Some(created_ids[0]));
+    assert_eq!(top_scroll_y, px(0.));
+
+    // Expanding task and typing `j`/`k`/backspace inside title edits text without navigating or deleting task.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("j k backspace");
+    cx.run_until_parked();
+    assert!(!store.task(created_ids[0]).unwrap().unwrap().is_deleted());
+    assert_eq!(store.task(created_ids[0]).unwrap().unwrap().title, "Task 0j");
+
+    // Even if focus returns to root while card is still expanded (editing), Delete/Backspace must not delete.
+    cx.update(|window, cx| {
+        let fh = view.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+    });
+    cx.simulate_keystrokes("delete");
+    cx.run_until_parked();
+    assert!(!store.task(created_ids[0]).unwrap().unwrap().is_deleted());
+
+    // Collapse card, then press Backspace -> soft-deletes selected task.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let fh = view.read(cx).focus_handle(cx);
+        window.focus(&fh, cx);
+    });
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert!(store.task(created_ids[0]).unwrap().unwrap().is_deleted());
+}
+
+#[gpui::test]
+fn title_notes_invalidate_groups_checklist_enter_focuses_next_and_invalid_when_shows_error(
+    cx: &mut TestAppContext,
+) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let today = ThingsView::today();
+    let task = store
+        .create_task(
+            TaskDraft {
+                title: "Initial".into(),
+                start_date: Some(today),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+    let item1 = store.add_checklist_item(task.id, "First step", None).unwrap();
+
+    setup_env_with_keymap(cx);
+    let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
+    cx.simulate_resize(size(px(960.), px(720.)));
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| v.expand_task(task.id, window, cx));
+    });
+    cx.run_until_parked();
+
+    // Mutate title and notes -> cached_groups invalidates immediately.
+    cx.simulate_input(" edited");
+    cx.update(|window, cx| {
+        let notes = view.read(cx).expanded.as_ref().unwrap().notes.clone();
+        window.focus(&notes.focus_handle(cx), cx);
+    });
+    cx.simulate_input("Body note");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let v = view.read(cx);
+        let groups = v.groups_rc(today, i18n::t(cx));
+        let cached_task = groups
+            .iter()
+            .flat_map(|g| g.tasks.iter())
+            .find(|t| t.id == task.id)
+            .unwrap();
+        assert_eq!(cached_task.title, "Initial edited");
+        assert_eq!(cached_task.notes, "Body note");
+    });
+
+    // Focus existing checklist item and press Enter -> inserts second item after it and focuses it.
+    cx.update(|window, cx| {
+        let first_input = view.read(cx).expanded.as_ref().unwrap().checklist_rows[0]
+            .input
+            .clone();
+        window.focus(&first_input.focus_handle(cx), cx);
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let items = store.checklist(task.id).unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].id, item1.id);
+    cx.update(|window, cx| {
+        let card = view.read(cx).expanded.as_ref().unwrap();
+        assert_eq!(card.checklist_rows.len(), 2);
+        assert!(card.checklist_rows[1].input.focus_handle(cx).is_focused(window));
+    });
+
+    // Toggling checklist item complete marks row.completed = true.
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.handle_card_action(CardAction::ToggleChecklistItem(item1.id, true), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let card = view.read(cx).expanded.as_ref().unwrap();
+        assert!(card.checklist_rows[0].completed);
+    });
+
+    // Invalid When date shows parse-error banner and preserves existing start_date until edited/valid.
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.handle_card_action(CardAction::TogglePopover(CardPopover::When), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let date_input = view.read(cx).when_picker.as_ref().unwrap().1.date_input.clone();
+        date_input.update(cx, |i, cx| i.set_text("", cx));
+    });
+    cx.simulate_input("not-a-date");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(v.when_date_error);
+        assert!(v.when_picker.is_some());
+    });
+    assert!(cx.debug_bounds("things-when-date-error").is_some());
+    assert_eq!(store.task(task.id).unwrap().unwrap().start_date, Some(today));
+
+    // Typing valid date clears error and schedules on Enter.
+    cx.update(|_, cx| {
+        let date_input = view.read(cx).when_picker.as_ref().unwrap().1.date_input.clone();
+        date_input.update(cx, |i, cx| i.set_text("", cx));
+    });
+    let target = today + Duration::days(2);
+    cx.simulate_input(&target.format("%Y-%m-%d").to_string());
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(!view.read(cx).when_date_error));
+    assert!(cx.debug_bounds("things-when-date-error").is_none());
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(store.task(task.id).unwrap().unwrap().start_date, Some(target));
 }

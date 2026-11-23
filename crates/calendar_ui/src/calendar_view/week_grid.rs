@@ -163,6 +163,11 @@ impl CalendarView {
         });
         let gutter = if secondary_tz.is_some() { px(108.) } else { px(56.) };
         let line = theme.colors().border_variant;
+        let buckets = week
+            .first()
+            .copied()
+            .zip(week.last().copied())
+            .map(|(first, last)| self.bucket_range(first, last, today, cx));
 
         // All-day strip: day numbers and tasks without a time.
         let all_day = h_flex()
@@ -183,16 +188,33 @@ impl CalendarView {
             )
             .children(week.iter().copied().map(|date| {
                 let accent = theme.colors().accent;
-                let tasks: Vec<AnyElement> = self
-                    .tasks
+                let day_tasks = buckets
+                    .as_ref()
+                    .and_then(|b| b.tasks.get(&date))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let day_events = buckets
+                    .as_ref()
+                    .and_then(|b| b.events.get(&date))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let day_extras = buckets
+                    .as_ref()
+                    .map(|b| self.day_extras_from_buckets(b, date, today, cx))
+                    .unwrap_or_default();
+                let mut tasks: Vec<AnyElement> = day_tasks
                     .iter()
-                    .filter(|t| self.options.shows_task(t, date) && t.due_time.is_none())
+                    .filter(|t| t.due_time.is_none())
                     .map(|t| self.task_bar_with_resize(t, Some(date), true, cx).into_any_element())
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .chain(self.events_on(date, cx).into_iter().filter(|e| e.start_time.is_none()).map(|e| self.event_bar(e, date, cx).into_any_element()).collect::<Vec<_>>())
-                    .chain(self.day_extras(date, cx))
                     .collect();
+                tasks.extend(
+                    day_events
+                        .iter()
+                        .filter(|e| e.start_time.is_none())
+                        .cloned()
+                        .map(|e| self.event_bar(e, date, cx).into_any_element()),
+                );
+                tasks.extend(day_extras);
                 v_flex()
                     .id(SharedString::from(format!("week-allday-{date}")))
                     .debug_selector(move || format!("week-allday-{date}"))
@@ -345,7 +367,12 @@ impl CalendarView {
             let mut column_items: Vec<TimedColumnItem<'_>> = Vec::new();
             let mut intervals: Vec<TimedInterval> = Vec::new();
 
-            for t in self.tasks.iter().filter(|t| self.options.show_completed || !t.is_completed()) {
+            let day_tasks = buckets
+                .as_ref()
+                .and_then(|b| b.tasks.get(&date))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for &t in day_tasks {
                 let Some((orig_from, orig_to)) = calendar::timed_segment(t, date) else { continue };
                 let preview = self.timed_resize.as_ref().filter(|r| r.id == t.id && r.date == date);
                 let (from, to) = preview.map_or((orig_from, orig_to), TimedResize::snapped_range);
@@ -356,7 +383,12 @@ impl CalendarView {
                 column_items.push(TimedColumnItem::Task { task: t, orig_from, orig_to, top, height });
             }
 
-            for event in self.events_on(date, cx) {
+            let day_events = buckets
+                .as_ref()
+                .and_then(|b| b.events.get(&date))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for event in day_events {
                 let Some(from) = (if event.start == date { event.start_time } else { Some(NaiveTime::MIN) }) else {
                     continue;
                 };
@@ -368,7 +400,7 @@ impl CalendarView {
                 let top = week_axis::offset(from);
                 let height = (week_axis::offset(to) - top).max(18.);
                 intervals.push(TimedInterval { start: top, end: top + height });
-                column_items.push(TimedColumnItem::Event { event, top, height });
+                column_items.push(TimedColumnItem::Event { event: event.clone(), top, height });
             }
 
             let placements = assign_timed_lanes(&intervals);

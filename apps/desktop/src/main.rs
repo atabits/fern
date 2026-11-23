@@ -134,10 +134,6 @@ fn open_store(dir: &Path) -> Result<(Store, bool, PathBuf, desktop_common::diagn
         }
         std::fs::remove_file(&pending).ok();
     }
-    // The sync log keeps one entry per row; without a server it would grow with every edit.
-    if let Err(err) = store.compact_sync_log() {
-        eprintln!("failed to compact the sync log: {err:#}");
-    }
     let db_health = match recovered_health {
         Some(health) => health,
         None => match store.quick_check() {
@@ -359,15 +355,24 @@ fn main() -> Result<()> {
         // the throwaway data of the debug build's screenshots). Run off the UI thread after the
         // main window is open so cold startup stays instant even with a large tasks.db.
         if std::env::var_os("FERN_DEV_STATE").is_none() {
-            let backup_db_path = cx.global::<DbPath>().0.clone();
+            let maint_db_path = cx.global::<DbPath>().0.clone();
             cx.background_spawn(async move {
-                let today = chrono::Local::now().date_naive();
-                let res = backups_dir().and_then(|dir| {
-                    let backup_store = Store::open(&backup_db_path)?;
-                    backup_store.daily_backup(&dir, today, DAILY_BACKUPS)
-                });
-                if let Err(err) = res {
-                    eprintln!("failed to back up the data: {err:#}");
+                match Store::open(&maint_db_path) {
+                    Ok(maint_store) => {
+                        // The sync log keeps one entry per row; without a server it would grow with every edit.
+                        if let Err(err) = maint_store.compact_sync_log() {
+                            eprintln!("failed to compact the sync log: {err:#}");
+                        }
+                        let today = chrono::Local::now().date_naive();
+                        if let Err(err) =
+                            backups_dir().and_then(|dir| maint_store.daily_backup(&dir, today, DAILY_BACKUPS))
+                        {
+                            eprintln!("failed to back up the data: {err:#}");
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("failed to back up the data: {err:#}");
+                    }
                 }
             })
             .detach();

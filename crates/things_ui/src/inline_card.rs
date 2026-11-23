@@ -452,6 +452,9 @@ pub fn render_expanded_card<V: 'static>(
             let toggle_act = on_action.clone();
             let delete_act = on_action.clone();
             h_flex()
+                .when(cfg!(test), |el| {
+                    el.debug_selector(move || format!("things-cl-row-{item_id}"))
+                })
                 .gap_2()
                 .py_0p5()
                 .child(
@@ -462,7 +465,16 @@ pub fn render_expanded_card<V: 'static>(
                             toggle_act(this, CardAction::ToggleChecklistItem(item_id, next_done), window, cx);
                         })),
                 )
-                .child(div().flex_1().min_w_0().text_size(px(13.)).child(row.input.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(13.))
+                        .when(row.completed, |el| {
+                            el.text_color(Color::Muted.color(cx)).line_through()
+                        })
+                        .child(row.input.clone()),
+                )
                 .child(
                     IconButton::new(SharedString::from(format!("things-cl-del-{item_id}")), IconName::X)
                         .size(px(20.))

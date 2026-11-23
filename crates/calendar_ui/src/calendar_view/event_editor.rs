@@ -159,9 +159,13 @@ impl CalendarView {
 
     pub(super) fn save_event_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.event_editor.as_ref() else { return };
+        let strings = i18n::t(cx);
         let title = editor.title.read(cx).text().trim().to_owned();
         if title.is_empty() {
-            window.focus(&editor.title.focus_handle(cx), cx);
+            if let Some(ed) = self.event_editor.as_mut() {
+                ed.error = Some(strings.cal_event_title.to_owned());
+                window.focus(&ed.title.focus_handle(cx), cx);
+            }
             cx.notify();
             return;
         }
@@ -177,7 +181,6 @@ impl CalendarView {
         let end_raw = editor.end_time.read(cx).text().trim().to_owned();
 
         let today = Local::now().date_naive();
-        let strings = i18n::t(cx);
         let Some(date) = NaiveDate::parse_from_str(&date_raw, "%Y-%m-%d")
             .ok()
             .or_else(|| calendar::parse_date(&date_raw, today, strings))
@@ -201,16 +204,25 @@ impl CalendarView {
         let (local_start_time, local_end_time) = if all_day {
             (None, None)
         } else {
-            let st = parse_hhmm(&start_raw);
-            let et = st.map(|from| {
-                parse_hhmm(&end_raw).unwrap_or_else(|| {
-                    let end_dt = date.and_time(from) + chrono::Duration::hours(1);
-                    end_dt.time()
-                })
-            });
-            (st, et)
+            let Some(st) = parse_hhmm(&start_raw) else {
+                if let Some(ed) = self.event_editor.as_mut() {
+                    ed.error = Some(format!("{}: {}", strings.range_start, strings.time_placeholder));
+                    window.focus(&ed.start_time.focus_handle(cx), cx);
+                }
+                cx.notify();
+                return;
+            };
+            let Some(et) = parse_hhmm(&end_raw) else {
+                if let Some(ed) = self.event_editor.as_mut() {
+                    ed.error = Some(format!("{}: {}", strings.range_end, strings.time_placeholder));
+                    window.focus(&ed.end_time.focus_handle(cx), cx);
+                }
+                cx.notify();
+                return;
+            };
+            (Some(st), Some(et))
         };
-        let effective_all_day = all_day || local_start_time.is_none();
+        let effective_all_day = all_day;
         let local_end_date = date + chrono::Duration::days(span_days);
 
         let Some(feeds) = crate::subscriptions::feeds(cx) else {
@@ -331,10 +343,10 @@ impl CalendarView {
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(div().flex_1().child(field(strings.filter_date, editor.date.clone(), 30.)))
+                        .child(div().flex_1().min_w_0().child(field(strings.filter_date, editor.date.clone(), 30.)))
                         .when(!editor.all_day, |el| {
-                            el.child(div().w(px(76.)).child(field(strings.range_start, editor.start_time.clone(), 30.)))
-                                .child(div().w(px(76.)).child(field(strings.range_end, editor.end_time.clone(), 30.)))
+                            el.child(div().w(px(96.)).child(field(strings.range_start, editor.start_time.clone(), 30.)))
+                                .child(div().w(px(96.)).child(field(strings.range_end, editor.end_time.clone(), 30.)))
                         }),
                 )
                 .child(
@@ -347,6 +359,14 @@ impl CalendarView {
                             if let Some(ed) = &mut this.event_editor {
                                 ed.all_day = !ed.all_day;
                                 ed.error = None;
+                                if !ed.all_day {
+                                    if ed.start_time.read(cx).text().trim().is_empty() {
+                                        ed.start_time.update(cx, |inp, cx| inp.set_text("09:00", cx));
+                                    }
+                                    if ed.end_time.read(cx).text().trim().is_empty() {
+                                        ed.end_time.update(cx, |inp, cx| inp.set_text("10:00", cx));
+                                    }
+                                }
                                 cx.notify();
                             }
                         })),

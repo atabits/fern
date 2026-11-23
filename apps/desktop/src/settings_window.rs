@@ -12,7 +12,7 @@ use gpui::{
     point, size,
 };
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, VerticalScrollbar, popover};
+use ui::{Placement, PopoverAttachment, VerticalScrollbar, popover, v_scroll};
 
 use crate::actions::{CloseWindow, DismissSettings};
 use crate::calendar;
@@ -146,6 +146,9 @@ pub struct SettingsWindow {
     recording_shortcut: Option<shortcuts_settings_view::RecordingTarget>,
     recording_rejected: bool,
     confirm_reset_shortcuts: bool,
+    pending_theme_switch: Option<std::sync::Arc<theme::Theme>>,
+    theme_save_error: Option<String>,
+    pending_delete_subscription: Option<(fern_core::Id, String)>,
     plugin_settings: Entity<plugin_ui::PluginSettingsView>,
     _updates: Option<gpui::Subscription>,
     _feeds: Option<gpui::Subscription>,
@@ -331,6 +334,9 @@ impl SettingsWindow {
             recording_shortcut: None,
             recording_rejected: false,
             confirm_reset_shortcuts: false,
+            pending_theme_switch: None,
+            theme_save_error: None,
+            pending_delete_subscription: None,
             plugin_settings,
             _updates: updates,
             _feeds: feeds,
@@ -373,6 +379,9 @@ impl SettingsWindow {
             window.set_window_title(strings.settings);
             this.sync_passphrase.update(cx, |input, cx| {
                 input.set_placeholder(strings.sync_passphrase_placeholder, cx);
+            });
+            this.subscription_name.update(cx, |input, cx| {
+                input.set_placeholder(strings.subscription_name_placeholder, cx);
             });
         })
         .detach();
@@ -443,6 +452,9 @@ impl SettingsWindow {
         self.recording_shortcut = None;
         self.recording_rejected = false;
         self.confirm_reset_shortcuts = false;
+        self.pending_theme_switch = None;
+        self.theme_save_error = None;
+        self.pending_delete_subscription = None;
         if page == Page::About {
             self.refresh_auto_backups(cx);
         }
@@ -477,7 +489,11 @@ impl SettingsWindow {
         if crate::app_view::dismiss_plugin_modal(cx) {
             window.focus(&self.focus_handle, cx);
             cx.notify();
-        } else if self.pending_restore.take().is_some() {
+        } else if self.pending_theme_switch.take().is_some()
+            || self.theme_save_error.take().is_some()
+            || self.pending_delete_subscription.take().is_some()
+            || self.pending_restore.take().is_some()
+        {
             cx.notify();
         } else if self.confirm_reset_shortcuts {
             self.confirm_reset_shortcuts = false;
@@ -1098,9 +1114,21 @@ impl SettingsWindow {
             PopoverAttachment::new(
                 Placement::BelowRight,
                 popover(cx)
+                    .when(cfg!(test), |el| {
+                        el.debug_selector(move || format!("settings-select-popover-{menu:?}"))
+                    })
                     .min_w(px(180.))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_menu(None, cx)))
-                    .children(items),
+                    .child(
+                        v_scroll(
+                            SharedString::from(format!("settings-select-scroll-{menu:?}")),
+                            v_flex()
+                                .id(SharedString::from(format!("settings-select-list-{menu:?}")))
+                                .children(items),
+                        )
+                        .max_h(px(260.))
+                        .compact(),
+                    ),
             )
         });
         let hover_bg = cx.theme().colors().element_hover;
@@ -1843,14 +1871,9 @@ impl SettingsWindow {
                                         .child(Label::new(folder).color(Color::Muted).truncate()),
                                 )
                                 .child(
-                                    div()
-                                        .id("open-data-folder")
-                                        .px_2()
-                                        .py_1()
-                                        .rounded(px(4.))
-                                        .hover(|s| s.bg(colors.element_hover))
-                                        .cursor_pointer()
-                                        .child(Label::new(strings.open_folder).color(Color::Accent))
+                                    Button::new("open-data-folder", strings.open_folder)
+                                        .variant(ButtonVariant::Secondary)
+                                        .size(ButtonSize::Sm)
                                         .on_click(|_, _, cx| {
                                             if let Ok(dir) = crate::data_dir() {
                                                 cx.open_with_system(&dir);
@@ -1943,31 +1966,34 @@ impl SettingsWindow {
                         .child(
                             group().child(
                                 h_flex()
-                                    .h(px(ROW_HEIGHT))
+                                    .min_h(px(ROW_HEIGHT))
+                                    .py_1p5()
                                     .px_4()
-                                    .gap_4()
-                                    .child(div().flex_1().child(Label::new(strings.backup_restore)))
+                                    .gap_x_4()
+                                    .gap_y_1p5()
+                                    .flex_wrap()
+                                    .child(div().flex_1().min_w(px(110.)).child(Label::new(strings.backup_restore)))
                                     .child(
-                                        div()
-                                            .id("generate-backup")
-                                            .px_2()
-                                            .py_1()
-                                            .rounded(px(4.))
-                                            .hover(|s| s.bg(colors.element_hover))
-                                            .cursor_pointer()
-                                            .child(Label::new(strings.generate_backup).color(Color::Accent))
-                                            .on_click(cx.listener(|this, _, _, cx| this.generate_backup(cx))),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("import-backup")
-                                            .px_2()
-                                            .py_1()
-                                            .rounded(px(4.))
-                                            .hover(|s| s.bg(colors.element_hover))
-                                            .cursor_pointer()
-                                            .child(Label::new(strings.import_backups).color(Color::Accent))
-                                            .on_click(cx.listener(|this, _, _, cx| this.import_backup(cx))),
+                                        h_flex()
+                                            .gap_2()
+                                            .flex_none()
+                                            .flex_wrap()
+                                            .child(
+                                                Button::new("generate-backup", strings.generate_backup)
+                                                    .variant(ButtonVariant::Secondary)
+                                                    .size(ButtonSize::Sm)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.generate_backup(cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("import-backup", strings.import_backups)
+                                                    .variant(ButtonVariant::Secondary)
+                                                    .size(ButtonSize::Sm)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.import_backup(cx)
+                                                    })),
+                                            ),
                                     ),
                             ),
                         )
@@ -2055,6 +2081,8 @@ impl Render for SettingsWindow {
             )
             .children(self.render_reset_shortcuts_confirm(cx))
             .children(self.render_restore_backup_confirm(cx))
+            .children(self.render_delete_subscription_confirm(cx))
+            .children(self.render_theme_confirm(cx))
             .child(plugin_ui::render_plugin_overlays(window, cx));
         crate::title_bar::window_frame(root, window, cx)
     }
@@ -2175,7 +2203,8 @@ mod tests {
         cx.update(|window, cx| {
             settings.update(cx, |s, cx| s.open_subscription_form(None, window, cx));
         });
-        let caldav_btn = cx.debug_bounds("subscription-kind-caldav").unwrap().center();
+        let kind_tabs = cx.debug_bounds("subscription-kind-tabs").unwrap();
+        let caldav_btn = point(kind_tabs.left() + kind_tabs.size.width * 0.75, kind_tabs.center().y);
         cx.simulate_click(caldav_btn, gpui::Modifiers::default());
         let fastmail_btn = cx.debug_bounds("caldav-provider-fastmail").unwrap().center();
         cx.simulate_click(fastmail_btn, gpui::Modifiers::default());
@@ -2553,5 +2582,88 @@ mod tests {
         app_cx.update(|cx| {
             assert!(cx.windows().is_empty(), "third Escape must close SettingsWindow");
         });
+    }
+
+    #[gpui::test]
+    fn subscription_delete_confirms_locale_refreshes_placeholder_and_select_scrolls(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+            cx.set_global(CurrentLocale(Locale::En));
+            crate::subscriptions::init(store.clone(), cx);
+        });
+        let (settings, cx) = cx.add_window_view(|window, cx| {
+            let mut settings = SettingsWindow::new(store.clone(), cx);
+            settings.attach_window(window, cx);
+            settings.set_page(Page::Integrations, cx);
+            window.focus(&settings.focus_handle, cx);
+            settings
+        });
+        cx.simulate_resize(gpui::size(px(800.), px(400.)));
+        cx.run_until_parked();
+
+        // Add a subscription directly, then test Trash confirmation + Escape + Confirm.
+        cx.update(|_, cx| {
+            crate::subscriptions::feeds(cx).unwrap().update(cx, |feeds, cx| {
+                feeds.add("Team Calendar", "https://example.com/team.ics", None, cx);
+            });
+        });
+        cx.run_until_parked();
+        let sub_id = store.subscriptions().unwrap()[0].id;
+        let del_sel: &'static str = Box::leak(format!("subscription-delete-{sub_id}").into_boxed_str());
+        let del_btn = cx.debug_bounds(del_sel).unwrap().center();
+        cx.simulate_click(del_btn, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("confirm-delete-subscription").is_some());
+        assert_eq!(store.subscriptions().unwrap().len(), 1);
+
+        // Escape cancels deletion without closing Settings.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("confirm-delete-subscription").is_none());
+        assert_eq!(store.subscriptions().unwrap().len(), 1);
+        cx.update(|_, cx| assert!(!settings.read(cx).is_closing()));
+
+        // Confirming deletes the subscription.
+        let del_btn = cx.debug_bounds(del_sel).unwrap().center();
+        cx.simulate_click(del_btn, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("confirm-delete-subscription").is_some());
+        settings.update(cx, |s, cx| s.confirm_delete_subscription(cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("confirm-delete-subscription").is_none());
+        assert!(store.subscriptions().unwrap().is_empty());
+
+        // Switching locale updates window & subscription_name placeholder cleanly.
+        cx.update(|window, cx| {
+            settings.update(cx, |s, cx| {
+                s.open_subscription_form(None, window, cx);
+                s.set_locale(Locale::Ru, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(i18n::locale(cx), Locale::Ru);
+            settings.update(cx, |s, _| s.subscription_form = None);
+        });
+
+        // 19-row DailyTime select popover caps height in a 400px-tall Settings window.
+        cx.update(|window, cx| {
+            settings.update(cx, |s, cx| {
+                s.update(window, cx, |p| {
+                    p.notifications.daily = chrono::NaiveTime::from_hms_opt(9, 0, 0);
+                });
+                s.set_page(Page::Notifications, cx);
+                s.set_menu(Some(Menu::DailyTime), cx);
+            });
+        });
+        cx.run_until_parked();
+        let row = cx.debug_bounds("settings-row-DailyTime").unwrap();
+        let pop = cx.debug_bounds("settings-select-popover-DailyTime").unwrap();
+        assert!(row.bottom() <= px(400.));
+        assert!(pop.size.height <= px(280.), "popover must stay bounded: {pop:?}");
     }
 }

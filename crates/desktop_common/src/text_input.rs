@@ -99,7 +99,9 @@ pub struct TextInput {
     mode: Mode,
     content: SharedString,
     placeholder: SharedString,
+    text_color: Option<gpui::Hsla>,
     placeholder_color: Option<gpui::Hsla>,
+    caret_color: Option<gpui::Hsla>,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -199,7 +201,9 @@ impl TextInput {
             mode,
             content: "".into(),
             placeholder: placeholder.into(),
+            text_color: None,
             placeholder_color: None,
+            caret_color: None,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -258,6 +262,26 @@ impl TextInput {
     pub fn set_placeholder_color(&mut self, color: gpui::Hsla, cx: &mut Context<Self>) {
         self.placeholder_color = Some(color);
         cx.notify();
+    }
+
+    /// Overrides typed text, placeholder, and caret colors for surfaces whose polarity
+    /// can differ from the active app theme (such as sticky notes).
+    pub fn set_ink_override(
+        &mut self,
+        text: Option<gpui::Hsla>,
+        placeholder: Option<gpui::Hsla>,
+        caret: Option<gpui::Hsla>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.text_color != text
+            || self.placeholder_color != placeholder
+            || self.caret_color != caret
+        {
+            self.text_color = text;
+            self.placeholder_color = placeholder;
+            self.caret_color = caret;
+            cx.notify();
+        }
     }
 
     /// Replaces the text without emitting [`Changed`], for loading data from outside.
@@ -1233,9 +1257,9 @@ fn display_runs(
     let (text, color) = if is_placeholder {
         (input.placeholder.clone(), input.placeholder_color.unwrap_or(placeholder_color))
     } else if input.masked {
-        (masked_text(&input.content), style.color)
+        (masked_text(&input.content), input.text_color.unwrap_or(style.color))
     } else {
-        (input.content.clone(), style.color)
+        (input.content.clone(), input.text_color.unwrap_or(style.color))
     };
     let text_len = text.len();
     let run = TextRun {
@@ -1337,7 +1361,8 @@ impl Element for TextElement {
         }
 
         // The height depends on the width, so it is measured during layout.
-        let (text, runs, _) = display_runs(input, window, placeholder_color, cx.theme().colors().accent);
+        let highlight_color = input.caret_color.unwrap_or(cx.theme().colors().accent);
+        let (text, runs, _) = display_runs(input, window, placeholder_color, highlight_color);
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         let layout_id = window.request_measured_layout(style, move |known, available, window, _| {
             let width = known.width.or(match available.width {
@@ -1367,8 +1392,9 @@ impl Element for TextElement {
         let theme = cx.theme().clone();
         let input = self.input.read(cx);
         let line_height = window.line_height();
+        let highlight_color = input.caret_color.unwrap_or(theme.colors().text_accent);
         let (text, runs, is_placeholder) =
-            display_runs(input, window, theme.colors().text_placeholder, theme.colors().text_accent);
+            display_runs(input, window, theme.colors().text_placeholder, highlight_color);
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         let wrap_width = input.mode.wraps().then_some(text_width(bounds.size.width));
         let lines = shape(text, &runs, font_size, wrap_width, window);
@@ -1435,6 +1461,15 @@ impl Element for TextElement {
         let origin = layout.origin() + point(px(0.), text_y_offset);
 
         let selected_range = input.selected_range.clone();
+        let caret_color = input.caret_color.unwrap_or(theme.colors().accent);
+        let selection_color = input
+            .caret_color
+            .or(input.text_color)
+            .map_or(theme.colors().text_selection, |c| c.opacity(0.22));
+        let highlight_bg = input
+            .caret_color
+            .or(input.text_color)
+            .map_or_else(|| theme.colors().accent.opacity(0.18), |c| c.opacity(0.18));
         let mut selection = Vec::new();
         let mut cursor = None;
         if selected_range.is_empty() {
@@ -1442,7 +1477,7 @@ impl Element for TextElement {
                 let position = layout.position_for_offset(input.display_offset(input.cursor_offset()));
                 cursor = Some(fill(
                     Bounds::new(origin + position, size(CARET_WIDTH, line_height)),
-                    theme.colors().accent,
+                    caret_color,
                 ));
             }
         } else {
@@ -1454,7 +1489,7 @@ impl Element for TextElement {
                         origin + from,
                         origin + point(to_x, from.y + line_height),
                     ),
-                    theme.colors().text_selection,
+                    selection_color,
                 )
             };
             if start.y == end.y {
@@ -1488,7 +1523,7 @@ impl Element for TextElement {
                                 origin + point(start.x - px(3.), start.y + px(1.)),
                                 origin + point(end.x + px(3.), end.y + line_height - px(1.)),
                             ),
-                            theme.colors().accent.opacity(0.18),
+                            highlight_bg,
                         )
                         .corner_radii(px(4.))
                     })

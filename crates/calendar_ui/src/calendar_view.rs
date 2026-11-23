@@ -1,7 +1,7 @@
 //! The calendar: tasks placed on their due dates in a month grid or a week with a time axis,
 //! matched to TickTick's Calendar section.
 
-use std::{collections::{BTreeMap, HashSet}, rc::Rc, time::Duration};
+use std::{collections::{BTreeMap, HashMap, HashSet}, rc::Rc, time::Duration};
 
 use chrono::{Datelike, Local, NaiveDate, NaiveTime};
 use fern_core::{CalendarOptions, ColorBy, Id, Store, Task};
@@ -154,9 +154,55 @@ pub struct CalendarView {
     focus_sessions: Vec<fern_core::FocusSession>,
     timed_resize: Option<TimedResize>,
     event_editor: Option<EventEditor>,
+    pending_delete_event: Option<PendingDeleteEvent>,
     pending_complete: HashSet<Id>,
     active: bool,
     dirty: bool,
+}
+
+struct PendingDeleteEvent {
+    subscription_id: Id,
+    uid: String,
+    title: String,
+    calendar: String,
+}
+
+struct DayBuckets<'a> {
+    tasks: HashMap<NaiveDate, Vec<&'a Task>>,
+    events: HashMap<NaiveDate, Vec<EventBar>>,
+    habits: HashMap<NaiveDate, Vec<(&'a fern_core::Habit, Option<&'a fern_core::Checkin>)>>,
+    focus: HashMap<NaiveDate, Vec<&'a fern_core::FocusSession>>,
+    countdowns: HashMap<NaiveDate, Vec<&'a fern_core::Countdown>>,
+}
+
+fn fast_forward_repeat_anchor(
+    start: NaiveDate,
+    end: NaiveDate,
+    first: NaiveDate,
+    repeat: &fern_core::Recurrence,
+) -> NaiveDate {
+    use fern_core::Frequency;
+    let interval = i64::from(repeat.interval.max(1));
+    let step = if !repeat.is_specific_dates()
+        && !repeat.skip_weekends
+        && !repeat.skip_holidays
+        && !repeat.lunar
+        && !repeat.forgetting_curve
+    {
+        match repeat.frequency {
+            Frequency::Daily => Some(interval),
+            Frequency::Weekly if repeat.weekdays == 0 => Some(7 * interval),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let Some(step) = step else { return start };
+    let elapsed = (first.max(end + chrono::Duration::days(1)) - start)
+        .num_days()
+        .saturating_sub(1)
+        .max(0);
+    start + chrono::Duration::days(elapsed / step * step)
 }
 
 struct ContextMenuState {
@@ -505,6 +551,7 @@ impl CalendarView {
             focus_sessions: Vec::new(),
             timed_resize: None,
             event_editor: None,
+            pending_delete_event: None,
             pending_complete: HashSet::new(),
             active: true,
             dirty: false,
@@ -645,6 +692,8 @@ impl CalendarView {
         };
         let sub_id = event.subscription_id;
         let uid = event.key.clone();
+        let delete_title = event.title.clone();
+        let delete_calendar = event.calendar.clone();
         let edit_snapshot = event.clone();
         popover(cx)
             .w(px(300.))
@@ -706,12 +755,22 @@ impl CalendarView {
                             )
                         })
                         .child(
-                            IconButton::new("calendar-event-delete", IconName::Trash)
-                                .icon_color(Color::Error)
-                                .tip(strings.delete, ui::TipSide::Above)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.delete_caldav_event(sub_id, &uid, cx);
-                                })),
+                            div()
+                                .debug_selector(|| "calendar-event-delete".to_owned())
+                                .child(
+                                    IconButton::new("calendar-event-delete", IconName::Trash)
+                                        .icon_color(Color::Error)
+                                        .tip(strings.delete, ui::TipSide::Above)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.request_delete_caldav_event(
+                                                sub_id,
+                                                uid.clone(),
+                                                delete_title.clone(),
+                                                delete_calendar.clone(),
+                                                cx,
+                                            );
+                                        })),
+                                ),
                         ),
                 )
             })
@@ -829,13 +888,163 @@ impl CalendarView {
             })
     }
 
+    fn bucket_range<'a>(
+        &'a self,
+        first: NaiveDate,
+        last: NaiveDate,
+        today: NaiveDate,
+        cx: &App,
+    ) -> DayBuckets<'a> {
+        let mut tasks: HashMap<NaiveDate, Vec<&'a Task>> = HashMap::new();
+        for task in &self.tasks {
+            if task.is_deleted() || (!self.options.show_completed && task.is_completed()) {
+                continue;
+            }
+            let Some(due) = task.due_date else { continue };
+            let end = task.end_date.unwrap_or(due).max(due);
+            if due <= last && end >= first {
+                for date in calendar_year::dates_between(due.max(first), end.min(last)) {
+                    tasks.entry(date).or_default().push(task);
+                }
+            }
+            if let Some(repeat) = task
+                .repeat
+                .as_ref()
+                .filter(|_| self.options.show_repeats && !task.is_closed() && end < last)
+            {
+                let mut cur = fast_forward_repeat_anchor(due, end, first, repeat);
+                let mut current = repeat.clone();
+                loop {
+                    let next = current.next_after(cur);
+                    if next <= cur || next > last {
+                        break;
+                    }
+                    if next >= first && next > end {
+                        tasks.entry(next).or_default().push(task);
+                    }
+                    cur = next;
+                    current = current.advance();
+                }
+            }
+        }
+
+        let mut events: HashMap<NaiveDate, Vec<EventBar>> = HashMap::new();
+        for event in self.events_between(first, last, cx) {
+            let start = event.start.max(first);
+            let end = event.end.min(last);
+            if start <= end {
+                for date in calendar_year::dates_between(start, end) {
+                    events.entry(date).or_default().push(event.clone());
+                }
+            }
+        }
+
+        let mut habits: HashMap<NaiveDate, Vec<(&'a fern_core::Habit, Option<&'a fern_core::Checkin>)>> =
+            HashMap::new();
+        if self.options.show_habits && first <= today {
+            let week_start = calendar::week_start();
+            let hist_last = last.min(today);
+            for habit in &self.habits {
+                let recs = self.habit_records.get(&habit.id).map(Vec::as_slice).unwrap_or(&[]);
+                if (first..=last).contains(&today)
+                    && !habit.archived
+                    && habit.is_active_on(today, recs, week_start)
+                {
+                    let today_rec = recs.iter().find(|r| r.date == today);
+                    habits.entry(today).or_default().push((habit, today_rec));
+                }
+                let mut seen_dates: HashSet<NaiveDate> = HashSet::new();
+                for rec in recs {
+                    if rec.date >= first
+                        && rec.date < today
+                        && rec.date <= hist_last
+                        && seen_dates.insert(rec.date)
+                        && (rec.is_handled() || rec.is_partial())
+                    {
+                        habits.entry(rec.date).or_default().push((habit, Some(rec)));
+                    }
+                }
+            }
+        }
+
+        let mut focus: HashMap<NaiveDate, Vec<&'a fern_core::FocusSession>> = HashMap::new();
+        if self.options.show_focus {
+            for session in &self.focus_sessions {
+                if let Some(start) = chrono::DateTime::from_timestamp_millis(session.started_at) {
+                    let date = start.with_timezone(&Local).date_naive();
+                    if (first..=last).contains(&date) {
+                        focus.entry(date).or_default().push(session);
+                    }
+                }
+            }
+            for list in focus.values_mut() {
+                list.sort_by_key(|s| s.started_at);
+            }
+        }
+
+        let mut countdowns: HashMap<NaiveDate, Vec<&'a fern_core::Countdown>> = HashMap::new();
+        if self.options.show_countdowns {
+            for countdown in self.countdowns.iter().filter(|c| !c.archived) {
+                if let Some(repeat) = &countdown.repeat {
+                    if (first..=last).contains(&countdown.date) {
+                        countdowns.entry(countdown.date).or_default().push(countdown);
+                    }
+                    let mut date = fast_forward_repeat_anchor(countdown.date, countdown.date, first, repeat);
+                    let mut current = repeat.clone();
+                    loop {
+                        let next = current.next_after(date);
+                        if next <= date || next > last {
+                            break;
+                        }
+                        if next >= first && next > countdown.date {
+                            countdowns.entry(next).or_default().push(countdown);
+                        }
+                        date = next;
+                        current = current.advance();
+                    }
+                } else {
+                    let yearly = countdown.kind != fern_core::CountdownKind::Countdown;
+                    let years = if yearly {
+                        first.year().max(countdown.date.year())..=last.year()
+                    } else {
+                        countdown.date.year()..=countdown.date.year()
+                    };
+                    for year in years {
+                        let Some(date) = countdown
+                            .date
+                            .with_year(year)
+                            .or_else(|| NaiveDate::from_ymd_opt(year, 2, 28))
+                        else {
+                            continue;
+                        };
+                        if (first..=last).contains(&date) {
+                            countdowns.entry(date).or_default().push(countdown);
+                        }
+                    }
+                }
+            }
+        }
+
+        DayBuckets { tasks, events, habits, focus, countdowns }
+    }
+
+    fn day_extras_from_buckets(
+        &self,
+        buckets: &DayBuckets<'_>,
+        date: NaiveDate,
+        today: NaiveDate,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let habits = buckets.habits.get(&date).map(Vec::as_slice).unwrap_or(&[]);
+        let focus = buckets.focus.get(&date).map(Vec::as_slice).unwrap_or(&[]);
+        let countdowns = buckets.countdowns.get(&date).map(Vec::as_slice).unwrap_or(&[]);
+        self.render_day_extras_from(date, today, habits, focus, countdowns, cx)
+    }
+
     fn day_extras(&self, date: NaiveDate, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
         let today = Local::now().date_naive();
         let week_start = calendar::week_start();
-        let bar = |tint: gpui::Hsla| h_flex().h(px(18.)).flex_none().gap_1().px_1().rounded(px(3.)).bg(tint.opacity(0.28));
-        let mut items: Vec<AnyElement> = Vec::new();
+        let mut habits: Vec<(&fern_core::Habit, Option<&fern_core::Checkin>)> = Vec::new();
         if self.options.show_habits && date <= today {
             for habit in &self.habits {
                 let recs = self.habit_records.get(&habit.id).map(Vec::as_slice).unwrap_or(&[]);
@@ -845,60 +1054,84 @@ impl CalendarView {
                 } else {
                     day_rec.is_some_and(|r| r.is_handled() || r.is_partial())
                 };
-                if !show {
-                    continue;
+                if show {
+                    habits.push((habit, day_rec));
                 }
-                let done = day_rec.is_some_and(|r| r.is_done());
-                let tint = match self.options.habit_color {
-                    fern_core::HabitColor::Theme => theme.colors().accent,
-                    fern_core::HabitColor::Fixed => crate::calendar_options_view::palette(self.options.habit_fixed),
-                    fern_core::HabitColor::Habit => {
-                        crate::lists_panel::parse_color(habit.color.as_deref()).unwrap_or(theme.colors().accent)
-                    }
-                };
-                let id = habit.id;
-                let key = (id, date);
-                let open = self.open_habit == Some(key);
-                let time_badge = (date == today)
-                    .then(|| habit.reminders.first().copied())
-                    .flatten()
-                    .map(|t| calendar::format_time(t, strings));
-                items.push(
-                    div()
-                        .relative()
-                        .child(
-                            bar(tint)
-                                .id(SharedString::from(format!("cal-habit-{id}-{date}")))
-                                .cursor_pointer()
-                                .when(done, |el| el.opacity(0.65))
-                                .child(
-                                    Icon::new(if done { IconName::Check } else { IconName::FernHabit })
-                                        .size(IconSize::XSmall)
-                                        .color(if done { Color::Accent } else { Color::Muted }),
-                                )
-                                .child(div().flex_1().min_w_0().child(Label::new(habit.name.clone()).size(LabelSize::XSmall).truncate()))
-                                .when_some(time_badge, |el, t| {
-                                    el.child(Label::new(t).size(LabelSize::XSmall).color(Color::Muted))
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.open_event = None;
-                                    this.open_habit = if this.open_habit == Some(key) { None } else { Some(key) };
-                                    cx.notify();
-                                })),
-                        )
-                        .when(open, |el| {
-                            el.child(PopoverAttachment::new(
-                                Placement::BelowLeft,
-                                self.render_habit_popover(habit, date, cx),
-                            ))
-                        })
-                        .into_any_element(),
-                );
             }
         }
+        let focus = self.options.focus_on(&self.focus_sessions, date);
+        let countdowns: Vec<&fern_core::Countdown> = self
+            .countdowns
+            .iter()
+            .filter(|c| !c.archived && self.options.shows_countdown(c, date))
+            .collect();
+        self.render_day_extras_from(date, today, &habits, &focus, &countdowns, cx)
+    }
+
+    fn render_day_extras_from(
+        &self,
+        date: NaiveDate,
+        today: NaiveDate,
+        habits: &[(&fern_core::Habit, Option<&fern_core::Checkin>)],
+        focus: &[&fern_core::FocusSession],
+        countdowns: &[&fern_core::Countdown],
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let bar = |tint: gpui::Hsla| h_flex().h(px(18.)).flex_none().gap_1().px_1().rounded(px(3.)).bg(tint.opacity(0.28));
+        let mut items: Vec<AnyElement> = Vec::new();
+        for &(habit, day_rec) in habits {
+            let done = day_rec.is_some_and(|r| r.is_done());
+            let tint = match self.options.habit_color {
+                fern_core::HabitColor::Theme => theme.colors().accent,
+                fern_core::HabitColor::Fixed => crate::calendar_options_view::palette(self.options.habit_fixed),
+                fern_core::HabitColor::Habit => {
+                    crate::lists_panel::parse_color(habit.color.as_deref()).unwrap_or(theme.colors().accent)
+                }
+            };
+            let id = habit.id;
+            let key = (id, date);
+            let open = self.open_habit == Some(key);
+            let time_badge = (date == today)
+                .then(|| habit.reminders.first().copied())
+                .flatten()
+                .map(|t| calendar::format_time(t, strings));
+            items.push(
+                div()
+                    .relative()
+                    .child(
+                        bar(tint)
+                            .id(SharedString::from(format!("cal-habit-{id}-{date}")))
+                            .cursor_pointer()
+                            .when(done, |el| el.opacity(0.65))
+                            .child(
+                                Icon::new(if done { IconName::Check } else { IconName::FernHabit })
+                                    .size(IconSize::XSmall)
+                                    .color(if done { Color::Accent } else { Color::Muted }),
+                            )
+                            .child(div().flex_1().min_w_0().child(Label::new(habit.name.clone()).size(LabelSize::XSmall).truncate()))
+                            .when_some(time_badge, |el, t| {
+                                el.child(Label::new(t).size(LabelSize::XSmall).color(Color::Muted))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_event = None;
+                                this.open_habit = if this.open_habit == Some(key) { None } else { Some(key) };
+                                cx.notify();
+                            })),
+                    )
+                    .when(open, |el| {
+                        el.child(PopoverAttachment::new(
+                            Placement::BelowLeft,
+                            self.render_habit_popover(habit, date, cx),
+                        ))
+                    })
+                    .into_any_element(),
+            );
+        }
         // A focus record: an outlined bar with a timer, the task and the time it started.
-        for session in self.options.focus_on(&self.focus_sessions, date) {
+        for session in focus {
             let start = chrono::DateTime::from_timestamp_millis(session.started_at).map(|t| t.with_timezone(&Local).time());
             items.push(
                 h_flex()
@@ -915,7 +1148,7 @@ impl CalendarView {
                     .into_any_element(),
             );
         }
-        for countdown in self.countdowns.iter().filter(|c| !c.archived && self.options.shows_countdown(c, date)) {
+        for countdown in countdowns {
             let tint = match self.options.countdown_color {
                 fern_core::CountdownColor::Fixed => crate::calendar_options_view::palette(self.options.countdown_fixed),
                 fern_core::CountdownColor::Countdown => crate::lists_panel::parse_color(countdown.color.as_deref()).unwrap_or(theme.status().warning),
@@ -1005,7 +1238,7 @@ impl CalendarView {
         if self.timed_resize.take().is_some() {
             cx.notify();
             true
-        } else if self.event_editor.take().is_some() {
+        } else if self.pending_delete_event.take().is_some() || self.event_editor.take().is_some() {
             window.focus(&self.focus_handle, cx);
             cx.notify();
             true
@@ -1600,8 +1833,27 @@ impl CalendarView {
         self.reload(cx);
     }
 
+    pub(super) fn request_delete_caldav_event(
+        &mut self,
+        subscription_id: Id,
+        uid: String,
+        title: String,
+        calendar: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_event = None;
+        self.pending_delete_event = Some(PendingDeleteEvent {
+            subscription_id,
+            uid,
+            title,
+            calendar,
+        });
+        cx.notify();
+    }
+
     fn delete_caldav_event(&mut self, subscription_id: Id, uid: &str, cx: &mut Context<Self>) {
         self.open_event = None;
+        self.pending_delete_event = None;
         if let Some(feeds) = crate::subscriptions::feeds(cx) {
             feeds.update(cx, |feeds, cx| {
                 if let Err(err) = feeds.delete_event(subscription_id, uid, cx) {
@@ -1610,6 +1862,49 @@ impl CalendarView {
             });
         }
         cx.notify();
+    }
+
+    fn render_delete_event_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pending = self.pending_delete_event.as_ref()?;
+        let strings = i18n::t(cx);
+        let title = if pending.title.trim().is_empty() {
+            strings.untitled
+        } else {
+            pending.title.as_str()
+        };
+        let sub_id = pending.subscription_id;
+        let uid = pending.uid.clone();
+        let mut dialog = ConfirmDialog::new(
+            "calendar-delete-event-modal",
+            format!("{} \"{}\"?", strings.delete, title),
+        )
+        .width(px(360.))
+        .cancel_label(strings.cancel)
+        .confirm_label(strings.delete)
+        .destructive(true)
+        .on_cancel(cx.listener(|this, _, window, cx| {
+            this.pending_delete_event = None;
+            window.focus(&this.focus_handle, cx);
+            cx.notify();
+        }))
+        .on_confirm(cx.listener(move |this, _, window, cx| {
+            this.pending_delete_event = None;
+            this.delete_caldav_event(sub_id, &uid, cx);
+            window.focus(&this.focus_handle, cx);
+        }));
+        if !pending.calendar.trim().is_empty() {
+            dialog = dialog.description(pending.calendar.clone());
+        }
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .when(cfg!(test), |el| {
+                    el.debug_selector(|| "calendar-delete-event-modal".to_owned())
+                })
+                .child(dialog)
+                .into_any_element(),
+        )
     }
 
     fn move_event_to_day(&mut self, dragged: &DraggedEvent, target_day: NaiveDate, cx: &mut Context<Self>) {
@@ -2192,12 +2487,18 @@ impl CalendarView {
             .into_any_element()
     }
 
-    fn render_day(&self, date: NaiveDate, today: NaiveDate, slots: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn has_modal(&self) -> bool {
+        self.event_editor.is_some()
+            || self.options_dialog.is_some()
+            || self.pending_delete_event.is_some()
+    }
+
+    fn render_day(&self, date: NaiveDate, today: NaiveDate, slots: usize, buckets: &DayBuckets<'_>, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let tasks = self.tasks_on(date);
-        let extras = self.day_extras(date, cx);
-        let events = self.events_on(date, cx);
+        let tasks = buckets.tasks.get(&date).map(Vec::as_slice).unwrap_or(&[]);
+        let extras = self.day_extras_from_buckets(buckets, date, today, cx);
+        let events = buckets.events.get(&date).map(Vec::as_slice).unwrap_or(&[]);
         let total = tasks.len() + events.len() + extras.len();
         let visible = if total > slots.min(TASKS_PER_DAY) {
             slots.saturating_sub(1).min(TASKS_PER_DAY)
@@ -2285,7 +2586,7 @@ impl CalendarView {
                     // space creates a task, including for non-task items and the more row.
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .children(tasks.iter().take(visible).map(|task| self.task_bar_with_resize(task, Some(date), true, cx)))
-                    .children(events.into_iter().take(event_room).map(|event| self.event_bar(event, date, cx)))
+                    .children(events.iter().take(event_room).cloned().map(|event| self.event_bar(event, date, cx)))
                     .children(extras.into_iter().take(room))
                     .when(hidden > 0 && slots > 0, |el| {
                         el.child(
@@ -2787,6 +3088,10 @@ impl CalendarView {
     fn render_month_grid(&self, today: NaiveDate, has_horizon_banner: bool, window: &Window, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors();
         let shown_weeks = self.month_grid_weeks();
+        let buckets = shown_weeks
+            .first()
+            .zip(shown_weeks.last())
+            .map(|(first_w, last_w)| self.bucket_range(first_w[0], last_w[6], today, cx));
         let banner_height = if has_horizon_banner { HORIZON_BANNER_HEIGHT } else { 0. };
         let grid_height = window.viewport_size().height - crate::title_bar::header_inset()
             - crate::title_bar::frame_vertical_inset(window)
@@ -2814,7 +3119,11 @@ impl CalendarView {
                                 .child(Label::new(format!("W{}", calendar::week_number(&week))).size(LabelSize::XSmall).color(Color::Muted)),
                         )
                     })
-                    .children(week.into_iter().filter(|d| self.options.shows_day(*d)).map(|date| self.render_day(date, today, slots, cx)))
+                    .children(
+                        week.into_iter()
+                            .filter(|d| self.options.shows_day(*d))
+                            .filter_map(|date| buckets.as_ref().map(|b| self.render_day(date, today, slots, b, cx))),
+                    )
             }))
     }
 }
@@ -3129,25 +3438,94 @@ impl Render for CalendarView {
             .track_focus(&self.focus_handle)
             .key_context(match (self.task_editor.is_some(), self.mode) {
                 (true, _) => "CalendarTaskEditor",
+                (_, _) if self.has_modal() => "CalendarModal",
                 (_, _) if self.year_jump.is_some() => "CalendarDateInput",
                 (false, CalendarMode::Year) => "Calendar CalendarYear",
                 _ => "Calendar",
             })
-            .on_action(cx.listener(|this, _: &NewTask, window, cx| this.open_task_editor(window, cx)))
+            .on_action(cx.listener(|this, _: &NewTask, window, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.open_task_editor(window, cx);
+            }))
             // The view menu's keys, as in the original: D/1, W/2, M/3.
-            .on_action(cx.listener(|this, _: &DayView, _, cx| this.set_mode(CalendarMode::Day, cx)))
-            .on_action(cx.listener(|this, _: &WeekView, _, cx| this.set_mode(CalendarMode::Week, cx)))
-            .on_action(cx.listener(|this, _: &MonthView, _, cx| this.set_mode(CalendarMode::Month, cx)))
-            .on_action(cx.listener(|this, _: &AgendaView, _, cx| this.set_mode(CalendarMode::Agenda, cx)))
-            .on_action(cx.listener(|this, _: &YearView, _, cx| this.set_mode(CalendarMode::Year, cx)))
-            .on_action(cx.listener(|this, _: &MultiDayMode, _, cx| this.set_mode(CalendarMode::MultiDay(this.multi_days), cx)))
-            .on_action(cx.listener(|this, _: &PreviousPeriod, _, cx| this.shift(-1, cx)))
-            .on_action(cx.listener(|this, _: &NextPeriod, _, cx| this.shift(1, cx)))
-            .on_action(cx.listener(|this, _: &PreviousYear, _, cx| this.shift_year_using_keys(-1, cx)))
-            .on_action(cx.listener(|this, _: &NextYear, _, cx| this.shift_year_using_keys(1, cx)))
-            .on_action(cx.listener(|this, _: &CalendarToday, _, cx| this.go_to_today(cx)))
-            .on_action(cx.listener(|this, _: &PrintYear, _, cx| this.print_year(cx)))
+            .on_action(cx.listener(|this, _: &DayView, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.set_mode(CalendarMode::Day, cx);
+            }))
+            .on_action(cx.listener(|this, _: &WeekView, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.set_mode(CalendarMode::Week, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MonthView, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.set_mode(CalendarMode::Month, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AgendaView, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.set_mode(CalendarMode::Agenda, cx);
+            }))
+            .on_action(cx.listener(|this, _: &YearView, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.set_mode(CalendarMode::Year, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MultiDayMode, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.set_mode(CalendarMode::MultiDay(this.multi_days), cx);
+            }))
+            .on_action(cx.listener(|this, _: &PreviousPeriod, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.shift(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextPeriod, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.shift(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PreviousYear, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.shift_year_using_keys(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextYear, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.shift_year_using_keys(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CalendarToday, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.go_to_today(cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrintYear, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
+                this.print_year(cx);
+            }))
             .on_action(cx.listener(|this, _: &crate::actions::PrintList, _, cx| {
+                if this.has_modal() {
+                    return;
+                }
                 if this.mode == CalendarMode::Year {
                     this.print_year(cx);
                 }
@@ -3180,6 +3558,7 @@ impl Render for CalendarView {
             .children(self.options_dialog.clone())
             .children(self.render_context_menu(cx))
             .children(self.render_event_editor_modal(cx))
+            .children(self.render_delete_event_dialog(cx))
     }
 }
 

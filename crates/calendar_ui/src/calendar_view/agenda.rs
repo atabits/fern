@@ -249,7 +249,7 @@ impl CalendarView {
                     .py(px(30.))
                     .items_start()
                     .child(div().pt(px(6.)).child(day))
-                    .child(v_flex().flex_1().gap_2().children(entries))
+                    .child(v_flex().flex_1().min_w_0().gap_2().children(entries))
                     .into_any_element(),
             );
         }
@@ -257,15 +257,14 @@ impl CalendarView {
             "agenda-scroll",
             v_flex()
                 .id("agenda")
-                .pl(px(185.))
-                .pr(px(60.))
                 .pb_6()
-                // The original's agenda: 185 px in from the left, up to 1030 px wide, each day 100 px
-                // apart.
                 .child(
                     v_flex()
+                        .w_full()
+                        .max_w(px(760.))
+                        .mx_auto()
+                        .px_6()
                         .pt(px(14.))
-                        .max_w(px(1030.))
                         .when(rows.is_empty(), |el| {
                             el.child(
                                 div()

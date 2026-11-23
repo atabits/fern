@@ -158,6 +158,8 @@ pub struct AppView {
     notices_open: bool,
     active_alerts: Vec<Notice>,
     sync: crate::sync::SyncStatus,
+    sync_task: Option<gpui::Task<()>>,
+    sync_generation: u64,
     /// Cached `store.sync_config().is_some()` so `render` never queries SQLite every frame.
     pub(crate) has_sync_config: bool,
     /// Cached `tray::always_on_top` so `render_account_menu` never queries SQLite every frame.
@@ -466,6 +468,8 @@ impl AppView {
             notices_open: false,
             active_alerts: Vec::new(),
             sync: crate::sync::SyncStatus::Off,
+            sync_task: None,
+            sync_generation: 0,
             has_sync_config,
             always_on_top,
             last_tray_tooltip: "Fern".to_owned(),
@@ -970,8 +974,16 @@ impl AppView {
         // The default list, smart list visibility, mini calendar, week start and horizons flag show up in the views.
         self.sync_external_all(cx);
         self.has_sync_config = self.store.sync_config().ok().flatten().is_some();
-        if !self.has_sync_config && self.sync != crate::sync::SyncStatus::Off {
-            self.set_sync_status(crate::sync::SyncStatus::Off, cx);
+        self.sync_generation = self.sync_generation.wrapping_add(1);
+        if self.has_sync_config {
+            if self.sync_task.is_none() {
+                self.start_sync(cx);
+            }
+        } else {
+            self.sync_task = None;
+            if self.sync != crate::sync::SyncStatus::Off {
+                self.set_sync_status(crate::sync::SyncStatus::Off, cx);
+            }
         }
         if !self.section.enabled(self.features) {
             let fallback = first_enabled_task_section(self.features);
@@ -1387,49 +1399,82 @@ impl AppView {
     /// Syncs on start, whenever there are local changes to send, and every few minutes to fetch
     /// other devices' changes. Screenshots of the debug build do not sync.
     fn start_sync(&mut self, cx: &mut Context<Self>) {
-        if std::env::var_os("FERN_DEV_STATE").is_some() {
+        if std::env::var_os("FERN_DEV_STATE").is_some() || !self.has_sync_config {
+            self.sync_task = None;
             return;
         }
         let db_path = cx.try_global::<crate::DbPath>().map(|p| p.0.clone());
-        cx.spawn(async move |this, cx| {
+        self.sync_task = Some(cx.spawn(async move |this, cx| {
+            let mut bg_store: Option<Store> = None;
             let mut since_pull = std::time::Duration::ZERO;
             let mut first = true;
             loop {
-                let due = if first || since_pull >= crate::sync::PULL_EVERY {
-                    if this.upgrade().is_none() {
-                        break;
-                    }
-                    true
-                } else if let Some(path) = db_path.clone() {
-                    if this.upgrade().is_none() {
-                        break;
-                    }
-                    cx.background_executor()
+                if this.upgrade().is_none() {
+                    break;
+                }
+                enum SyncPoll {
+                    NotConfigured,
+                    Due(bool),
+                }
+                let force_due = first || since_pull >= crate::sync::PULL_EVERY;
+                let poll = if let Some(path) = db_path.clone() {
+                    let taken_store = bg_store.take();
+                    let (returned_store, poll) = cx
+                        .background_executor()
                         .spawn(async move {
-                            Store::open(&path)
-                                .ok()
-                                .and_then(|s| s.has_unsent_changes().ok())
-                                .unwrap_or(false)
+                            let bg = taken_store.or_else(|| Store::open(&path).ok());
+                            let poll = match bg.as_ref() {
+                                Some(s) => match s.sync_config() {
+                                    Ok(None) => SyncPoll::NotConfigured,
+                                    Ok(Some(_)) => {
+                                        let due = force_due || s.has_unsent_changes().unwrap_or(false);
+                                        SyncPoll::Due(due)
+                                    }
+                                    Err(_) => SyncPoll::Due(force_due),
+                                },
+                                None => SyncPoll::Due(force_due),
+                            };
+                            (bg, poll)
                         })
-                        .await
+                        .await;
+                    bg_store = returned_store;
+                    poll
                 } else {
-                    match this.update(cx, |this, _| this.store.has_unsent_changes().unwrap_or(false)) {
-                        Ok(has) => has,
+                    match this.update(cx, |this, _| match this.store.sync_config() {
+                        Ok(None) => SyncPoll::NotConfigured,
+                        Ok(Some(_)) => {
+                            SyncPoll::Due(force_due || this.store.has_unsent_changes().unwrap_or(false))
+                        }
+                        Err(_) => SyncPoll::Due(force_due),
+                    }) {
+                        Ok(poll) => poll,
                         Err(_) => break,
                     }
                 };
-                if due {
-                    since_pull = std::time::Duration::ZERO;
-                    if this.update(cx, |this, cx| this.sync_now(cx)).is_err() {
+                match poll {
+                    SyncPoll::NotConfigured => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.has_sync_config = false;
+                            if this.sync != crate::sync::SyncStatus::Off {
+                                this.set_sync_status(crate::sync::SyncStatus::Off, cx);
+                            }
+                            this.sync_task = None;
+                        });
                         break;
                     }
+                    SyncPoll::Due(true) => {
+                        since_pull = std::time::Duration::ZERO;
+                        if this.update(cx, |this, cx| this.sync_now(cx)).is_err() {
+                            break;
+                        }
+                    }
+                    SyncPoll::Due(false) => {}
                 }
                 first = false;
                 cx.background_executor().timer(crate::sync::PUSH_CHECK_EVERY).await;
                 since_pull += crate::sync::PUSH_CHECK_EVERY;
             }
-        })
-        .detach();
+        }));
     }
 
     /// One sync with the server from Settings → Sync: sends the local changes, applies the others
@@ -1438,6 +1483,79 @@ impl AppView {
         if self.sync == crate::sync::SyncStatus::Running {
             return;
         }
+        if let Some(db_path) = cx.try_global::<crate::DbPath>().map(|p| p.0.clone()) {
+            if !self.has_sync_config {
+                if self.store.sync_config().ok().flatten().is_none() {
+                    if self.sync != crate::sync::SyncStatus::Off {
+                        self.set_sync_status(crate::sync::SyncStatus::Off, cx);
+                    }
+                    return;
+                }
+                self.has_sync_config = true;
+            }
+            enum BgSyncOutcome {
+                Off,
+                Done {
+                    config: fern_core::sync::SyncConfig,
+                    outcome: fern_core::sync::SyncOutcome,
+                },
+            }
+            let started_gen = self.sync_generation;
+            self.set_sync_status(crate::sync::SyncStatus::Running, cx);
+            let bg_sync = cx.background_spawn(async move {
+                let bg_store = Store::open(&db_path)?;
+                let Some(config) = bg_store.sync_config()? else {
+                    return Ok(BgSyncOutcome::Off);
+                };
+                let request = bg_store.sync_request()?;
+                let answer = crate::sync::post(&config, &request.body)?;
+                if bg_store.sync_config().ok().flatten().as_ref() != Some(&config) {
+                    return Ok(BgSyncOutcome::Off);
+                }
+                let outcome = bg_store.finish_sync_detailed(&request, &answer)?;
+                Ok(BgSyncOutcome::Done { config, outcome })
+            });
+            cx.spawn(async move |this, cx| {
+                let result: anyhow::Result<BgSyncOutcome> = bg_sync.await;
+                this.update(cx, |this, cx| {
+                    if this.sync_generation != started_gen {
+                        this.set_sync_status(crate::sync::SyncStatus::Off, cx);
+                        if this.has_sync_config {
+                            this.sync_now(cx);
+                        }
+                        return;
+                    }
+                    if !this.has_sync_config {
+                        this.set_sync_status(crate::sync::SyncStatus::Off, cx);
+                        return;
+                    }
+                    match result {
+                        Ok(BgSyncOutcome::Off) => {
+                            this.has_sync_config = false;
+                            this.sync_task = None;
+                            this.set_sync_status(crate::sync::SyncStatus::Off, cx);
+                        }
+                        Ok(BgSyncOutcome::Done { config, outcome }) => {
+                            if outcome.conflicts_preserved > 0 {
+                                desktop_common::diagnostics::log_event(
+                                    "sync",
+                                    format!("preserved {} offline note conflict(s)", outcome.conflicts_preserved),
+                                );
+                            }
+                            if outcome.applied > 0 {
+                                this.reload_all(cx);
+                            }
+                            this.sync_files(config, cx);
+                        }
+                        Err(err) => this.complete_sync(Err(err), cx),
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+
         let config = match self.store.sync_config() {
             Ok(Some(config)) => config,
             Ok(None) => {
@@ -1599,6 +1717,12 @@ impl AppView {
         self.features = prefs.features;
         self.rail_items = prefs.rail_items;
         self.has_sync_config = self.store.sync_config().ok().flatten().is_some();
+        if !self.has_sync_config {
+            self.sync_task = None;
+            if self.sync != crate::sync::SyncStatus::Off {
+                self.set_sync_status(crate::sync::SyncStatus::Off, cx);
+            }
+        }
         crate::calendar::set_week_start(prefs.week_start);
         crate::calendar::set_hour12(prefs.hour12);
         crate::calendar::set_date_format(prefs.date_format);
@@ -1814,8 +1938,9 @@ impl AppView {
             v_flex()
                 .id("active-reminder-alerts")
                 .debug_selector(|| "active-reminder-alerts".to_owned())
+                .occlude()
                 .absolute()
-                .bottom(px(16.))
+                .top(title_bar::height() + px(12.))
                 .right(px(16.))
                 .w(px(320.))
                 .gap_2()
@@ -1910,27 +2035,23 @@ impl AppView {
                                         NoticeAction::Complete | NoticeAction::CheckIn | NoticeAction::PlusOne
                                     );
                                     div()
-                                        .id(SharedString::from(format!("alert-{i}-{key}")))
                                         .debug_selector(move || format!("alert-{i}-{key}"))
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded(px(4.))
-                                        .when(primary, |btn| {
-                                            btn.bg(theme.colors().accent)
-                                                .hover(|s| s.opacity(0.9))
-                                                .child(Label::new(action.label(strings)).size(LabelSize::Small).color(Color::OnAccent))
-                                        })
-                                        .when(!primary, |btn| {
-                                            btn.border_1()
-                                                .border_color(theme.colors().border)
-                                                .hover(|s| s.bg(theme.colors().element_hover))
-                                                .child(Label::new(action.label(strings)).size(LabelSize::Small))
-                                        })
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.answer_notice(&notice, Reply::Action(action), window, cx);
-                                        }))
+                                        .child(
+                                            Button::new(
+                                                SharedString::from(format!("alert-{i}-{key}")),
+                                                action.label(strings),
+                                            )
+                                            .variant(if primary {
+                                                ButtonVariant::Primary
+                                            } else {
+                                                ButtonVariant::Secondary
+                                            })
+                                            .size(ButtonSize::Sm)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.answer_notice(&notice, Reply::Action(action), window, cx);
+                                            })),
+                                        )
                                 })),
                             )
                         })
@@ -1953,21 +2074,21 @@ impl AppView {
                     .py_1()
                     .items_center()
                     .child(div().flex_1().child(Label::new(strings.notifications).weight(gpui::FontWeight::SEMIBOLD)))
-                    .when(!self.notices.items.is_empty(), |el| {
+                    .when(!self.notices.items.is_empty() || !self.active_alerts.is_empty(), |el| {
                         el.child(
                             div()
-                                .id("notices-clear-all")
-                                .px_1p5()
-                                .py_0p5()
-                                .rounded(px(4.))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme.colors().element_hover))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.notices.items.clear();
-                                    this.notices.unread = 0;
-                                    cx.notify();
-                                }))
-                                .child(Label::new(strings.clear).size(LabelSize::XSmall).color(Color::Muted)),
+                                .debug_selector(|| "notices-clear-all".to_owned())
+                                .child(
+                                    Button::new("notices-clear-all", strings.clear)
+                                        .variant(ButtonVariant::Ghost)
+                                        .size(ButtonSize::Sm)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.notices.items.clear();
+                                            this.notices.unread = 0;
+                                            this.active_alerts.clear();
+                                            cx.notify();
+                                        })),
+                                ),
                         )
                     }),
             )
@@ -1991,40 +2112,55 @@ impl AppView {
                         let actions = notice.actions();
                         let buttons = actions.iter().map(|&action| {
                             let notice = notice.clone();
-                            div()
-                                .id(SharedString::from(format!("notice-{i}-{}", action.key())))
-                                .px_2()
-                                .py_0p5()
-                                .rounded(px(4.))
-                                .border_1().border_color(theme.colors().border)
-                                .hover(|s| s.bg(theme.colors().element_hover))
-                                .cursor_pointer()
-                                .child(Label::new(action.label(strings)).size(LabelSize::Small))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.answer_notice(&notice, Reply::Action(action), window, cx);
-                                }))
+                            let primary = matches!(
+                                action,
+                                NoticeAction::Complete | NoticeAction::CheckIn | NoticeAction::PlusOne
+                            );
+                            Button::new(
+                                SharedString::from(format!("notice-{i}-{}", action.key())),
+                                action.label(strings),
+                            )
+                            .variant(if primary {
+                                ButtonVariant::Primary
+                            } else {
+                                ButtonVariant::Secondary
+                            })
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.answer_notice(&notice, Reply::Action(action), window, cx);
+                            }))
                         });
-                        let item_height = if actions.is_empty() {
-                            44.
-                        } else if actions.len() > 3 {
-                            92.
-                        } else {
-                            72.
-                        };
-                        ListItem::new(SharedString::from(format!("notice-{i}")))
-                            .height(px(item_height))
-                            .start_slot(Icon::new(IconName::AlarmClock).color(Color::Accent))
+                        h_flex()
+                            .id(SharedString::from(format!("notice-{i}")))
+                            .debug_selector(move || format!("notice-{i}"))
+                            .min_h(px(44.))
+                            .w_full()
+                            .items_start()
+                            .gap_2()
+                            .px_2()
+                            .py_1p5()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                            .on_click(cx.listener(move |this, _, window, cx| this.open_notice(target, window, cx)))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .pt(px(2.))
+                                    .child(Icon::new(IconName::AlarmClock).color(Color::Accent)),
+                            )
                             .child(
                                 v_flex()
+                                    .flex_1()
                                     .min_w_0()
-                                    .py_1()
-                                    .gap_0p5()
+                                    .gap_1()
                                     .child(Label::new(notice.title.clone()).truncate())
                                     .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted))
-                                    .child(h_flex().flex_wrap().gap_1().children(buttons)),
+                                    .when(!actions.is_empty(), |el| {
+                                        el.child(h_flex().flex_wrap().gap_1().children(buttons))
+                                    }),
                             )
-                            .on_click(cx.listener(move |this, _, window, cx| this.open_notice(target, window, cx)))
                     })),
                 )
                 .min_h_0()
@@ -2310,3 +2446,101 @@ pub(crate) fn lock_horizons_flag() -> HorizonsFlagGuard {
 
 #[cfg(all(test, debug_assertions))]
 mod tests;
+
+#[cfg(all(test, debug_assertions))]
+mod ux_perf_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn bell_clear_dismisses_active_alerts_and_renders_alerts_top_right(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            let _ = crate::keymap::load_default(&assets::Assets, cx);
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Pay taxes").unwrap();
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        let at = chrono::Local::now().naive_local();
+        let notice = Notice {
+            target: Target::Task(task.id),
+            title: task.title.clone(),
+            at,
+            constant: true,
+            has_goal: false,
+        };
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.add_notices(vec![notice.clone()], cx);
+                app.push_active_alerts(vec![notice], cx);
+                app.set_notices_open(true, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let alerts_bounds = cx.debug_bounds("active-reminder-alerts").unwrap();
+        assert!(
+            alerts_bounds.top() >= title_bar::height(),
+            "alerts banner must anchor below the title bar, got top={:?}",
+            alerts_bounds.top()
+        );
+        assert!(
+            alerts_bounds.bottom() < px(350.),
+            "alerts banner must stay top-right rather than covering bottom-right footers, got bottom={:?}",
+            alerts_bounds.bottom()
+        );
+        let notice_row_bounds = cx.debug_bounds("notice-0").unwrap();
+        assert!(
+            notice_row_bounds.size.height > px(44.),
+            "bell row with wrapped action buttons should size dynamically without fixed clipping: {:?}",
+            notice_row_bounds.size.height
+        );
+
+        let clear_bounds = cx.debug_bounds("notices-clear-all").unwrap();
+        cx.simulate_click(clear_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let view = app.read(cx);
+            assert!(view.notices.items.is_empty());
+            assert_eq!(view.notices.unread, 0);
+            assert!(!view.has_active_alert(Target::Task(task.id)));
+        });
+        assert!(cx.debug_bounds("active-reminder-alerts").is_none());
+    }
+
+    #[gpui::test]
+    fn unconfigured_sync_skips_background_polling_and_leaves_status_off_with_db_path(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = std::env::temp_dir().join(format!("fern-sync-idle-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("tasks.db");
+        let store = Rc::new(Store::open(&db_path).unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(crate::DbPath(db_path.clone()));
+        });
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let view = app.read(cx);
+            assert!(!view.has_sync_config);
+            assert!(view.sync_task.is_none());
+            assert_eq!(view.sync, crate::sync::SyncStatus::Off);
+        });
+
+        // Manual sync_now when unconfigured must stay Off without starting background work.
+        cx.update(|_, cx| app.update(cx, |app, cx| app.sync_now(cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).sync, crate::sync::SyncStatus::Off);
+        });
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

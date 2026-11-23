@@ -763,9 +763,11 @@ fn writable_caldav_event_crud_and_drag_move(cx: &mut TestAppContext) {
 
     cx.update(|cx| {
         theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
         crate::subscriptions::init(store.clone(), cx);
     });
     let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
+    cx.simulate_resize(size(px(1000.), px(700.)));
     cx.run_until_parked();
     let next_day = day + chrono::Duration::days(1);
     cx.update(|_, cx| {
@@ -784,10 +786,42 @@ fn writable_caldav_event_crud_and_drag_move(cx: &mut TestAppContext) {
         assert!(view.read(cx).events_on(day, cx).is_empty());
 
         view.update(cx, |cal, cx| {
-            cal.delete_caldav_event(sub_id, "cal-ev-1", cx);
+            cal.request_delete_caldav_event(
+                sub_id,
+                "cal-ev-1".into(),
+                "Design Sync".into(),
+                "Team".into(),
+                cx,
+            );
         });
     });
     cx.run_until_parked();
+    // Cancelling via backdrop dismiss keeps the remote event intact.
+    let modal_bounds = cx
+        .debug_bounds("calendar-delete-event-modal")
+        .expect("delete event confirmation modal");
+    assert_eq!(view.read_with(cx, |cal, cx| cal.events_on(next_day, cx).len()), 1);
+    cx.simulate_click(point(px(10.), px(10.)), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |cal, cx| cal.events_on(next_day, cx).len()), 1);
+    assert!(cx.debug_bounds("calendar-delete-event-modal").is_none());
+
+    // Confirming the dialog deletes the CalDAV event.
+    view.update(cx, |cal, cx| {
+        cal.request_delete_caldav_event(
+            sub_id,
+            "cal-ev-1".into(),
+            "Design Sync".into(),
+            "Team".into(),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("calendar-delete-event-modal").is_some());
+    let confirm_pos = point(modal_bounds.center().x + px(125.), modal_bounds.center().y + px(34.));
+    cx.simulate_click(confirm_pos, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("calendar-delete-event-modal").is_none());
     cx.update(|_, cx| {
         assert!(view.read(cx).events_on(next_day, cx).is_empty());
     });
@@ -1344,4 +1378,251 @@ fn dragging_horizon_goal_chip_onto_calendar_day_schedules_and_clears_horizon(cx:
     assert_eq!(scheduled_week.due_date, Some(today));
     assert_eq!(scheduled_week.horizon, None);
     assert!(cx.debug_bounds("calendar-week-goals-banner").is_none());
+}
+
+#[gpui::test]
+fn caldav_event_editor_validates_empty_title_and_invalid_times(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let sub_id = store
+        .add_caldav_subscription(
+            "Work",
+            "http://127.0.0.1:9/dav/work/",
+            Some("#3B82F6"),
+            fern_core::ical::CalendarProvider::CalDav,
+            "alice",
+            "pw",
+            true,
+        )
+        .unwrap();
+    cx.update(|cx| {
+        theme::init(cx);
+        crate::subscriptions::init(store.clone(), cx);
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
+    cx.run_until_parked();
+
+    let day = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+    cx.update(|window, cx| {
+        view.update(cx, |cal, cx| {
+            cal.open_new_event_editor(day, window, cx);
+
+            // Empty title must set ed.error and keep editor open.
+            cal.save_event_editor(window, cx);
+            let ed = cal.event_editor.as_ref().expect("editor stays open on empty title");
+            assert!(ed.error.is_some());
+
+            // Invalid start time must set ed.error instead of converting to all-day.
+            ed.title.update(cx, |inp, cx| inp.set_text("Late sync", cx));
+            ed.start_time.update(cx, |inp, cx| inp.set_text("25:99", cx));
+            cal.save_event_editor(window, cx);
+            let ed = cal.event_editor.as_ref().expect("editor stays open on bad start time");
+            assert!(ed.error.is_some());
+
+            // Empty start time when !all_day must also set ed.error.
+            ed.start_time.update(cx, |inp, cx| inp.set_text("", cx));
+            cal.save_event_editor(window, cx);
+            let ed = cal.event_editor.as_ref().expect("editor stays open on empty start time");
+            assert!(ed.error.is_some());
+
+            // Invalid end time must set ed.error instead of silently falling back.
+            ed.start_time.update(cx, |inp, cx| inp.set_text("10:30 PM", cx));
+            ed.end_time.update(cx, |inp, cx| inp.set_text("not-a-time", cx));
+            cal.save_event_editor(window, cx);
+            let ed = cal.event_editor.as_ref().expect("editor stays open on bad end time");
+            assert!(ed.error.is_some());
+            assert!(store.calendar_events(sub_id).unwrap().is_empty());
+
+            // Valid 12h start/end strings save cleanly as a timed event.
+            ed.end_time.update(cx, |inp, cx| inp.set_text("11:15 PM", cx));
+            cal.save_event_editor(window, cx);
+            assert!(cal.event_editor.is_none());
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let bars = view.read(cx).events_on(day, cx);
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].title, "Late sync");
+        assert_eq!(bars[0].start_time, NaiveTime::from_hms_opt(22, 30, 0));
+        assert_eq!(bars[0].end_time, NaiveTime::from_hms_opt(23, 15, 0));
+    });
+}
+
+#[gpui::test]
+fn calendar_modal_blocks_view_and_navigation_shortcuts(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    store
+        .add_caldav_subscription(
+            "Team",
+            "http://127.0.0.1:9/dav/cal/",
+            None,
+            fern_core::ical::CalendarProvider::CalDav,
+            "alice",
+            "pw",
+            true,
+        )
+        .unwrap();
+    cx.update(|cx| {
+        theme::init(cx);
+        crate::subscriptions::init(store.clone(), cx);
+        assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let mut cal = CalendarView::new(store.clone(), window, cx);
+        cal.month = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        cal.anchor = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap();
+        cal.reload(cx);
+        window.focus(&cal.focus_handle, cx);
+        cal
+    });
+    cx.simulate_resize(size(px(1000.), px(700.)));
+    cx.run_until_parked();
+
+    // 1. Options modal blocks view/navigation actions.
+    cx.update(|_, cx| view.update(cx, |cal, cx| cal.open_options(Page::Main, cx)));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(DayView), cx);
+        window.dispatch_action(Box::new(WeekView), cx);
+        window.dispatch_action(Box::new(NextPeriod), cx);
+        window.dispatch_action(Box::new(CalendarToday), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let cal = view.read(cx);
+        assert_eq!(cal.mode, CalendarMode::Month);
+        assert_eq!(cal.month, NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(view.read(cx).options_dialog.is_none()));
+
+    // 2. Event editor modal blocks view/navigation actions even when focus leaves TextInput.
+    cx.update(|window, cx| {
+        view.update(cx, |cal, cx| {
+            cal.open_new_event_editor(NaiveDate::from_ymd_opt(2026, 11, 18).unwrap(), window, cx);
+            window.focus(&cal.focus_handle, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(AgendaView), cx);
+        window.dispatch_action(Box::new(PreviousPeriod), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let cal = view.read(cx);
+        assert_eq!(cal.mode, CalendarMode::Month);
+        assert_eq!(cal.month, NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(view.read(cx).event_editor.is_none()));
+}
+
+#[gpui::test]
+fn calendar_options_subpages_have_working_back_buttons(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    cx.update(theme::init);
+    let (view, cx) = cx.add_window_view(|_, cx| CalendarOptionsDialog::new(store, Page::Color, cx));
+    cx.simulate_resize(size(px(700.), px(600.)));
+    cx.run_until_parked();
+
+    let back_pos = cx
+        .debug_bounds("calendar-options-back")
+        .expect("back button on Color page")
+        .center();
+    cx.simulate_click(back_pos, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("calendar-options-back").is_none());
+
+    let style_pos = cx.debug_bounds("calendar-style").expect("style row on Main page").center();
+    cx.simulate_click(style_pos, Modifiers::default());
+    cx.run_until_parked();
+    let back_pos = cx
+        .debug_bounds("calendar-options-back")
+        .expect("back button on Style page")
+        .center();
+    cx.simulate_click(back_pos, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("calendar-options-back").is_none());
+    let _ = view;
+}
+
+#[gpui::test]
+fn bucket_range_matches_per_day_queries_across_repeats_spans_and_events(cx: &mut TestAppContext) {
+    use fern_core::{Frequency, Recurrence};
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let month = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+    let d = |day| NaiveDate::from_ymd_opt(2026, 11, day).unwrap();
+
+    let single = store.add_task("Single").unwrap();
+    store.set_due(single.id, Some(d(5)), None).unwrap();
+
+    let span = store.add_task("Multi-day").unwrap();
+    store.set_due(span.id, Some(d(10)), None).unwrap();
+    store.set_due_end(span.id, Some((d(12), None))).unwrap();
+
+    let repeat = store.add_task("Every 3 days").unwrap();
+    let rep_start = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+    store.set_due(repeat.id, Some(rep_start), None).unwrap();
+    store
+        .set_repeat(repeat.id, Some(Recurrence::new(Frequency::Daily, 3)), rep_start)
+        .unwrap();
+
+    store
+        .add_subscription_with_feed(
+            "Meetings",
+            "https://example.com/cal.ics",
+            None,
+            concat!(
+                "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:wk-1\nSUMMARY:Standup\n",
+                "DTSTART:20261102T090000\nDTEND:20261102T093000\n",
+                "RRULE:FREQ=WEEKLY;COUNT=4\nEND:VEVENT\nEND:VCALENDAR"
+            ),
+        )
+        .unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        crate::subscriptions::init(store.clone(), cx);
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let mut cal = CalendarView::new(store.clone(), window, cx);
+        cal.month = month;
+        cal.reload(cx);
+        cal
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let cal = view.read(cx);
+        let weeks = cal.month_grid_weeks();
+        let first = weeks[0][0];
+        let last = weeks[weeks.len() - 1][6];
+        let today = d(15);
+        let buckets = cal.bucket_range(first, last, today, cx);
+
+        for week in weeks {
+            for day in week {
+                let expected_tasks: Vec<_> = cal.tasks_on(day).into_iter().map(|t| t.id).collect();
+                let actual_tasks: Vec<_> = buckets
+                    .tasks
+                    .get(&day)
+                    .map(|list| list.iter().map(|t| t.id).collect())
+                    .unwrap_or_default();
+                assert_eq!(actual_tasks, expected_tasks, "tasks mismatch on {day}");
+
+                let expected_events: Vec<_> =
+                    cal.events_on(day, cx).into_iter().map(|e| (e.key, e.start)).collect();
+                let actual_events: Vec<_> = buckets
+                    .events
+                    .get(&day)
+                    .map(|list| list.iter().map(|e| (e.key.clone(), e.start)).collect())
+                    .unwrap_or_default();
+                assert_eq!(actual_events, expected_events, "events mismatch on {day}");
+            }
+        }
+    });
 }

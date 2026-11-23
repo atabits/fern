@@ -11,11 +11,16 @@ impl TaskDetail {
     /// Formats a task's comments section.
     pub(super) fn render_comments(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let sticky = self.sticky_tokens();
         let read_only = self.is_read_only();
         v_flex()
             .pt_3()
             .gap_2()
-            .child(Label::new(format!("{} {}", strings.comments, self.session.comments.len())).size(LabelSize::Small).color(Color::Muted))
+            .child(
+                Label::new(format!("{} {}", strings.comments, self.session.comments.len()))
+                    .size(LabelSize::Small)
+                    .color(sticky.map_or(Color::Muted, |t| Color::Custom(t.muted))),
+            )
             .children(self.session.comments.iter().map(|comment| {
                 let id = comment.id;
                 let when = chrono::DateTime::from_timestamp_millis(comment.created_at)
@@ -30,21 +35,26 @@ impl TaskDetail {
                     .gap_2()
                     .p_2()
                     .rounded(px(6.))
-                    .bg(theme.colors().surface_background)
+                    .bg(sticky.map_or(theme.colors().surface_background, |t| t.surface))
                     .child(
                         v_flex()
                             .flex_1()
                             .min_w_0()
                             .gap_0p5()
-                            .child(Label::new(comment.text.clone()))
-                            .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
+                            .child(Label::new(comment.text.clone()).when_some(sticky, |l, t| l.color(t.ink)))
+                            .child(
+                                Label::new(when)
+                                    .size(LabelSize::XSmall)
+                                    .color(sticky.map_or(Color::Muted, |t| Color::Custom(t.muted))),
+                            ),
                     )
                     .when(!read_only, |el| {
                         el.child(
                             div().when(!crate::touch::active(), |el| el.invisible()).group_hover(group_name, |s| s.visible()).child(
                                 IconButton::new(SharedString::from(format!("comment-delete-{id}")), IconName::X)
                                     .icon_size(IconSize::XSmall)
-                                    .icon_color(Color::Muted)
+                                    .icon_color(sticky.map_or(Color::Muted, |t| Color::Custom(t.muted)))
+                                    .when_some(sticky, |b, t| b.hover_color(t.surface))
                                     .tooltip(Tooltip::text(strings.delete))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if this.is_read_only() {
@@ -66,6 +76,7 @@ impl TaskDetail {
     /// The original's comment field over the bottom bar: "Write a comment" with an emoji button.
     pub(super) fn render_comment_box(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let sticky = self.sticky_tokens();
         let emoji_menu = self.comment_emoji.then(|| {
             let picks: Vec<_> = crate::emoji::search("").into_iter().take(40).map(|e| {
                 div()
@@ -102,7 +113,8 @@ impl TaskDetail {
         });
         let has_comment_text = !self.comment_input.read(cx).text().trim().is_empty();
         div()
-            .px_5()
+            .when(sticky.is_some(), |el| el.px_3())
+            .when(sticky.is_none(), |el| el.px_5())
             .pb_2()
             .child(
                 h_flex()
@@ -112,14 +124,15 @@ impl TaskDetail {
                     .gap_1()
                     .rounded(px(6.))
                     .border_1()
-                    .border_color(theme.colors().accent)
-                    .bg(theme.colors().surface_background)
+                    .border_color(sticky.map_or(theme.colors().accent, |t| t.accent))
+                    .bg(sticky.map_or(theme.colors().surface_background, |t| t.surface))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(div().flex_1().child(self.comment_input.clone()))
                     .child(
                         div().relative().child(
                             IconButton::new("comment-emoji", IconName::Smile)
-                                .icon_color(Color::Muted)
+                                .icon_color(sticky.map_or(Color::Muted, |t| Color::Custom(t.muted)))
+                                .when_some(sticky, |b, t| b.hover_color(t.surface))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.comment_emoji = !this.comment_emoji;
                                     cx.notify();
@@ -130,7 +143,8 @@ impl TaskDetail {
                     .when(has_comment_text, |el| {
                         el.child(
                             IconButton::new("comment-send", IconName::ArrowUp)
-                                .icon_color(Color::Accent)
+                                .icon_color(sticky.map_or(Color::Accent, |t| Color::Custom(t.accent)))
+                                .when_some(sticky, |b, t| b.hover_color(t.surface))
                                 .tooltip(Tooltip::text(i18n::t(cx).add))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     let text = this.comment_input.read(cx).text().trim().to_owned();
@@ -153,8 +167,13 @@ impl TaskDetail {
     /// The attached files under the notes: a click opens one with the system's app.
     pub(super) fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let sticky = self.sticky_tokens();
         let strings = i18n::t(cx);
         let read_only = self.is_read_only();
+        let hover_bg = sticky.map_or(theme.colors().element_hover, |t| t.surface);
+        let row_border = sticky.map_or(theme.colors().border_variant, |t| t.border);
+        let muted_color = sticky.map_or(Color::Muted, |t| Color::Custom(t.muted));
+        let delete_hover_color = sticky.map_or(theme.status().error, |t| t.error);
         v_flex().gap_1().children(self.session.attachments.iter().map(|attachment| {
             let path = match &self.session.draft {
                 Some(draft) => draft.attachments.iter().find(|prepared| prepared.metadata().id == attachment.id).map(|prepared| prepared.path().to_owned()),
@@ -177,18 +196,34 @@ impl TaskDetail {
                 .gap_2()
                 .rounded(px(6.))
                 .border_1()
-                .border_color(theme.colors().border_variant)
+                .border_color(row_border)
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.colors().element_hover))
-                .child(Icon::new(if is_image { IconName::Image } else { IconName::Paperclip }).size(IconSize::Small).color(Color::Muted))
-                .child(div().flex_1().min_w_0().child(Label::new(attachment.name.clone()).size(LabelSize::Small).truncate()))
-                .child(Label::new(format_size(attachment.size)).size(LabelSize::XSmall).color(Color::Muted))
+                .hover(move |s| s.bg(hover_bg))
+                .child(
+                    Icon::new(if is_image { IconName::Image } else { IconName::Paperclip })
+                        .size(IconSize::Small)
+                        .color(muted_color),
+                )
+                .child(
+                    div().flex_1().min_w_0().child(
+                        Label::new(attachment.name.clone())
+                            .size(LabelSize::Small)
+                            .when_some(sticky, |l, t| l.color(t.ink))
+                            .truncate(),
+                    ),
+                )
+                .child(
+                    Label::new(format_size(attachment.size))
+                        .size(LabelSize::XSmall)
+                        .color(muted_color),
+                )
                 .when(!read_only, |el| {
                     el.child(
                         IconButton::new(SharedString::from(format!("attachment-delete-{att_id}")), IconName::X)
                             .size(px(20.))
                             .icon_size(IconSize::XSmall)
-                            .hover_icon_color(theme.status().error)
+                            .when_some(sticky, |b, t| b.icon_color(t.muted).hover_color(t.surface))
+                            .hover_icon_color(delete_hover_color)
                             .tooltip(Tooltip::text(strings.delete))
                             .on_click(
                             cx.listener(move |this, _, _, cx| {

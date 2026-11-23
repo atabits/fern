@@ -187,18 +187,22 @@ impl Theme {
             calendar,
             matrix,
         ) = match preset.gradient {
-            Some(gradient) => (
-                gradient.surface(background, 1.),
-                transparent_black(),
-                white(),
-                white().opacity(if dark { 0.60 } else { 0.70 }),
-                white().opacity(gradient.rail_icons[0]),
-                white().opacity(gradient.rail_icons[1]),
-                gradient.surface(background, gradient.lists),
-                if dark { border_variant } else { transparent_black() },
-                gradient.surface(background, gradient.calendar),
-                gradient.surface(if dark { panel } else { background }, gradient.matrix),
-            ),
+            Some(gradient) => {
+                let rail_stops = gradient.stops.map(|c| Hsla::from(rgb(c)));
+                let rail_ink = foreground_on(&rail_stops, 2.8);
+                (
+                    gradient.surface(background, 1.),
+                    transparent_black(),
+                    rail_ink,
+                    rail_ink.opacity(if dark { 0.60 } else { 0.72 }),
+                    rail_ink.opacity(gradient.rail_icons[0].max(0.55)),
+                    rail_ink.opacity(gradient.rail_icons[1].max(0.55)),
+                    gradient.surface(background, gradient.lists),
+                    if dark { border_variant } else { transparent_black() },
+                    gradient.surface(background, gradient.calendar),
+                    gradient.surface(if dark { panel } else { background }, gradient.matrix),
+                )
+            }
             None => (
                 if dark { panel.into() } else { title_bar.into() },
                 border_variant,
@@ -248,6 +252,14 @@ impl Theme {
         } else {
             accent.opacity(0.12)
         };
+        let list_muted_opacity = if dark {
+            0.58
+        } else if preset.gradient.is_some() {
+            0.68
+        } else {
+            0.58
+        };
+        let on_accent = foreground_on(&[accent], 3.8);
         Self {
             id: preset.id.into(),
             name: preset.id.into(),
@@ -268,8 +280,8 @@ impl Theme {
                 lists_background: lists,
                 lists_border,
                 list_text: list_ink.opacity(if dark { 0.90 } else { 1. }),
-                list_text_muted: list_ink.opacity(0.45),
-                list_count: if !dark && preset.gradient.is_some() { list_ink } else { list_ink.opacity(0.45) },
+                list_text_muted: list_ink.opacity(list_muted_opacity),
+                list_count: if !dark && preset.gradient.is_some() { list_ink } else { list_ink.opacity(list_muted_opacity) },
                 list_hover,
                 list_selected,
                 calendar_background: calendar,
@@ -291,8 +303,8 @@ impl Theme {
                 icon_muted: text_muted,
                 checkbox_border: background.blend(ink.opacity(0.48)),
                 accent,
-                on_accent: foreground_on(&[accent], 3.),
-                icon_on_accent: foreground_on(&[accent], 3.),
+                on_accent,
+                icon_on_accent: on_accent,
                 text_selection: accent.opacity(if dark { 0.34 } else { 0.25 }),
             },
             status: {
@@ -403,24 +415,48 @@ mod tests {
             let theme = Theme::from_preset(preset);
             let colors = theme.colors();
             assert!(contrast(colors.text_accent, colors.background) >= 4.49, "{}", preset.id);
-            assert!(contrast(colors.on_accent, colors.accent) >= 3.0, "{}", preset.id);
+            assert!(contrast(colors.on_accent, colors.accent) >= 3.8, "{}", preset.id);
             assert_eq!(colors.on_accent, colors.icon_on_accent, "{}", preset.id);
             if let Some(gradient) = preset.gradient {
-                assert_eq!(colors.sidebar_icon, white(), "sidebar_icon {}", preset.id);
+                let rail_stops = gradient.stops.map(|c| Hsla::from(rgb(c)));
+                let expected_rail_ink = foreground_on(&rail_stops, 2.8);
+                assert_eq!(colors.sidebar_icon, expected_rail_ink, "sidebar_icon {}", preset.id);
                 assert_eq!(
                     colors.sidebar_icon_hover,
-                    white().opacity(if preset.is_dark() { 0.60 } else { 0.70 }),
+                    expected_rail_ink.opacity(if preset.is_dark() { 0.60 } else { 0.72 }),
                     "sidebar_icon_hover {}",
                     preset.id,
                 );
-                assert_eq!(colors.sidebar_icon_muted, white().opacity(gradient.rail_icons[0]), "{}", preset.id);
-                assert_eq!(colors.sidebar_icon_bottom, white().opacity(gradient.rail_icons[1]), "{}", preset.id);
+                assert_eq!(
+                    colors.sidebar_icon_muted,
+                    expected_rail_ink.opacity(gradient.rail_icons[0].max(0.55)),
+                    "sidebar_icon_muted {}",
+                    preset.id,
+                );
+                assert_eq!(
+                    colors.sidebar_icon_bottom,
+                    expected_rail_ink.opacity(gradient.rail_icons[1].max(0.55)),
+                    "sidebar_icon_bottom {}",
+                    preset.id,
+                );
                 for stop in gradient.stops {
                     let stop: Hsla = rgb(stop).into();
+                    assert!(contrast(colors.sidebar_icon, stop) >= 2.8, "sidebar_icon {}", preset.id);
                     let list_bg = colors.background.blend(stop.opacity(gradient.lists));
                     let list_fg = list_bg.blend(colors.list_text);
+                    let list_muted_fg = list_bg.blend(colors.list_text_muted);
+                    let list_count_fg = list_bg.blend(colors.list_count);
                     assert!(contrast(list_fg, list_bg) >= 4.49, "list_text {}", preset.id);
+                    assert!(contrast(list_muted_fg, list_bg) >= 3.0, "list_text_muted {}", preset.id);
+                    assert!(contrast(list_count_fg, list_bg) >= 3.0, "list_count {}", preset.id);
                 }
+            } else {
+                let list_fg = colors.background.blend(colors.list_text);
+                let list_muted_fg = colors.background.blend(colors.list_text_muted);
+                let list_count_fg = colors.background.blend(colors.list_count);
+                assert!(contrast(list_fg, colors.background) >= 4.49, "list_text {}", preset.id);
+                assert!(contrast(list_muted_fg, colors.background) >= 3.0, "list_text_muted {}", preset.id);
+                assert!(contrast(list_count_fg, colors.background) >= 3.0, "list_count {}", preset.id);
             }
         }
         let light = Theme::light();

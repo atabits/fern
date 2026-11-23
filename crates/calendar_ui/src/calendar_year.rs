@@ -227,7 +227,7 @@ fn holiday_dates_in_range(
     dates
 }
 
-fn dates_between(from: NaiveDate, through: NaiveDate) -> impl Iterator<Item = NaiveDate> {
+pub(super) fn dates_between(from: NaiveDate, through: NaiveDate) -> impl Iterator<Item = NaiveDate> {
     from.iter_days().take_while(move |date| *date <= through)
 }
 
@@ -899,6 +899,9 @@ impl CalendarView {
                     .text_center()
                     .rounded_full()
                     .when(is_today && !is_open, |el| el.text_color(colors.on_accent))
+                    .when(heatmap && !is_open && !is_today && level >= 3, |el| {
+                        el.text_color(theme::foreground_on(&[background], 3.5))
+                    })
                     .when(!heatmap, |el| {
                         el.when(is_today || is_open, |el| el.bg(background))
                             .group_hover(cell_group, move |style| style.bg(hovered))
@@ -1291,5 +1294,40 @@ mod tests {
             align_month_to_columns(may_31, 3),
             NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()
         );
+    }
+
+    #[test]
+    fn year_heatmap_level_3_and_4_foreground_meets_legible_contrast() {
+        fn wcag_contrast(a: gpui::Hsla, b: gpui::Hsla) -> f32 {
+            let lum = |c: gpui::Hsla| {
+                let rgb = c.to_rgb();
+                let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+                0.2126 * lin(rgb.r) + 0.7152 * lin(rgb.g) + 0.0722 * lin(rgb.b)
+            };
+            let (la, lb) = (lum(a), lum(b));
+            (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+        }
+
+        for preset in theme::LIGHT_PRESETS.iter().chain(&theme::DARK_PRESETS) {
+            let t = theme::Theme::from_preset(preset);
+            let colors = t.colors();
+            for level in [3u8, 4u8] {
+                let heat_opacity = if t.is_light() {
+                    [0., 0.16, 0.3, 0.5, 0.7][usize::from(level)]
+                } else {
+                    f32::from(level) * 0.2
+                };
+                let bg = colors.background.blend(colors.accent.opacity(heat_opacity));
+                let fg = theme::foreground_on(&[bg], 3.5);
+                let ratio = wcag_contrast(fg, bg);
+                assert!(
+                    ratio >= 3.5,
+                    "preset {} level {} contrast too low: {:.2}",
+                    preset.id,
+                    level,
+                    ratio
+                );
+            }
+        }
     }
 }

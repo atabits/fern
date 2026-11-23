@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use fern_core::{ThemeMode, ThemeSelection};
-use gpui::{FontWeight, PromptLevel, SharedString, WeakEntity};
+use gpui::{FontWeight, SharedString};
 use theme::{Theme, ThemeRegistry};
 use ui::prelude::*;
 
@@ -39,7 +39,9 @@ fn night_swatches(
 
     h_flex().flex_wrap().gap_2().children(bundled.chain(custom).map(|(theme, name)| {
         let selected = theme.id() == night.id();
-        let pick = pick.clone();
+        let click_pick = pick.clone();
+        let key_pick = pick.clone();
+        let key_theme = theme.clone();
         let id = SharedString::from(format!("night-swatch-{}", theme.id()));
         div()
             .id(id)
@@ -58,31 +60,19 @@ fn night_swatches(
             .focus_visible(|s| s.border_color(colors.text))
             .when(show_tooltips, |el| el.tooltip(Tooltip::text(name)))
             .child(div().size_full().rounded_full().bg(theme.swatch()))
+            .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
+                let key = event.keystroke.key.as_str();
+                let m = &event.keystroke.modifiers;
+                if !m.control && !m.alt && !m.platform && !m.shift && matches!(key, "enter" | "space") {
+                    cx.stop_propagation();
+                    key_pick(key_theme.clone(), window, cx);
+                }
+            })
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
-                pick(theme.clone(), window, cx)
+                click_pick(theme.clone(), window, cx)
             })
     }))
-}
-
-/// GPUI keeps a hoverable tooltip open while the pointer crosses into the palette.
-struct NightPalette(WeakEntity<SettingsWindow>);
-
-impl Render for NightPalette {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(settings) = self.0.upgrade() else { return div() };
-        let active = cx.theme().clone();
-        let remembered_dark = remembered(&settings.read(cx).preferences.theme, true, cx);
-        let night = if active.is_dark() { active } else { remembered_dark };
-        ui::popover(cx).w(px(252.)).child(night_swatches(
-            &night,
-            false,
-            move |theme, window, cx| {
-                settings.update(cx, |settings, cx| settings.pick_theme(theme.clone(), window, cx));
-            },
-            cx,
-        ))
-    }
 }
 
 impl SettingsWindow {
@@ -94,19 +84,8 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) {
         if let Err(error) = self.store.save_theme_selection(&selection) {
-            let strings = i18n::t(cx);
-            let prompt = window.prompt(
-                PromptLevel::Warning,
-                strings.theme_save_failed,
-                Some(&error.to_string()),
-                &[strings.ok],
-                cx,
-            );
-            cx.background_executor()
-                .spawn(async move {
-                    let _ = prompt.await;
-                })
-                .detach();
+            self.theme_save_error = Some(error.to_string());
+            cx.notify();
             return;
         }
         self.preferences.theme = selection;
@@ -128,26 +107,98 @@ impl SettingsWindow {
             && theme.is_dark() != system_dark
             && cx.theme().is_dark() == system_dark
         {
-            let strings = i18n::t(cx);
-            let answers = [strings.theme_once, strings.theme_always, strings.cancel];
-            let response = window.prompt(
-                PromptLevel::Info,
-                strings.switch_theme,
-                Some(strings.theme_override_hint),
-                &answers,
-                cx,
-            );
-            cx.spawn_in(window, async move |this, cx| {
-                let Ok(choice @ (0 | 1)) = response.await else { return };
-                this.update_in(cx, |this, window, cx| {
-                    this.use_theme(theme, choice == 1, window, cx);
-                })
-                .ok();
-            })
-            .detach();
+            self.pending_theme_switch = Some(theme);
+            cx.notify();
         } else {
             self.use_theme(theme, false, window, cx);
         }
+    }
+
+    fn confirm_theme_switch(&mut self, always: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(theme) = self.pending_theme_switch.take() {
+            self.use_theme(theme, always, window, cx);
+        }
+    }
+
+    pub(super) fn render_theme_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.pending_theme_switch.is_some() {
+            let strings = i18n::t(cx);
+            return Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .when(cfg!(test), |el| el.debug_selector(|| "confirm-switch-theme".to_owned()))
+                    .child(
+                        ConfirmDialog::new("confirm-switch-theme", strings.switch_theme)
+                            .width(px(480.))
+                            .description(strings.theme_override_hint)
+                            .cancel_label(strings.cancel)
+                            .secondary_action(
+                                strings.theme_once,
+                                cx.listener(|this, _, window, cx| {
+                                    this.confirm_theme_switch(false, window, cx);
+                                }),
+                            )
+                            .confirm_label(strings.theme_always)
+                            .on_cancel(cx.listener(|this, _, _, cx| {
+                                this.pending_theme_switch = None;
+                                cx.notify();
+                            }))
+                            .on_confirm(cx.listener(|this, _, window, cx| {
+                                this.confirm_theme_switch(true, window, cx);
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if let Some(error) = self.theme_save_error.as_ref() {
+            let strings = i18n::t(cx);
+            let colors = cx.theme().colors();
+            return Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .when(cfg!(test), |el| el.debug_selector(|| "theme-save-error".to_owned()))
+                    .child(
+                        Modal::new("theme-save-error-modal")
+                            .width(px(380.))
+                            .on_dismiss(cx.listener(|this, _, _, cx| {
+                                this.theme_save_error = None;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .text_size(px(16.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(colors.text)
+                                    .child(strings.theme_save_failed),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .text_size(LabelSize::Small.pixels())
+                                    .line_height(px(18.))
+                                    .text_color(colors.text_muted)
+                                    .child(error.clone()),
+                            )
+                            .child(
+                                h_flex().w_full().pt_1().justify_end().child(
+                                    Button::new("theme-save-error-ok", strings.ok)
+                                        .variant(ButtonVariant::Primary)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.theme_save_error = None;
+                                            cx.notify();
+                                        })),
+                                ),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        None
     }
 
     fn use_theme(
@@ -221,39 +272,31 @@ impl SettingsWindow {
         let strings = i18n::t(cx);
         let registry = ThemeRegistry::global(cx);
         let bundled_light = registry.bundled_light().to_vec();
+        let bundled_dark = registry.bundled_dark().to_vec();
         let custom_themes = registry.custom_themes().to_vec();
         let theme_errors: Vec<SharedString> =
             registry.errors().iter().cloned().map(SharedString::from).collect();
         let active = cx.theme().clone();
-        let is_bundled_dark = active.is_dark() && registry.is_bundled_dark_id(active.id());
         let night = if active.is_dark() {
             active.clone()
         } else {
             remembered(&self.preferences.theme, true, cx)
         };
-        let dark_tile_theme = if is_bundled_dark {
-            active.clone()
-        } else if let Some(saved_dark) =
-            self.preferences.theme.dark.as_deref().filter(|id| registry.is_bundled_dark_id(id))
-        {
-            registry.resolve(true, Some(saved_dark))
-        } else {
-            registry.resolve(true, None)
-        };
         let follow = self.preferences.theme.mode == ThemeMode::System;
         let colors = active.colors();
-        let owner = cx.weak_entity();
-        let night_dots = dark_tile_theme.swatch();
+        let night_owner = cx.weak_entity();
 
         let tile = |id: SharedString,
                     theme: Arc<Theme>,
                     label: SharedString,
                     selected: bool,
-                    dark_group_tile: bool,
                     tooltip: Option<SharedString>| {
-            let swatch_bg = if dark_group_tile { gpui::black().into() } else { theme.swatch() };
+            let debug_id = id.clone();
+            let click_theme = theme.clone();
+            let key_theme = theme.clone();
             v_flex()
                 .id(id)
+                .when(cfg!(test), |el| el.debug_selector(move || format!("theme-tile-{debug_id}")))
                 .tab_index(0)
                 .role(gpui::Role::RadioButton)
                 .aria_toggled(selected.into())
@@ -269,10 +312,6 @@ impl SettingsWindow {
                 .cursor_pointer()
                 .hover(|s| s.bg(colors.ghost_element_hover))
                 .focus_visible(|s| s.border_color(colors.accent))
-                .when(dark_group_tile, |el| {
-                    let owner = owner.clone();
-                    el.hoverable_tooltip(move |_, cx| cx.new(|_| NightPalette(owner.clone())).into())
-                })
                 .when_some(tooltip, |el, text| el.tooltip(Tooltip::text(text)))
                 .child(
                     div()
@@ -284,15 +323,7 @@ impl SettingsWindow {
                                 .rounded(px(8.))
                                 .border_1()
                                 .border_color(colors.border)
-                                .bg(swatch_bg)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when(dark_group_tile, |el| {
-                                    el.child(h_flex().gap(px(5.)).children(
-                                        (0..3).map(|_| div().size(px(7.)).rounded_full().bg(night_dots)),
-                                    ))
-                                }),
+                                .bg(theme.swatch()),
                         )
                         .when(selected, |el| {
                             el.child(
@@ -330,12 +361,19 @@ impl SettingsWindow {
                             .color(if selected { Color::Default } else { Color::Muted }),
                     ),
                 )
+                .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                    let key = event.keystroke.key.as_str();
+                    let m = &event.keystroke.modifiers;
+                    if !m.control && !m.alt && !m.platform && !m.shift && matches!(key, "enter" | "space") {
+                        cx.stop_propagation();
+                        this.pick_theme(key_theme.clone(), window, cx);
+                    }
+                }))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.pick_theme(theme.clone(), window, cx)
+                    this.pick_theme(click_theme.clone(), window, cx)
                 }))
         };
 
-        let night_owner = owner.clone();
         let night_picker = move |cx: &App| {
             let night_owner = night_owner.clone();
             night_swatches(
@@ -431,7 +469,7 @@ impl SettingsWindow {
                             None => format!("{} ({badge})", theme.name()),
                         };
                         let label = SharedString::from(theme.name().to_owned());
-                        tile(id, theme, label, selected, false, Some(tooltip.into()))
+                        tile(id, theme, label, selected, Some(tooltip.into()))
                     }))
                     .into_any_element()
             })
@@ -515,27 +553,40 @@ impl SettingsWindow {
                                             .to_owned()
                                             .into()
                                     };
-                                    tile(theme.id_shared(), theme, label, selected, false, None)
+                                    tile(theme.id_shared(), theme, label, selected, None)
                                 },
-                            ))
-                            .child(tile(
-                                "theme-night".into(),
-                                dark_tile_theme,
-                                strings.dark_theme.into(),
-                                is_bundled_dark,
-                                true,
-                                None,
                             )),
                     ),
             )
-            .when(!follow && active.is_dark(), |el| {
-                el.child(
-                    v_flex()
-                        .gap_2()
-                        .child(Label::new(strings.night_theme).weight(FontWeight::SEMIBOLD))
-                        .child(night_picker(cx)),
-                )
-            })
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(Label::new(strings.dark_theme).weight(FontWeight::SEMIBOLD))
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .items_start()
+                            .gap_x_1()
+                            .gap_y_2()
+                            .children(bundled_dark.into_iter().enumerate().map(
+                                |(idx, theme)| {
+                                    let selected = active.id() == theme.id();
+                                    let label: SharedString = if theme.is_custom() {
+                                        theme.name().to_owned().into()
+                                    } else {
+                                        strings
+                                            .dark_theme_names
+                                            .get(idx)
+                                            .copied()
+                                            .unwrap_or_else(|| theme.name())
+                                            .to_owned()
+                                            .into()
+                                    };
+                                    tile(theme.id_shared(), theme, label, selected, None)
+                                },
+                            )),
+                    ),
+            )
             .child(custom_section)
     }
 }
@@ -679,5 +730,87 @@ mod tests {
             apply_theme(&store.preferences().unwrap().theme, window, cx);
         });
         cx.update(|_, cx| assert_eq!(cx.theme().id(), "night"));
+    }
+
+    #[gpui::test]
+    fn switching_dark_preset_in_system_mode_uses_confirm_dialog_and_renders_inline_dark_tiles(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let initial = ThemeSelection {
+            mode: ThemeMode::System,
+            light: Some("matcha".into()),
+            dark: Some("darkcyan".into()),
+        };
+        store.save_theme_selection(&initial).unwrap();
+        let (settings, cx) = cx.add_window_view(|window, cx| {
+            let mut settings = SettingsWindow::new(store.clone(), cx);
+            apply_theme(&settings.preferences.theme, window, cx);
+            settings.set_page(super::super::Page::Appearance, cx);
+            window.focus(&settings.focus_handle, cx);
+            settings
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(780.)));
+        cx.run_until_parked();
+
+        // All 6 dark preset tiles render inline even when active theme is light.
+        for id in ["night", "darkcyan", "darkgreen", "darkyellow", "darkpink", "darkpurple"] {
+            let sel: &'static str = Box::leak(format!("theme-tile-{id}").into_boxed_str());
+            assert!(cx.debug_bounds(sel).is_some(), "missing inline dark tile {sel}");
+        }
+
+        // Clicking a dark tile while Follow System is active opens ConfirmDialog instead of OS prompt.
+        let purple_tile = cx.debug_bounds("theme-tile-darkpurple").unwrap().center();
+        cx.simulate_click(purple_tile, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("confirm-switch-theme").is_some());
+        cx.update(|_, cx| assert_eq!(cx.theme().id(), "matcha"));
+
+        // Escape dismisses the ConfirmDialog without closing SettingsWindow or switching theme.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("confirm-switch-theme").is_none());
+        cx.update(|_, cx| {
+            assert!(!settings.read(cx).is_closing());
+            assert_eq!(cx.theme().id(), "matcha");
+        });
+
+        // Clicking darkpurple again and choosing "Just this time" applies temporary dark theme.
+        let purple_tile = cx.debug_bounds("theme-tile-darkpurple").unwrap().center();
+        cx.simulate_click(purple_tile, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("confirm-switch-theme").is_some());
+        cx.update(|window, cx| {
+            settings.update(cx, |s, cx| s.confirm_theme_switch(false, window, cx));
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("confirm-switch-theme").is_none());
+        assert_eq!(store.preferences().unwrap().theme.mode, ThemeMode::System);
+        assert_eq!(store.preferences().unwrap().theme.dark.as_deref(), Some("darkcyan"));
+        cx.update(|_, cx| assert_eq!(cx.theme().id(), "darkpurple"));
+
+        // Picking matcha returns to Follow System light, then choosing "Keep this theme" on darkgreen
+        // disables Follow System and persists darkgreen.
+        let matcha_tile = cx.debug_bounds("theme-tile-matcha").unwrap().center();
+        cx.simulate_click(matcha_tile, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let green_tile = cx.debug_bounds("theme-tile-darkgreen").unwrap().center();
+        cx.simulate_click(green_tile, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("confirm-switch-theme").is_some());
+        cx.update(|window, cx| {
+            settings.update(cx, |s, cx| s.confirm_theme_switch(true, window, cx));
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("confirm-switch-theme").is_none());
+        let saved = store.preferences().unwrap().theme;
+        assert_eq!(saved.mode, ThemeMode::Dark);
+        assert_eq!(saved.dark.as_deref(), Some("darkgreen"));
+        cx.update(|_, cx| assert_eq!(cx.theme().id(), "darkgreen"));
     }
 }

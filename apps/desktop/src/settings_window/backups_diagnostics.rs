@@ -89,18 +89,20 @@ impl SettingsWindow {
                     )
                     .child(
                         div()
-                            .id(SharedString::from(format!("auto-backup-restore-{idx}")))
+                            .flex_none()
                             .debug_selector(move || format!("auto-backup-restore-{idx}"))
-                            .px_2()
-                            .py_1()
-                            .rounded(px(4.))
-                            .hover(|s| s.bg(colors.element_hover))
-                            .cursor_pointer()
-                            .child(Label::new(strings.restore_action).color(Color::Accent))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.pending_restore = Some(path.clone());
-                                cx.notify();
-                            })),
+                            .child(
+                                Button::new(
+                                    SharedString::from(format!("auto-backup-restore-{idx}")),
+                                    strings.restore_action,
+                                )
+                                .variant(ButtonVariant::Secondary)
+                                .size(ButtonSize::Sm)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pending_restore = Some(path.clone());
+                                    cx.notify();
+                                })),
+                            ),
                     )
             }))
         };

@@ -501,6 +501,11 @@ impl Render for StickyNote {
         let style = self.style();
         let foreground: gpui::Hsla = gpui::rgb(style.foreground()).into();
         let (background, titlebar) = PALETTE[style.color];
+        let hover_control = |el: gpui::Div| {
+            el.when(!crate::touch::active(), |el| {
+                el.opacity(0.).group_hover("sticky-window", |style| style.opacity(1.))
+            })
+        };
         v_flex()
             .id("sticky-window")
             .group("sticky-window")
@@ -509,6 +514,9 @@ impl Render for StickyNote {
             .on_action(cx.listener(|this, _: &desktop_common::actions::CloseWindow, window, cx| {
                 this.forget(cx);
                 window.defer(cx, |window, _| window.remove_window());
+            }))
+            .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
+                this.dismiss_transients(window, cx);
             }))
             .on_action(cx.listener(|this, _: &TogglePin, window, cx| this.toggle_pin(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleColor, window, cx| this.toggle_palette(window, cx)))
@@ -592,41 +600,55 @@ impl Render for StickyNote {
                         h_flex()
                         .debug_selector(|| "sticky-title-controls".into())
                         .flex_none()
-                        .when(!crate::touch::active(), |bar| bar.opacity(0.).group_hover("sticky-window", |style| style.opacity(1.)))
                         .child(
-                        IconButton::new("sticky-color", IconName::PaintRoller)
-                            .size(px(20.)).icon_size(IconSize::Small).icon_color(Color::Custom(foreground))
-                            .hover_color(foreground.opacity(0.12))
-                            .tooltip(popup::tooltip(strings.color))
-                            .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx))),
+                            hover_control(div()).child(
+                                IconButton::new("sticky-color", IconName::PaintRoller)
+                                    .size(px(20.)).icon_size(IconSize::Small).icon_color(Color::Custom(foreground))
+                                    .hover_color(foreground.opacity(0.12))
+                                    .tooltip(popup::tooltip(strings.color))
+                                    .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx))),
+                            ),
                         )
                         .child(
-                            IconButton::new("sticky-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
-                                .size(px(20.))
-                                .icon_size(IconSize::Small)
-                                .icon_color(Color::Custom(foreground))
-                                .hover_color(foreground.opacity(0.12))
-                                .tooltip(popup::tooltip(if self.pinned { strings.unpin } else { strings.pin }))
-                                .on_click(cx.listener(|this, _, window, cx| this.toggle_pin(window, cx))),
+                            div()
+                                .when(self.pinned, |el| {
+                                    el.opacity(0.85).group_hover("sticky-window", |style| style.opacity(1.))
+                                })
+                                .when(!self.pinned && !crate::touch::active(), |el| {
+                                    el.opacity(0.).group_hover("sticky-window", |style| style.opacity(1.))
+                                })
+                                .child(
+                                    IconButton::new("sticky-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
+                                        .size(px(20.))
+                                        .icon_size(IconSize::Small)
+                                        .icon_color(Color::Custom(foreground))
+                                        .hover_color(foreground.opacity(0.12))
+                                        .tooltip(popup::tooltip(if self.pinned { strings.unpin } else { strings.pin }))
+                                        .on_click(cx.listener(|this, _, window, cx| this.toggle_pin(window, cx))),
+                                ),
                         )
                         .child(
-                        IconButton::new("sticky-compact", if self.compact { IconName::ChevronDown } else { IconName::ChevronUp })
-                            .size(px(20.)).icon_size(IconSize::Small).icon_color(Color::Custom(foreground))
-                            .hover_color(foreground.opacity(0.12))
-                            .tooltip(popup::tooltip(if self.compact { strings.habit_expand } else { strings.habit_collapse }))
-                            .on_click(cx.listener(|this, _, window, cx| this.toggle_compact(window, cx))),
+                            hover_control(div()).child(
+                                IconButton::new("sticky-compact", if self.compact { IconName::ChevronDown } else { IconName::ChevronUp })
+                                    .size(px(20.)).icon_size(IconSize::Small).icon_color(Color::Custom(foreground))
+                                    .hover_color(foreground.opacity(0.12))
+                                    .tooltip(popup::tooltip(if self.compact { strings.habit_expand } else { strings.habit_collapse }))
+                                    .on_click(cx.listener(|this, _, window, cx| this.toggle_compact(window, cx))),
+                            ),
                         )
                         .child(
-                        IconButton::new("sticky-close", IconName::X)
-                            .icon_color(Color::Custom(foreground))
-                            .size(px(20.))
-                            .icon_size(IconSize::Small)
-                            .hover_color(foreground.opacity(0.12))
-                            .tooltip(popup::tooltip(strings.close))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.forget(cx);
-                                window.remove_window();
-                            })),
+                            hover_control(div()).child(
+                                IconButton::new("sticky-close", IconName::X)
+                                    .icon_color(Color::Custom(foreground))
+                                    .size(px(20.))
+                                    .icon_size(IconSize::Small)
+                                    .hover_color(foreground.opacity(0.12))
+                                    .tooltip(popup::tooltip(strings.close))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.forget(cx);
+                                        window.remove_window();
+                                    })),
+                            ),
                         ),
                     ),
             )
@@ -668,7 +690,13 @@ impl Render for StickyPalette {
         v_flex()
             .id("sticky-palette")
             .track_focus(&self.focus)
-            .on_action(cx.listener(|_, _: &DismissTransient, window, _| window.remove_window()))
+            .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
+                this.note.update(cx, |note, owner, _| {
+                    note.palette = None;
+                    owner.activate_window();
+                }).ok();
+                window.remove_window();
+            }))
             .size_full()
             .rounded(px(8.))
             .bg(theme.colors().elevated_surface_background)
@@ -680,15 +708,27 @@ impl Render for StickyPalette {
             .children(PALETTE.chunks(6).enumerate().map(|(row, colors)| {
                 h_flex().gap_2().children(colors.iter().enumerate().map(|(column, (color, _))| {
                     let index = row * 6 + column;
+                    let selected = self.selected == index;
+                    let check_color = theme::foreground_on(&[gpui::rgb(*color).into()], 3.);
                     div()
                         .id(("sticky-palette-color", index))
                         .debug_selector(move || format!("sticky-palette-color-{index}"))
                         .size(px(36.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .rounded(px(5.))
                         .bg(gpui::rgb(*color))
                         .border_2()
-                        .border_color(if self.selected == index { theme.colors().accent } else { theme.colors().border })
-                        .when(self.selected != index, |el| el.hover(|s| s.border_color(theme.colors().text_muted)))
+                        .border_color(if selected { theme.colors().accent } else { theme.colors().border })
+                        .when(!selected, |el| el.hover(|s| s.border_color(theme.colors().text_muted)))
+                        .when(selected, |el| {
+                            el.child(
+                                div()
+                                    .debug_selector(|| "sticky-palette-check".into())
+                                    .child(Icon::new(IconName::Check).size(IconSize::Medium).color(check_color)),
+                            )
+                        })
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.note.update(cx, |note, window, cx| {
@@ -1388,5 +1428,68 @@ mod tests {
         assert!(!saved[0].open);
         assert_eq!(saved[0].width, 400.);
         note.read_with(cx, |n, _| assert!(n.save_bounds_task.is_none()));
+    }
+
+    #[gpui::test]
+    #[cfg(debug_assertions)]
+    fn pinned_note_palette_check_and_escape_dismiss_transients(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Sticky UX").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (note, cx) = cx.add_window_view(|window, cx| new_note(store.clone(), task.id, window, cx));
+        cx.simulate_resize(size(px(260.), px(240.)));
+
+        // Pinning keeps sticky-pin state active and visible.
+        cx.update(|window, cx| note.update(cx, |n, cx| n.toggle_pin(window, cx)));
+        cx.update(|_, cx| assert!(note.read(cx).pinned));
+
+        // StickyPalette shows check mark on the selected swatch and closes on Escape from note or palette.
+        let palette = cx.update(|window, cx| {
+            note.update(cx, |n, cx| {
+                n.color = Some(10);
+                n.toggle_palette(window, cx);
+                n.palette.unwrap()
+            })
+        });
+        let mut palette_cx = gpui::VisualTestContext::from_window(palette.into(), cx);
+        let check_bounds = palette_cx.debug_bounds("sticky-palette-check").expect("selected swatch renders check icon");
+        let selected_bounds = palette_cx.debug_bounds("sticky-palette-color-10").unwrap();
+        assert!(selected_bounds.contains(&check_bounds.center()));
+
+        // Escape dispatched on StickyNote (either at root focus or propagated from TaskDetail)
+        // dismisses an open palette cleanly.
+        cx.update(|window, cx| {
+            let focus = note.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(note.read(cx).palette.is_none()));
+
+        let title = cx.debug_bounds("task-detail-title").unwrap().center();
+        cx.simulate_click(title, Modifiers::default());
+        cx.update(|window, cx| {
+            note.update(cx, |n, cx| n.toggle_palette(window, cx));
+            assert!(note.read(cx).palette.is_some());
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(note.read(cx).palette.is_none()));
+
+        // Reopening palette and pressing Escape inside the palette also clears note.palette.
+        let palette = cx.update(|window, cx| {
+            note.update(cx, |n, cx| {
+                n.toggle_palette(window, cx);
+                n.palette.unwrap()
+            })
+        });
+        let mut palette_cx = gpui::VisualTestContext::from_window(palette.into(), cx);
+        palette_cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(note.read(cx).palette.is_none()));
     }
 }

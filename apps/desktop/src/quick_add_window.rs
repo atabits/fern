@@ -2,15 +2,15 @@
 //! without bringing the app forward, with live date recognition, quick date chips, priority,
 //! and list selection. Enter adds the task, Escape or a click elsewhere closes it.
 
-use chrono::{Datelike, Duration, Local, NaiveDate, NaiveTime, Timelike as _};
+use chrono::{Duration, Local, NaiveDate, NaiveTime, Timelike as _};
 use fern_core::{Id, List, Preferences, Priority};
 use gpui::{
-    AnyWindowHandle, Bounds, Entity, Focusable as _, Global, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions, point, size,
+    AnyWindowHandle, Bounds, Entity, FocusHandle, Focusable as _, Global, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions, point, size,
 };
 use ui::prelude::*;
 
-use crate::actions::CloseWindow;
+use crate::actions::{CloseWindow, DismissTransient};
 use crate::app_view::AppView;
 use crate::i18n;
 use crate::lists_panel;
@@ -18,7 +18,7 @@ use crate::task_rows;
 use crate::text_input::{Cancelled, Changed, Mode, MultiLinePasted, Submitted, TextInput};
 
 const WIDTH: f32 = 560.;
-const HEIGHT: f32 = 96.;
+const HEIGHT: f32 = 112.;
 
 /// The open Quick Add window, which the shortcut brings back rather than opening another.
 struct OpenQuickAdd(AnyWindowHandle);
@@ -55,10 +55,12 @@ pub fn open(main: WindowHandle<AppView>, cx: &mut App) {
 
 pub struct QuickAddWindow {
     main: WindowHandle<AppView>,
+    focus: FocusHandle,
     input: Entity<TextInput>,
     lists: Vec<List>,
     preferences: Preferences,
     picked_date: Option<NaiveDate>,
+    date_picked_by_user: bool,
     parsed_due: Option<(NaiveDate, Option<NaiveTime>)>,
     parsed_horizon: Option<fern_core::Horizon>,
     parsed_repeat: bool,
@@ -71,12 +73,28 @@ pub struct QuickAddWindow {
     list_id: Option<Id>,
 }
 
+impl gpui::Focusable for QuickAddWindow {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 impl QuickAddWindow {
     fn new(main: WindowHandle<AppView>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         desktop_common::sticky_windows::set_topmost(window, true);
+        let focus = cx.focus_handle();
         let (lists, preferences) = main
             .read_with(cx, |view, _| view.quick_add_context())
             .unwrap_or_default();
+        let today = Local::now().date_naive();
+        let picked_date = preferences
+            .task_defaults
+            .date
+            .map(|d| d.date_with_week_start(today, preferences.week_start));
+        let priority = preferences.task_defaults.priority;
+        let list_id = preferences
+            .default_list
+            .filter(|id| lists.iter().any(|l| l.id == *id));
         let strings = i18n::t(cx);
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx).intercept_multiline_paste());
         cx.subscribe_in(&input, window, |this, _, Submitted(_), window, cx| {
@@ -84,7 +102,11 @@ impl QuickAddWindow {
         })
         .detach();
         cx.subscribe(&input, |this, _, MultiLinePasted(lines), cx| {
-            this.batch_lines = lines.clone();
+            this.batch_lines = lines
+                .iter()
+                .map(|l| l.trim().to_owned())
+                .filter(|l| !l.is_empty())
+                .collect();
             cx.notify();
         })
         .detach();
@@ -107,10 +129,12 @@ impl QuickAddWindow {
         window.focus(&input.focus_handle(cx), cx);
         Self {
             main,
+            focus,
             input,
             lists,
             preferences,
-            picked_date: None,
+            picked_date,
+            date_picked_by_user: false,
             parsed_due: None,
             parsed_horizon: None,
             parsed_repeat: false,
@@ -118,9 +142,13 @@ impl QuickAddWindow {
             parsed_priority: None,
             parsed_list: None,
             batch_lines: Vec::new(),
-            priority: Priority::None,
-            list_id: None,
+            priority,
+            list_id,
         }
+    }
+
+    fn focus_input(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.input.focus_handle(cx), cx);
     }
 
     fn update_parsed_due(&mut self, cx: &mut Context<Self>) {
@@ -149,11 +177,19 @@ impl QuickAddWindow {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let date = self.picked_date;
+        let date = if !self.date_picked_by_user && self.parsed_horizon.is_some() {
+            None
+        } else {
+            self.picked_date
+        };
         let priority = (self.priority != Priority::None).then_some(self.priority);
-        let list = self.list_id.map(Some);
+        let list = Some(self.list_id);
         let lines: Vec<String> = if !self.batch_lines.is_empty() {
             std::mem::take(&mut self.batch_lines)
+                .into_iter()
+                .map(|l| l.trim().to_owned())
+                .filter(|l| !l.is_empty())
+                .collect()
         } else {
             let text = self.input.read(cx).text().trim().to_owned();
             if text.is_empty() {
@@ -163,7 +199,7 @@ impl QuickAddWindow {
             }
         };
         if lines.is_empty() {
-            close(window, cx);
+            self.focus_input(window, cx);
             return;
         }
         if let Some(mgr) = active_hook_manager(cx) {
@@ -185,6 +221,7 @@ impl QuickAddWindow {
     }
 
     fn toggle_date(&mut self, target: NaiveDate, cx: &mut Context<Self>) {
+        self.date_picked_by_user = true;
         self.picked_date = if self.picked_date == Some(target) { None } else { Some(target) };
         cx.notify();
     }
@@ -202,6 +239,7 @@ impl QuickAddWindow {
     fn cycle_list(&mut self, cx: &mut Context<Self>) {
         if self.lists.is_empty() {
             self.list_id = None;
+            cx.notify();
             return;
         }
         self.list_id = match self.list_id {
@@ -230,7 +268,7 @@ impl Render for QuickAddWindow {
         let strings = i18n::t(cx);
         let today = Local::now().date_naive();
         let tomorrow = today + Duration::days(1);
-        let next_week = today + Duration::days(7 - today.weekday().num_days_from_monday() as i64);
+        let next_week = fern_core::next_week_date(today, self.preferences.week_start);
         let batch_count = self.batch_lines.len();
         let has_text = batch_count > 0 || !self.input.read(cx).text().trim().is_empty();
         let add_label: SharedString = if batch_count > 0 {
@@ -238,12 +276,18 @@ impl Render for QuickAddWindow {
         } else {
             strings.add.into()
         };
-        let shown_due = self.parsed_due.or_else(|| self.picked_date.map(|d| (d, None)));
+        let chip_due = (self.date_picked_by_user || self.parsed_horizon.is_none())
+            .then_some(self.picked_date)
+            .flatten();
+        let shown_due = self.parsed_due.or_else(|| chip_due.map(|d| (d, None)));
+        let shown_horizon = shown_due.is_none().then_some(self.parsed_horizon).flatten();
+        let show_repeat_only = shown_due.is_none() && shown_horizon.is_none() && self.parsed_repeat;
 
         let date_chip = |id: &'static str, label: &'static str, date: NaiveDate, cx: &mut Context<Self>| {
-            let active = self.picked_date == Some(date);
+            let active = chip_due == Some(date);
             h_flex()
                 .id(id)
+                .debug_selector(move || id.to_owned())
                 .h(px(24.))
                 .px_2()
                 .rounded(px(5.))
@@ -252,7 +296,10 @@ impl Render for QuickAddWindow {
                 .hover(|s| s.bg(theme.colors().ghost_element_hover))
                 .tooltip(Tooltip::text(desktop_common::calendar::format_date(date, strings)))
                 .child(Label::new(label).size(LabelSize::XSmall).color(if active { Color::Accent } else { Color::Muted }))
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_date(date, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.toggle_date(date, cx);
+                    this.focus_input(window, cx);
+                }))
         };
 
         let effective_list = self.parsed_list.or(self.list_id);
@@ -280,23 +327,46 @@ impl Render for QuickAddWindow {
 
         v_flex()
             .size_full()
+            .track_focus(&self.focus)
             .on_action(|_: &CloseWindow, window, cx| {
+                window.defer(cx, close);
+            })
+            .on_action(|_: &DismissTransient, window, cx| {
                 window.defer(cx, close);
             })
             .px_4()
             .py_2()
-            .justify_between()
+            .gap_1()
             .bg(theme.colors().elevated_surface_background)
             .border_1()
             .border_color(theme.colors().border)
             .text_color(theme.colors().text)
             .child(
                 h_flex()
-                    .h(px(42.))
+                    .flex_none()
+                    .h(px(34.))
                     .gap_3()
                     .text_size(px(16.))
                     .child(Icon::new(IconName::Plus).color(Color::Accent))
-                    .child(div().flex_1().min_w_0().overflow_hidden().child(self.input.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .debug_selector(|| "qa-input".to_owned())
+                            .child(self.input.clone()),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(px(22.))
+                    .w_full()
+                    .pl(px(28.))
+                    .gap_1p5()
+                    .items_center()
+                    .overflow_hidden()
+                    .debug_selector(|| "qa-badges".to_owned())
                     .when_some(shown_due, |el, (date, time)| {
                         let (label, _) = task_rows::due_label(date, time, today, strings);
                         el.child(
@@ -314,7 +384,7 @@ impl Render for QuickAddWindow {
                                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Accent)),
                         )
                     })
-                    .when_some(shown_due.is_none().then_some(self.parsed_horizon).flatten(), |el, horizon| {
+                    .when_some(shown_horizon, |el, horizon| {
                         let label = crate::calendar::format_horizon_badge(horizon, strings);
                         el.child(
                             h_flex()
@@ -334,16 +404,23 @@ impl Render for QuickAddWindow {
                     .children(self.parsed_tags.iter().take(3).map(|tag| {
                         h_flex()
                             .flex_none()
+                            .max_w(px(130.))
                             .px_1p5()
                             .h(px(22.))
                             .rounded(px(5.))
                             .bg(theme.colors().element_hover)
-                            .child(Label::new(format!("#{tag}")).size(LabelSize::XSmall).color(Color::Muted))
+                            .child(
+                                Label::new(format!("#{tag}"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
                     }))
                     .when(batch_count > 0, |el| {
                         el.child(
                             h_flex()
                                 .id("qa-batch-pill")
+                                .flex_none()
                                 .h(px(22.))
                                 .px_1p5()
                                 .gap_1()
@@ -360,16 +437,18 @@ impl Render for QuickAddWindow {
                                         .icon_size(IconSize::XSmall)
                                         .icon_color(Color::Accent)
                                         .tooltip(Tooltip::text(strings.clear))
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             this.batch_lines.clear();
+                                            this.focus_input(window, cx);
                                             cx.notify();
                                         })),
                                 ),
                         )
                     })
-                    .when(shown_due.is_none() && self.parsed_horizon.is_none() && self.parsed_repeat, |el| {
+                    .when(show_repeat_only, |el| {
                         el.child(
                             h_flex()
+                                .flex_none()
                                 .h(px(22.))
                                 .px_1p5()
                                 .rounded(px(4.))
@@ -380,6 +459,7 @@ impl Render for QuickAddWindow {
             )
             .child(
                 h_flex()
+                    .flex_none()
                     .h(px(30.))
                     .gap_1p5()
                     .items_center()
@@ -387,16 +467,24 @@ impl Render for QuickAddWindow {
                     .child(date_chip("qa-tomorrow", strings.tomorrow, tomorrow, cx))
                     .child(date_chip("qa-next-week", strings.next_week, next_week, cx))
                     .child(
-                        IconButton::new("qa-priority", IconName::Flag)
-                            .size(px(24.))
-                            .icon_size(IconSize::Small)
-                            .icon_color(priority_color)
-                            .tooltip(Tooltip::text(priority_tip))
-                            .on_click(cx.listener(|this, _, _, cx| this.cycle_priority(cx))),
+                        div()
+                            .debug_selector(|| "qa-priority".to_owned())
+                            .child(
+                                IconButton::new("qa-priority", IconName::Flag)
+                                    .size(px(24.))
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(priority_color)
+                                    .tooltip(Tooltip::text(priority_tip))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cycle_priority(cx);
+                                        this.focus_input(window, cx);
+                                    })),
+                            ),
                     )
                     .child(
                         h_flex()
                             .id("qa-list")
+                            .debug_selector(|| "qa-list".to_owned())
                             .h(px(24.))
                             .px_2()
                             .gap_1()
@@ -406,30 +494,28 @@ impl Render for QuickAddWindow {
                             .tooltip(Tooltip::text(list_label.clone()))
                             .child(Icon::new(list_icon).size(IconSize::XSmall).color(list_color))
                             .child(Label::new(list_label).size(LabelSize::XSmall).color(Color::Muted).truncate())
-                            .on_click(cx.listener(|this, _, _, cx| this.cycle_list(cx))),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cycle_list(cx);
+                                this.focus_input(window, cx);
+                            })),
                     )
                     .child(div().flex_1())
                     .child(
-                        h_flex()
-                            .id("qa-submit")
-                            .h(px(26.))
-                            .px_3()
-                            .rounded(px(5.))
-                            .when(has_text, |el| el.cursor_pointer())
-                            .bg(if has_text { theme.colors().accent } else { theme.colors().element_hover })
-                            .hover(|s| {
-                                s.bg(if has_text {
-                                    theme.colors().accent.opacity(0.9)
-                                } else {
-                                    theme.colors().element_hover
-                                })
+                        div()
+                            .id("qa-submit-wrap")
+                            .debug_selector(|| "qa-submit".to_owned())
+                            .when(!has_text, |el| {
+                                el.on_click(cx.listener(|this, _, window, cx| {
+                                    this.focus_input(window, cx);
+                                }))
                             })
                             .child(
-                                Label::new(add_label)
-                                    .size(LabelSize::Small)
-                                    .color(if has_text { Color::OnAccent } else { Color::Muted }),
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                                Button::new("qa-submit", add_label)
+                                    .variant(ButtonVariant::Primary)
+                                    .size(ButtonSize::Sm)
+                                    .disabled(!has_text)
+                                    .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                            ),
                     ),
             )
     }
@@ -981,5 +1067,187 @@ mod tests {
         assert_eq!(disabled_tasks[0].title, "Plan Q4 offsite this month");
         assert_eq!(disabled_tasks[0].horizon, None);
         let _ = main2;
+    }
+
+    #[gpui::test]
+    fn quick_add_window_seeds_defaults_and_allows_explicit_inbox_override(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(theme::init);
+        let store = Rc::new(fern_core::Store::open_in_memory().unwrap());
+        let work = store
+            .add_list(&fern_core::ListDraft {
+                name: "Work".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let today = Local::now().date_naive();
+        store
+            .update_preferences(|p| {
+                p.default_list = Some(work.id);
+                p.task_defaults.date = Some(fern_core::DefaultDate::Today);
+                p.task_defaults.priority = Priority::Medium;
+            })
+            .unwrap();
+        let (main, main_cx) =
+            cx.add_window_view(|window, cx| AppView::new(store.clone(), false, window, cx));
+        let main_handle = main_cx.window_handle().downcast::<AppView>().unwrap();
+
+        // 1. Opened window seeds list_id, picked_date, and priority from preferences.
+        let (qa, qa_cx) =
+            cx.add_window_view(|window, cx| QuickAddWindow::new(main_handle, window, cx));
+        qa_cx.update(|window, cx| {
+            qa.update(cx, |qa, cx| {
+                assert_eq!(qa.list_id, Some(work.id));
+                assert_eq!(qa.picked_date, Some(today));
+                assert_eq!(qa.priority, Priority::Medium);
+                qa.input.update(cx, |input, cx| input.set_text("Default task", cx));
+                qa.submit(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let tasks = store.tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].list_id, Some(work.id));
+        assert_eq!(tasks[0].due_date, Some(today));
+        assert_eq!(tasks[0].priority, Priority::Medium);
+
+        // 2. Cycling list from Work -> Inbox passes Some(None) and overrides default_list.
+        let (qa2, qa2_cx) =
+            cx.add_window_view(|window, cx| QuickAddWindow::new(main_handle, window, cx));
+        qa2_cx.update(|window, cx| {
+            qa2.update(cx, |qa, cx| {
+                assert_eq!(qa.list_id, Some(work.id));
+                qa.cycle_list(cx);
+                assert_eq!(qa.list_id, None);
+                qa.input.update(cx, |input, cx| input.set_text("Inbox override", cx));
+                qa.submit(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let tasks = store.tasks().unwrap();
+        let inbox_task = tasks.iter().find(|t| t.title == "Inbox override").unwrap();
+        assert_eq!(inbox_task.list_id, None);
+
+        // 3. Seeded default date does not override typed horizon when user did not click a date chip.
+        let (qa3, qa3_cx) =
+            cx.add_window_view(|window, cx| QuickAddWindow::new(main_handle, window, cx));
+        qa3_cx.update(|window, cx| {
+            qa3.update(cx, |qa, cx| {
+                qa.input.update(cx, |input, cx| input.set_text("Quarterly review this month", cx));
+                qa.update_parsed_due(cx);
+                qa.submit(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let tasks = store.tasks().unwrap();
+        let horizon_task = tasks.iter().find(|t| t.title == "Quarterly review").unwrap();
+        assert_eq!(horizon_task.due_date, None);
+        assert_eq!(horizon_task.horizon, Some(fern_core::Horizon::current_month(today)));
+        let _ = main;
+    }
+
+    #[gpui::test]
+    fn quick_add_window_chip_clicks_preserve_input_focus_and_empty_submit_is_guarded(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            theme::init(cx);
+            let _ = crate::keymap::load_default(&assets::Assets, cx);
+        });
+        let store = Rc::new(fern_core::Store::open_in_memory().unwrap());
+        store
+            .add_list(&fern_core::ListDraft {
+                name: "Work".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let (main, main_cx) =
+            cx.add_window_view(|window, cx| AppView::new(store.clone(), false, window, cx));
+        let main_handle = main_cx.window_handle().downcast::<AppView>().unwrap();
+
+        let (qa, qa_cx) =
+            cx.add_window_view(|window, cx| QuickAddWindow::new(main_handle, window, cx));
+        qa_cx.simulate_resize(size(px(WIDTH), px(HEIGHT)));
+        qa_cx.run_until_parked();
+
+        // Clicking disabled Add when empty does not close window or create a task.
+        let submit_bounds = qa_cx.debug_bounds("qa-submit").unwrap();
+        qa_cx.simulate_click(submit_bounds.center(), gpui::Modifiers::default());
+        qa_cx.run_until_parked();
+        assert!(store.tasks().unwrap().is_empty());
+        qa_cx.update(|window, cx| {
+            assert!(qa.read(cx).input.focus_handle(cx).is_focused(window));
+        });
+
+        // Clicking date/priority/list chips keeps input focused so Enter/Escape still work.
+        for selector in ["qa-tomorrow", "qa-priority", "qa-list"] {
+            let bounds = qa_cx.debug_bounds(selector).unwrap();
+            qa_cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            qa_cx.run_until_parked();
+            qa_cx.update(|window, cx| {
+                assert!(
+                    qa.read(cx).input.focus_handle(cx).is_focused(window),
+                    "input must remain focused after clicking {selector}"
+                );
+            });
+        }
+
+        // Input width is not crushed even with due + 3 tags + batch pill.
+        qa_cx.update(|_, cx| {
+            qa.update(cx, |qa, cx| {
+                qa.input.update(cx, |input, cx| {
+                    input.set_text("Write design doc tomorrow #alpha #beta #gamma", cx);
+                });
+                qa.update_parsed_due(cx);
+                qa.batch_lines = vec!["One".into(), "Two".into()];
+                cx.notify();
+            });
+        });
+        qa_cx.run_until_parked();
+        let input_bounds = qa_cx.debug_bounds("qa-input").unwrap();
+        let badges_bounds = qa_cx.debug_bounds("qa-badges").unwrap();
+        assert!(
+            input_bounds.size.width > px(400.),
+            "input width must not be crushed by badges: {:?}",
+            input_bounds.size.width
+        );
+        assert!(
+            badges_bounds.top() >= input_bounds.bottom(),
+            "badges must sit in a dedicated row below input"
+        );
+
+        // Escape still dismisses cleanly after chip interactions.
+        let windows_before = qa_cx.update(|_, cx| cx.windows().len());
+        qa_cx.simulate_keystrokes("escape");
+        qa_cx.run_until_parked();
+        let windows_after = cx.update(|cx| cx.windows().len());
+        assert_eq!(windows_after, windows_before - 1);
+        let _ = main;
+    }
+
+    #[gpui::test]
+    fn quick_add_window_next_week_chip_respects_week_start(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let sun_store = Rc::new(fern_core::Store::open_in_memory().unwrap());
+        sun_store
+            .update_preferences(|p| p.week_start = chrono::Weekday::Sun)
+            .unwrap();
+        let (sun_main, sun_main_cx) =
+            cx.add_window_view(|window, cx| AppView::new(sun_store.clone(), false, window, cx));
+        let sun_main_handle = sun_main_cx.window_handle().downcast::<AppView>().unwrap();
+        let (sun_qa, sun_qa_cx) =
+            cx.add_window_view(|window, cx| QuickAddWindow::new(sun_main_handle, window, cx));
+        sun_qa_cx.simulate_resize(size(px(WIDTH), px(HEIGHT)));
+        sun_qa_cx.run_until_parked();
+        let next_week_bounds = sun_qa_cx.debug_bounds("qa-next-week").unwrap();
+        sun_qa_cx.simulate_click(next_week_bounds.center(), gpui::Modifiers::default());
+        sun_qa_cx.run_until_parked();
+        let expected_sun_next_week =
+            fern_core::next_week_date(Local::now().date_naive(), chrono::Weekday::Sun);
+        sun_qa_cx.update(|_, cx| {
+            assert_eq!(sun_qa.read(cx).picked_date, Some(expected_sun_next_week));
+        });
+        let _ = sun_main;
     }
 }

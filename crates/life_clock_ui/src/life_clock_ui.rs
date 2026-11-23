@@ -642,28 +642,18 @@ impl LifeClockView {
             .absolute()
             .top(desktop_common::layout::title_bar_height() + px(14.))
             .left(px(14.))
+            .debug_selector(|| "life-clock-sidebar-toggle".to_owned())
             .child(
-                div()
-                    .id("life-clock-sidebar-toggle")
-                    .debug_selector(|| "life-clock-sidebar-toggle".to_owned())
-                    .group("life-clock-rail-btn")
+                IconButton::new("life-clock-sidebar-toggle", IconName::PanelLeft)
                     .size(px(28.))
-                    .rounded(px(6.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rail_fg.opacity(0.10)))
+                    .icon_size(IconSize::Medium)
+                    .icon_color(rail_fg.opacity(0.30))
+                    .hover_icon_color(rail_fg.opacity(0.85))
+                    .hover_color(rail_fg.opacity(0.10))
                     .tooltip(Tooltip::text(tip))
                     .on_click(cx.listener(|_, _, _, cx| {
                         cx.emit(LifeClockEvent::ToggleSidebar);
-                    }))
-                    .child(
-                        Icon::new(IconName::PanelLeft)
-                            .size(IconSize::Medium)
-                            .color(rail_fg.opacity(0.30))
-                            .group_hover_color("life-clock-rail-btn", rail_fg.opacity(0.85)),
-                    ),
+                    })),
             )
     }
 
@@ -674,40 +664,36 @@ impl LifeClockView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let help_bounds = self.help_button_bounds.clone();
-        let dark_theme_mode =
-            self.palette_mode == LifeClockPaletteMode::FernTheme && cx.theme().is_dark();
+        let help_fg = palette.quote_text;
 
         div()
             .absolute()
-            .bottom(px(16.))
+            .top(desktop_common::layout::title_bar_height() + px(14.))
             .right(px(16.))
             .child(
                 div()
                     .relative()
                     .child(
                         div()
-                            .id("life-clock-help-button")
-                            .debug_selector(|| "life-clock-help-button".to_owned())
                             .relative()
-                            .size(px(26.))
-                            .rounded_full()
-                            .bg(palette.help_bg)
-                            .when(dark_theme_mode, |el| {
-                                el.border_1().border_color(palette.help_fg.opacity(0.16))
-                            })
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(palette.help_fg)
-                            .hover(|s| s.opacity(0.85))
-                            .tooltip(Tooltip::text(strings.life_clock_help_tooltip))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_popover(cx);
-                            }))
-                            .child("?")
+                            .debug_selector(|| "life-clock-help-button".to_owned())
+                            .child(
+                                IconButton::new(
+                                    "life-clock-help-button",
+                                    IconName::CircleQuestionMark,
+                                )
+                                .size(px(28.))
+                                .icon_size(IconSize::Medium)
+                                .icon_color(
+                                    help_fg.opacity(if self.popover_open { 0.90 } else { 0.50 }),
+                                )
+                                .hover_icon_color(help_fg.opacity(0.90))
+                                .hover_color(help_fg.opacity(0.08))
+                                .tooltip(Tooltip::text(strings.life_clock_help_tooltip))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_popover(cx);
+                                })),
+                            )
                             .child(
                                 canvas(
                                     move |bounds, _, _| {
@@ -721,7 +707,7 @@ impl LifeClockView {
                     )
                     .when(self.popover_open, |el| {
                         el.child(PopoverAttachment::new(
-                            Placement::AboveRight,
+                            Placement::BelowRight,
                             self.render_popover(strings, cx),
                         ))
                     }),
@@ -1351,6 +1337,9 @@ mod tests {
             let toggle = cx
                 .debug_bounds("life-clock-sidebar-toggle")
                 .expect("sidebar toggle bounds");
+            let help = cx
+                .debug_bounds("life-clock-help-button")
+                .expect("help button bounds");
 
             assert!(
                 age.right() <= center_x,
@@ -1370,6 +1359,13 @@ mod tests {
                 toggle.right(),
                 age.left()
             );
+            assert!(
+                quote.right() <= help.left(),
+                "at {w}x{h}: top-right help button ({:?}) overlapped quote block ({:?})",
+                help.left(),
+                quote.right()
+            );
+            assert_eq!(help.top(), toggle.top());
         }
     }
 

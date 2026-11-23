@@ -247,7 +247,7 @@ pub fn render_sidebar<V: 'static>(
                         )
                         .size(px(18.))
                         .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
+                        .icon_color(theme_colors.list_text_muted)
                         .tooltip(Tooltip::text(if collapsed {
                             strings.habit_expand
                         } else {
@@ -258,7 +258,11 @@ pub fn render_sidebar<V: 'static>(
                             on_toggle(this, SidebarAction::ToggleArea(folder_id), window, cx);
                         })),
                     )
-                    .child(Icon::new(IconName::Folder).size(IconSize::Small).color(Color::Icon)),
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::Small)
+                            .color(theme_colors.list_text),
+                    ),
             )
             .child(
                 Label::new(folder.name.clone())
@@ -274,7 +278,7 @@ pub fn render_sidebar<V: 'static>(
                 )
                 .size(px(20.))
                 .icon_size(IconSize::XSmall)
-                .icon_color(Color::Muted)
+                .icon_color(theme_colors.list_text_muted)
                 .tooltip(Tooltip::text(strings.things_new_project))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
@@ -370,7 +374,7 @@ pub fn render_sidebar<V: 'static>(
                         ThingsViewKind::Someday,
                         strings.things_someday,
                         IconName::Archive,
-                        theme_colors.icon_muted,
+                        theme_colors.list_text_muted,
                         props.counts.someday,
                         Some(DropDestination::Someday),
                         cx,
@@ -394,7 +398,7 @@ pub fn render_sidebar<V: 'static>(
                                     Label::new(format!("{} · {}", strings.things_areas, strings.things_projects))
                                         .size(LabelSize::XSmall)
                                         .weight(FontWeight::SEMIBOLD)
-                                        .color(Color::Muted),
+                                        .color(theme_colors.list_text_muted),
                                 ),
                             )
                             .children(areas_and_projects)

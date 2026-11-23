@@ -72,24 +72,16 @@ impl CalendarView {
                 }
             }
         }
-        let tabs = h_flex().p(px(3.)).rounded(px(8.)).bg(theme.colors().surface_background).children(strings.arrange_tabs.iter().enumerate().map(|(i, label)| {
-            div()
-                .id(SharedString::from(format!("arrange-tab-{i}")))
-                .flex_1()
-                .h(px(28.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.))
-                .cursor_pointer()
-                .when(i == tab, |el| el.bg(theme.colors().element_selected))
-                .when(i != tab, |el| el.hover(|s| s.bg(theme.colors().ghost_element_hover)))
-                .child(Label::new(*label).size(LabelSize::Small).color(if i == tab { Color::Default } else { Color::Muted }))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.arrange = Some(i);
-                    cx.notify();
-                }))
-        }));
+        let tabs = SegmentedTabs::new().full_width().tabs(
+            strings.arrange_tabs.iter().enumerate().map(|(i, label)| {
+                SegmentedTab::new(SharedString::from(format!("arrange-tab-{i}")), *label)
+                    .toggle_state(i == tab)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.arrange = Some(i);
+                        cx.notify();
+                    }))
+            }),
+        );
         let mut body: Vec<AnyElement> = Vec::new();
         for (index, (name, tasks)) in groups.into_iter().enumerate() {
             let key = (tab, name.clone());

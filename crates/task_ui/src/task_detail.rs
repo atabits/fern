@@ -127,6 +127,7 @@ pub struct TaskDetail {
     /// Leaves top clearance for the overlaid window buttons when docked at the window's right edge.
     top_inset: bool,
     sticky_style: Option<crate::sticky_settings::StickySettings>,
+    sticky_surface: Option<(Hsla, Hsla)>,
     /// The calendar's card writes its date out with the weekday.
     calendar_card: bool,
     /// The Add Subtask field shown while the task has no subtasks, from the "…" menu.
@@ -271,6 +272,7 @@ impl TaskDetail {
             card: false,
             top_inset: false,
             sticky_style: None,
+            sticky_surface: None,
             calendar_card: false,
             subtask_open: false,
             body_scroll: gpui::ScrollHandle::new(),
@@ -461,6 +463,7 @@ impl TaskDetail {
         self.sync_subtasks();
         self.sync_attachments();
         self.sync_comments();
+        self.sync_sticky_inputs(cx);
         cx.notify();
     }
 
@@ -756,6 +759,7 @@ impl TaskDetail {
             return;
         };
         let items = self.session.draft.as_ref().map_or_else(|| self.session.store.checklist(task).unwrap_or_default(), |draft| draft.checklist.clone());
+        let sticky_tokens = self.sticky_tokens();
         let mut old: Vec<ChecklistRow> = std::mem::take(&mut self.checklist);
         for item in items {
             let row = match old.iter().position(|row| row.item.id == item.id) {
@@ -763,6 +767,12 @@ impl TaskDetail {
                     let mut row = old.swap_remove(index);
                     if row.item.title != item.title && row.input.read(cx).text() != item.title {
                         row.input.update(cx, |input, cx| input.set_text(item.title.clone(), cx));
+                    }
+                    if row.item.completed != item.completed
+                        && let Some(t) = sticky_tokens
+                    {
+                        let ink = if item.completed { t.muted } else { t.ink };
+                        row.input.update(cx, |input, cx| input.set_ink_override(Some(ink), Some(t.muted), Some(t.ink), cx));
                     }
                     row.item = item;
                     row
@@ -777,11 +787,17 @@ impl TaskDetail {
     fn checklist_row(&mut self, item: ChecklistItem, cx: &mut Context<Self>) -> ChecklistRow {
         let id = item.id;
         let title = item.title.clone();
+        let completed = item.completed;
         let read_only = self.is_read_only();
+        let sticky_tokens = self.sticky_tokens();
         let input = cx.new(|cx| {
             let mut input = TextInput::new(Mode::Wrapped, "", cx).without_cancel();
             input.set_text(title, cx);
             input.set_read_only(read_only, cx);
+            if let Some(t) = sticky_tokens {
+                let ink = if completed { t.muted } else { t.ink };
+                input.set_ink_override(Some(ink), Some(t.muted), Some(t.ink), cx);
+            }
             input
         });
         let subscriptions = [
@@ -905,6 +921,7 @@ impl TaskDetail {
                 self.sync_subtasks();
                 self.sync_attachments();
                 self.sync_comments();
+                self.sync_sticky_inputs(cx);
                 cx.notify();
             }
             other => self.show(other, cx),
@@ -1459,6 +1476,7 @@ impl TaskDetail {
     /// The "Task Activities" panel at the bottom of the details, as in the original.
     fn render_activity(&self, activity: &[fern_core::Activity], strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let sticky = self.sticky_tokens();
 
         v_scroll(
             "task-activity-scroll",
@@ -1469,9 +1487,16 @@ impl TaskDetail {
                 .gap_2()
                 .child(
                     h_flex()
-                        .child(div().flex_1().child(Label::new(strings.task_activities).weight(FontWeight::SEMIBOLD)))
+                        .child(
+                            div().flex_1().child(
+                                Label::new(strings.task_activities)
+                                    .weight(FontWeight::SEMIBOLD)
+                                    .when_some(sticky, |l, t| l.color(t.ink)),
+                            ),
+                        )
                         .child(
                             IconButton::new("close-activity", IconName::X)
+                                .when_some(sticky, |b, t| b.icon_color(t.muted).hover_color(t.surface))
                                 .tooltip(Tooltip::text(strings.close))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.session.activity = None;
@@ -1489,17 +1514,17 @@ impl TaskDetail {
                     h_flex()
                         .items_start()
                         .gap_2()
-                        .child(div().mt(px(5.)).size(px(8.)).flex_none().rounded_full().bg(theme.colors().accent))
+                        .child(div().mt(px(5.)).size(px(8.)).flex_none().rounded_full().bg(sticky.map_or(theme.colors().accent, |t| t.accent)))
                         .child(
                             v_flex()
-                                .child(Label::new(text).size(LabelSize::Small))
-                                .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
+                                .child(Label::new(text).size(LabelSize::Small).when_some(sticky, |l, t| l.color(t.ink)))
+                                .child(Label::new(when).size(LabelSize::XSmall).color(sticky.map_or(Color::Muted, |t| Color::Custom(t.muted)))),
                         )
                 })),
         )
         .max_h(px(240.))
         .border_t_1()
-        .border_color(theme.colors().border)
+        .border_color(sticky.map_or(theme.colors().border, |t| t.border))
         .into_any_element()
     }
 
@@ -1535,6 +1560,7 @@ impl TaskDetail {
         if let Ok(Some(fresh)) = self.session.store.task(task.id) {
             *task = fresh;
         }
+        self.sync_sticky_inputs(cx);
         cx.emit(TaskUpdated);
         cx.notify();
     }
@@ -1575,7 +1601,12 @@ impl TaskDetail {
         self.finish_toggle_completed(task.id, completed, cx);
     }
 
-    fn render_progress_bar(done: usize, total: usize, theme: &theme::Theme) -> AnyElement {
+    fn render_progress_bar(
+        done: usize,
+        total: usize,
+        theme: &theme::Theme,
+        sticky: Option<StickyPaletteTokens>,
+    ) -> AnyElement {
         let ratio = if total == 0 { 0.0 } else { (done as f32 / total as f32).clamp(0.0, 1.0) };
         h_flex()
             .gap_2()
@@ -1587,19 +1618,22 @@ impl TaskDetail {
                     .h(px(3.))
                     .rounded_full()
                     .overflow_hidden()
-                    .bg(theme.colors().border_variant)
-                    .child(div().h_full().w(gpui::relative(ratio)).rounded_full().bg(theme.colors().accent)),
+                    .bg(sticky.map_or(theme.colors().border_variant, |t| t.border))
+                    .child(div().h_full().w(gpui::relative(ratio)).rounded_full().bg(sticky.map_or(theme.colors().accent, |t| t.accent))),
             )
-            .child(Label::new(format!("{done}/{total}")).size(LabelSize::XSmall).color(Color::Muted))
+            .child(Label::new(format!("{done}/{total}")).size(LabelSize::XSmall).color(sticky.map_or(Color::Muted, |t| Color::Custom(t.muted))))
             .into_any_element()
     }
 
     fn render_checklist(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
+        let sticky = self.sticky_tokens();
         let read_only = self.is_read_only();
         let total = self.checklist.len();
         let done_count = self.checklist.iter().filter(|r| r.item.completed).count();
+        let muted_text = sticky.map_or(theme.colors().text_muted, |t| t.muted);
+        let delete_hover = sticky.map_or(theme.status().error, |t| t.error);
         v_flex()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .when(total > 0, |el| {
@@ -1607,13 +1641,14 @@ impl TaskDetail {
                     h_flex()
                         .gap_1()
                         .items_center()
-                        .child(div().flex_1().min_w_0().child(Self::render_progress_bar(done_count, total, &theme)))
+                        .child(div().flex_1().min_w_0().child(Self::render_progress_bar(done_count, total, &theme, sticky)))
                         .when(done_count > 0 && !read_only, |bar| {
                             bar.child(
                                 IconButton::new("checklist-uncheck-all", IconName::RotateCcw)
                                     .size(px(22.))
                                     .icon_size(IconSize::XSmall)
-                                    .icon_color(Color::Muted)
+                                    .icon_color(sticky.map_or(Color::Muted, |t| Color::Custom(t.muted)))
+                                    .when_some(sticky, |b, t| b.hover_color(t.surface))
                                     .tooltip(Tooltip::text(strings.checklist_uncheck_all))
                                     .on_click(cx.listener(|this, _, _, cx| this.uncheck_all_checklist_items(cx))),
                             )
@@ -1621,7 +1656,8 @@ impl TaskDetail {
                                 IconButton::new("checklist-clear-completed", IconName::BrushCleaning)
                                     .size(px(22.))
                                     .icon_size(IconSize::XSmall)
-                                    .icon_color(Color::Muted)
+                                    .icon_color(sticky.map_or(Color::Muted, |t| Color::Custom(t.muted)))
+                                    .when_some(sticky, |b, t| b.hover_color(t.surface))
                                     .tooltip(Tooltip::text(strings.checklist_clear_completed))
                                     .on_click(cx.listener(|this, _, _, cx| this.clear_completed_checklist_items(cx))),
                             )
@@ -1632,6 +1668,26 @@ impl TaskDetail {
                 let id = row.item.id;
                 let done = row.item.completed;
                 let row_group = SharedString::from(format!("checklist-item-{id}"));
+                let checkbox_id = SharedString::from(format!("item-checkbox-{id}"));
+                let checkbox = if let Some(t) = sticky {
+                    sticky_checkbox(checkbox_id, done, false, false, None, t)
+                        .when(!read_only, |cb| {
+                            cb.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_checklist_item(id, !done, cx)
+                            }))
+                        })
+                        .into_any_element()
+                } else {
+                    Checkbox::new(checkbox_id)
+                        .size(px(14.))
+                        .toggle_state(done)
+                        .when(!read_only, |cb| {
+                            cb.on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_checklist_item(id, !done, cx)
+                            }))
+                        })
+                        .into_any_element()
+                };
                 h_flex()
                     .id(SharedString::from(format!("item-{id}")))
                     .debug_selector(move || format!("checklist-item-{id}"))
@@ -1640,23 +1696,12 @@ impl TaskDetail {
                     .items_start()
                     .gap_2()
                     .py_1()
-                    .child(
-                        div().mt(px(3.)).child(
-                            Checkbox::new(SharedString::from(format!("item-checkbox-{id}")))
-                                .size(px(14.))
-                                .toggle_state(done)
-                                .when(!read_only, |cb| {
-                                    cb.on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_checklist_item(id, !done, cx)
-                                    }))
-                                }),
-                        ),
-                    )
+                    .child(div().mt(px(3.)).child(checkbox))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .when(done, |el| el.text_color(theme.colors().text_muted).line_through())
+                            .when(done, |el| el.text_color(muted_text).line_through())
                             .child(row.input.clone()),
                     )
                     .when(!read_only, |el| {
@@ -1665,10 +1710,10 @@ impl TaskDetail {
                                 .id(SharedString::from(format!("item-delete-{id}")))
                                 .flex_none()
                                 .px_1()
-                                .text_color(theme.colors().text_muted)
+                                .text_color(muted_text)
                                 .opacity(if crate::touch::active() { 1. } else { 0. })
                                 .group_hover(row_group, |s| s.opacity(1.))
-                                .hover(|s| s.text_color(theme.status().error))
+                                .hover(move |s| s.text_color(delete_hover))
                                 .cursor_pointer()
                                 .tooltip(Tooltip::text(strings.delete))
                                 .child("✕")
@@ -1681,7 +1726,7 @@ impl TaskDetail {
                     h_flex()
                         .min_h(px(30.))
                         .gap_2()
-                        .child(Icon::new(IconName::Plus).size(IconSize::Small))
+                        .child(Icon::new(IconName::Plus).size(IconSize::Small).when_some(sticky, |i, t| i.color(t.muted)))
                         .child(div().flex_1().child(self.new_item.clone())),
                 )
             })
@@ -1689,6 +1734,7 @@ impl TaskDetail {
 
     fn render_subtasks(&self, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let sticky = self.sticky_tokens();
         let can_add = self.can_add_subtask();
         let can_edit = !self.is_read_only();
         let total = self.session.subtasks.len();
@@ -1697,7 +1743,7 @@ impl TaskDetail {
         let countdown_dates = self.session.preferences.countdown_dates;
         v_flex()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .when(total > 0, |el| el.child(Self::render_progress_bar(done_count, total, &theme)))
+            .when(total > 0, |el| el.child(Self::render_progress_bar(done_count, total, &theme, sticky)))
             .children(self.session.subtasks.iter().map(|subtask| {
                 let id = subtask.id;
                 let done = subtask.is_completed();
@@ -1705,23 +1751,43 @@ impl TaskDetail {
                 let due = subtask
                     .due_date
                     .map(|date| task_rows::row_due_label(date, subtask.due_time, today, strings, countdown_dates));
+                let checkbox_id = SharedString::from(format!("subtask-checkbox-{id}"));
+                let checkbox = if let Some(t) = sticky {
+                    sticky_checkbox(
+                        checkbox_id,
+                        done,
+                        subtask.is_wont_do(),
+                        subtask.is_in_progress(),
+                        t.priority_color(subtask.priority),
+                        t,
+                    )
+                    .when(can_edit, |cb| {
+                        cb.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_subtask(id, !done, cx);
+                        }))
+                    })
+                    .into_any_element()
+                } else {
+                    Checkbox::new(checkbox_id)
+                        .size(px(14.))
+                        .toggle_state(done)
+                        .in_progress(subtask.is_in_progress())
+                        .dismissed(subtask.is_wont_do())
+                        .tint(task_rows::priority_color(subtask.priority, &theme))
+                        .when(can_edit, |cb| {
+                            cb.on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_subtask(id, !done, cx);
+                            }))
+                        })
+                        .into_any_element()
+                };
                 div().group(group_name.clone()).child(
                     ListItem::new(SharedString::from(format!("subtask-{id}")))
                         .height(px(30.))
-                        .start_slot(
-                            Checkbox::new(SharedString::from(format!("subtask-checkbox-{id}")))
-                                .size(px(14.))
-                                .toggle_state(done)
-                                .in_progress(subtask.is_in_progress())
-                                .dismissed(subtask.is_wont_do())
-                                .tint(task_rows::priority_color(subtask.priority, &theme))
-                                .when(can_edit, |cb| {
-                                    cb.on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.toggle_subtask(id, !done, cx);
-                                    }))
-                                }),
-                        )
+                        .when_some(sticky, |item, t| item.hover_color(t.surface))
+                        .start_slot(checkbox)
                         .child(
                             div()
                                 .flex_1()
@@ -1733,7 +1799,11 @@ impl TaskDetail {
                                     } else {
                                         subtask.title.clone().into()
                                     })
-                                    .color(if done { Color::Muted } else { Color::Default })
+                                    .color(if done {
+                                        sticky.map_or(Color::Muted, |t| Color::Custom(t.muted))
+                                    } else {
+                                        sticky.map_or(Color::Default, |t| Color::Custom(t.ink))
+                                    })
                                     .truncate(),
                                 ),
                         )
@@ -1745,7 +1815,11 @@ impl TaskDetail {
                                     el.child(
                                         Label::new(label)
                                             .size(LabelSize::XSmall)
-                                            .color(if overdue && !done { Color::Error } else { Color::Muted }),
+                                            .color(if overdue && !done {
+                                                sticky.map_or(Color::Error, |t| Color::Custom(t.error))
+                                            } else {
+                                                sticky.map_or(Color::Muted, |t| Color::Custom(t.muted))
+                                            }),
                                     )
                                 })
                                 .when(can_edit, |el| {
@@ -1758,7 +1832,8 @@ impl TaskDetail {
                                                 IconButton::new(SharedString::from(format!("subtask-unlink-btn-{id}")), IconName::X)
                                                     .size(px(22.))
                                                     .icon_size(IconSize::XSmall)
-                                                    .icon_color(Color::Muted)
+                                                    .icon_color(sticky.map_or(Color::Muted, |t| Color::Custom(t.muted)))
+                                                    .when_some(sticky, |b, t| b.hover_color(t.surface))
                                                     .tooltip(Tooltip::text(strings.unlink_parent))
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         cx.stop_propagation();
@@ -1767,7 +1842,7 @@ impl TaskDetail {
                                             ),
                                     )
                                 })
-                                .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall)),
+                                .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).when_some(sticky, |i, t| i.color(t.muted))),
                         )
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(id)))),
                 )
@@ -1778,7 +1853,7 @@ impl TaskDetail {
                         .min_h(px(30.))
                         .px_2()
                         .gap_2()
-                        .child(Icon::new(IconName::Plus).size(IconSize::Small))
+                        .child(Icon::new(IconName::Plus).size(IconSize::Small).when_some(sticky, |i, t| i.color(t.muted)))
                         .child(div().flex_1().child(self.subtask_input.clone())),
                 )
             })
@@ -1788,6 +1863,7 @@ impl TaskDetail {
     /// for the field being picked.
     fn render_tags_row(&self, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let sticky = self.sticky_tokens();
         let read_only = self.is_read_only();
         h_flex()
             .flex_wrap()
@@ -1799,21 +1875,24 @@ impl TaskDetail {
                     fern_core::Estimate::Pomos(n) => format!("{n} {}", strings.pomo_unit),
                     fern_core::Estimate::Minutes(n) => strings.format_minutes(n as i64),
                 };
+                let chip_color = sticky.map_or(Color::Accent, |t| Color::Custom(t.accent));
+                let chip_bg = sticky.map_or_else(|| theme.colors().accent.opacity(0.2), |t| t.surface);
+                let chip_hover = sticky.map_or_else(|| theme.colors().accent.opacity(0.3), |t| t.accent.opacity(0.2));
                 h_flex()
                     .id("estimate-chip")
                     .h(px(18.))
                     .px(px(6.))
                     .gap_1()
                     .rounded_full()
-                    .bg(theme.colors().accent.opacity(0.2))
+                    .bg(chip_bg)
                     .when(!read_only, |el| {
                         el.cursor_pointer()
-                            .hover(|s| s.bg(theme.colors().accent.opacity(0.3)))
+                            .hover(move |s| s.bg(chip_hover))
                             .tooltip(Tooltip::text(strings.estimation))
                             .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Estimate, cx)))
                     })
-                    .child(Icon::new(IconName::CircleDot).size(IconSize::XSmall).color(Color::Accent))
-                    .child(Label::new(text).size(LabelSize::XSmall).color(Color::Accent))
+                    .child(Icon::new(IconName::CircleDot).size(IconSize::XSmall).color(chip_color))
+                    .child(Label::new(text).size(LabelSize::XSmall).color(chip_color))
             }))
             // As the original's, a tag is a plain chip; a click opens the tag picker, where it is
             // unticked.
@@ -1825,11 +1904,18 @@ impl TaskDetail {
                             this.open_tags(Popup::InlineTags, window, cx);
                         }))
                     })
-                    .child(match self.sticky_style {
-                        Some(style) => div().h(px(18.)).px(px(6.)).rounded_full()
-                            .bg(gpui::rgb(style.foreground()).opacity(0.12))
-                            .text_color(gpui::rgb(style.foreground())).text_size(px(11.))
-                            .child(tag).into_any_element(),
+                    .child(match sticky {
+                        Some(t) => div()
+                            .h(px(18.))
+                            .px(px(6.))
+                            .flex()
+                            .items_center()
+                            .rounded_full()
+                            .bg(t.surface)
+                            .text_color(t.ink)
+                            .text_size(px(11.))
+                            .child(tag)
+                            .into_any_element(),
                         None => {
                             let color = self.tag_color(&tag, cx);
                             Chip::new(tag, color).into_any_element()
@@ -1837,6 +1923,9 @@ impl TaskDetail {
                     })
             }))
             .when(!read_only, |el| {
+                let add_border = sticky.map_or(theme.colors().accent, |t| t.accent);
+                let add_hover = sticky.map_or(theme.colors().element_hover, |t| t.surface);
+                let add_color = sticky.map_or(Color::Accent, |t| Color::Custom(t.accent));
                 el.child(
                     // The original's "+" after the tags: an accent-outlined circle.
                     div()
@@ -1848,10 +1937,10 @@ impl TaskDetail {
                         .justify_center()
                         .rounded_full()
                         .border_1()
-                        .border_color(theme.colors().accent)
+                        .border_color(add_border)
                         .cursor_pointer()
-                        .hover(|s| s.bg(theme.colors().element_hover))
-                        .child(Icon::new(IconName::Plus).size(IconSize::Custom(px(11.))).color(Color::Accent))
+                        .hover(move |s| s.bg(add_hover))
+                        .child(Icon::new(IconName::Plus).size(IconSize::Custom(px(11.))).color(add_color))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_tags(Popup::InlineTags, window, cx);
                         }))
@@ -1903,12 +1992,141 @@ fn label_button(id: &'static str, icon: IconName, label: SharedString, color: Co
         .child(Label::new(label).color(color))
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct StickyPaletteTokens {
+    pub bg: Hsla,
+    pub ink: Hsla,
+    pub muted: Hsla,
+    pub border: Hsla,
+    pub checkbox_border: Hsla,
+    pub surface: Hsla,
+    pub accent: Hsla,
+    pub error: Hsla,
+}
+
+impl StickyPaletteTokens {
+    fn from_surface(bg: Hsla, fg: Hsla) -> Self {
+        let is_dark = fg.l > 0.5;
+        Self {
+            bg,
+            ink: fg,
+            muted: fg.opacity(0.65),
+            border: fg.opacity(0.20),
+            checkbox_border: fg.opacity(0.58),
+            surface: fg.opacity(0.08),
+            accent: gpui::rgb(if is_dark { 0x95b7ff } else { 0x254c9e }).into(),
+            error: gpui::rgb(if is_dark { 0xff8a8e } else { 0x991b1b }).into(),
+        }
+    }
+
+    fn from_settings(style: crate::sticky_settings::StickySettings) -> Self {
+        let palette = crate::sticky_settings::PALETTE;
+        let bg = gpui::rgb(palette[style.color.min(palette.len() - 1)].0).into();
+        let fg = gpui::rgb(style.foreground()).into();
+        Self::from_surface(bg, fg)
+    }
+
+    fn priority_color(self, priority: Priority) -> Option<Hsla> {
+        let is_dark = self.ink.l > 0.5;
+        match priority {
+            Priority::High => Some(self.error),
+            Priority::Medium => Some(gpui::rgb(if is_dark { 0xfbbf24 } else { 0xb45309 }).into()),
+            Priority::Low => Some(self.accent),
+            Priority::None => None,
+        }
+    }
+}
+
+fn sticky_checkbox(
+    id: impl Into<gpui::ElementId>,
+    checked: bool,
+    dismissed: bool,
+    in_progress: bool,
+    priority_color: Option<Hsla>,
+    tokens: StickyPaletteTokens,
+) -> gpui::Stateful<gpui::Div> {
+    let border = if dismissed {
+        tokens.muted
+    } else if checked {
+        tokens.checkbox_border
+    } else if in_progress {
+        priority_color.unwrap_or(tokens.accent)
+    } else {
+        priority_color.unwrap_or(tokens.checkbox_border)
+    };
+    div()
+        .id(id)
+        .size(px(14.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.))
+        .overflow_hidden()
+        .border_1()
+        .border_color(border)
+        .when(dismissed, |el| {
+            el.bg(tokens.surface).child(
+                Icon::new(IconName::X)
+                    .size(IconSize::Custom(px(12.)))
+                    .color(tokens.muted),
+            )
+        })
+        .when(!dismissed && checked, |el| {
+            el.bg(tokens.checkbox_border).child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Custom(px(12.)))
+                    .color(tokens.bg),
+            )
+        })
+        .when(!dismissed && !checked && in_progress, |el| {
+            let fill = priority_color.unwrap_or(tokens.accent);
+            el.bg(fill.opacity(0.14))
+                .items_end()
+                .child(div().w_full().h(px(14.) * 0.44).bg(fill.opacity(0.75)))
+        })
+        .when(!dismissed && !checked && !in_progress, |el| {
+            el.when_some(priority_color, |el, c| el.bg(c.opacity(0.15)))
+        })
+}
+
 impl TaskDetail {
+    pub(super) fn sticky_tokens(&self) -> Option<StickyPaletteTokens> {
+        self.sticky_surface.map(|(bg, fg)| StickyPaletteTokens::from_surface(bg, fg))
+    }
+
+    fn sync_sticky_inputs(&self, cx: &mut Context<Self>) {
+        let tokens = self.sticky_tokens();
+        let (ink, muted, caret) = match tokens {
+            Some(t) => (Some(t.ink), Some(t.muted), Some(t.ink)),
+            None => (None, None, None),
+        };
+        let task_done = self.session.task.as_ref().is_some_and(|t| t.is_completed());
+        let title_ink = tokens.map(|t| if task_done { t.muted } else { t.ink });
+        self.title.update(cx, |input, cx| input.set_ink_override(title_ink, muted, caret, cx));
+        for input in [
+            &self.notes,
+            &self.new_item,
+            &self.subtask_input,
+            &self.comment_input,
+            &self.location_input,
+        ] {
+            input.update(cx, |input, cx| input.set_ink_override(ink, muted, caret, cx));
+        }
+        for row in &self.checklist {
+            let row_ink = tokens.map(|t| if row.item.completed { t.muted } else { t.ink });
+            row.input.update(cx, |input, cx| input.set_ink_override(row_ink, muted, caret, cx));
+        }
+    }
+
     pub fn set_sticky_style(&mut self, settings: crate::sticky_settings::StickySettings, cx: &mut Context<Self>) {
+        let palette = crate::sticky_settings::PALETTE;
+        let bg: Hsla = gpui::rgb(palette[settings.color.min(palette.len() - 1)].0).into();
+        let fg: Hsla = gpui::rgb(settings.foreground()).into();
         self.sticky_style = Some(settings);
+        self.sticky_surface = Some((bg, fg));
         self.editor_window.inline_popup = None;
-        let muted = gpui::rgb(if settings.color >= 9 { 0xbcc5d6 } else { 0x525566 }).into();
-        self.notes.update(cx, |input, cx| input.set_placeholder_color(muted, cx));
+        self.sync_sticky_inputs(cx);
         cx.notify();
     }
 }
@@ -1917,10 +2135,10 @@ impl Render for TaskDetail {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let sticky_foreground: Option<Hsla> = self.sticky_style.map(|style| gpui::rgb(style.foreground()).into());
-        let button_hover = sticky_foreground.map_or(theme.colors().element_hover, |color| color.opacity(0.12));
-        let muted = sticky_foreground.map_or(Color::Muted, |color| Color::Custom(color.opacity(0.8)));
-        let sticky = self.sticky_style.is_some();
+        let sticky_tokens = self.sticky_tokens();
+        let button_hover = sticky_tokens.map_or(theme.colors().element_hover, |t| t.surface);
+        let muted = sticky_tokens.map_or(Color::Muted, |t| Color::Custom(t.muted));
+        let sticky = sticky_tokens.is_some();
         if let Some(target) = self.editor_window.take_pending_focus(window) {
             let input = match target {
                 FocusTarget::NewItem => Some(self.new_item.clone()),
@@ -1971,20 +2189,20 @@ impl Render for TaskDetail {
                             div()
                                 .size(px(52.))
                                 .rounded_full()
-                                .bg(theme.colors().surface_background)
+                                .bg(sticky_tokens.map_or(theme.colors().surface_background, |t| t.surface))
                                 .border_1()
-                                .border_color(theme.colors().border_variant)
+                                .border_color(sticky_tokens.map_or(theme.colors().border_variant, |t| t.border))
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(Icon::new(IconName::SquareCheck).size(IconSize::Large).color(Color::Muted)),
+                                .child(Icon::new(IconName::SquareCheck).size(IconSize::Large).color(muted)),
                         )
                         .child(
                             div()
                                 .w_full()
                                 .text_center()
                                 .text_size(px(13.))
-                                .text_color(theme.colors().text_muted)
+                                .text_color(sticky_tokens.map_or(theme.colors().text_muted, |t| t.muted))
                                 .child(strings.select_task),
                         ),
                 );
@@ -2057,7 +2275,7 @@ impl Render for TaskDetail {
             .unwrap_or_else(|| strings.inbox.into());
         let list_icon = if list_id.is_some() { IconName::List } else { IconName::Inbox };
         let task_id = task.id;
-        let drop_color = theme.colors().accent.opacity(0.08);
+        let drop_color = sticky_tokens.map_or_else(|| theme.colors().accent.opacity(0.08), |t| t.surface);
 
         panel
             .when(!read_only, |el| {
@@ -2209,8 +2427,8 @@ impl Render for TaskDetail {
                                         .gap_1()
                                         .cursor_pointer()
                                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(parent_id))))
-                                        .child(Label::new(parent_title).color(Color::Muted).truncate())
-                                        .child(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted)),
+                                        .child(Label::new(parent_title).color(muted).truncate())
+                                        .child(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(muted)),
                                 )
                                 .when(!read_only && !sticky, |el| {
                                     el.child(
@@ -2264,7 +2482,7 @@ impl Render for TaskDetail {
                                     .line_height(px(28.))
                                     .when_some(self.sticky_style, |el, style| el.line_height(px(style.font_px() + 5.)))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .when(done, |el| el.text_color(theme.colors().text_muted))
+                                    .when(done, |el| el.text_color(sticky_tokens.map_or(theme.colors().text_muted, |t| t.muted)))
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                     .child(self.title.clone()),
                             )
@@ -2344,7 +2562,9 @@ impl Render for TaskDetail {
                     })
                     .when(self.show_checklist, |el| el.child(self.render_checklist(cx)))
                     .when(!self.session.attachments.is_empty(), |el| el.child(self.render_attachments(cx)))
-                    .children(self.session.attachment_errors.iter().map(|error| Label::new(error.clone()).color(Color::Error)))
+                    .children(self.session.attachment_errors.iter().map(|error| {
+                        Label::new(error.clone()).color(sticky_tokens.map_or(Color::Error, |t| Color::Custom(t.error)))
+                    }))
                     .when(show_location && !sticky, |el| {
                         el.child(
                             h_flex()
@@ -2385,7 +2605,11 @@ impl Render for TaskDetail {
                         el.child(div().pt(px(18.)).child(self.render_tags_row(strings, cx)))
                     })
                     .when(!self.session.subtasks.is_empty() || self.subtask_open, |el| {
-                        el.child(div().pt_2().child(Divider::horizontal())).child(self.render_subtasks(strings, cx))
+                        let divider = match sticky_tokens {
+                            Some(t) => div().flex_none().h(px(1.)).w_full().bg(t.border).into_any_element(),
+                            None => Divider::horizontal().into_any_element(),
+                        };
+                        el.child(div().pt_2().child(divider)).child(self.render_subtasks(strings, cx))
                     })
                     .when(!self.session.comments.is_empty(), |el| el.child(self.render_comments(strings, cx))),
                 )
@@ -2395,10 +2619,10 @@ impl Render for TaskDetail {
                 .when_some(self.sticky_style, |el, style| el.color(gpui::rgb(style.foreground()).into())),
             )
             .when(self.session.draft.as_ref().is_some_and(|draft| draft.save_failed), |el| {
-                el.child(div().px_5().py_1().child(Label::new(strings.task_save_failed).color(Color::Error)))
+                el.child(div().px_5().py_1().child(Label::new(strings.task_save_failed).color(sticky_tokens.map_or(Color::Error, |t| Color::Custom(t.error)))))
             })
             .when(self.session.draft.as_ref().is_some_and(|draft| draft.pending_attachments > 0), |el| {
-                el.child(div().px_5().py_1().child(Label::new(strings.attachment_preparing).color(Color::Muted)))
+                el.child(div().px_5().py_1().child(Label::new(strings.attachment_preparing).color(muted)))
             })
             // The bottom bar's "A" shows the description's Markdown toolbar over it, as the original.
             .when(self.format_bar && !read_only, |el| {
@@ -2431,12 +2655,19 @@ impl Render for TaskDetail {
                     .map(|bar| {
                         if task.is_deleted() {
                             bar.child(
-                                label_button("restore-task", IconName::ArchiveRestore, strings.restore.into(), Color::Default, button_hover)
-                                    .on_click(cx.listener(|this, _, _, cx| this.restore(cx))),
+                                label_button(
+                                    "restore-task",
+                                    IconName::ArchiveRestore,
+                                    strings.restore.into(),
+                                    sticky_tokens.map_or(Color::Default, |t| Color::Custom(t.ink)),
+                                    button_hover,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.restore(cx))),
                             )
                             .child(div().flex_1())
                             .child(
                                 IconButton::new("delete-forever", IconName::Trash)
+                                    .when_some(sticky_tokens, |b, t| b.icon_color(t.muted).hover_color(t.surface))
                                     .tooltip(Tooltip::text(strings.delete_forever))
                                     .on_click(cx.listener(|this, _, _, cx| this.delete_forever(cx))),
                             )
@@ -2449,7 +2680,7 @@ impl Render for TaskDetail {
                                     .items_center()
                                     .min_w_0()
                                     .text_size(px(11.))
-                                    .text_color(sticky_foreground.unwrap_or(theme.colors().text).opacity(0.68))
+                                    .text_color(sticky_tokens.map_or_else(|| theme.colors().text.opacity(0.68), |t| t.muted))
                                     .when(date.is_none(), |date| date.opacity(0.))
                                     .child(div().truncate().child(due_text.clone())),
                             ))
@@ -2483,7 +2714,7 @@ impl Render for TaskDetail {
                                     .min_w_0()
                                     .cursor_pointer()
                                     .text_size(px(11.))
-                                    .text_color(sticky_foreground.unwrap_or(theme.colors().text).opacity(0.68))
+                                    .text_color(sticky_tokens.map_or_else(|| theme.colors().text.opacity(0.68), |t| t.muted))
                                     .when(date.is_none(), |date| date.opacity(0.).group_hover("sticky-window", |style| style.opacity(1.)))
                                     .child(div().truncate().child(due_text.clone()))
                                     .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::Due, window, cx)))
@@ -2510,15 +2741,17 @@ impl Render for TaskDetail {
                             ))
                             .child(div().flex_1())
                             .when(self.copied_feedback, |bar| {
+                                let chip_bg = sticky_tokens.map_or_else(|| theme.colors().accent.opacity(0.14), |t| t.surface);
+                                let chip_color = sticky_tokens.map_or(Color::Accent, |t| Color::Custom(t.accent));
                                 bar.child(
                                     h_flex()
                                         .gap_1()
                                         .px_2()
                                         .py_0p5()
                                         .rounded(px(4.))
-                                        .bg(theme.colors().accent.opacity(0.14))
-                                        .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent))
-                                        .child(Label::new(strings.summary_copied).size(LabelSize::XSmall).color(Color::Accent)),
+                                        .bg(chip_bg)
+                                        .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(chip_color))
+                                        .child(Label::new(strings.summary_copied).size(LabelSize::XSmall).color(chip_color)),
                                 )
                             })
                             .when(!sticky && self.word_count > 0, |bar| {
@@ -2812,6 +3045,95 @@ mod tests {
             "delete_forever must wait for host confirmation before purging"
         );
     }
+
+    #[gpui::test]
+    fn cross_polarity_sticky_inputs_and_tokens_use_sticky_ink(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Cross-polarity note").unwrap();
+        let item = store.add_checklist_item(task.id, "Open item", None).unwrap();
+        store.add_subtask(task.id, "Child subtask").unwrap();
+        store.add_comment(task.id, "A comment").unwrap();
+        let task = store.task(task.id).unwrap().unwrap();
+
+        // Dark app theme + light pastel yellow sticky (color 0 -> fg 0x24262b).
+        cx.update(|cx| {
+            theme::init(cx);
+            theme::set(theme::Theme::dark(), cx);
+            cx.set_global(CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut detail = TaskDetail::new(store.clone(), window, cx);
+            detail.show(Some(task.clone()), cx);
+            detail.set_sticky_style(crate::sticky_settings::StickySettings { color: 0, ..Default::default() }, cx);
+            detail
+        });
+        cx.run_until_parked();
+
+        let light_fg: Hsla = gpui::rgb(0x24262b).into();
+        let light_bg: Hsla = gpui::rgb(crate::sticky_settings::PALETTE[0].0).into();
+        cx.update(|window, cx| {
+            let detail = view.read(cx);
+            let tokens = detail.sticky_tokens().expect("sticky tokens set");
+            assert_eq!(tokens.bg, light_bg);
+            assert_eq!(tokens.ink, light_fg);
+            assert_eq!(tokens.muted, light_fg.opacity(0.65));
+            assert_eq!(tokens.border, light_fg.opacity(0.20));
+            assert_eq!(tokens.checkbox_border, light_fg.opacity(0.58));
+            assert_eq!(tokens.surface, light_fg.opacity(0.08));
+
+            for focus_input in [
+                detail.title.clone(),
+                detail.notes.clone(),
+                detail.new_item.clone(),
+                detail.subtask_input.clone(),
+                detail.checklist[0].input.clone(),
+            ] {
+                window.focus(&focus_input.focus_handle(cx), cx);
+                window.refresh();
+                window.draw(cx).clear(cx);
+                assert!(
+                    window.painted_quads().iter().any(|quad| quad.background == gpui::Background::from(light_fg)),
+                    "sticky caret must paint in light_fg instead of dark-theme accent"
+                );
+            }
+        });
+
+        // Adding a new checklist item inherits the active sticky ink override, and toggling
+        // completion switches its text override to muted sticky ink.
+        cx.update(|_, cx| {
+            view.update(cx, |detail, cx| {
+                detail.add_checklist_item("Second item", Some(item.id), cx);
+                detail.sync_checklist(cx);
+                detail.toggle_checklist_item(item.id, true, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Light app theme + dark charcoal sticky (color 11 -> fg 0xf5f5f5).
+        let dark_fg: Hsla = gpui::rgb(0xf5f5f5).into();
+        cx.update(|window, cx| {
+            theme::set(theme::Theme::light(), cx);
+            view.update(cx, |detail, cx| {
+                detail.set_sticky_style(crate::sticky_settings::StickySettings { color: 11, ..Default::default() }, cx);
+                detail.comment_open = true;
+                window.focus(&detail.comment_input.focus_handle(cx), cx);
+            });
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert!(
+                window.painted_quads().iter().any(|quad| quad.background == gpui::Background::from(dark_fg)),
+                "comment input caret on dark sticky must paint in dark_fg"
+            );
+            let title = view.read(cx).title.clone();
+            window.focus(&title.focus_handle(cx), cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert!(
+                window.painted_quads().iter().any(|quad| quad.background == gpui::Background::from(dark_fg)),
+                "title caret on dark sticky must paint in dark_fg"
+            );
+        });
+    }
 }
 
 fn format_size(bytes: u64) -> String {
@@ -2879,9 +3201,10 @@ fn render_markdown_blocks(
 ) -> AnyElement {
     use fern_core::markdown::BlockKind;
     let theme = cx.theme();
+    let sticky_tokens = sticky.map(StickyPaletteTokens::from_settings);
     let line_height = px(sticky.map_or(22., |style| style.font_px() + 8.));
-    let accent = sticky.map_or(theme.colors().text_accent, |s| gpui::rgb(if s.color >= 9 { 0x95b7ff } else { 0x254c9e }).into());
-    let muted = sticky.map_or(theme.colors().text_muted, |s| gpui::rgb(if s.color >= 9 { 0xbcc5d6 } else { 0x525566 }).into());
+    let accent = sticky_tokens.map_or(theme.colors().text_accent, |t| t.accent);
+    let muted = sticky_tokens.map_or(theme.colors().text_muted, |t| t.muted);
     let styled = |text: String, runs: Vec<(std::ops::Range<usize>, fern_core::markdown::Style)>| {
         let highlights = runs
             .into_iter()
@@ -2906,7 +3229,7 @@ fn render_markdown_blocks(
                     h.background_color = Some(theme.status().warning.opacity(0.35));
                 }
                 if style.code {
-                    h.background_color = Some(theme.colors().element_hover);
+                    h.background_color = Some(sticky_tokens.map_or(theme.colors().element_hover, |t| t.surface));
                 }
                 (range, h)
             })
@@ -2958,14 +3281,29 @@ fn render_markdown_blocks(
                     .child(body)
                     .into_any_element(),
                 BlockKind::Check(done) => {
-                    let cb = Checkbox::new(("md-check", ix)).size(px(14.)).toggle_state(done);
-                    let cb = if let Some(toggle) = on_toggle_check.clone() {
-                        cb.on_click(move |_, window, cx| {
-                            cx.stop_propagation();
-                            toggle(ix, window, cx);
-                        })
+                    let cb = if let Some(t) = sticky_tokens {
+                        let cb = sticky_checkbox(("md-check", ix), done, false, false, None, t);
+                        if let Some(toggle) = on_toggle_check.clone() {
+                            cb.cursor_pointer()
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    toggle(ix, window, cx);
+                                })
+                                .into_any_element()
+                        } else {
+                            cb.into_any_element()
+                        }
                     } else {
-                        cb
+                        let cb = Checkbox::new(("md-check", ix)).size(px(14.)).toggle_state(done);
+                        if let Some(toggle) = on_toggle_check.clone() {
+                            cb.on_click(move |_, window, cx| {
+                                cx.stop_propagation();
+                                toggle(ix, window, cx);
+                            })
+                            .into_any_element()
+                        } else {
+                            cb.into_any_element()
+                        }
                     };
                     h_flex()
                         .items_start()
@@ -2975,7 +3313,7 @@ fn render_markdown_blocks(
                         .into_any_element()
                 }
                 BlockKind::Quote => div().pl_3().border_l_2().border_color(accent).text_color(muted).child(body).into_any_element(),
-                BlockKind::Divider => div().my_1().h(px(1.)).bg(theme.colors().border).into_any_element(),
+                BlockKind::Divider => div().my_1().h(px(1.)).bg(sticky_tokens.map_or(theme.colors().border, |t| t.border)).into_any_element(),
                 BlockKind::Image(_) if !show_images => body.text_color(muted).into_any_element(),
                 // An image line shows the image at most as wide as the panel, as the original; a
                 // relative address is a file among the attachments.

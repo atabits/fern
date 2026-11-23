@@ -56,8 +56,16 @@ impl CalendarOptionsDialog {
         let options = store.calendar_options().unwrap_or_default();
         let lists = store.lists().unwrap_or_default();
         let tags = store.tags().unwrap_or_default();
-        let tz_input = cx.new(|cx| TextInput::new(Mode::SingleLine, "", cx).without_cancel());
+        let strings = i18n::t(cx);
+        let tz_input =
+            cx.new(|cx| TextInput::new(Mode::SingleLine, strings.timezone_search, cx).without_cancel());
         cx.subscribe(&tz_input, |_, _, _: &Changed, cx| cx.notify()).detach();
+        cx.observe_global::<i18n::CurrentLocale>(|this, cx| {
+            let placeholder = i18n::t(cx).timezone_search;
+            this.tz_input.update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+            cx.notify();
+        })
+        .detach();
         cx.observe_global::<crate::data_version::DataVersion>(|this, cx| {
             if crate::data_version::changed_elsewhere(cx.entity_id(), cx) {
                 this.reload(cx);
@@ -94,9 +102,27 @@ impl CalendarOptionsDialog {
         cx.notify();
     }
 
+    fn back_button(&self, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .debug_selector(|| "calendar-options-back".to_owned())
+            .child(
+                IconButton::new("calendar-options-back", IconName::ChevronLeft)
+                    .icon_color(Color::Muted)
+                    .tooltip(ui::Tooltip::text(strings.view_options))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.page = Page::Main;
+                        this.color_menu = false;
+                        this.tz_menu = false;
+                        cx.notify();
+                    })),
+            )
+    }
+
     fn header(&self, title: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         h_flex()
+            .gap_1()
+            .when(self.page != Page::Main, |el| el.child(self.back_button(strings, cx)))
             .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(title))
             .child(
                 IconButton::new("calendar-options-x", IconName::X)
@@ -108,10 +134,11 @@ impl CalendarOptionsDialog {
 
     fn render_main(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
-        let group = || v_flex().py_1().rounded(px(8.)).bg(theme.colors().element_selected);
+        let group = || v_flex().py_1().rounded(px(8.)).bg(theme.colors().surface_background);
         let page_row = |id: &'static str, label: &'static str, page: Page, cx: &mut Context<Self>| {
             h_flex()
                 .id(id)
+                .debug_selector(move || id.to_owned())
                 .h(px(40.))
                 .px_4()
                 .rounded(px(6.))
@@ -173,8 +200,9 @@ impl CalendarOptionsDialog {
                         .rounded(px(6.))
                         .border_1()
                         .border_color(theme.colors().border)
-                        .child(self.tz_input.clone())
-                        .child(Label::new(if self.tz_input.read(cx).text().is_empty() { strings.timezone_search } else { "" }).size(LabelSize::Small).color(Color::Muted)),
+                        .bg(theme.colors().background)
+                        .text_size(px(12.))
+                        .child(div().flex_1().min_w_0().child(self.tz_input.clone())),
                 )
                 .child(
                     v_scroll(
@@ -351,7 +379,7 @@ impl CalendarOptionsDialog {
                 .py_1()
                 .rounded_full()
                 .cursor_pointer()
-                .bg(if on { accent.opacity(0.15) } else { theme.colors().element_selected })
+                .bg(if on { accent.opacity(0.15) } else { theme.colors().surface_background })
                 .when(!on, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
                 .child(Label::new(*label).color(if on { Color::Accent } else { Color::Muted }))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -364,7 +392,7 @@ impl CalendarOptionsDialog {
             .gap_3()
             .child(
                 h_flex()
-                    .child(div().w(px(26.)))
+                    .child(self.back_button(strings, cx))
                     .child(tabs)
                     .child(
                         IconButton::new("calendar-options-x", IconName::X)
@@ -378,7 +406,7 @@ impl CalendarOptionsDialog {
                     .h(px(48.))
                     .px_4()
                     .rounded(px(8.))
-                    .bg(theme.colors().element_selected)
+                    .bg(theme.colors().surface_background)
                     .child(div().flex_1().child(Label::new(strings.color_by)))
                     .child(
                         div().relative().child(
@@ -411,7 +439,7 @@ impl CalendarOptionsDialog {
                     )
                     .max_h(px(320.))
                     .rounded(px(8.))
-                    .bg(theme.colors().element_selected)
+                    .bg(theme.colors().surface_background)
                     .overflow_hidden()
                     .compact(),
                 )
@@ -464,15 +492,24 @@ impl CalendarOptionsDialog {
                 .child(Label::new(label))
         };
         let item = |modern: bool| {
-            let card = div()
+            let (title_color, time_color, bg) = if modern {
+                (Color::Default, Color::Muted, accent.opacity(0.3))
+            } else {
+                let fill = accent.opacity(0.65);
+                let blended = theme.colors().surface_background.blend(fill);
+                let fg = theme::foreground_on(&[blended], 4.5);
+                (Color::Custom(fg), Color::Custom(fg.opacity(0.82)), fill)
+            };
+            div()
                 .w(px(100.))
                 .h(px(44.))
                 .px_1p5()
                 .py_1()
                 .rounded(px(3.))
-                .child(Label::new(strings.preview_task).size(LabelSize::XSmall))
-                .child(Label::new("09:00-10:00").size(LabelSize::XSmall).color(Color::Muted));
-            if modern { card.bg(accent.opacity(0.3)).border_l_2().border_color(accent) } else { card.bg(accent.opacity(0.65)) }
+                .bg(bg)
+                .when(modern, |el| el.border_l_2().border_color(accent))
+                .child(Label::new(strings.preview_task).size(LabelSize::XSmall).color(title_color))
+                .child(Label::new("09:00-10:00").size(LabelSize::XSmall).color(time_color))
         };
         let hours = || v_flex().gap(px(16.)).children(["09:00", "10:00"].map(|h| Label::new(h).size(LabelSize::XSmall).color(Color::Muted)));
         let style_choice = |id: &'static str, modern: bool, label: &'static str, cx: &mut Context<Self>| {
@@ -518,7 +555,7 @@ impl CalendarOptionsDialog {
                 .child(radio(on, label))
                 .on_click(cx.listener(move |this, _, _, cx| this.change(cx, |o| o.heatmap = shown)))
         };
-        let card = || h_flex().rounded(px(8.)).bg(theme.colors().element_selected);
+        let card = || h_flex().rounded(px(8.)).bg(theme.colors().surface_background);
         let heading = |title: &'static str, hint: &'static str| {
             v_flex().gap_0p5().child(Label::new(title).weight(FontWeight::SEMIBOLD)).child(Label::new(hint).size(LabelSize::Small).color(Color::Muted))
         };

@@ -8,6 +8,55 @@ use crate::subscriptions::{ChinaHolidaySource, ChinaHolidayStatus};
 use super::{Menu, ROW_HEIGHT, SettingsWindow};
 
 impl SettingsWindow {
+    pub(super) fn confirm_delete_subscription(&mut self, cx: &mut Context<Self>) {
+        let Some((id, _)) = self.pending_delete_subscription.take() else {
+            return;
+        };
+        if self
+            .subscription_form
+            .as_ref()
+            .is_some_and(|(form_id, _)| *form_id == Some(id))
+        {
+            self.subscription_form = None;
+        }
+        if let Some(feeds) = crate::subscriptions::feeds(cx) {
+            feeds.update(cx, |feeds, cx| feeds.delete(id, cx));
+        }
+        cx.notify();
+    }
+
+    pub(super) fn render_delete_subscription_confirm(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (_, title) = self.pending_delete_subscription.as_ref()?;
+        let strings = i18n::t(cx);
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .when(cfg!(test), |el| {
+                    el.debug_selector(|| "confirm-delete-subscription".to_owned())
+                })
+                .child(
+                    ConfirmDialog::new(
+                        "confirm-delete-subscription",
+                        format!("{} \"{title}\"?", strings.subscription_delete),
+                    )
+                    .cancel_label(strings.cancel)
+                    .confirm_label(strings.subscription_delete)
+                    .destructive(true)
+                    .on_cancel(cx.listener(|this, _, _, cx| {
+                        this.pending_delete_subscription = None;
+                        cx.notify();
+                    }))
+                    .on_confirm(cx.listener(|this, _, _, cx| {
+                        this.confirm_delete_subscription(cx);
+                    })),
+                )
+                .into_any_element(),
+        )
+    }
     pub(super) fn render_china_holiday_source(
         &self,
         current: Option<(fern_core::Id, ChinaHolidaySource)>,
@@ -184,14 +233,26 @@ impl SettingsWindow {
                             .on_click(cx.listener(move |this, _, window, cx| this.open_subscription_form(Some(id), window, cx))),
                     )
                     .child(
-                        IconButton::new(SharedString::from(format!("subscription-delete-{id}")), IconName::Trash)
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text(strings.subscription_delete))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                if let Some(feeds) = crate::subscriptions::feeds(cx) {
-                                    feeds.update(cx, |feeds, cx| feeds.delete(id, cx));
-                                }
-                            })),
+                        div()
+                            .when(cfg!(test), |el| {
+                                el.debug_selector(move || format!("subscription-delete-{id}"))
+                            })
+                            .child(
+                                IconButton::new(
+                                    SharedString::from(format!("subscription-delete-{id}")),
+                                    IconName::Trash,
+                                )
+                                .icon_color(Color::Muted)
+                                .hover_icon_color(Color::Error)
+                                .tooltip(Tooltip::text(strings.subscription_delete))
+                                .on_click({
+                                    let title = subscription.title().to_owned();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.pending_delete_subscription = Some((id, title.clone()));
+                                        cx.notify();
+                                    })
+                                }),
+                            ),
                     )
                     .into_any_element()
             })
@@ -226,27 +287,16 @@ impl SettingsWindow {
                     }))
             }));
             let is_caldav = self.subscription_kind == fern_core::ical::CalendarKind::CalDav;
-            let mode_btn = |id: &'static str, label: &'static str, kind: fern_core::ical::CalendarKind| {
-                let active = self.subscription_kind == kind;
-                div()
-                    .id(id)
-                    .debug_selector(move || id.to_owned())
-                    .px_2p5()
-                    .h(px(26.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .when(active, |el| el.bg(colors.element_selected))
-                    .when(!active, |el| el.hover(|s| s.bg(colors.ghost_element_hover)))
-                    .child(Label::new(label).size(LabelSize::Small).color(if active { Color::Accent } else { Color::Default }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.subscription_kind = kind;
-                        if kind == fern_core::ical::CalendarKind::CalDav && this.subscription_provider == fern_core::ical::CalendarProvider::Url {
-                            this.subscription_provider = fern_core::ical::CalendarProvider::CalDav;
-                        }
-                        cx.notify();
-                    }))
+            let set_kind = |kind: fern_core::ical::CalendarKind| {
+                cx.listener(move |this, _, _, cx| {
+                    this.subscription_kind = kind;
+                    if kind == fern_core::ical::CalendarKind::CalDav
+                        && this.subscription_provider == fern_core::ical::CalendarProvider::Url
+                    {
+                        this.subscription_provider = fern_core::ical::CalendarProvider::CalDav;
+                    }
+                    cx.notify();
+                })
             };
             let provider_label = |p: fern_core::ical::CalendarProvider| match p {
                 fern_core::ical::CalendarProvider::Url => strings.cal_provider_url,
@@ -259,12 +309,24 @@ impl SettingsWindow {
             };
             group()
                 .child(
-                    h_flex()
-                        .px_4()
-                        .py_2()
-                        .gap_1()
-                        .child(mode_btn("subscription-kind-ics", strings.cal_source_ics, fern_core::ical::CalendarKind::Ics))
-                        .child(mode_btn("subscription-kind-caldav", strings.cal_source_caldav, fern_core::ical::CalendarKind::CalDav)),
+                    div().px_4().py_2().child(
+                        div()
+                            .debug_selector(|| "subscription-kind-tabs".to_owned())
+                            .child(
+                                SegmentedTabs::new()
+                                    .full_width()
+                                    .tab(
+                                        SegmentedTab::new("subscription-kind-ics", strings.cal_source_ics)
+                                            .toggle_state(!is_caldav)
+                                            .on_click(set_kind(fern_core::ical::CalendarKind::Ics)),
+                                    )
+                                    .tab(
+                                        SegmentedTab::new("subscription-kind-caldav", strings.cal_source_caldav)
+                                            .toggle_state(is_caldav)
+                                            .on_click(set_kind(fern_core::ical::CalendarKind::CalDav)),
+                                    ),
+                            ),
+                    ),
                 )
                 .when(is_caldav, |el| {
                     el.child(
@@ -339,13 +401,13 @@ impl SettingsWindow {
                                 .py_1()
                                 .gap_2()
                                 .child(
-                                    form_button(
+                                    Button::new(
                                         "caldav-discover",
                                         if self.subscription_discovering { "…" } else { strings.cal_discover },
-                                        false,
-                                        &colors,
                                     )
-                                    .when(!has_url || self.subscription_discovering, |el| el.opacity(0.45).cursor_default())
+                                    .variant(ButtonVariant::Secondary)
+                                    .size(ButtonSize::Sm)
+                                    .disabled(!has_url || self.subscription_discovering)
                                     .on_click(cx.listener(|this, _, _, cx| this.discover_caldav(cx))),
                                 )
                                 .when_some(self.subscription_discover_error.as_ref(), |el, err| {
@@ -396,13 +458,20 @@ impl SettingsWindow {
                         .py_2()
                         .gap_2()
                         .justify_end()
-                        .child(form_button("subscription-cancel", strings.cancel, false, &colors).on_click(cx.listener(|this, _, _, cx| {
-                            this.subscription_form = None;
-                            cx.notify();
-                        })))
                         .child(
-                            form_button("subscription-save", strings.ok, true, &colors)
-                                .when(!has_url, |el| el.opacity(0.45).cursor_default())
+                            Button::new("subscription-cancel", strings.cancel)
+                                .variant(ButtonVariant::Secondary)
+                                .size(ButtonSize::Sm)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.subscription_form = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("subscription-save", strings.ok)
+                                .variant(ButtonVariant::Primary)
+                                .size(ButtonSize::Sm)
+                                .disabled(!has_url)
                                 .on_click(cx.listener(|this, _, _, cx| this.save_subscription_form(cx))),
                         ),
                 )
@@ -469,20 +538,4 @@ impl SettingsWindow {
         }
         page
     }
-}
-
-/// A small dialog button: the accent for the one that confirms, a frame for the other.
-fn form_button(id: &'static str, label: &'static str, primary: bool, colors: &theme::ThemeColors) -> Stateful<Div> {
-    div()
-        .id(id)
-        .w(px(80.))
-        .h(px(28.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(6.))
-        .cursor_pointer()
-        .when(primary, |el| el.bg(colors.accent).hover(|s| s.opacity(0.9)))
-        .when(!primary, |el| el.border_1().border_color(colors.border).hover(|s| s.bg(colors.element_hover)))
-        .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
 }

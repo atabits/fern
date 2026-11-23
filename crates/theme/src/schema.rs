@@ -838,7 +838,7 @@ fn refine_theme(content: &ThemeContent, author: Option<&str>) -> (Theme, Vec<Str
         }
 
         if accent_override.is_some() || background_override.is_some() || text_override.is_some() {
-            let on_accent = foreground_on(&[accent], 3.);
+            let on_accent = foreground_on(&[accent], 3.8);
             theme.colors.accent = accent;
             theme.colors.text_accent = readable_accent(accent, background, ink);
             theme.colors.on_accent = on_accent;
@@ -857,7 +857,7 @@ fn refine_theme(content: &ThemeContent, author: Option<&str>) -> (Theme, Vec<Str
             theme.colors.text_accent = readable_accent(accent, theme.colors.background, ink);
         }
         if accent_override.is_some() {
-            let on_accent = foreground_on(&[accent], 3.);
+            let on_accent = foreground_on(&[accent], 3.8);
             theme.colors.accent = accent;
             theme.colors.on_accent = on_accent;
             theme.colors.icon_on_accent = on_accent;
@@ -913,7 +913,7 @@ mod tests {
         for theme in &themes {
             assert!(theme.is_custom());
             assert!(contrast(theme.colors().text_accent, theme.colors().background) >= 4.49, "{}", theme.id());
-            assert!(contrast(theme.colors().on_accent, theme.colors().accent) >= 3.0, "{}", theme.id());
+            assert!(contrast(theme.colors().on_accent, theme.colors().accent) >= 3.8, "{}", theme.id());
         }
         assert_eq!(themes[0].id(), "fern-dusk");
         assert!(themes[0].is_dark());
@@ -1027,7 +1027,7 @@ mod tests {
         assert_eq!(theme.colors().background, try_parse_color("#2e3440").unwrap());
         assert_eq!(theme.colors().sidebar_background, Background::from(try_parse_color("#242933").unwrap()));
         assert_eq!(theme.colors().lists_background, Background::from(try_parse_color("#2e3440").unwrap()));
-        assert!(contrast(theme.colors().on_accent, theme.colors().accent) >= 3.0);
+        assert!(contrast(theme.colors().on_accent, theme.colors().accent) >= 3.8);
         assert!(contrast(theme.colors().text_accent, theme.colors().background) >= 4.49);
         assert_ne!(theme.colors().border_variant, Theme::dark().colors().border_variant);
         assert_ne!(theme.colors().text_muted, Theme::dark().colors().text_muted);

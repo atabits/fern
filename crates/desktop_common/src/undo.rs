@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use chrono::{NaiveDate, NaiveDateTime};
-use fern_core::{Id, Store, Task};
+use fern_core::{Horizon, Id, Store, Task};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UndoAction {
@@ -10,16 +10,23 @@ pub enum UndoAction {
     Reopen { id: Id, cascaded: Vec<Id> },
     /// The task went to the trash.
     Restore(Id),
-    /// A repeating task was completed: its completed copy goes and its dates/state come back.
+    /// A repeating task was completed: its completed copy goes and its dates/horizon/state come back.
     ReopenRepeat {
         id: Id,
         copy: Id,
         due: Option<NaiveDate>,
         end: Option<NaiveDate>,
         start: Option<NaiveDate>,
+        horizon: Option<Horizon>,
         repeat: Option<fern_core::Recurrence>,
         in_progress: bool,
         snoozed_until: Option<NaiveDateTime>,
+    },
+    /// A task's horizon assignment changed (e.g., rollover or drag-and-drop).
+    RestoreHorizon {
+        id: Id,
+        before: Option<Horizon>,
+        after: Option<Horizon>,
     },
 }
 
@@ -33,7 +40,7 @@ impl UndoAction {
                 store.reopen_tasks(&ids)
             }
             Self::Restore(id) => store.restore_task(*id),
-            Self::ReopenRepeat { id, copy, due, end, start: _, repeat, in_progress, snoozed_until } => {
+            Self::ReopenRepeat { id, copy, due, end, start: _, horizon, repeat, in_progress, snoozed_until } => {
                 // Never delete the completed copy if the repeating parent was purged or deleted.
                 let Some(parent) = store.task(*id)? else {
                     return Ok(());
@@ -41,7 +48,7 @@ impl UndoAction {
                 if parent.is_deleted() {
                     return Ok(());
                 }
-                store.undo_repeat(*id, *copy, *due, *end, repeat.as_ref())?;
+                store.undo_repeat_with_horizon(*id, *copy, *due, *end, *horizon, repeat.as_ref())?;
                 if *in_progress {
                     store.set_in_progress(*id, true)?;
                 }
@@ -49,6 +56,15 @@ impl UndoAction {
                     store.snooze_task(*id, at)?;
                 }
                 Ok(())
+            }
+            Self::RestoreHorizon { id, before, .. } => {
+                let Some(task) = store.task(*id)? else {
+                    return Ok(());
+                };
+                if task.is_deleted() {
+                    return Ok(());
+                }
+                store.set_horizon(*id, *before)
             }
         }
     }
@@ -63,17 +79,18 @@ impl UndoAction {
                 }
                 Ok(Some(complete(store, &task)?))
             }
-            Self::ReopenRepeat { id, copy, due, end, start, .. } => {
+            Self::ReopenRepeat { id, copy, due, end, start, horizon, .. } => {
                 let Some(task) = store.task(*id)? else { return Ok(None) };
                 if task.is_deleted() || task.is_completed() {
                     return Ok(None);
                 }
                 // Guard against double-advancing when the repeating task was never undone
-                // or has already moved past its pre-completion dates.
+                // or has already moved past its pre-completion dates/horizon.
                 if store.task(*copy)?.is_some()
                     || task.due_date != *due
                     || task.end_date != *end
                     || task.start_date != *start
+                    || task.horizon != *horizon
                 {
                     return Ok(None);
                 }
@@ -86,6 +103,18 @@ impl UndoAction {
                 }
                 store.delete_task(*id)?;
                 Ok(Some(Self::Restore(*id)))
+            }
+            Self::RestoreHorizon { id, before, after } => {
+                let Some(task) = store.task(*id)? else { return Ok(None) };
+                if task.is_deleted() || task.horizon != *before {
+                    return Ok(None);
+                }
+                store.set_horizon(*id, *after)?;
+                Ok(Some(Self::RestoreHorizon {
+                    id: *id,
+                    before: *before,
+                    after: *after,
+                }))
             }
         }
     }
@@ -101,6 +130,7 @@ pub fn complete(store: &Store, task: &Task) -> Result<UndoAction> {
             due: task.due_date,
             end: task.end_date,
             start: task.start_date,
+            horizon: task.horizon,
             repeat: task.repeat.clone(),
             in_progress: task.in_progress_at.is_some(),
             snoozed_until: task.snoozed_until,
@@ -263,5 +293,55 @@ mod tests {
         assert_eq!(store.task(task.id).unwrap().unwrap().start_date, Some(tomorrow));
         // Second redo is guarded by start_date mismatch even if copy were deleted.
         assert!(redone.redo(&store).unwrap().is_none());
+    }
+
+    #[test]
+    fn undo_and_redo_work_for_repeating_horizon_task_and_restore_horizon() {
+        let store = Store::open_in_memory().unwrap();
+        let w48 = Horizon::Week { year: 2026, week: 48 };
+        let w49 = Horizon::Week { year: 2026, week: 49 };
+        let task = store
+            .create_task(
+                fern_core::TaskDraft {
+                    title: "Weekly horizon habit".into(),
+                    horizon: Some(w48),
+                    repeat: Some(fern_core::Recurrence::new(fern_core::Frequency::Weekly, 1)),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        let undo = complete(&store, &task).unwrap();
+        assert!(matches!(undo, UndoAction::ReopenRepeat { horizon: Some(h), .. } if h == w48));
+        assert_eq!(store.task(task.id).unwrap().unwrap().horizon, Some(w49));
+
+        // Double redo before undo must be a no-op.
+        assert!(undo.redo(&store).unwrap().is_none());
+
+        // Undo restores horizon back to W48 and removes completed copy.
+        undo.apply(&store).unwrap();
+        assert_eq!(store.task(task.id).unwrap().unwrap().horizon, Some(w48));
+        assert_eq!(store.tasks().unwrap().iter().filter(|t| t.is_completed()).count(), 0);
+
+        // Redo advances cleanly back to W49.
+        let redone = undo.redo(&store).unwrap().expect("redo must advance horizon repeat");
+        assert_eq!(store.task(task.id).unwrap().unwrap().horizon, Some(w49));
+        assert!(redone.redo(&store).unwrap().is_none());
+
+        // RestoreHorizon undo/redo roundtrip.
+        let m12 = Horizon::Month { year: 2026, month: 12 };
+        let move_task = store.add_task("Horizon move").unwrap();
+        store.set_horizon(move_task.id, Some(m12)).unwrap();
+        let restore = UndoAction::RestoreHorizon {
+            id: move_task.id,
+            before: None,
+            after: Some(m12),
+        };
+        restore.apply(&store).unwrap();
+        assert_eq!(store.task(move_task.id).unwrap().unwrap().horizon, None);
+        let redone_move = restore.redo(&store).unwrap().expect("redo must reapply horizon");
+        assert_eq!(store.task(move_task.id).unwrap().unwrap().horizon, Some(m12));
+        // Redo again without undo is guarded.
+        assert!(redone_move.redo(&store).unwrap().is_none());
     }
 }

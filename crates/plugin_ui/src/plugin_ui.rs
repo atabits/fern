@@ -11,7 +11,7 @@ pub use modal::{
     render_plugin_overlays,
 };
 pub use settings_view::{PluginSettingsTab, PluginSettingsView};
-pub use view::{PluginView, PluginViewEvent, UiTreeState};
+pub use view::{PluginView, PluginViewEvent, UiTreeState, rasterize_svg, safe_usvg_options};
 
 #[cfg(test)]
 mod tests {

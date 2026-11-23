@@ -532,8 +532,10 @@ impl SummaryView {
         if let Some(path) = menu.strip_prefix("image:") {
             let path = path.to_owned();
             let (export, _, _) = self.export_snapshot(cx);
+            let fonts = crate::report_image::load_report_fonts(cx);
             let task = cx.background_executor().spawn(async move {
-                let png = crate::report_image::png(&export.heading, &export.groups)
+                let fonts = fonts.map_err(|err| err.to_string())?;
+                let png = crate::report_image::png_with_fonts(&export.heading, &export.groups, fonts)
                     .map_err(|err| err.to_string())?;
                 std::fs::write(&path, png).map_err(|err| err.to_string())
             });

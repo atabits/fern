@@ -14,7 +14,6 @@ pub mod markdown_toolbar;
 pub mod paths;
 pub mod plugin_bus;
 pub mod portable;
-pub mod report_image;
 pub mod resize;
 pub mod sound;
 pub mod sticky_opener;

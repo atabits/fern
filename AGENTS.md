@@ -13,7 +13,7 @@ Fern uses a layered Cargo workspace so crates compile in parallel and edits to o
   - `crates/icons`, `crates/assets`, `crates/theme`, `crates/ui`: design tokens, bundled fonts/icons, reusable GPUI primitives.
   - `crates/i18n` (`fern_i18n`): static translation tables (`EN`, `RU`, `ZH_CN`) and `CurrentLocale` global. Every new UI string must be added to all locales in `Strings`.
 - **Shared Desktop Layers**
-  - `crates/desktop_common`: app paths (`paths`), global actions (`actions`), `keymap`, date/time formatting (`calendar`), `text_input`, `touch`/`touch_keyboard`, `markdown_toolbar`, `export`, `report_image`, `sync`, `subscriptions`, `undo`, `DataVersion`, `StickyOpener`, layout constants, and small cross-view presenters (`colors`, `habit_helpers`, `countdown_helpers`).
+  - `crates/desktop_common`: app paths (`paths`), global actions (`actions`), `keymap`, date/time formatting (`calendar`), `text_input`, `touch`/`touch_keyboard`, `markdown_toolbar`, `export`, `sync`, `subscriptions`, `undo`, `DataVersion`, `StickyOpener`, layout constants, and small cross-view presenters (`colors`, `habit_helpers`, `countdown_helpers`).
   - `crates/task_ui`: reusable task components shared across views (`drag`, `task_rows`, `task_menu`, `due_picker`, `lists_panel`, `list_dialog`, `tag_dialog`, `print`, `task_detail`).
 - **Parallel Feature Crates** *(independent siblings — compile in parallel)*
   - `crates/countdown_ui`
@@ -22,15 +22,16 @@ Fern uses a layered Cargo workspace so crates compile in parallel and edits to o
   - `crates/focus_ui`
   - `crates/sticky_ui`
   - `crates/calendar_ui`
+  - `crates/horizons_ui`
   - `crates/summary_ui`
-  - `crates/todo_ui` *(depends on `summary_ui`)*
+  - `crates/todo_ui` *(depends on `summary_ui`, `horizons_ui`)*
 - **Thin Binaries**
   - `apps/desktop` (`fern_desktop`): thin window shell (`main.rs`, `app_view.rs`, `sidebar.rs`, `title_bar.rs`, `settings_window.rs`, `search_modal.rs`, `quick_add_window.rs`, `reminders.rs`, `hotkeys.rs`, `tray.rs`, `updater.rs`, `user_themes.rs`, `release_notes.rs`).
   - `apps/server` (`fern_server`): optional self-hosted HTTP sync server.
 
 ### Strict Architectural Rules
 1. **Keep `apps/desktop` thin.** Put feature UI code in its corresponding `crates/<feature>_ui` crate (or create a new crate if adding a major section). Never dump large new views into `apps/desktop`.
-2. **No dependencies between sibling `*_ui` crates** (except `todo_ui -> summary_ui`).
+2. **No dependencies between sibling `*_ui` crates** (except `todo_ui -> summary_ui, horizons_ui`).
    - Wire cross-view actions via GPUI `EventEmitter` + `cx.subscribe` / `cx.subscribe_in` in `apps/desktop/src/app_view.rs`.
    - Use shared globals/callbacks in `desktop_common` (such as `DataVersion` for cross-window refresh and `StickyOpener` for opening sticky notes) rather than importing another feature crate.
 3. **New crate conventions:**

@@ -1891,7 +1891,9 @@ fn render_svg_node(
         .into_any_element()
 }
 
-pub(crate) fn safe_usvg_options() -> usvg::Options<'static> {
+/// `usvg` options with external/data `<image>` resolution disabled so untrusted
+/// plugin SVGs cannot read local files or recursively load embedded images.
+pub fn safe_usvg_options() -> usvg::Options<'static> {
     usvg::Options {
         image_href_resolver: usvg::ImageHrefResolver {
             resolve_data: Box::new(|_, _, _| None),
@@ -1899,6 +1901,44 @@ pub(crate) fn safe_usvg_options() -> usvg::Options<'static> {
         },
         ..usvg::Options::default()
     }
+}
+
+/// Sanitizes an untrusted SVG, substitutes `currentColor` with `ink_rgb`,
+/// safely rasterizes it centered inside `width_px × height_px`, and converts
+/// it to a GPUI `RenderImage`.
+pub fn rasterize_svg(
+    raw_svg: &str,
+    width_px: u32,
+    height_px: u32,
+    ink_rgb: (u8, u8, u8),
+    cx: &App,
+) -> Option<Arc<RenderImage>> {
+    let sanitized = sanitize_svg(raw_svg).ok()?;
+    let (r, g, b) = ink_rgb;
+    let resolved_svg = if sanitized.to_ascii_lowercase().contains("currentcolor") {
+        let hex = format!("#{r:02x}{g:02x}{b:02x}");
+        replace_ascii_case_insensitive(&sanitized, "currentcolor", &hex)
+    } else {
+        sanitized
+    };
+
+    let opts = safe_usvg_options();
+    let tree = usvg::Tree::from_str(&resolved_svg, &opts).ok()?;
+    let svg_size = tree.size();
+    let sx = width_px as f32 / svg_size.width().max(1.0);
+    let sy = height_px as f32 / svg_size.height().max(1.0);
+    let scale = sx.min(sy);
+    let dx = (width_px as f32 - svg_size.width() * scale) * 0.5;
+    let dy = (height_px as f32 - svg_size.height() * scale) * 0.5;
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width_px, height_px)?;
+    let transform =
+        resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(dx, dy);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    let png = pixmap.encode_png().ok()?;
+    let gpui_img = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
+    gpui_img.to_image_data(cx.svg_renderer()).ok()
 }
 
 fn rasterize_svg_cached(
@@ -1928,33 +1968,7 @@ fn rasterize_svg_cached(
         return cached.clone();
     }
 
-    let rendered = (|| -> Option<Arc<RenderImage>> {
-        let sanitized = sanitize_svg(raw_content).ok()?;
-        let resolved_svg = if sanitized.to_ascii_lowercase().contains("currentcolor") {
-            let hex = format!("#{r:02x}{g:02x}{b:02x}");
-            replace_ascii_case_insensitive(&sanitized, "currentcolor", &hex)
-        } else {
-            sanitized
-        };
-
-        let opts = safe_usvg_options();
-        let tree = usvg::Tree::from_str(&resolved_svg, &opts).ok()?;
-        let svg_size = tree.size();
-        let sx = px_w as f32 / svg_size.width().max(1.0);
-        let sy = px_h as f32 / svg_size.height().max(1.0);
-        let scale = sx.min(sy);
-        let dx = (px_w as f32 - svg_size.width() * scale) * 0.5;
-        let dy = (px_h as f32 - svg_size.height() * scale) * 0.5;
-
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(px_w, px_h)?;
-        let transform =
-            resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(dx, dy);
-        resvg::render(&tree, transform, &mut pixmap.as_mut());
-
-        let png = pixmap.encode_png().ok()?;
-        let gpui_img = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
-        gpui_img.to_image_data(cx.svg_renderer()).ok()
-    })();
+    let rendered = rasterize_svg(raw_content, px_w, px_h, (r, g, b), cx);
 
     let entry_bytes = if rendered.is_some() {
         (px_w as usize)

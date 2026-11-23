@@ -4,6 +4,27 @@ use anyhow::{Context, Result, ensure};
 const REPORT_WIDTH: u32 = 1000;
 const MAX_REPORT_PIXELS: u64 = 32_000_000;
 
+/// Bundled fallback fonts for summary PNG export (Latin and Cyrillic baseline).
+const REPORT_FONT_PATHS: [&str; 2] = [
+    "fonts/IBMPlexSans-Regular.ttf",
+    "fonts/IBMPlexSans-Bold.ttf",
+];
+
+/// Loads the bundled report font buffers from GPUI's `AssetSource` on the UI thread
+/// so `summary_ui` never needs a compile-time dependency on the `assets` crate.
+pub fn load_report_fonts(cx: &gpui::App) -> Result<Vec<Vec<u8>>> {
+    let mut fonts = Vec::with_capacity(REPORT_FONT_PATHS.len());
+    for path in REPORT_FONT_PATHS {
+        let font = cx
+            .asset_source()
+            .load(path)
+            .with_context(|| format!("missing report font: {path}"))?
+            .with_context(|| format!("missing report font: {path}"))?;
+        fonts.push(font.into_owned());
+    }
+    Ok(fonts)
+}
+
 /// XML 1.0 §2.2 legal character production: strips NUL, control chars (except TAB/LF/CR),
 /// and U+FFFE/U+FFFF which cause SVG XML parsing to fail.
 fn is_valid_xml_char(ch: char) -> bool {
@@ -63,23 +84,27 @@ fn wrap(text: &str, limit: usize) -> Vec<String> {
     lines
 }
 
-pub fn png(heading: &str, groups: &[(String, Vec<String>)]) -> Result<Vec<u8>> {
+pub fn png_with_fonts(
+    heading: &str,
+    groups: &[(String, Vec<String>)],
+    bundled_fonts: Vec<Vec<u8>>,
+) -> Result<Vec<u8>> {
     let mut options = resvg::usvg::Options::default();
     options.fontdb_mut().load_system_fonts();
-    render_png(heading, groups, options)
+    render_png(heading, groups, bundled_fonts, options)
 }
 
 fn render_png(
     heading: &str,
     groups: &[(String, Vec<String>)],
+    bundled_fonts: Vec<Vec<u8>>,
     mut options: resvg::usvg::Options<'_>,
 ) -> Result<Vec<u8>> {
     // System fonts vary across platforms. Ship a baseline for Latin and Cyrillic,
     // while allowing the renderer to fall back to installed fonts for other scripts.
     let fonts = options.fontdb_mut();
-    for path in ["fonts/IBMPlexSans-Regular.ttf", "fonts/IBMPlexSans-Bold.ttf"] {
-        let font = assets::Assets::get(path).with_context(|| format!("missing report font: {path}"))?;
-        fonts.load_font_data(font.data.into_owned());
+    for font_data in bundled_fonts {
+        fonts.load_font_data(font_data);
     }
 
     let mut lines = Vec::new();
@@ -114,12 +139,29 @@ fn render_png(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+
+    fn test_fonts() -> Vec<Vec<u8>> {
+        let assets_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        REPORT_FONT_PATHS
+            .into_iter()
+            .map(|path| std::fs::read(assets_root.join(path)).expect("bundled report font"))
+            .collect()
+    }
+
     #[test]
     fn image_renders_multilingual_content_without_system_fonts() {
         let text = "Отчёт <edited> & tasks ".repeat(20);
         assert!(wrap(&text, 82).iter().all(|line| line.chars().count() <= 82));
-        let bytes = render_png("Отчёт", &[("Completed".into(), vec![text])], resvg::usvg::Options::default()).unwrap();
+        let bytes = render_png(
+            "Отчёт",
+            &[("Completed".into(), vec![text])],
+            test_fonts(),
+            resvg::usvg::Options::default(),
+        )
+        .unwrap();
         assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         let decoded = resvg::tiny_skia::Pixmap::decode_png(&bytes).unwrap();
         assert_eq!(decoded.width(), REPORT_WIDTH);
@@ -131,7 +173,7 @@ mod tests {
     #[test]
     fn image_preserves_wide_text() {
         let groups = [(String::new(), vec!["W".repeat(82)])];
-        let bytes = render_png("", &groups, resvg::usvg::Options::default()).unwrap();
+        let bytes = render_png("", &groups, test_fonts(), resvg::usvg::Options::default()).unwrap();
         let decoded = resvg::tiny_skia::Pixmap::decode_png(&bytes).unwrap();
         assert!(decoded.width() > REPORT_WIDTH);
         assert!(decoded.pixels().chunks_exact(decoded.width() as usize)
@@ -147,6 +189,7 @@ mod tests {
         let bytes = render_png(
             dirty_heading,
             &[(dirty_group.into(), vec![dirty_item.into()])],
+            test_fonts(),
             resvg::usvg::Options::default(),
         )
         .unwrap();

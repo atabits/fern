@@ -11,11 +11,13 @@ workspace = true
 path = "src/summary_ui.rs"
 
 [dependencies]
+anyhow.workspace = true
 chrono.workspace = true
 desktop_common.workspace = true
 fern_core.workspace = true
 fern_i18n.workspace = true
 gpui.workspace = true
+resvg.workspace = true
 task_ui.workspace = true
 theme.workspace = true
 ui.workspace = true

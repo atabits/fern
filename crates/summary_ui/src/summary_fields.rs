@@ -7,7 +7,17 @@ use super::Report;
 
 impl super::SummaryView {
     pub(super) fn save_png(&mut self, heading: String, groups: Vec<(String, Vec<String>)>, cx: &mut gpui::Context<Self>) {
-        let generate = cx.background_executor().spawn(async move { crate::report_image::png(&heading, &groups) });
+        let fonts = match crate::report_image::load_report_fonts(cx) {
+            Ok(fonts) => fonts,
+            Err(error) => {
+                self.saved = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let generate = cx.background_executor().spawn(async move {
+            crate::report_image::png_with_fonts(&heading, &groups, fonts)
+        });
         cx.spawn(async move |this, cx| {
             let result = generate.await;
             this.update(cx, |this, cx| match result {

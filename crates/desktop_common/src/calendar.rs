@@ -1,6 +1,7 @@
 //! Date math for the due-date calendar.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, Timelike, Weekday};
 
@@ -52,6 +53,17 @@ pub fn set_week_numbers(on: bool) {
 
 pub fn week_numbers() -> bool {
     WEEK_NUMBERS.with(Cell::get)
+}
+
+/// Global master switch mirroring `Preferences.features.horizons` for cross-app Horizons UI.
+static HORIZONS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn horizons_enabled() -> bool {
+    HORIZONS_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_horizons_enabled(enabled: bool) {
+    HORIZONS_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 /// The ISO week number shown for a calendar row: the week of its Thursday-most day, which is
@@ -366,6 +378,82 @@ pub fn month_title(month: NaiveDate, strings: &Strings) -> String {
         .replace("{yyyy}", &month.year().to_string())
 }
 
+/// Compact localized badge label for a [`fern_core::Horizon`], used in classic task rows,
+/// rollover origin chips, and quick-assign selectors.
+pub fn format_horizon_badge(horizon: fern_core::Horizon, strings: &Strings) -> String {
+    match horizon {
+        fern_core::Horizon::Week { week, .. } => {
+            format!("{}{week}{}", strings.horizons_week_prefix, strings.horizons_week_suffix)
+        }
+        fern_core::Horizon::Month { month, .. } => {
+            strings.life_clock_months[(month.saturating_sub(1) as usize).min(11)].to_owned()
+        }
+        fern_core::Horizon::Quarter { year, quarter } => {
+            format!("{}{quarter} {year}", strings.horizons_quarter_prefix)
+        }
+        fern_core::Horizon::Year(year) => year.to_string(),
+        fern_core::Horizon::Decade(start_year) => {
+            format!("{start_year}{}", strings.horizons_decade_suffix)
+        }
+        fern_core::Horizon::Life => strings.horizons_life.to_owned(),
+    }
+}
+
+/// Formats a week's Monday..=Sunday calendar span cleanly for the active locale
+/// (e.g. `"Nov 23–29"`, `"23–29 ноя"`, `"11月23–29日"`), appending the year when different from `today`.
+fn format_week_range(mon: NaiveDate, sun: NaiveDate, iso_year: i32, today: NaiveDate, strings: &Strings) -> String {
+    let base = if mon.month() == sun.month() {
+        let mon_short = strings.months_short[mon.month0() as usize];
+        if strings.year_first_dates {
+            format!("{mon_short}{}–{}日", mon.day(), sun.day())
+        } else if strings.day_before_month {
+            format!("{}–{} {mon_short}", mon.day(), sun.day())
+        } else {
+            format!("{mon_short} {}–{}", mon.day(), sun.day())
+        }
+    } else {
+        format!("{} – {}", short_date(mon, strings), short_date(sun, strings))
+    };
+    if iso_year != today.year() {
+        format!("{base} {iso_year}")
+    } else {
+        base
+    }
+}
+
+/// Column heading `(primary_title, optional_subtitle)` for a [`fern_core::Horizon`].
+pub fn format_horizon_heading(
+    horizon: fern_core::Horizon,
+    today: NaiveDate,
+    strings: &Strings,
+) -> (String, Option<String>) {
+    match horizon {
+        fern_core::Horizon::Week { year, week } => {
+            let title = format!("{}{week}{}", strings.horizons_week_prefix, strings.horizons_week_suffix);
+            let subtitle = fern_core::horizon::week_bounds(year, week)
+                .map(|(mon, sun)| format_week_range(mon, sun, year, today, strings));
+            (title, subtitle)
+        }
+        fern_core::Horizon::Month { year, month } => {
+            let title = strings.months[(month.saturating_sub(1) as usize).min(11)].to_owned();
+            let subtitle = (year != today.year()).then(|| year.to_string());
+            (title, subtitle)
+        }
+        fern_core::Horizon::Quarter { year, quarter } => {
+            let title = format!("{}{quarter}", strings.horizons_quarter_prefix);
+            let subtitle = (year != today.year()).then(|| year.to_string());
+            (title, subtitle)
+        }
+        fern_core::Horizon::Year(year) => (year.to_string(), None),
+        fern_core::Horizon::Decade(start_year) => {
+            let title = format!("{start_year}{}", strings.horizons_decade_suffix);
+            let subtitle = Some(format!("{start_year}–{}", start_year + 9));
+            (title, subtitle)
+        }
+        fern_core::Horizon::Life => (strings.horizons_life.to_owned(), None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +636,98 @@ mod tests {
 
         let (h, m, _delta) = week_axis::hour_in_timezone(d(2026, 10, 18), 12, chrono_tz::UTC);
         assert!(h < 24 && m == 0);
+    }
+
+    #[test]
+    fn horizon_badges_localize_across_locales() {
+        use fern_core::Horizon;
+        let week = Horizon::Week { year: 2026, week: 48 };
+        let month = Horizon::Month { year: 2026, month: 11 };
+        let quarter = Horizon::Quarter { year: 2026, quarter: 4 };
+        let year = Horizon::Year(2026);
+        let decade = Horizon::Decade(2020);
+
+        assert_eq!(format_horizon_badge(week, &EN), "W48");
+        assert_eq!(format_horizon_badge(week, &RU), "Н48");
+        assert_eq!(format_horizon_badge(week, &ZH_CN), "第48周");
+
+        assert_eq!(format_horizon_badge(month, &EN), "Nov");
+        assert_eq!(format_horizon_badge(month, &RU), "Ноя");
+        assert_eq!(format_horizon_badge(month, &ZH_CN), "11月");
+
+        assert_eq!(format_horizon_badge(quarter, &EN), "Q4 2026");
+        assert_eq!(format_horizon_badge(quarter, &RU), "Q4 2026");
+        assert_eq!(format_horizon_badge(quarter, &ZH_CN), "Q4 2026");
+
+        assert_eq!(format_horizon_badge(year, &EN), "2026");
+        assert_eq!(format_horizon_badge(decade, &EN), "2020s");
+        assert_eq!(format_horizon_badge(decade, &RU), "2020-е");
+        assert_eq!(format_horizon_badge(decade, &ZH_CN), "2020年代");
+
+        assert_eq!(format_horizon_badge(Horizon::Life, &EN), "Life");
+        assert_eq!(format_horizon_badge(Horizon::Life, &RU), "Жизнь");
+        assert_eq!(format_horizon_badge(Horizon::Life, &ZH_CN), "人生");
+    }
+
+    #[test]
+    fn horizon_headings_format_titles_and_subtitles() {
+        use fern_core::Horizon;
+        let today = d(2026, 11, 23);
+
+        // Same-month ISO week (2026-W48 = Nov 23..Nov 29)
+        assert_eq!(
+            format_horizon_heading(Horizon::Week { year: 2026, week: 48 }, today, &EN),
+            ("W48".into(), Some("Nov 23–29".into()))
+        );
+        assert_eq!(
+            format_horizon_heading(Horizon::Week { year: 2026, week: 48 }, today, &RU),
+            ("Н48".into(), Some("23–29 ноя".into()))
+        );
+        assert_eq!(
+            format_horizon_heading(Horizon::Week { year: 2026, week: 48 }, today, &ZH_CN),
+            ("第48周".into(), Some("11月23–29日".into()))
+        );
+
+        // Cross-month ISO week (2026-W49 = Nov 30..Dec 6)
+        assert_eq!(
+            format_horizon_heading(Horizon::Week { year: 2026, week: 49 }, today, &EN),
+            ("W49".into(), Some("Nov 30 – Dec 6".into()))
+        );
+
+        // Month & Quarter omit current year and show other years
+        assert_eq!(
+            format_horizon_heading(Horizon::Month { year: 2026, month: 11 }, today, &RU),
+            ("Ноябрь".into(), None)
+        );
+        assert_eq!(
+            format_horizon_heading(Horizon::Month { year: 2027, month: 1 }, today, &EN),
+            ("January".into(), Some("2027".into()))
+        );
+        assert_eq!(
+            format_horizon_heading(Horizon::Quarter { year: 2026, quarter: 4 }, today, &EN),
+            ("Q4".into(), None)
+        );
+        assert_eq!(
+            format_horizon_heading(Horizon::Quarter { year: 2027, quarter: 1 }, today, &EN),
+            ("Q1".into(), Some("2027".into()))
+        );
+
+        // Year, Decade, Life
+        assert_eq!(format_horizon_heading(Horizon::Year(2026), today, &EN), ("2026".into(), None));
+        assert_eq!(
+            format_horizon_heading(Horizon::Decade(2020), today, &RU),
+            ("2020-е".into(), Some("2020–2029".into()))
+        );
+        assert_eq!(format_horizon_heading(Horizon::Life, today, &RU), ("Жизнь".into(), None));
+    }
+
+    #[test]
+    fn horizons_enabled_flag_toggles_and_restores() {
+        let initial = horizons_enabled();
+        assert!(initial);
+        set_horizons_enabled(false);
+        assert!(!horizons_enabled());
+        set_horizons_enabled(true);
+        assert!(horizons_enabled());
     }
 }

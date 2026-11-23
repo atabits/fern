@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use chrono::{NaiveDate, NaiveTime, Timelike as _};
-use fern_core::{Id, Kind, Priority, Recurrence, ScheduleBucket, Task, TaskDraft};
+use fern_core::{Horizon, Id, Kind, Priority, Recurrence, ScheduleBucket, Task, TaskDraft};
 use fern_i18n as i18n;
 use gpui::{App, AppContext as _, Global};
 
@@ -326,6 +326,7 @@ pub fn task_to_hook_json(task: &Task) -> serde_json::Value {
         "endTime": task.end_time.map(|t| t.format("%H:%M").to_string()),
         "startDate": task.start_date.map(|d| d.format("%Y-%m-%d").to_string()),
         "scheduleBucket": bucket,
+        "horizon": task.horizon.map(|h| h.as_code()),
         "repeat": task.repeat.as_ref().map(ToString::to_string),
         "tags": task.tags,
         "checklist": task.checklist.map(|(done, total)| serde_json::json!({ "done": done, "total": total })),
@@ -465,6 +466,9 @@ pub fn task_draft_to_hook_json(draft: &TaskDraft, top: bool) -> serde_json::Valu
     }
     if let Some(d) = draft.start_date {
         obj.insert("startDate".to_owned(), serde_json::Value::String(d.format("%Y-%m-%d").to_string()));
+    }
+    if let Some(h) = draft.horizon {
+        obj.insert("horizon".to_owned(), serde_json::Value::String(h.as_code()));
     }
     if let Some(rep) = &draft.repeat {
         obj.insert("repeat".to_owned(), serde_json::Value::String(rep.to_string()));
@@ -631,6 +635,18 @@ pub fn parse_task_draft_from_hook_json(
             other => bail!("invalid scheduleBucket {other:?}"),
         };
     }
+    if let Some(h_val) = obj.get("horizon") {
+        match h_val {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(s) if s.trim().is_empty() => {}
+            serde_json::Value::String(s) => {
+                draft.horizon = Some(
+                    Horizon::parse(s).with_context(|| format!("invalid horizon {s:?}"))?,
+                );
+            }
+            _ => bail!("invalid horizon"),
+        }
+    }
     if let Some(rep) = obj.get("repeat").and_then(serde_json::Value::as_str)
         && !rep.trim().is_empty()
     {
@@ -780,5 +796,34 @@ mod tests {
         assert_eq!(parsed.schedule_bucket, ScheduleBucket::Evening);
         assert_eq!(parsed.tags, vec!["ops".to_owned()]);
         assert_eq!(parsed.reminders, vec![0, 15]);
+
+        // Verify horizon serialization & parsing in plugin hook JSON.
+        let w48 = Horizon::Week { year: 2026, week: 48 };
+        let h_task = store
+            .create_task(
+                TaskDraft {
+                    title: "Horizon hook".into(),
+                    horizon: Some(w48),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(task_to_hook_json(&h_task)["horizon"], "W2026-48");
+        assert_eq!(json["horizon"], serde_json::Value::Null);
+
+        let h_draft = TaskDraft {
+            title: "Horizon draft".into(),
+            horizon: Some(w48),
+            ..Default::default()
+        };
+        let h_draft_json = task_draft_to_hook_json(&h_draft, true);
+        assert_eq!(h_draft_json["horizon"], "W2026-48");
+        let (parsed_h, _) = parse_task_draft_from_hook_json(&h_draft_json, true).unwrap();
+        assert_eq!(parsed_h.horizon, Some(w48));
+        assert!(
+            parse_task_draft_from_hook_json(&serde_json::json!({"title": "Bad", "horizon": "W2025-53"}), true)
+                .is_err()
+        );
     }
 }

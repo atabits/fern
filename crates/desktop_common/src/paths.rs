@@ -43,3 +43,23 @@ pub fn pending_restore_path() -> Result<std::path::PathBuf> {
 pub fn backups_dir() -> Result<std::path::PathBuf> {
     Ok(data_dir()?.join("backups"))
 }
+
+/// Where installed plugins live (`<data_dir>/plugins`).
+pub fn plugins_dir() -> Result<std::path::PathBuf> {
+    Ok(data_dir()?.join("plugins"))
+}
+
+/// Encrypted secrets vault file, stored outside `tasks.db` and excluded from backups/sync.
+pub fn plugin_secrets_path() -> Result<std::path::PathBuf> {
+    Ok(data_dir()?.join("plugin-secrets.vault"))
+}
+
+/// Master key file for `plugin-secrets.vault`.
+pub fn plugin_secrets_key_path() -> Result<std::path::PathBuf> {
+    Ok(data_dir()?.join("plugin-secrets.key"))
+}
+
+/// Offline registry catalog and ETag cache directory (`<data_dir>/plugins/.registry-cache`).
+pub fn plugin_registry_cache_dir() -> Result<std::path::PathBuf> {
+    Ok(plugins_dir()?.join(".registry-cache"))
+}

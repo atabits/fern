@@ -1,15 +1,18 @@
 //! Windows single-instance guard keyed on the active data directory.
 //!
-//! Launching `fern.exe` or a `fern://task/<id>` deep link while an instance is already running
-//! for the same data directory forwards the link (if any) and activates the existing window
-//! instead of spawning duplicate reminder/sync loops and tray icons.
+//! Launching `fern.exe` or a `fern://` deep link (`fern://task/<id>`, `fern://plugin/...`) while
+//! an instance is already running for the same data directory forwards the link (if any) and
+//! activates the existing window instead of spawning duplicate reminder/sync loops and tray icons.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
-use fern_core::Id;
+use fern_core::{
+    Id,
+    link::{DeepLink, parse_deep_link},
+};
 use sha2::{Digest as _, Sha256};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM,
@@ -67,8 +70,8 @@ fn to_wide(text: &str) -> Vec<u16> {
 ///
 /// Returns `Ok(Some(InstanceGuard))` when this process is the primary instance.
 /// Returns `Ok(None)` when another instance is already running for `data_dir` after forwarding
-/// `link` (if any) and asking the running instance to activate.
-pub fn acquire(data_dir: &Path, link: Option<Id>) -> Result<Option<InstanceGuard>> {
+/// `link_uri` (if any) and asking the running instance to activate.
+pub fn acquire(data_dir: &Path, link_uri: Option<&str>) -> Result<Option<InstanceGuard>> {
     if std::env::var_os("FERN_DEV_STATE").is_some() {
         return Ok(Some(InstanceGuard));
     }
@@ -78,7 +81,7 @@ pub fn acquire(data_dir: &Path, link: Option<Id>) -> Result<Option<InstanceGuard
     let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     if already_exists {
         let _ = unsafe { CloseHandle(handle) };
-        forward_to_running(data_dir, link);
+        forward_to_running(data_dir, link_uri);
         return Ok(None);
     }
     let mut slot = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -100,12 +103,21 @@ pub fn register_window(data_dir: &Path, hwnd: HWND) {
     }
 }
 
-/// Reads and consumes any `fern://task/<id>` link forwarded by a secondary launch.
-pub fn take_pending_link(data_dir: &Path) -> Option<Id> {
+/// Parses a serialized pending deep link (supporting `fern://` URIs and legacy bare UUID strings).
+pub fn parse_pending_link(raw: &str) -> Option<DeepLink> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    parse_deep_link(trimmed).or_else(|| Id::parse_str(trimmed).ok().map(DeepLink::Task))
+}
+
+/// Reads and consumes any `fern://` deep link forwarded by a secondary launch.
+pub fn take_pending_link(data_dir: &Path) -> Option<DeepLink> {
     let path = data_dir.join(PENDING_LINK_FILE);
     let text = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(&path);
-    Id::parse_str(text.trim()).ok()
+    parse_pending_link(&text)
 }
 
 /// Releases the single-instance mutex and removes the recorded window handle.
@@ -118,15 +130,14 @@ pub fn release() {
     }
 }
 
-fn write_pending_link(data_dir: &Path, id: Id) {
+fn write_pending_link(data_dir: &Path, uri: &str) {
     let pid = unsafe { GetCurrentProcessId() };
     let target = data_dir.join(PENDING_LINK_FILE);
     let tmp = data_dir.join(format!("{PENDING_LINK_FILE}.{pid}.tmp"));
-    let text = id.to_string();
-    if std::fs::write(&tmp, text.as_bytes()).is_ok()
+    if std::fs::write(&tmp, uri.as_bytes()).is_ok()
         && std::fs::rename(&tmp, &target).is_err()
     {
-        let _ = std::fs::write(&target, text.as_bytes());
+        let _ = std::fs::write(&target, uri.as_bytes());
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -151,9 +162,9 @@ fn read_running_window(data_dir: &Path) -> Option<(u32, HWND)> {
     Some((pid, hwnd))
 }
 
-fn forward_to_running(data_dir: &Path, link: Option<Id>) {
-    if let Some(id) = link {
-        write_pending_link(data_dir, id);
+fn forward_to_running(data_dir: &Path, link_uri: Option<&str>) {
+    if let Some(uri) = link_uri {
+        write_pending_link(data_dir, uri);
     }
     let msg = activate_message();
     // Retry briefly in case the primary instance is still creating its main window.
@@ -188,9 +199,32 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fern-single-instance-test-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let id = uuid::Uuid::now_v7();
-        write_pending_link(&dir, id);
-        assert_eq!(take_pending_link(&dir), Some(id));
+
+        // Backwards-compatible bare UUID format.
+        write_pending_link(&dir, &id.to_string());
+        assert_eq!(take_pending_link(&dir), Some(DeepLink::Task(id)));
         assert_eq!(take_pending_link(&dir), None);
+
+        // Task deep-link URI.
+        write_pending_link(&dir, &fern_core::link::task_link(id));
+        assert_eq!(take_pending_link(&dir), Some(DeepLink::Task(id)));
+        assert_eq!(take_pending_link(&dir), None);
+
+        // Plugin deep-link URI with query parameters.
+        write_pending_link(&dir, "fern://plugin/pomodoro/start?minutes=25&label=Deep");
+        assert_eq!(
+            take_pending_link(&dir),
+            Some(DeepLink::Plugin {
+                plugin_id: "pomodoro".into(),
+                command: "start".into(),
+                params: vec![
+                    ("minutes".into(), "25".into()),
+                    ("label".into(), "Deep".into()),
+                ],
+            })
+        );
+        assert_eq!(take_pending_link(&dir), None);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

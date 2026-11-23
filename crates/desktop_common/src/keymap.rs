@@ -40,6 +40,7 @@ pub const USER_KEYMAP_TEMPLATE: &str = r#"// Fern user keymap — overrides the 
 // Contexts (support &&, ||, !):
 //   Workspace      Main window (all sections)
 //   Tasks          Tasks module (lists sidebar + task list + details)
+//   ThingsView     Things view module (Inbox / Today / Upcoming / Anytime / Someday)
 //   TaskList       Focused task list (not while typing in a text field)
 //   TaskDetail     Task details panel / sticky note editor
 //   TaskDraft      Calendar / quick draft editor
@@ -154,6 +155,7 @@ pub const USER_KEYMAP_TEMPLATE: &str = r#"// Fern user keymap — overrides the 
 //   markdown::NumberedList, markdown::Link, markdown::Code, markdown::Quote
 //
 // Drafts & Dialogs:
+//   things::OpenWhen            Open the When schedule picker for the active task (context: "ThingsView")
 //   task_detail::SaveDraft      Save the active draft (context: "TaskDraft")
 //   settings::DismissSettings   Dismiss popup or close Settings (context: "Settings")
 //
@@ -632,7 +634,7 @@ fn contexts_overlap(a: Option<&str>, b: Option<&str>) -> bool {
     let in_main_workspace = |r: &str| {
         matches!(
             r,
-            "Workspace" | "Tasks" | "TaskList" | "TaskDetail" | "Calendar" | "CalendarYear" | "Habits" | "Matrix" | "Focus" | "Countdown"
+            "Workspace" | "Tasks" | "ThingsView" | "TaskList" | "TaskDetail" | "Calendar" | "CalendarYear" | "Habits" | "Matrix" | "Focus" | "Countdown"
         )
     };
     (ra == "Workspace" && in_main_workspace(rb)) || (rb == "Workspace" && in_main_workspace(ra))
@@ -1386,5 +1388,97 @@ mod tests {
         ensure_user_keymap_file_at(&path).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn things_view_secondary_s_opens_when_without_breaking_workspace_sync_now(
+        cx: &mut TestAppContext,
+    ) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use gpui::{
+            Context, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+            Window, div,
+        };
+
+        struct Harness {
+            workspace_focus: FocusHandle,
+            things_focus: FocusHandle,
+            propagate_when: bool,
+            when_hits: Arc<AtomicUsize>,
+            sync_hits: Arc<AtomicUsize>,
+        }
+
+        impl Render for Harness {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let when_hits = Arc::clone(&self.when_hits);
+                let sync_hits = Arc::clone(&self.sync_hits);
+                let propagate_when = self.propagate_when;
+                div()
+                    .key_context("Workspace")
+                    .track_focus(&self.workspace_focus)
+                    .on_action(move |_: &crate::actions::SyncNow, _, _| {
+                        sync_hits.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .child(
+                        div()
+                            .key_context("ThingsView")
+                            .track_focus(&self.things_focus)
+                            .on_action(move |_: &crate::actions::OpenWhen, _, cx| {
+                                when_hits.fetch_add(1, Ordering::SeqCst);
+                                if propagate_when {
+                                    cx.propagate();
+                                }
+                            }),
+                    )
+            }
+        }
+
+        cx.update(|cx| {
+            let errors = load_default(&assets::Assets, cx).unwrap();
+            assert!(errors.is_empty(), "keymap errors: {errors:?}");
+        });
+
+        let when_hits = Arc::new(AtomicUsize::new(0));
+        let sync_hits = Arc::new(AtomicUsize::new(0));
+        let (view, wcx) = cx.add_window_view(|_, cx| Harness {
+            workspace_focus: cx.focus_handle(),
+            things_focus: cx.focus_handle(),
+            propagate_when: false,
+            when_hits: Arc::clone(&when_hits),
+            sync_hits: Arc::clone(&sync_hits),
+        });
+
+        // 1. Inside ThingsView, secondary-s dispatches things::OpenWhen (NOT fern::SyncNow).
+        wcx.update(|window, cx| {
+            let handle = view.read(cx).things_focus.clone();
+            handle.focus(window, cx);
+        });
+        wcx.simulate_keystrokes("secondary-s");
+        assert_eq!(when_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(sync_hits.load(Ordering::SeqCst), 0);
+
+        // 2. When ThingsView propagates OpenWhen (e.g. no task active), Workspace SyncNow runs.
+        wcx.update(|_, cx| {
+            view.update(cx, |this, cx| {
+                this.propagate_when = true;
+                cx.notify();
+            });
+        });
+        wcx.run_until_parked();
+        wcx.simulate_keystrokes("secondary-s");
+        assert_eq!(when_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(sync_hits.load(Ordering::SeqCst), 1);
+
+        // 3. Outside ThingsView (focus on Workspace), secondary-s dispatches fern::SyncNow directly.
+        wcx.update(|window, cx| {
+            let handle = view.read(cx).workspace_focus.clone();
+            handle.focus(window, cx);
+        });
+        wcx.simulate_keystrokes("secondary-s");
+        assert_eq!(when_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(sync_hits.load(Ordering::SeqCst), 2);
     }
 }

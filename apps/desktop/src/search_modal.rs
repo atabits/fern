@@ -1,9 +1,11 @@
 //! The search popover, matched to TickTick's: a field with filter chips, results grouped into
 //! tasks, tags and lists, matches highlighted, and "View more" for the full result list.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use chrono::Local;
+use desktop_common::plugin_bus::{PluginBus, PluginCommandSpec, PluginSearchHit};
 use fern_core::search::{DateRange, TagRule, TaskFilter};
 use fern_core::{Habit, Id, Kind, List, Priority, Store, Tag, Task, View};
 use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, StyledText};
@@ -38,11 +40,17 @@ enum Menu {
     Priority,
 }
 
+#[derive(Clone)]
 pub enum SearchEvent {
     OpenTask(Id),
     OpenHabit(Id),
     OpenView(View),
     CreateTask(String),
+    RunPluginCommand {
+        plugin_id: String,
+        command_id: String,
+        arg: Option<String>,
+    },
     Dismissed,
 }
 
@@ -54,6 +62,10 @@ pub struct SearchModal {
     habits: Vec<Habit>,
     tags: Vec<Tag>,
     lists: Vec<List>,
+    plugin_commands: Vec<PluginCommandSpec>,
+    plugin_hits: Vec<PluginSearchHit>,
+    last_plugin_query: String,
+    pending_complete: HashSet<Id>,
     all_lists: Vec<List>,
     all_tags: Vec<Tag>,
     search_task: Option<gpui::Task<()>>,
@@ -78,11 +90,24 @@ impl Focusable for SearchModal {
 }
 
 impl SearchModal {
+    pub fn clear_plugin_search_hits(cx: &mut App) {
+        if cx
+            .try_global::<PluginBus>()
+            .is_some_and(|bus| !bus.search_hits.is_empty())
+        {
+            PluginBus::update(cx, |bus| bus.search_hits.clear());
+        }
+    }
+
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+        Self::clear_plugin_search_hits(cx);
         let strings = i18n::t(cx);
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx));
         cx.subscribe(&input, |this, _, _: &Changed, cx| this.schedule_refresh(cx)).detach();
-        cx.subscribe(&input, |_, _, _: &Cancelled, cx| cx.emit(SearchEvent::Dismissed)).detach();
+        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+            this.emit_close(SearchEvent::Dismissed, cx);
+        })
+        .detach();
         cx.subscribe(&input, |this, _, _: &Submitted, cx| this.open_selected(cx)).detach();
         let all_lists = store.lists().unwrap_or_default();
         let all_tags = store.tags().unwrap_or_default();
@@ -90,6 +115,10 @@ impl SearchModal {
             this.all_lists = this.store.lists().unwrap_or_default();
             this.all_tags = this.store.tags().unwrap_or_default();
             cx.notify();
+        })
+        .detach();
+        cx.observe_global::<PluginBus>(|this, cx| {
+            this.sync_plugin_results(cx);
         })
         .detach();
         let custom_from = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.range_from, cx));
@@ -102,6 +131,10 @@ impl SearchModal {
             habits: Vec::new(),
             tags: Vec::new(),
             lists: Vec::new(),
+            plugin_commands: Vec::new(),
+            plugin_hits: Vec::new(),
+            last_plugin_query: String::new(),
+            pending_complete: HashSet::new(),
             all_lists,
             all_tags,
             search_task: None,
@@ -113,6 +146,14 @@ impl SearchModal {
             custom_open: false,
             selected: 0,
         }
+    }
+
+    fn emit_close(&mut self, event: SearchEvent, cx: &mut Context<Self>) {
+        self.search_task = None;
+        self.last_plugin_query.clear();
+        self.plugin_hits.clear();
+        Self::clear_plugin_search_hits(cx);
+        cx.emit(event);
     }
 
     #[cfg(debug_assertions)]
@@ -147,7 +188,61 @@ impl SearchModal {
         self.tags = self.all_tags.iter().filter(|t| matches(&t.name)).cloned().collect();
         self.lists = self.all_lists.iter().filter(|l| matches(&l.name)).cloned().collect();
         self.selected = 0;
+        if self.filter != Filter::All || query.is_empty() {
+            self.last_plugin_query.clear();
+            self.plugin_hits.clear();
+            Self::clear_plugin_search_hits(cx);
+            self.sync_plugin_results(cx);
+        } else if query != self.last_plugin_query {
+            self.last_plugin_query = query.clone();
+            self.plugin_hits.clear();
+            Self::clear_plugin_search_hits(cx);
+            self.sync_plugin_results(cx);
+            plugin_ui::PluginHost::search_async(query, cx);
+        } else {
+            self.sync_plugin_results(cx);
+        }
+    }
+
+    fn sync_plugin_results(&mut self, cx: &mut Context<Self>) {
+        let query = self.query(cx);
+        if self.filter != Filter::All || query.is_empty() {
+            self.plugin_commands.clear();
+            self.plugin_hits.clear();
+        } else if let Some(bus) = cx.try_global::<PluginBus>() {
+            self.plugin_commands = bus
+                .commands
+                .iter()
+                .filter(|cmd| {
+                    !task_rows::match_ranges(&cmd.title, &query).is_empty()
+                        || !task_rows::match_ranges(&cmd.plugin_name, &query).is_empty()
+                })
+                .cloned()
+                .collect();
+            self.plugin_hits = bus.search_hits.clone();
+        } else {
+            self.plugin_commands.clear();
+            self.plugin_hits.clear();
+        }
+        let count = self.visible_events().len();
+        if count == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(count - 1);
+        }
         cx.notify();
+    }
+
+    fn plugin_hit_event(hit: &PluginSearchHit) -> Option<SearchEvent> {
+        if let Some(task_id) = hit.task_id {
+            Some(SearchEvent::OpenTask(task_id))
+        } else {
+            hit.command_id.as_ref().map(|command_id| SearchEvent::RunPluginCommand {
+                plugin_id: hit.plugin_id.clone(),
+                command_id: command_id.clone(),
+                arg: hit.command_arg.clone(),
+            })
+        }
     }
 
     fn set_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
@@ -432,6 +527,14 @@ impl SearchModal {
         if self.shows(Filter::Lists) {
             events.extend(self.lists.iter().map(|l| SearchEvent::OpenView(View::List(l.id))));
         }
+        if self.filter == Filter::All {
+            events.extend(self.plugin_commands.iter().map(|cmd| SearchEvent::RunPluginCommand {
+                plugin_id: cmd.plugin_id.clone(),
+                command_id: cmd.command_id.clone(),
+                arg: None,
+            }));
+            events.extend(self.plugin_hits.iter().filter_map(Self::plugin_hit_event));
+        }
         events
     }
 
@@ -453,6 +556,22 @@ impl SearchModal {
             || task.list_id.is_some_and(|id| self.all_lists.iter().any(|l| l.id == id && l.archived))
     }
 
+    fn finish_complete_task(
+        store: &Store,
+        task: &Task,
+        entity_id: gpui::EntityId,
+        cx: &mut App,
+    ) -> bool {
+        if let Err(err) = desktop_common::undo::complete(store, task) {
+            eprintln!("failed to toggle task from search: {err:#}");
+            return false;
+        }
+        desktop_common::completion_mark::record(task.id, cx);
+        desktop_common::sound::play_complete(store);
+        desktop_common::data_version::data_changed(entity_id, cx);
+        true
+    }
+
     fn toggle_task_completion(&mut self, task: &Task, cx: &mut Context<Self>) {
         if self.is_task_read_only(task) {
             return;
@@ -460,9 +579,33 @@ impl SearchModal {
         let done = task.is_completed();
         let wont_do = task.is_wont_do();
         let completing = !done && !wont_do;
-        let result = if completing {
-            desktop_common::undo::complete(&self.store, task).map(|_| ())
-        } else if wont_do {
+        if completing {
+            if !self.pending_complete.insert(task.id) {
+                return;
+            }
+            if let Some(mgr) = crate::quick_add_window::active_hook_manager(cx) {
+                let store = self.store.clone();
+                let task_snapshot = task.clone();
+                let task_id = task.id;
+                let entity_id = cx.entity_id();
+                let weak = cx.weak_entity();
+                crate::quick_add_window::run_before_task_complete(mgr, task, cx, move |allowed, cx| {
+                    let _ = weak.update(cx, |this, _| {
+                        this.pending_complete.remove(&task_id);
+                    });
+                    if allowed && Self::finish_complete_task(&store, &task_snapshot, entity_id, cx) {
+                        let _ = weak.update(cx, |this, cx| this.refresh(cx));
+                    }
+                });
+                return;
+            }
+            self.pending_complete.remove(&task.id);
+            if Self::finish_complete_task(&self.store, task, cx.entity_id(), cx) {
+                self.refresh(cx);
+            }
+            return;
+        }
+        let result = if wont_do {
             self.store.set_wont_do(task.id, false)
         } else {
             self.store.set_completed(task.id, false)
@@ -470,10 +613,6 @@ impl SearchModal {
         if let Err(err) = result {
             eprintln!("failed to toggle task from search: {err:#}");
             return;
-        }
-        if completing {
-            desktop_common::completion_mark::record(task.id, cx);
-            desktop_common::sound::play_complete(&self.store);
         }
         desktop_common::data_version::data_changed(cx.entity_id(), cx);
         self.refresh(cx);
@@ -484,12 +623,12 @@ impl SearchModal {
         if events.is_empty() {
             let query = self.query(cx);
             if !query.is_empty() {
-                cx.emit(SearchEvent::CreateTask(query));
+                self.emit_close(SearchEvent::CreateTask(query), cx);
             }
             return;
         }
         let index = self.selected.min(events.len() - 1);
-        cx.emit(events.swap_remove(index));
+        self.emit_close(events.swap_remove(index), cx);
     }
 
     fn highlighted(&self, text: &str, query: &str, cx: &App) -> StyledText {
@@ -750,7 +889,83 @@ impl Render for SearchModal {
         } else {
             Vec::new()
         };
-        let nothing = has_query && task_rows.is_empty() && habit_rows.is_empty() && tag_rows.is_empty() && list_rows.is_empty();
+        let command_rows = if self.filter == Filter::All {
+            self.plugin_commands
+                .iter()
+                .map(|cmd| {
+                    let is_selected = has_query && row_index == selected_index;
+                    row_index += 1;
+                    let plugin_id = cmd.plugin_id.clone();
+                    let command_id = cmd.command_id.clone();
+                    ListItem::new(SharedString::from(format!(
+                        "search-plugin-cmd-{}-{}",
+                        cmd.plugin_id, cmd.command_id
+                    )))
+                    .height(px(30.))
+                    .toggle_state(is_selected)
+                    .start_slot(Icon::new(IconName::Code).color(Color::Accent))
+                    .child(div().text_size(px(13.)).child(self.highlighted(&cmd.title, &query, cx)))
+                    .end_slot(Label::new(cmd.plugin_name.clone()).size(LabelSize::XSmall).color(Color::Muted))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(SearchEvent::RunPluginCommand {
+                            plugin_id: plugin_id.clone(),
+                            command_id: command_id.clone(),
+                            arg: None,
+                        });
+                    }))
+                    .into_any_element()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let plugin_hit_rows = if self.filter == Filter::All {
+            self.plugin_hits
+                .iter()
+                .enumerate()
+                .map(|(idx, hit)| {
+                    let event = Self::plugin_hit_event(hit);
+                    let is_selected = has_query && event.is_some() && row_index == selected_index;
+                    if event.is_some() {
+                        row_index += 1;
+                    }
+                    let mut item = ListItem::new(SharedString::from(format!(
+                        "search-plugin-hit-{}-{idx}",
+                        hit.plugin_id
+                    )))
+                    .height(px(30.))
+                    .toggle_state(is_selected)
+                    .start_slot(Icon::new(IconName::Zap).color(Color::Muted))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_size(px(13.)).child(self.highlighted(&hit.title, &query, cx)))
+                            .when_some(hit.subtitle.clone(), |el, sub| {
+                                el.child(Label::new(sub).size(LabelSize::XSmall).color(Color::Muted).truncate())
+                            }),
+                    );
+                    if let Some(badge) = hit.badge.clone() {
+                        item = item.end_slot(Label::new(badge).size(LabelSize::XSmall).color(Color::Muted));
+                    }
+                    if let Some(ev) = event {
+                        item = item.on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(ev.clone());
+                        }));
+                    }
+                    item.into_any_element()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let nothing = has_query
+            && task_rows.is_empty()
+            && habit_rows.is_empty()
+            && tag_rows.is_empty()
+            && list_rows.is_empty()
+            && command_rows.is_empty()
+            && plugin_hit_rows.is_empty();
 
         v_flex()
             .w(px(560.))
@@ -779,7 +994,9 @@ impl Render for SearchModal {
                     _ => {}
                 }
             }))
-            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(SearchEvent::Dismissed)))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.emit_close(SearchEvent::Dismissed, cx);
+            }))
             .child(
                 h_flex()
                     .gap_2()
@@ -813,7 +1030,9 @@ impl Render for SearchModal {
                         IconButton::new("close-search", IconName::X)
                             .icon_size(IconSize::Medium)
                             .tooltip(Tooltip::text(strings.close))
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(SearchEvent::Dismissed))),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.emit_close(SearchEvent::Dismissed, cx);
+                            })),
                     ),
             )
             // As the original's: the line under the field, then the chips.
@@ -897,7 +1116,9 @@ impl Render for SearchModal {
                         })
                         .when(!habit_rows.is_empty(), |el| el.child(Self::group_heading(strings.section_habits)).children(habit_rows))
                         .when(!tag_rows.is_empty(), |el| el.child(Self::group_heading(strings.tags)).children(tag_rows))
-                        .when(!list_rows.is_empty(), |el| el.child(Self::group_heading(strings.lists)).children(list_rows)),
+                        .when(!list_rows.is_empty(), |el| el.child(Self::group_heading(strings.lists)).children(list_rows))
+                        .when(!command_rows.is_empty(), |el| el.child(Self::group_heading(strings.plugins_commands)).children(command_rows))
+                        .when(!plugin_hit_rows.is_empty(), |el| el.child(Self::group_heading(strings.plugins)).children(plugin_hit_rows)),
                 )
                 .flex_1()
                 .min_h(px(180.)),
@@ -995,5 +1216,153 @@ mod tests {
         assert_eq!(updated.due_date, Some(day + chrono::Duration::days(7)));
         let completed_copies = store.tasks().unwrap().into_iter().filter(|t| t.is_completed()).count();
         assert_eq!(completed_copies, 1);
+    }
+
+    #[gpui::test]
+    fn plugin_commands_and_search_hits_emit_navigation_and_command_events(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Unrelated task").unwrap();
+        cx.update(|cx| {
+            let mut bus = PluginBus::default();
+            bus.commands.push(PluginCommandSpec {
+                plugin_id: "pomo".into(),
+                command_id: "start".into(),
+                title: "Start Focus Session".into(),
+                plugin_name: "Pomo".into(),
+            });
+            cx.set_global(bus);
+        });
+
+        let events: Rc<std::cell::RefCell<Vec<SearchEvent>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let events_slot = events.clone();
+        let (modal, cx) = cx.add_window_view(|_window, cx| {
+            let entity = cx.entity();
+            cx.subscribe(&entity, move |_, _, event: &SearchEvent, _| {
+                events_slot.borrow_mut().push(event.clone());
+            })
+            .detach();
+            SearchModal::new(store, cx)
+        });
+
+        cx.update(|_, cx| {
+            modal.update(cx, |modal, cx| {
+                modal.set_query("Focus", cx);
+            });
+            PluginBus::update(cx, |bus| {
+                bus.search_hits.push(PluginSearchHit {
+                    id: "hit-1".into(),
+                    plugin_id: "notes".into(),
+                    provider_id: "external".into(),
+                    title: "External Focus Note".into(),
+                    subtitle: Some("Notes".into()),
+                    badge: Some("Sync".into()),
+                    task_id: Some(task.id),
+                    command_id: None,
+                    command_arg: None,
+                });
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            modal.update(cx, |modal, cx| {
+                assert_eq!(modal.visible_events().len(), 2);
+                modal.open_selected(cx);
+                // Re-deliver hits for second selection check (open_selected clears hits on close).
+                modal.plugin_hits.push(PluginSearchHit {
+                    id: "hit-1".into(),
+                    plugin_id: "notes".into(),
+                    provider_id: "external".into(),
+                    title: "External Focus Note".into(),
+                    subtitle: Some("Notes".into()),
+                    badge: Some("Sync".into()),
+                    task_id: Some(task.id),
+                    command_id: None,
+                    command_arg: None,
+                });
+                modal.move_selection(1, cx);
+                modal.open_selected(cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let emitted = events.borrow();
+        assert!(matches!(
+            &emitted[0],
+            SearchEvent::RunPluginCommand {
+                plugin_id,
+                command_id,
+                arg: None
+            } if plugin_id == "pomo" && command_id == "start"
+        ));
+        assert!(matches!(&emitted[1], SearchEvent::OpenTask(id) if *id == task.id));
+    }
+
+    #[gpui::test]
+    fn stale_plugin_search_hits_cleared_on_new_query_empty_query_and_close(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Alpha task").unwrap();
+        let make_hit = |title: &str| PluginSearchHit {
+            id: format!("hit-{title}"),
+            plugin_id: "notes".into(),
+            provider_id: "external".into(),
+            title: title.into(),
+            subtitle: None,
+            badge: None,
+            task_id: Some(task.id),
+            command_id: None,
+            command_arg: None,
+        };
+
+        // Pre-populate stale hits before opening SearchModal -> opening must clear them.
+        cx.update(|cx| {
+            let mut bus = PluginBus::default();
+            bus.search_hits.push(make_hit("Stale alpha"));
+            cx.set_global(bus);
+        });
+        let (modal, cx) = cx.add_window_view(|_window, cx| SearchModal::new(store, cx));
+        cx.update(|_, cx| {
+            assert!(cx.global::<PluginBus>().search_hits.is_empty());
+        });
+
+        // Query "alpha", receive plugin hit, then switch to "beta" -> stale alpha hits clear immediately.
+        cx.update(|_, cx| {
+            modal.update(cx, |m, cx| m.set_query("alpha", cx));
+            PluginBus::update(cx, |bus| bus.search_hits.push(make_hit("Alpha hit")));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(modal.read(cx).plugin_hits.len(), 1);
+            modal.update(cx, |m, cx| m.set_query("beta", cx));
+            assert!(modal.read(cx).plugin_hits.is_empty());
+            assert!(cx.global::<PluginBus>().search_hits.is_empty());
+        });
+
+        // Clearing to empty query clears PluginBus::search_hits too.
+        cx.update(|_, cx| {
+            PluginBus::update(cx, |bus| bus.search_hits.push(make_hit("Beta hit")));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(modal.read(cx).plugin_hits.len(), 1);
+            modal.update(cx, |m, cx| m.set_query("", cx));
+            assert!(modal.read(cx).plugin_hits.is_empty());
+            assert!(cx.global::<PluginBus>().search_hits.is_empty());
+        });
+
+        // Dismissing SearchModal clears PluginBus::search_hits.
+        cx.update(|_, cx| {
+            modal.update(cx, |m, cx| m.set_query("gamma", cx));
+            PluginBus::update(cx, |bus| bus.search_hits.push(make_hit("Gamma hit")));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(cx.global::<PluginBus>().search_hits.len(), 1);
+            modal.update(cx, |m, cx| m.emit_close(SearchEvent::Dismissed, cx));
+            assert!(cx.global::<PluginBus>().search_hits.is_empty());
+        });
     }
 }

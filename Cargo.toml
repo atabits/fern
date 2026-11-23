@@ -10,11 +10,15 @@ members = [
     "crates/habit_ui",
     "crates/i18n",
     "crates/icons",
+    "crates/life_clock_ui",
     "crates/matrix_ui",
+    "crates/plugin_ui",
+    "crates/plugins",
     "crates/sticky_ui",
     "crates/summary_ui",
     "crates/task_ui",
     "crates/theme",
+    "crates/things_ui",
     "crates/todo_ui",
     "crates/ui",
     "apps/desktop",
@@ -43,11 +47,15 @@ fern_i18n = { path = "crates/i18n" }
 focus_ui = { path = "crates/focus_ui" }
 habit_ui = { path = "crates/habit_ui" }
 icons = { path = "crates/icons" }
+life_clock_ui = { path = "crates/life_clock_ui" }
 matrix_ui = { path = "crates/matrix_ui" }
+plugin_ui = { path = "crates/plugin_ui" }
+plugins = { path = "crates/plugins" }
 sticky_ui = { path = "crates/sticky_ui" }
 summary_ui = { path = "crates/summary_ui" }
 task_ui = { path = "crates/task_ui" }
 theme = { path = "crates/theme" }
+things_ui = { path = "crates/things_ui" }
 todo_ui = { path = "crates/todo_ui" }
 ui = { path = "crates/ui" }
 
@@ -116,6 +124,8 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac", "sha2"] }
 raw-window-handle = "0.6"
 resvg = "0.46"
+roxmltree = "0.21"
+rquickjs = { version = "0.14.0", features = ["loader", "futures", "classes", "macro", "chrono"] }
 rust-embed = { version = "8", features = ["include-exclude"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
@@ -133,14 +143,19 @@ uuid = { version = "1", features = ["v7", "serde"] }
 walkdir = "2"
 winresource = "0.1"
 x11rb = { version = "0.13", features = ["randr"] }
+zeroize = "1"
 zip = { version = "9.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 windows = { version = "0.62", features = [
     "Data_Xml_Dom",
     "Foundation",
     "UI_Notifications",
     "UI_ViewManagement",
+    "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
     "Win32_System_WinRT",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",

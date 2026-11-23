@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "@fern/sdk",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "paths": {
+      "@fern/sdk": ["./src/index.ts"],
+      "@fern/sdk/jsx-runtime": ["./src/jsx-runtime.ts"],
+      "@fern/sdk/jsx-dev-runtime": ["./src/jsx-runtime.ts"]
+    }
+  },
+  "include": [
+    "fern.d.ts",
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "example/src/**/*.ts",
+    "example/src/**/*.tsx"
+  ]
+}

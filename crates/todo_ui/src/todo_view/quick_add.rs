@@ -130,19 +130,151 @@ impl TodoView {
         self.add_quick_with(text, None, None, None, cx);
     }
 
+    fn attach_draft_files(&mut self, task_id: Id, files: Vec<std::path::PathBuf>, cx: &App) {
+        let strings = i18n::t(cx);
+        let errors: Vec<_> = files
+            .into_iter()
+            .filter_map(|file| {
+                let result =
+                    crate::attachments_dir().and_then(|dir| self.store.add_attachment(task_id, &file, &dir));
+                let error = result.err()?;
+                let name = file.file_name().unwrap_or(file.as_os_str()).to_string_lossy();
+                Some(
+                    strings
+                        .attachment_failed
+                        .replace("{file}", &name)
+                        .replace("{error}", &crate::sync::attachment_error(&error, strings)),
+                )
+            })
+            .collect();
+        self.add_attachment_error = (!errors.is_empty()).then(|| errors.join("\n"));
+    }
+
     pub(super) fn add_task(&mut self, input: &str, cx: &App) -> Option<Task> {
         let result = self.add_task_as(input, &self.view, &self.add_draft);
         let task = self.check(result)?;
-        let strings = i18n::t(cx);
-        let errors: Vec<_> = std::mem::take(&mut self.add_draft.files).into_iter().filter_map(|file| {
-            let result = crate::attachments_dir().and_then(|dir| self.store.add_attachment(task.id, &file, &dir));
-            let error = result.err()?;
-            let name = file.file_name().unwrap_or(file.as_os_str()).to_string_lossy();
-            Some(strings.attachment_failed.replace("{file}", &name)
-                .replace("{error}", &crate::sync::attachment_error(&error, strings)))
-        }).collect();
-        self.add_attachment_error = (!errors.is_empty()).then(|| errors.join("\n"));
+        let files = std::mem::take(&mut self.add_draft.files);
+        self.attach_draft_files(task.id, files, cx);
         Some(task)
+    }
+
+    /// Computes the structured [`fern_core::TaskDraft`] and `top` flag corresponding to `input`
+    /// typed in `view` with `draft`'s picker selections (used by `beforeTaskCreate` plugin hooks).
+    fn build_hook_task_draft(
+        input: &str,
+        view: &View,
+        draft: &AddDraft,
+        lists: &[fern_core::List],
+        preferences: &fern_core::Preferences,
+        today: NaiveDate,
+    ) -> (fern_core::TaskDraft, bool) {
+        let list_names: Vec<String> = lists.iter().map(|l| l.name.clone()).collect();
+        let parsed = fern_core::parse_quick_add_with(input, today, &list_names, preferences.recognition);
+        let title = if parsed.title.is_empty() { input.trim() } else { parsed.title.as_str() };
+        let view_due = match view {
+            View::Today | View::Next7Days => Some(today),
+            View::Tomorrow => Some(today + Duration::days(1)),
+            View::Day(day) => Some(*day),
+            _ => None,
+        };
+        let defaults = &preferences.task_defaults;
+        let from_picker = parsed.due_date.is_none() && draft.date.is_some();
+        let due_time = if from_picker { draft.time } else { parsed.due_time };
+        let due_date = parsed
+            .due_date
+            .or(draft.date)
+            .or(view_due)
+            .or(defaults.date.map(|d| d.date(today)));
+        let (end_date, end_time) = if due_date.is_some() && from_picker {
+            match draft.end {
+                Some((d, t)) => (Some(d), t),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+        let reminders = if due_date.is_some() {
+            match draft.reminders.as_ref().filter(|_| from_picker) {
+                Some(reminders) => reminders.clone(),
+                None => {
+                    let reminder = if due_time.is_some() {
+                        defaults.timed_reminder
+                    } else {
+                        defaults.all_day_reminder
+                    };
+                    reminder.into_iter().collect()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let mut tags = parsed.tags;
+        if let Some(tag) = &defaults.tag
+            && !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
+        {
+            tags.push(tag.clone());
+        }
+        if let View::Tag(tag) = view
+            && !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
+        {
+            tags.push(tag.clone());
+        }
+        for tag in &draft.tags {
+            if !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
+                tags.push(tag.clone());
+            }
+        }
+        let repeat = parsed
+            .repeat
+            .or_else(|| draft.repeat.clone().filter(|_| draft.date.is_some()));
+        let draft_priority = draft.priority.filter(|p| *p != fern_core::Priority::None);
+        let priority = parsed
+            .priority
+            .or(draft_priority)
+            .or((defaults.priority != fern_core::Priority::None).then_some(defaults.priority))
+            .unwrap_or(fern_core::Priority::None);
+        let parsed_list = parsed
+            .list
+            .and_then(|name| lists.iter().find(|l| l.name == name))
+            .map(|l| l.id);
+        let view_list = match view {
+            View::List(id) => Some(*id),
+            _ => None,
+        };
+        let default_list = match view {
+            View::Inbox | View::List(_) => None,
+            _ => preferences.default_list,
+        };
+        let list_id = parsed_list
+            .map(Some)
+            .or(draft.list)
+            .or(view_list.map(Some))
+            .or(default_list.map(Some))
+            .flatten();
+        let note_list = list_id
+            .is_some_and(|id| lists.iter().any(|l| l.id == id && l.kind == fern_core::Kind::Note));
+        let kind = if draft.note || note_list {
+            fern_core::Kind::Note
+        } else {
+            fern_core::Kind::Task
+        };
+        (
+            fern_core::TaskDraft {
+                title: title.to_owned(),
+                list_id,
+                kind,
+                priority,
+                due_date,
+                due_time,
+                end_date,
+                end_time,
+                repeat,
+                reminders,
+                tags,
+                ..Default::default()
+            },
+            !defaults.add_to_bottom,
+        )
     }
 
     /// Adds a task from the add field's text as if typed in `view` with `draft`'s choices.
@@ -269,6 +401,152 @@ impl TodoView {
     /// Adds the typed task, as Enter in the add field or its "Add" button does.
     pub(super) fn submit_new_task(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         if text.trim().is_empty() {
+            return;
+        }
+        if let Some(hooks) = desktop_common::plugin_bus::PluginHooksGlobal::global(cx)
+            .filter(desktop_common::plugin_bus::PluginHooksGlobal::is_active)
+        {
+            if self.submitting_task {
+                return;
+            }
+            self.submitting_task = true;
+            let raw_text = text.to_owned();
+            let view = self.view.clone();
+            let draft_snapshot = self.add_draft.clone();
+            let lists = self.lists.clone();
+            let preferences = self.preferences.clone();
+            let today = Self::today();
+            let window_handle = window.window_handle();
+            cx.spawn(async move |this, cx| {
+                let hooks_t = hooks.clone();
+                let raw_for_t = raw_text.clone();
+                let transform = cx
+                    .background_spawn(async move { hooks_t.run_quick_add_transform(raw_for_t) })
+                    .await;
+                let transformed = match transform {
+                    Ok(desktop_common::plugin_bus::PluginHookDecision::Cancel(reason)) => {
+                        cx.update(|cx| {
+                            let fallback = i18n::t(cx).plugins_task_create_cancelled;
+                            desktop_common::plugin_bus::push_hook_cancel_toast(&reason, fallback, cx);
+                        });
+                        let _ = this.update(cx, |this, cx| {
+                            this.submitting_task = false;
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    Ok(desktop_common::plugin_bus::PluginHookDecision::Modify(val)) => {
+                        desktop_common::plugin_bus::extract_transformed_quick_add(&val)
+                            .unwrap_or(raw_text)
+                    }
+                    Ok(desktop_common::plugin_bus::PluginHookDecision::Allow) => raw_text,
+                    Err(err) => {
+                        eprintln!("plugin quickAddTransform hook failed: {err:#}");
+                        raw_text
+                    }
+                };
+
+                let (task_draft, default_top) = Self::build_hook_task_draft(
+                    &transformed,
+                    &view,
+                    &draft_snapshot,
+                    &lists,
+                    &preferences,
+                    today,
+                );
+                let draft_json =
+                    desktop_common::plugin_bus::task_draft_to_hook_json(&task_draft, default_top);
+                let before_res = cx
+                    .background_spawn(async move { hooks.run_before_task_create(draft_json) })
+                    .await;
+
+                match before_res {
+                    Ok(desktop_common::plugin_bus::PluginHookDecision::Cancel(reason)) => {
+                        cx.update(|cx| {
+                            let fallback = i18n::t(cx).plugins_task_create_cancelled;
+                            desktop_common::plugin_bus::push_hook_cancel_toast(&reason, fallback, cx);
+                        });
+                        let _ = this.update(cx, |this, cx| {
+                            this.submitting_task = false;
+                            cx.notify();
+                        });
+                    }
+                    Ok(desktop_common::plugin_bus::PluginHookDecision::Modify(modified_json)) => {
+                        let parsed = desktop_common::plugin_bus::parse_task_draft_from_hook_json(
+                            &modified_json,
+                            default_top,
+                        );
+                        let mut input_to_clear = None;
+                        let _ = this.update(cx, |this, cx| {
+                            this.submitting_task = false;
+                            let created = match parsed {
+                                Ok((modified_draft, top)) => {
+                                    this.check(this.store.create_task(modified_draft, top))
+                                }
+                                Err(err) => {
+                                    eprintln!("plugin beforeTaskCreate returned invalid draft: {err:#}");
+                                    this.check(this.add_task_as(&transformed, &view, &draft_snapshot))
+                                }
+                            };
+                            if let Some(task) = created {
+                                let files = std::mem::take(&mut this.add_draft.files);
+                                this.attach_draft_files(task.id, files, cx);
+                                this.quick_add_due = None;
+                                this.add_draft = AddDraft::default();
+                                input_to_clear = Some(this.input.clone());
+                                this.reload(cx);
+                            }
+                        });
+                        if let Some(input) = input_to_clear {
+                            let _ = window_handle.update(cx, |_, window, cx| {
+                                input.update(cx, |input, cx| input.clear(window, cx));
+                            });
+                        }
+                    }
+                    Ok(desktop_common::plugin_bus::PluginHookDecision::Allow) => {
+                        let mut input_to_clear = None;
+                        let _ = this.update(cx, |this, cx| {
+                            this.submitting_task = false;
+                            let created = this.check(this.add_task_as(&transformed, &view, &draft_snapshot));
+                            if let Some(task) = created {
+                                let files = std::mem::take(&mut this.add_draft.files);
+                                this.attach_draft_files(task.id, files, cx);
+                                this.quick_add_due = None;
+                                this.add_draft = AddDraft::default();
+                                input_to_clear = Some(this.input.clone());
+                                this.reload(cx);
+                            }
+                        });
+                        if let Some(input) = input_to_clear {
+                            let _ = window_handle.update(cx, |_, window, cx| {
+                                input.update(cx, |input, cx| input.clear(window, cx));
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("plugin beforeTaskCreate hook failed: {err:#}");
+                        let mut input_to_clear = None;
+                        let _ = this.update(cx, |this, cx| {
+                            this.submitting_task = false;
+                            let created = this.check(this.add_task_as(&transformed, &view, &draft_snapshot));
+                            if let Some(task) = created {
+                                let files = std::mem::take(&mut this.add_draft.files);
+                                this.attach_draft_files(task.id, files, cx);
+                                this.quick_add_due = None;
+                                this.add_draft = AddDraft::default();
+                                input_to_clear = Some(this.input.clone());
+                                this.reload(cx);
+                            }
+                        });
+                        if let Some(input) = input_to_clear {
+                            let _ = window_handle.update(cx, |_, window, cx| {
+                                input.update(cx, |input, cx| input.clear(window, cx));
+                            });
+                        }
+                    }
+                }
+            })
+            .detach();
             return;
         }
         if self.add_task(text, cx).is_some() {

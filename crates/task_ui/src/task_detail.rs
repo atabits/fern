@@ -126,6 +126,7 @@ pub struct TaskDetail {
     /// The Add Subtask field shown while the task has no subtasks, from the "…" menu.
     subtask_open: bool,
     body_scroll: gpui::ScrollHandle,
+    pending_complete: Option<Id>,
     _session_subscriptions: Vec<Subscription>,
 }
 
@@ -264,6 +265,7 @@ impl TaskDetail {
             calendar_card: false,
             subtask_open: false,
             body_scroll: gpui::ScrollHandle::new(),
+            pending_complete: None,
             _session_subscriptions: subscriptions,
         }
     }
@@ -2184,12 +2186,14 @@ impl TaskDetail {
             .into_any_element()
     }
 
-    fn toggle_completed(&mut self, cx: &mut Context<Self>) {
+    fn finish_toggle_completed(&mut self, task_id: Id, completed: bool, cx: &mut Context<Self>) {
         if self.is_read_only() {
             return;
         }
         let Some(task) = self.session.task.as_mut() else { return };
-        let completed = !task.is_completed();
+        if task.id != task_id {
+            return;
+        }
         let mut undo = None;
         // Unchecking a "Won't Do" task reopens it.
         let result = if task.is_wont_do() {
@@ -2214,6 +2218,42 @@ impl TaskDetail {
         }
         cx.emit(TaskUpdated);
         cx.notify();
+    }
+
+    fn toggle_completed(&mut self, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
+        let Some(task) = self.session.task.clone() else { return };
+        let completed = !task.is_completed();
+        if completed
+            && !task.is_wont_do()
+            && desktop_common::plugin_bus::PluginHooksGlobal::global(cx)
+                .is_some_and(|h| h.is_active())
+        {
+            if self.pending_complete == Some(task.id) {
+                return;
+            }
+            let task_id = task.id;
+            self.pending_complete = Some(task_id);
+            let weak = cx.weak_entity();
+            desktop_common::plugin_bus::run_before_task_complete_hook(
+                &task,
+                cx,
+                move |allowed, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        if this.pending_complete == Some(task_id) {
+                            this.pending_complete = None;
+                        }
+                        if allowed {
+                            this.finish_toggle_completed(task_id, true, cx);
+                        }
+                    });
+                },
+            );
+            return;
+        }
+        self.finish_toggle_completed(task.id, completed, cx);
     }
 
     fn render_progress_bar(done: usize, total: usize, theme: &theme::Theme) -> AnyElement {

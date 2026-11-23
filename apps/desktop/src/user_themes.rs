@@ -95,6 +95,31 @@ fn ensure_sample_theme_file_at(dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn enabled_theme_plugins(cx: &App) -> Vec<plugins::runtime::PluginInfo> {
+    plugin_ui::PluginHost::global(cx)
+        .map(|host| {
+            host.plugins()
+                .iter()
+                .filter(|p| p.enabled && !p.manifest.contributions.themes.is_empty())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn load_user_and_plugin_themes(
+    dir: &Path,
+    theme_plugins: &[plugins::runtime::PluginInfo],
+) -> (Vec<Theme>, Vec<String>) {
+    let (mut themes, mut errors) = theme::load_themes_from_dir(dir);
+    if !theme_plugins.is_empty() {
+        let (plugin_themes, plugin_errors) = plugin_ui::collect_plugin_themes(theme_plugins);
+        themes.extend(plugin_themes);
+        errors.extend(plugin_errors);
+    }
+    (themes, errors)
+}
+
 pub fn load(cx: &mut App) {
     let Ok(dir) = themes_dir() else { return };
     let (themes, errors) = theme::load_themes_from_dir(&dir);
@@ -107,7 +132,10 @@ pub fn load(cx: &mut App) {
 /// Reloads user themes off the UI thread and applies the active theme selection.
 pub fn reload_and_apply_async(store: Rc<Store>, window: AnyWindowHandle, cx: &mut App) {
     let Ok(dir) = themes_dir() else { return };
-    let task = cx.background_executor().spawn(async move { theme::load_themes_from_dir(&dir) });
+    let theme_plugins = enabled_theme_plugins(cx);
+    let task = cx
+        .background_executor()
+        .spawn(async move { load_user_and_plugin_themes(&dir, &theme_plugins) });
     cx.spawn(async move |cx| {
         let (themes, errors) = task.await;
         cx.update(|cx| {
@@ -119,9 +147,12 @@ pub fn reload_and_apply_async(store: Rc<Store>, window: AnyWindowHandle, cx: &mu
 
 /// Ensures the sample theme file exists off the UI thread, reloads themes, and opens the file.
 pub fn create_and_open_sample_async(store: Rc<Store>, window: AnyWindowHandle, cx: &mut App) {
+    let theme_plugins = enabled_theme_plugins(cx);
     let task = cx.background_executor().spawn(async move {
         let path = ensure_sample_theme_file()?;
-        let loaded = themes_dir().map(|dir| theme::load_themes_from_dir(&dir)).unwrap_or_default();
+        let loaded = themes_dir()
+            .map(|dir| load_user_and_plugin_themes(&dir, &theme_plugins))
+            .unwrap_or_default();
         Ok::<_, anyhow::Error>((path, loaded))
     });
     cx.spawn(async move |cx| match task.await {
@@ -231,22 +262,26 @@ pub fn watch(store: Rc<Store>, window: AnyWindowHandle, cx: &mut App) {
             let poll_dir = dir.clone();
             let prev_fp = last_fp.clone();
             let bg_for_debounce = bg.clone();
-            let changed = bg
+            let final_fp = bg
                 .spawn(async move {
                     let next_fp = dir_fingerprint(&poll_dir);
                     if next_fp == prev_fp {
                         return None;
                     }
                     bg_for_debounce.timer(DEBOUNCE).await;
-                    let final_fp = dir_fingerprint(&poll_dir);
-                    let (themes, errors) = theme::load_themes_from_dir(&poll_dir);
-                    Some((final_fp, themes, errors))
+                    Some(dir_fingerprint(&poll_dir))
                 })
                 .await;
-            let Some((final_fp, themes, errors)) = changed else {
+            let Some(final_fp) = final_fp else {
                 continue;
             };
             last_fp = final_fp;
+
+            let theme_plugins = cx.update(|cx| enabled_theme_plugins(cx));
+            let load_dir = dir.clone();
+            let (themes, errors) = bg
+                .spawn(async move { load_user_and_plugin_themes(&load_dir, &theme_plugins) })
+                .await;
 
             let alive = cx.update(|cx| {
                 if cx.windows().is_empty() {

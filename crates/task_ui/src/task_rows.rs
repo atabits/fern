@@ -962,6 +962,8 @@ mod tests {
             section_id: None,
             reminders: Vec::new(),
             estimate: None,
+            start_date: None,
+            schedule_bucket: fern_core::ScheduleBucket::None,
             created_at: 0,
         }
     }

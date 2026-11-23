@@ -16,6 +16,7 @@ pub enum UndoAction {
         copy: Id,
         due: Option<NaiveDate>,
         end: Option<NaiveDate>,
+        start: Option<NaiveDate>,
         repeat: Option<fern_core::Recurrence>,
         in_progress: bool,
         snoozed_until: Option<NaiveDateTime>,
@@ -32,7 +33,7 @@ impl UndoAction {
                 store.reopen_tasks(&ids)
             }
             Self::Restore(id) => store.restore_task(*id),
-            Self::ReopenRepeat { id, copy, due, end, repeat, in_progress, snoozed_until } => {
+            Self::ReopenRepeat { id, copy, due, end, start: _, repeat, in_progress, snoozed_until } => {
                 // Never delete the completed copy if the repeating parent was purged or deleted.
                 let Some(parent) = store.task(*id)? else {
                     return Ok(());
@@ -62,14 +63,18 @@ impl UndoAction {
                 }
                 Ok(Some(complete(store, &task)?))
             }
-            Self::ReopenRepeat { id, copy, due, end, .. } => {
+            Self::ReopenRepeat { id, copy, due, end, start, .. } => {
                 let Some(task) = store.task(*id)? else { return Ok(None) };
                 if task.is_deleted() || task.is_completed() {
                     return Ok(None);
                 }
                 // Guard against double-advancing when the repeating task was never undone
                 // or has already moved past its pre-completion dates.
-                if store.task(*copy)?.is_some() || task.due_date != *due || task.end_date != *end {
+                if store.task(*copy)?.is_some()
+                    || task.due_date != *due
+                    || task.end_date != *end
+                    || task.start_date != *start
+                {
                     return Ok(None);
                 }
                 Ok(Some(complete(store, &task)?))
@@ -95,6 +100,7 @@ pub fn complete(store: &Store, task: &Task) -> Result<UndoAction> {
             copy,
             due: task.due_date,
             end: task.end_date,
+            start: task.start_date,
             repeat: task.repeat.clone(),
             in_progress: task.in_progress_at.is_some(),
             snoozed_until: task.snoozed_until,
@@ -227,5 +233,35 @@ mod tests {
         assert_eq!(store.task(task.id).unwrap().unwrap().due_date, next_due);
         assert!(undo.redo(&store).unwrap().is_none());
         assert_eq!(store.task(task.id).unwrap().unwrap().due_date, next_due);
+    }
+
+    #[test]
+    fn undo_and_redo_work_for_start_date_only_repeating_task() {
+        let store = Store::open_in_memory().unwrap();
+        let today = chrono::Local::now().date_naive();
+        let tomorrow = today + chrono::Duration::days(1);
+        let task = store
+            .create_task(
+                fern_core::TaskDraft {
+                    title: "Things habit".into(),
+                    start_date: Some(today),
+                    repeat: Some(fern_core::Recurrence::new(fern_core::Frequency::Daily, 1)),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        let undo = complete(&store, &task).unwrap();
+        assert_eq!(store.task(task.id).unwrap().unwrap().start_date, Some(tomorrow));
+        // Double redo before undo must be a no-op.
+        assert!(undo.redo(&store).unwrap().is_none());
+        // Undo restores start_date back to today.
+        undo.apply(&store).unwrap();
+        assert_eq!(store.task(task.id).unwrap().unwrap().start_date, Some(today));
+        // Redo re-advances cleanly.
+        let redone = undo.redo(&store).unwrap().expect("redo must re-advance");
+        assert_eq!(store.task(task.id).unwrap().unwrap().start_date, Some(tomorrow));
+        // Second redo is guarded by start_date mismatch even if copy were deleted.
+        assert!(redone.redo(&store).unwrap().is_none());
     }
 }

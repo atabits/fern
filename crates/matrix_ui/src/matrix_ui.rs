@@ -236,6 +236,8 @@ pub struct MatrixView {
     profile_menu: bool,
     profile_editor: Option<(Option<Id>, Entity<TextInput>)>,
     confirm_delete_profile: Option<(Id, String)>,
+    pending_complete: HashSet<Id>,
+    submitting_quadrant_task: bool,
 }
 
 impl EventEmitter<OpenTask> for MatrixView {}
@@ -293,6 +295,8 @@ impl MatrixView {
             profile_menu: false,
             profile_editor: None,
             confirm_delete_profile: None,
+            pending_complete: HashSet::new(),
+            submitting_quadrant_task: false,
         };
         this.reload(cx);
         cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
@@ -563,6 +567,126 @@ impl MatrixView {
                 return;
             }
             let today = Local::now().date_naive();
+            if let Some(hooks) = desktop_common::plugin_bus::PluginHooksGlobal::global(cx)
+                .filter(desktop_common::plugin_bus::PluginHooksGlobal::is_active)
+            {
+                if this.submitting_quadrant_task {
+                    return;
+                }
+                this.submitting_quadrant_task = true;
+                let raw_title = title.clone();
+                let rule = this.rules[quadrant].clone();
+                let store = this.store.clone();
+                let input_entity = input.clone();
+                let window_handle = window.window_handle();
+                cx.spawn(async move |this, cx| {
+                    let hooks_t = hooks.clone();
+                    let raw_for_t = raw_title.clone();
+                    let transform = cx
+                        .background_spawn(async move { hooks_t.run_quick_add_transform(raw_for_t) })
+                        .await;
+                    let transformed = match transform {
+                        Ok(desktop_common::plugin_bus::PluginHookDecision::Cancel(reason)) => {
+                            cx.update(|cx| {
+                                let fallback = i18n::t(cx).plugins_task_create_cancelled;
+                                desktop_common::plugin_bus::push_hook_cancel_toast(&reason, fallback, cx);
+                            });
+                            let _ = this.update(cx, |this, cx| {
+                                this.submitting_quadrant_task = false;
+                                cx.notify();
+                            });
+                            return;
+                        }
+                        Ok(desktop_common::plugin_bus::PluginHookDecision::Modify(val)) => {
+                            desktop_common::plugin_bus::extract_transformed_quick_add(&val)
+                                .unwrap_or(raw_title)
+                        }
+                        Ok(desktop_common::plugin_bus::PluginHookDecision::Allow) => raw_title,
+                        Err(err) => {
+                            eprintln!("plugin quickAddTransform hook failed: {err:#}");
+                            raw_title
+                        }
+                    };
+
+                    let built = Self::build_quadrant_draft(&store, &rule, &transformed, today);
+                    let (base_draft, default_top) = match built {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            eprintln!("failed to prepare matrix task: {err:#}");
+                            let _ = this.update(cx, |this, cx| {
+                                this.submitting_quadrant_task = false;
+                                this.notice = Some(MatrixNotice::Failed);
+                                cx.notify();
+                            });
+                            return;
+                        }
+                    };
+                    let draft_json = desktop_common::plugin_bus::task_draft_to_hook_json(
+                        &base_draft,
+                        default_top,
+                    );
+                    let before_res = cx
+                        .background_spawn(async move { hooks.run_before_task_create(draft_json) })
+                        .await;
+                    let (final_draft, top) = match before_res {
+                        Ok(desktop_common::plugin_bus::PluginHookDecision::Cancel(reason)) => {
+                            cx.update(|cx| {
+                                let fallback = i18n::t(cx).plugins_task_create_cancelled;
+                                desktop_common::plugin_bus::push_hook_cancel_toast(&reason, fallback, cx);
+                            });
+                            let _ = this.update(cx, |this, cx| {
+                                this.submitting_quadrant_task = false;
+                                cx.notify();
+                            });
+                            return;
+                        }
+                        Ok(desktop_common::plugin_bus::PluginHookDecision::Modify(modified_json)) => {
+                            match desktop_common::plugin_bus::parse_task_draft_from_hook_json(
+                                &modified_json,
+                                default_top,
+                            ) {
+                                Ok(pair) => pair,
+                                Err(err) => {
+                                    eprintln!("plugin beforeTaskCreate returned invalid draft: {err:#}");
+                                    (base_draft, default_top)
+                                }
+                            }
+                        }
+                        Ok(desktop_common::plugin_bus::PluginHookDecision::Allow) => {
+                            (base_draft, default_top)
+                        }
+                        Err(err) => {
+                            eprintln!("plugin beforeTaskCreate hook failed: {err:#}");
+                            (base_draft, default_top)
+                        }
+                    };
+
+                    let mut cleared = false;
+                    let _ = this.update(cx, |this, cx| {
+                        this.submitting_quadrant_task = false;
+                        match this.store.create_task(final_draft, top) {
+                            Ok(task) => {
+                                cleared = true;
+                                desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                this.reload(cx);
+                                this.notice = this.destination_notice(quadrant, &task, today, i18n::t(cx));
+                            }
+                            Err(err) => {
+                                eprintln!("failed to add the task: {err:#}");
+                                this.notice = Some(MatrixNotice::Failed);
+                                cx.notify();
+                            }
+                        }
+                    });
+                    if cleared {
+                        let _ = window_handle.update(cx, |_, window, cx| {
+                            input_entity.update(cx, |input, cx| input.clear(window, cx));
+                        });
+                    }
+                })
+                .detach();
+                return;
+            }
             let task = match this.add_quadrant_task(quadrant, title, today) {
                 Ok(task) => task,
                 Err(err) => {
@@ -600,14 +724,18 @@ impl MatrixView {
         Some(MatrixNotice::SavedElsewhere(destination))
     }
 
-    fn add_quadrant_task(&self, quadrant: usize, input: &str, today: NaiveDate) -> anyhow::Result<Task> {
-        let preferences = self.store.preferences()?;
-        let lists = self.store.lists()?;
+    fn build_quadrant_draft(
+        store: &Store,
+        rule: &QuadrantRule,
+        input: &str,
+        today: NaiveDate,
+    ) -> anyhow::Result<(TaskDraft, bool)> {
+        let preferences = store.preferences()?;
+        let lists = store.lists()?;
         let available = |id: Id| lists.iter().any(|list| list.id == id && !list.archived);
         let list_names: Vec<_> = lists.iter().filter(|list| !list.archived).map(|list| list.name.clone()).collect();
         let mut parsed = fern_core::parse_quick_add_with(input, today, &list_names, preferences.recognition);
         let title = if parsed.title.is_empty() { input.trim() } else { &parsed.title };
-        let rule = &self.rules[quadrant];
         let (priority, date) = rule.new_task_defaults(today);
         let preferred = preferences.default_list.filter(|id| available(*id));
         let default_list = if rule.lists.contains(&preferred) {
@@ -642,7 +770,7 @@ impl MatrixView {
             .or(parsed.due_date)
             .or_else(|| parsed.repeat.is_some().then_some(today));
         let reminder = if parsed.due_time.is_some() { defaults.timed_reminder } else { defaults.all_day_reminder };
-        self.store.create_task(
+        Ok((
             TaskDraft {
                 title: title.to_owned(),
                 list_id,
@@ -656,7 +784,12 @@ impl MatrixView {
                 ..Default::default()
             },
             !defaults.add_to_bottom,
-        )
+        ))
+    }
+
+    fn add_quadrant_task(&self, quadrant: usize, input: &str, today: NaiveDate) -> anyhow::Result<Task> {
+        let (draft, top) = Self::build_quadrant_draft(&self.store, &self.rules[quadrant], input, today)?;
+        self.store.create_task(draft, top)
     }
 
     fn dismiss_transient(&mut self, _: &DismissTransient, window: &mut Window, cx: &mut Context<Self>) {
@@ -721,6 +854,19 @@ impl MatrixView {
         self.store.is_task_read_only(id).unwrap_or(false)
     }
 
+    fn finish_toggle_complete(&mut self, task: &Task, done: bool, cx: &mut Context<Self>) {
+        if let Err(err) = desktop_common::task_ops::toggle_task_completion(
+            &self.store,
+            task,
+            done,
+            cx.entity_id(),
+            cx,
+        ) {
+            eprintln!("failed to toggle completion: {err:#}");
+        }
+        self.reload(cx);
+    }
+
     fn toggle_complete(&mut self, id: Id, cx: &mut Context<Self>) {
         if self.is_task_read_only(id) {
             return;
@@ -734,16 +880,42 @@ impl MatrixView {
         else {
             return;
         };
-        if let Err(err) = desktop_common::task_ops::toggle_task_completion(
-            &self.store,
-            &task,
-            !task.is_completed(),
-            cx.entity_id(),
-            cx,
-        ) {
-            eprintln!("failed to toggle completion: {err:#}");
+        let done = !task.is_completed();
+        if done
+            && !task.is_wont_do()
+            && desktop_common::plugin_bus::PluginHooksGlobal::global(cx)
+                .is_some_and(|h| h.is_active())
+        {
+            if !self.pending_complete.insert(id) {
+                return;
+            }
+            let weak = cx.weak_entity();
+            desktop_common::plugin_bus::run_before_task_complete_hook(
+                &task,
+                cx,
+                move |allowed, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.pending_complete.remove(&id);
+                        if !allowed || this.is_task_read_only(id) {
+                            cx.notify();
+                            return;
+                        }
+                        if let Some(current) = this
+                            .tasks
+                            .iter()
+                            .find(|t| t.id == id)
+                            .cloned()
+                            .or_else(|| this.store.task(id).ok().flatten())
+                            && !current.is_completed()
+                        {
+                            this.finish_toggle_complete(&current, true, cx);
+                        }
+                    });
+                },
+            );
+            return;
         }
-        self.reload(cx);
+        self.finish_toggle_complete(&task, done, cx);
     }
 
     fn delete_task(&mut self, id: Id, cx: &mut Context<Self>) {

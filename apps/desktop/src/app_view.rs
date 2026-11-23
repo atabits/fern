@@ -1,7 +1,11 @@
+use std::collections::HashMap;
 use std::rc::Rc;
 
-use fern_core::Store;
+use desktop_common::plugin_bus::{PluginBus, PluginNavAction, PluginSidebarViewSpec};
+use fern_core::{RailItemId, Store, link::DeepLink};
 use gpui::Focusable as _;
+use plugin_ui::{PluginHost, PluginView, PluginViewEvent, render_plugin_overlays};
+use things_ui::{ThingsEvent, ThingsView};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
@@ -15,6 +19,7 @@ use crate::countdown_view::CountdownView;
 use crate::focus_view::FocusView;
 use crate::habit_view::HabitView;
 use crate::i18n;
+use crate::life_clock_view::{LifeClockEvent, LifeClockPaletteMode, LifeClockView};
 use crate::matrix_view::{self, MatrixView};
 use crate::release_notes::{self, ReleaseNotes, action_button};
 use crate::reminders::{self, Notice, NoticeAction, Notices, Reply, Target};
@@ -47,24 +52,87 @@ fn format_sync_error(err: &anyhow::Error, strings: &i18n::Strings) -> String {
     desktop_common::diagnostics::redact_sensitive(&format!("{err:#}"))
 }
 
-fn reorder_enabled_rail(
-    original: &[fern_core::RailSection],
-    features: fern_core::Features,
+/// Handles Escape for an active plugin modal: closes any open `Select` popover inside a `View`
+/// modal first, otherwise dismisses the modal via `plugin_ui::dismiss_active_plugin_modal`
+/// (resolving pending `Confirm`/`Prompt` promises, unmounting `"__modal__"` handlers, and
+/// bumping `modal_generation`).
+pub(crate) fn dismiss_plugin_modal(cx: &mut App) -> bool {
+    plugin_ui::handle_plugin_modal_escape(cx)
+}
+
+fn is_plugin_view_reachable(
+    plugin_id: &str,
+    view_id: &str,
+    active_views: &[PluginSidebarViewSpec],
+    cx: &App,
+) -> bool {
+    if active_views
+        .iter()
+        .any(|spec| spec.plugin_id == plugin_id && spec.view_id == view_id)
+    {
+        return true;
+    }
+    PluginHost::global(cx)
+        .and_then(|host| host.plugin(plugin_id))
+        .is_some_and(|info| {
+            matches!(info.status, plugins::runtime::PluginStatus::CircuitBroken { .. })
+                && info
+                    .manifest
+                    .contributions
+                    .sidebar
+                    .iter()
+                    .any(|v| v.id == view_id)
+        })
+}
+
+#[cfg(all(test, debug_assertions))]
+fn builtins_of(items: &[RailItemId]) -> Vec<fern_core::RailSection> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            RailItemId::BuiltIn(section) => Some(*section),
+            RailItemId::Plugin { .. } => None,
+        })
+        .collect()
+}
+
+fn first_enabled_task_section(features: fern_core::Features) -> Section {
+    if features.tasks {
+        Section::Tasks
+    } else if features.things {
+        Section::Things
+    } else {
+        Section::Tasks
+    }
+}
+
+fn reorder_visible_rail_items(
+    original: &[RailItemId],
+    visible: &[RailItemId],
     from: usize,
     to: usize,
-) -> Vec<fern_core::RailSection> {
-    let mut enabled: Vec<fern_core::RailSection> =
-        original.iter().copied().filter(|&s| Section::from(s).enabled(features)).collect();
-    if from >= enabled.len() || to >= enabled.len() || from == to {
+) -> Vec<RailItemId> {
+    if from >= visible.len() || to >= visible.len() || from == to {
         return original.to_vec();
     }
-    let moved = enabled.remove(from);
-    enabled.insert(to, moved);
-    let mut next_enabled = enabled.into_iter();
-    original
-        .iter()
-        .copied()
-        .map(|s| if Section::from(s).enabled(features) { next_enabled.next().unwrap_or(s) } else { s })
+    let mut base = original.to_vec();
+    for item in visible {
+        if !base.contains(item) {
+            base.push(item.clone());
+        }
+    }
+    let mut reordered_visible = visible.to_vec();
+    let moved = reordered_visible.remove(from);
+    reordered_visible.insert(to, moved);
+    let mut next_visible = reordered_visible.into_iter();
+    base.into_iter()
+        .map(|item| {
+            if visible.contains(&item) {
+                next_visible.next().unwrap_or(item)
+            } else {
+                item
+            }
+        })
         .collect()
 }
 
@@ -72,11 +140,16 @@ pub struct AppView {
     pub(crate) store: Rc<Store>,
     section: Section,
     pub(crate) todo: gpui::Entity<TodoView>,
+    pub(crate) things: gpui::Entity<ThingsView>,
     pub(crate) calendar: gpui::Entity<CalendarView>,
     pub(crate) matrix: gpui::Entity<MatrixView>,
     pub(crate) countdown: gpui::Entity<CountdownView>,
+    pub(crate) life_clock: gpui::Entity<LifeClockView>,
+    pub(crate) life_clock_rail_hidden: bool,
     pub(crate) habits: gpui::Entity<HabitView>,
     pub(crate) focus: gpui::Entity<FocusView>,
+    plugin_views: HashMap<(String, String), gpui::Entity<PluginView>>,
+    window_handle: Option<gpui::WindowHandle<Self>>,
     title_bar: gpui::Entity<TitleBar>,
     pub(crate) search: Option<gpui::Entity<SearchModal>>,
     pub(crate) account_menu_open: bool,
@@ -90,19 +163,20 @@ pub struct AppView {
     always_on_top: bool,
     /// Settings → Features: the sections shown in the sidebar.
     pub(crate) features: fern_core::Features,
-    /// Order of icons in the narrow left navigation rail.
-    rail_order: Vec<fern_core::RailSection>,
+    /// Full rail item order including plugin sidebar views.
+    rail_items: Vec<RailItemId>,
     /// Scroll handle for the left navigation rail (needed so drag slot calculation accounts for scroll).
     rail_scroll: gpui::ScrollHandle,
     /// The rail icon currently being dragged, and the order before the drag started (for Escape).
     dragging_rail: Option<Section>,
-    rail_drag_origin: Option<Vec<fern_core::RailSection>>,
+    rail_drag_origin: Option<Vec<RailItemId>>,
     pub(crate) settings: Option<gpui::WindowHandle<SettingsWindow>>,
     update_notice: Option<Rc<ReleaseNotes>>,
     /// The Statistics page opened from the account menu, which covers the whole window.
     statistics_open: bool,
     /// The sidebar icon under the pointer, whose name shows beside it.
     nav_hovered: Option<Section>,
+    _modal_escape_sub: gpui::Subscription,
     #[cfg(test)]
     minimized_count: usize,
 }
@@ -115,6 +189,9 @@ impl AppView {
                 if !ok {
                     crate::tray::restore_main_window();
                     window.activate_window();
+                } else {
+                    view.unmount_all_plugin_views(cx);
+                    view.close_settings(cx);
                 }
                 ok
             })
@@ -123,6 +200,7 @@ impl AppView {
             return false;
         }
         crate::hotkeys::shutdown(cx);
+        PluginHost::shutdown(cx);
         crate::tray::prepare_quit();
         #[cfg(windows)]
         crate::single_instance::release();
@@ -141,7 +219,7 @@ impl AppView {
                             return;
                         }
                         if view.prepare_to_leave_calendar(window, cx) {
-                            view.close_settings(cx);
+                            view.shutdown_for_main_window_close(cx);
                             window.remove_window();
                         }
                     });
@@ -174,11 +252,29 @@ impl AppView {
                 if !view.prepare_to_leave_calendar(window, cx) {
                     return false;
                 }
-                view.close_settings(cx);
+                view.shutdown_for_main_window_close(cx);
                 true
             }).unwrap_or(true)
         });
         let todo = cx.new(|cx| TodoView::new(store.clone(), window, cx));
+        let things = cx.new(|cx| ThingsView::new(store.clone(), window, cx));
+        cx.subscribe_in(&things, window, |this, _, event: &ThingsEvent, window, cx| match event {
+            ThingsEvent::StartFocus {
+                task_id,
+                title,
+                stopwatch,
+            } => {
+                let (target_id, title, stopwatch) = (*task_id, title.clone(), *stopwatch);
+                if this.select(Section::Pomodoro, window, cx) {
+                    this.focus
+                        .update(cx, |focus, cx| focus.start_for(Some(target_id), title, stopwatch, cx));
+                }
+            }
+            ThingsEvent::OpenSearch => {
+                this.open_search(window, cx);
+            }
+        })
+        .detach();
         let calendar = cx.new(|cx| CalendarView::new(store.clone(), window, cx));
         // A task clicked in the calendar opens in the task list with its details.
         cx.subscribe_in(&calendar, window, |this, _, calendar_view::OpenTask(id), window, cx| {
@@ -188,7 +284,11 @@ impl AppView {
         // A picker asked for in the calendar's right-click menu opens with the task in the list.
         cx.subscribe_in(&calendar, window, |this, _, calendar_view::OpenTaskPicker(id, what), window, cx| {
             let (id, what) = (*id, *what);
-            if !this.select(Section::Tasks, window, cx) {
+            if !this.features.tasks && this.features.things {
+                this.open_task(id, window, cx);
+                return;
+            }
+            if !this.features.tasks || !this.select(Section::Tasks, window, cx) {
                 return;
             }
             this.todo.update(cx, |todo, cx| {
@@ -246,6 +346,16 @@ impl AppView {
         })
         .detach();
         let countdown = cx.new(|cx| CountdownView::new(store.clone(), cx));
+        let life_clock = cx.new(|cx| LifeClockView::new(store.clone(), cx));
+        cx.subscribe(&life_clock, |this, _, event: &LifeClockEvent, cx| match event {
+            LifeClockEvent::ToggleSidebar => {
+                this.toggle_life_clock_rail(cx);
+            }
+            LifeClockEvent::PaletteChanged(_) => {
+                this.sync_title_bar_appearance(cx);
+            }
+        })
+        .detach();
         let habits = cx.new(|cx| HabitView::new(store.clone(), cx));
         // "Start Focus" in a habit's menu starts a Pomodoro or a stopwatch linked to it.
         cx.subscribe_in(&habits, window, |this, _, event: &crate::habit_view::StartFocus, window, cx| {
@@ -266,14 +376,20 @@ impl AppView {
             cx.notify();
         })
         .detach();
-        cx.subscribe(&focus, |this, _, crate::focus_view::StatsClosed, cx| {
+        cx.subscribe_in(&focus, window, |this, _, crate::focus_view::StatsClosed, window, cx| {
             this.statistics_open = false;
+            if this.section == Section::LifeClock {
+                window.focus(&this.life_clock.focus_handle(cx), cx);
+            }
+            this.sync_title_bar_appearance(cx);
             cx.notify();
         })
         .detach();
         let initial_prefs = store.preferences().unwrap_or_default();
         let store_features = initial_prefs.features;
-        let rail_order = initial_prefs.rail_order;
+        let rail_items = initial_prefs.rail_items;
+        let initial_section = first_enabled_task_section(store_features);
+        let window_handle = window.window_handle().downcast::<Self>();
         let has_sync_config = store.sync_config().ok().flatten().is_some();
         let always_on_top = crate::tray::TrayPrefs::current(&store, cx).always_on_top;
         let update_notice = release_notes::take_update_notice(&store, first_start).unwrap_or_else(|err| {
@@ -290,18 +406,40 @@ impl AppView {
             cx.notify();
         })
         .detach();
+        cx.observe_global::<PluginBus>(|this, cx| {
+            this.on_plugin_bus_changed(cx);
+        })
+        .detach();
+        cx.observe_global::<i18n::CurrentLocale>(|_, cx| {
+            let code = cx.global::<i18n::CurrentLocale>().0.code().to_owned();
+            PluginHost::set_appearance(Some(code), None, cx);
+        })
+        .detach();
+        let _modal_escape_sub = cx.intercept_keystrokes(|event, _window, cx| {
+            if event.keystroke.key == "escape"
+                && !event.keystroke.modifiers.modified()
+                && dismiss_plugin_modal(cx)
+            {
+                cx.stop_propagation();
+            }
+        });
         // Mutated only by the debug-build dev state below.
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut this = Self {
             title_bar,
             store,
-            section: Section::Tasks,
+            section: initial_section,
             todo,
+            things,
             calendar,
             matrix,
             countdown,
+            life_clock,
+            life_clock_rail_hidden: false,
             habits,
             focus,
+            plugin_views: HashMap::new(),
+            window_handle,
             search: None,
             account_menu_open: false,
             notices: Notices::default(),
@@ -311,7 +449,7 @@ impl AppView {
             has_sync_config,
             always_on_top,
             features: store_features,
-            rail_order,
+            rail_items,
             rail_scroll: gpui::ScrollHandle::new(),
             dragging_rail: None,
             rail_drag_origin: None,
@@ -319,6 +457,7 @@ impl AppView {
             update_notice,
             statistics_open: false,
             nav_hovered: None,
+            _modal_escape_sub,
             #[cfg(test)]
             minimized_count: 0,
         };
@@ -336,12 +475,26 @@ impl AppView {
         .detach();
         #[cfg(debug_assertions)]
         crate::dev_state::apply(&mut this, window, cx);
+        this.sync_title_bar_appearance(cx);
         this
+    }
+
+    fn unmount_all_plugin_views(&mut self, cx: &mut Context<Self>) {
+        let views: Vec<_> = self.plugin_views.drain().map(|(_, view)| view).collect();
+        for view in views {
+            view.update(cx, |view, cx| view.unmount(cx));
+        }
+    }
+
+    fn shutdown_for_main_window_close(&mut self, cx: &mut Context<Self>) {
+        self.unmount_all_plugin_views(cx);
+        self.close_settings(cx);
+        PluginHost::shutdown(cx);
     }
 
     pub fn prepare_for_restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let _ = self.prepare_to_leave_calendar(window, cx);
-        self.close_settings(cx);
+        self.shutdown_for_main_window_close(cx);
     }
 
     fn prepare_to_leave_calendar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -354,6 +507,27 @@ impl AppView {
         false
     }
 
+    pub(crate) fn sync_title_bar_appearance(&self, cx: &mut Context<Self>) {
+        let appearance = (self.section == Section::LifeClock
+            && !self.statistics_open
+            && self.life_clock.read(cx).palette_mode() == LifeClockPaletteMode::Classic)
+            .then_some(theme::Appearance::Light);
+        self.title_bar
+            .update(cx, |bar, cx| bar.set_caption_appearance(appearance, cx));
+    }
+
+    pub(crate) fn set_life_clock_rail_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
+        self.life_clock_rail_hidden = hidden;
+        self.life_clock
+            .update(cx, |view, cx| view.set_sidebar_hidden(hidden, cx));
+        cx.notify();
+    }
+
+    fn toggle_life_clock_rail(&mut self, cx: &mut Context<Self>) {
+        let hidden = !self.life_clock_rail_hidden;
+        self.set_life_clock_rail_hidden(hidden, cx);
+    }
+
     pub(crate) fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) -> bool {
         // Search is a popover over the current screen, as in the original.
         if section == Section::Search {
@@ -363,10 +537,30 @@ impl AppView {
         if section != Section::Calendar && !self.prepare_to_leave_calendar(window, cx) {
             return false;
         }
+        if self.section == Section::LifeClock && section != Section::LifeClock {
+            self.life_clock_rail_hidden = false;
+            self.life_clock
+                .update(cx, |view, cx| view.set_sidebar_hidden(false, cx));
+        }
+        if self.section != section
+            && let Section::Plugin {
+                ref plugin_id,
+                ref view_id,
+            } = self.section
+        {
+            let key = (plugin_id.to_string(), view_id.to_string());
+            if let Some(prev) = self.plugin_views.remove(&key) {
+                prev.update(cx, |view, cx| view.unmount(cx));
+            }
+        }
         self.todo.update(cx, |todo, cx| todo.stop_search(cx));
         // Other sections change tasks and check habits in.
         if section == Section::Tasks && self.section != Section::Tasks {
             self.todo.update(cx, |todo, cx| todo.reload(cx));
+        }
+        if section == Section::Things {
+            self.things.update(cx, |things, cx| things.reload(cx));
+            window.focus(&self.things.focus_handle(cx), cx);
         }
         if section == Section::Calendar {
             self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
@@ -388,13 +582,26 @@ impl AppView {
             self.countdown.update(cx, |countdown, cx| countdown.reload(cx));
             window.focus(&self.countdown.focus_handle(cx), cx);
         }
+        if section == Section::LifeClock {
+            self.life_clock.update(cx, |life_clock, cx| life_clock.reload(cx));
+            window.focus(&self.life_clock.focus_handle(cx), cx);
+        }
+        if let Section::Plugin {
+            ref plugin_id,
+            ref view_id,
+        } = section
+        {
+            let view = self.ensure_plugin_view(plugin_id, view_id, window, cx);
+            window.focus(&view.focus_handle(cx), cx);
+        }
         self.section = section;
+        self.sync_title_bar_appearance(cx);
         cx.notify();
         true
     }
 
     fn start_rail_drag(&mut self, section: Section, cx: &mut Context<Self>) {
-        self.rail_drag_origin = Some(self.rail_order.clone());
+        self.rail_drag_origin = Some(self.rail_items.clone());
         self.dragging_rail = Some(section);
         self.nav_hovered = None;
         cx.notify();
@@ -404,7 +611,7 @@ impl AppView {
         if self.dragging_rail.take().is_some() {
             cx.stop_active_drag(window);
             if let Some(origin) = self.rail_drag_origin.take() {
-                self.rail_order = origin;
+                self.rail_items = origin;
             }
             self.nav_hovered = None;
             cx.notify();
@@ -424,10 +631,10 @@ impl AppView {
         }
         cx.stop_active_drag(window);
         let origin = self.rail_drag_origin.take();
-        if origin.as_ref() != Some(&self.rail_order) {
-            let order = self.rail_order.clone();
-            if let Ok(prefs) = self.store.update_preferences(|p| p.rail_order = order) {
-                self.rail_order = prefs.rail_order;
+        if origin.as_ref() != Some(&self.rail_items) {
+            let items = self.rail_items.clone();
+            if let Ok(prefs) = self.store.update_preferences(|p| p.set_rail_items(items)) {
+                self.rail_items = prefs.rail_items;
             }
         }
         self.nav_hovered = None;
@@ -436,45 +643,51 @@ impl AppView {
 
     fn move_rail_drag(
         &mut self,
-        event: &gpui::DragMoveEvent<crate::drag::DraggedRailSection>,
-        _window: &mut Window,
+        event: &gpui::DragMoveEvent<sidebar::DraggedRailItem>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dragged = event.drag(cx).section;
+        let dragged = event.drag(cx).item.clone();
         if self.dragging_rail.is_none() {
-            self.rail_drag_origin = Some(self.rail_order.clone());
+            self.rail_drag_origin = Some(self.rail_items.clone());
         }
-        self.dragging_rail = Some(Section::from(dragged));
-        let enabled_count = self
-            .rail_order
-            .iter()
-            .filter(|&&s| Section::from(s).enabled(self.features))
-            .count();
-        if enabled_count == 0 {
+        self.dragging_rail = Some(Section::try_from_rail_item(&dragged));
+        let plugin_views = cx
+            .try_global::<PluginBus>()
+            .map(|bus| bus.sidebar_views.clone())
+            .unwrap_or_default();
+        let visible = sidebar::visible_rail_items(&self.rail_items, self.features, &plugin_views);
+        if visible.is_empty() {
+            self.cancel_rail_drag(window, cx);
             return;
         }
         let top_y = title_bar::height() + px(sidebar::SECTIONS_TOP_OFFSET);
         let content_y = event.event.position.y - top_y - self.rail_scroll.offset().y;
         let slot = ((f32::from(content_y) / sidebar::SLOT_HEIGHT).floor() as isize)
-            .clamp(0, (enabled_count - 1) as isize) as usize;
-        let current = self
-            .rail_order
-            .iter()
-            .copied()
-            .filter(|&s| Section::from(s).enabled(self.features))
-            .position(|s| s == dragged)
-            .unwrap_or(0);
+            .clamp(0, (visible.len() - 1) as isize) as usize;
+        let Some(current) = visible.iter().position(|item| item == &dragged) else {
+            self.cancel_rail_drag(window, cx);
+            return;
+        };
         if current != slot {
-            self.rail_order = reorder_enabled_rail(&self.rail_order, self.features, current, slot);
+            self.rail_items = reorder_visible_rail_items(&self.rail_items, &visible, current, slot);
             self.nav_hovered = None;
             cx.notify();
         }
     }
 
+    fn close_search(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = self.search.take().is_some();
+        if closed {
+            SearchModal::clear_plugin_search_hits(cx);
+        }
+        closed
+    }
+
     pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let search = cx.new(|cx| SearchModal::new(self.store.clone(), cx));
         cx.subscribe_in(&search, window, |this, _, event, window, cx| {
-            this.search = None;
+            this.close_search(cx);
             match event {
                 SearchEvent::OpenTask(id) => {
                     this.open_task(*id, window, cx);
@@ -487,8 +700,12 @@ impl AppView {
                 }
                 SearchEvent::OpenView(fern_core::View::Search(query)) => {
                     let query = query.clone();
-                    if this.select(Section::Tasks, window, cx) {
-                        this.todo.update(cx, |todo, cx| todo.show_search_results(query, cx));
+                    if this.features.tasks {
+                        if this.select(Section::Tasks, window, cx) {
+                            this.todo.update(cx, |todo, cx| todo.show_search_results(query, cx));
+                        }
+                    } else if this.features.things {
+                        let _ = this.select(Section::Things, window, cx);
                     }
                 }
                 SearchEvent::OpenView(view) => {
@@ -497,8 +714,45 @@ impl AppView {
                 }
                 SearchEvent::CreateTask(query) => {
                     let query = query.clone();
-                    this.add_quick_task_with(&query, None, None, None, cx);
-                    this.select(Section::Tasks, window, cx);
+                    let target = if (this.section == Section::Things && this.features.things)
+                        || (!this.features.tasks && this.features.things)
+                    {
+                        Section::Things
+                    } else {
+                        Section::Tasks
+                    };
+                    if let Some(mgr) = crate::quick_add_window::active_hook_manager(cx)
+                        && let Some(win) = this.window_handle
+                    {
+                        let (lists, preferences) = this.quick_add_context();
+                        crate::quick_add_window::run_quick_add_plugins(
+                            mgr,
+                            win,
+                            vec![query],
+                            None,
+                            None,
+                            None,
+                            lists,
+                            preferences,
+                            Some(target),
+                            cx,
+                        );
+                    } else {
+                        this.add_quick_task_with(&query, None, None, None, cx);
+                        this.select(target, window, cx);
+                    }
+                }
+                SearchEvent::RunPluginCommand {
+                    plugin_id,
+                    command_id,
+                    arg,
+                } => {
+                    PluginHost::run_command_async(
+                        plugin_id.clone(),
+                        command_id.clone(),
+                        arg.clone(),
+                        cx,
+                    );
                 }
                 SearchEvent::Dismissed => {}
             }
@@ -524,18 +778,38 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         self.todo.update(cx, |todo, cx| todo.add_quick_with(text, date, priority, list, cx));
+        self.things.update(cx, |things, cx| things.reload(cx));
     }
 
-    /// Lists and quick-add recognition preference for the Quick Add window.
-    pub fn quick_add_context(&self) -> (Vec<fern_core::List>, fern_core::Recognition) {
+    /// Creates a task from a plugin-modified `beforeTaskCreate` draft.
+    pub fn add_plugin_task_draft(
+        &mut self,
+        draft: &fern_core::TaskDraft,
+        top: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(err) = self.store.create_task(draft.clone(), top) {
+            eprintln!("failed to create plugin-modified task: {err:#}");
+            return;
+        }
+        crate::sticky_note::data_changed(cx.entity_id(), cx);
+        self.reload_all(cx);
+    }
+
+    /// Lists and user preferences (recognition + task defaults) for the Quick Add window.
+    pub fn quick_add_context(&self) -> (Vec<fern_core::List>, fern_core::Preferences) {
         let lists = self.store.lists().unwrap_or_default().into_iter().filter(|l| !l.archived).collect();
-        let recognition = self.store.preferences().map(|p| p.recognition).unwrap_or_default();
-        (lists, recognition)
+        let preferences = self.store.preferences().unwrap_or_default();
+        (lists, preferences)
     }
 
     /// The add field of the task list, focused: New Task.
     pub fn quick_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.select(Section::Tasks, window, cx) {
+        let use_things = (self.section == Section::Things && self.features.things)
+            || (!self.features.tasks && self.features.things);
+        if use_things {
+            self.select(Section::Things, window, cx);
+        } else if self.features.tasks && self.select(Section::Tasks, window, cx) {
             self.todo.update(cx, |todo, cx| todo.focus_new_task(window, cx));
         }
     }
@@ -545,12 +819,42 @@ impl AppView {
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        self.todo.update(cx, |todo, cx| todo.toggle_lists(cx));
+        if self.section == Section::LifeClock {
+            self.toggle_life_clock_rail(cx);
+        } else {
+            self.todo.update(cx, |todo, cx| todo.toggle_lists(cx));
+        }
     }
 
     fn show_view(&mut self, view: fern_core::View, window: &mut Window, cx: &mut Context<Self>) {
-        if self.select(Section::Tasks, window, cx) {
-            self.todo.update(cx, |todo, cx| todo.select_view(view, window, cx));
+        if self.features.tasks {
+            if self.select(Section::Tasks, window, cx) {
+                self.todo.update(cx, |todo, cx| todo.select_view(view, window, cx));
+            }
+        } else if self.features.things {
+            let things_view = match view {
+                fern_core::View::Inbox => Some(things_ui::ThingsViewKind::Inbox),
+                fern_core::View::Today => Some(things_ui::ThingsViewKind::Today),
+                fern_core::View::Tomorrow
+                | fern_core::View::Next7Days
+                | fern_core::View::Day(_) => Some(things_ui::ThingsViewKind::Upcoming),
+                fern_core::View::Completed | fern_core::View::WontDo => {
+                    Some(things_ui::ThingsViewKind::Logbook)
+                }
+                fern_core::View::List(id) => Some(things_ui::ThingsViewKind::Project(id)),
+                fern_core::View::All
+                | fern_core::View::Tag(_)
+                | fern_core::View::Search(_)
+                | fern_core::View::Filter(_)
+                | fern_core::View::Summary => Some(things_ui::ThingsViewKind::Anytime),
+                fern_core::View::Trash => None,
+            };
+            if let Some(target_view) = things_view
+                && self.select(Section::Things, window, cx)
+            {
+                self.things
+                    .update(cx, |things, cx| things.select_view(target_view, window, cx));
+            }
         }
     }
 
@@ -575,7 +879,7 @@ impl AppView {
                 ListItem::new("account-statistics")
                     .start_slot(Icon::new(IconName::ChartNoAxesColumn).color(Color::Icon))
                     .child(Label::new(strings.statistics))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_statistics(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.open_statistics(window, cx))),
             )
             .child(
                 ListItem::new("account-shortcuts")
@@ -602,34 +906,39 @@ impl AppView {
             .into_any_element()
     }
 
-    pub(crate) fn open_statistics(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_statistics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.account_menu_open = false;
         self.statistics_open = true;
         self.focus.update(cx, |focus, cx| focus.open_stats_overview(cx));
+        window.focus(&self.focus.focus_handle(cx), cx);
+        self.sync_title_bar_appearance(cx);
         cx.notify();
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         if let Some(settings) = self.settings.take() {
-            let _ = settings.update(cx, |_, window, _| window.remove_window());
+            let _ = settings.update(cx, |settings, window, cx| settings.close_now(window, cx));
         }
     }
 
     fn apply_settings_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The default list, smart list visibility, mini calendar and week start show up in the views.
         self.todo.update(cx, |todo, cx| todo.reload(cx));
+        self.things.update(cx, |things, cx| things.reload(cx));
         self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
         // A section turned off in Features closes.
         let prefs = self.store.preferences().unwrap_or_default();
         self.features = prefs.features;
-        self.rail_order = prefs.rail_order;
+        self.rail_items = prefs.rail_items;
         self.has_sync_config = self.store.sync_config().ok().flatten().is_some();
         if !self.has_sync_config && self.sync != crate::sync::SyncStatus::Off {
             self.set_sync_status(crate::sync::SyncStatus::Off, cx);
         }
         if !self.section.enabled(self.features) {
-            self.select(Section::Tasks, window, cx);
+            let fallback = first_enabled_task_section(self.features);
+            self.select(fallback, window, cx);
         }
+        self.sync_title_bar_appearance(cx);
         cx.notify();
     }
 
@@ -655,10 +964,13 @@ impl AppView {
     ) {
         self.account_menu_open = false;
         if notes.is_some() {
-            self.search = None;
+            self.close_search(cx);
         }
         if let Some(settings) = self.settings {
-            let existing = settings.update(cx, |settings, settings_window, cx| {
+            let reused = settings.update(cx, |settings, settings_window, cx| {
+                if settings.is_closing() {
+                    return false;
+                }
                 if let Some(notes) = notes.clone() {
                     settings.show_release_notes(notes, settings_window, cx);
                 } else {
@@ -668,8 +980,9 @@ impl AppView {
                     settings_window.focus(&settings.focus_handle(cx), cx);
                 }
                 settings_window.activate_window();
+                true
             });
-            if existing.is_ok() {
+            if matches!(reused, Ok(true)) {
                 cx.notify();
                 return;
             }
@@ -683,11 +996,13 @@ impl AppView {
             }
         };
         if let Ok(settings) = handle.update(cx, |_, _, cx| cx.entity()) {
-            cx.subscribe_in(&settings, window, |this, _, event, window, cx| match event {
+            cx.subscribe_in(&settings, window, move |this, _, event, window, cx| match event {
                 SettingsEvent::Changed => this.apply_settings_changes(window, cx),
                 SettingsEvent::Dismissed => {
-                    this.settings = None;
-                    cx.notify();
+                    if this.settings == Some(handle) {
+                        this.settings = None;
+                        cx.notify();
+                    }
                 }
             })
             .detach();
@@ -750,16 +1065,205 @@ impl AppView {
 }
 
 impl AppView {
-    /// Opens a task from a `fern://task/…` link, in All with its details.
+    /// Opens a task from a `fern://task/…` link or notice, routing to Things when Things is active
+    /// or Classic Tasks is turned off.
     pub fn open_task(&mut self, task: fern_core::Id, window: &mut Window, cx: &mut Context<Self>) {
-        if self.select(Section::Tasks, window, cx) {
+        let use_things = (self.section == Section::Things && self.features.things)
+            || (!self.features.tasks && self.features.things);
+        if use_things {
+            if self.select(Section::Things, window, cx) {
+                self.things.update(cx, |things, cx| things.open_task(task, window, cx));
+            }
+        } else if self.features.tasks && self.select(Section::Tasks, window, cx) {
             self.todo.update(cx, |todo, cx| {
                 todo.open_task_in_all(task, cx);
             });
         }
     }
 
+    /// Dispatches any parsed `fern://` deep link (`task` or `plugin`).
+    pub fn open_deep_link(&mut self, link: DeepLink, window: &mut Window, cx: &mut Context<Self>) {
+        match link {
+            DeepLink::Task(id) => self.open_task(id, window, cx),
+            DeepLink::Plugin {
+                plugin_id,
+                command,
+                params,
+            } => {
+                let arg = if params.is_empty() {
+                    None
+                } else if params.len() == 1 && params[0].0 == "arg" {
+                    Some(params[0].1.clone())
+                } else {
+                    let map: serde_json::Map<String, serde_json::Value> = params
+                        .into_iter()
+                        .map(|(k, v)| (k, serde_json::Value::String(v)))
+                        .collect();
+                    Some(serde_json::Value::Object(map).to_string())
+                };
+                PluginHost::run_command_async(plugin_id, command, arg, cx);
+            }
+        }
+    }
+
+    fn ensure_plugin_view(
+        &mut self,
+        plugin_id: &str,
+        view_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Entity<PluginView> {
+        let key = (plugin_id.to_owned(), view_id.to_owned());
+        if let Some(existing) = self.plugin_views.get(&key) {
+            return existing.clone();
+        }
+        let pid = plugin_id.to_owned();
+        let vid = view_id.to_owned();
+        let entity = cx.new(|cx| PluginView::new(pid, vid, cx));
+        cx.subscribe_in(&entity, window, |this, _, event: &PluginViewEvent, window, cx| {
+            match event {
+                PluginViewEvent::OpenLogs { plugin_id } => {
+                    // `PluginView` may also have queued `OpenSettingsPlugins` + `requested_settings_plugin`
+                    // via `PluginHost::request_open_logs_for`; consume both so Settings opens and
+                    // fetches logs exactly once instead of double-dispatching on the next bus tick.
+                    let _ = PluginHost::take_requested_settings_plugin(cx);
+                    if cx
+                        .try_global::<PluginBus>()
+                        .is_some_and(|bus| {
+                            bus.pending_nav
+                                .iter()
+                                .any(|a| matches!(a, PluginNavAction::OpenSettingsPlugins))
+                        })
+                    {
+                        PluginBus::update(cx, |bus| {
+                            bus.pending_nav
+                                .retain(|a| !matches!(a, PluginNavAction::OpenSettingsPlugins));
+                        });
+                    }
+                    this.open_plugin_logs(plugin_id.clone(), window, cx);
+                }
+            }
+        })
+        .detach();
+        self.plugin_views.insert(key, entity.clone());
+        entity
+    }
+
+    fn open_plugin_logs(&mut self, plugin_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_at(None, Some(settings_window::Page::Plugins), window, cx);
+        if let Some(settings) = self.settings {
+            let _ = settings.update(cx, |settings, _, cx| {
+                settings.open_plugin_logs(&plugin_id, cx);
+            });
+        }
+    }
+
+    fn on_plugin_bus_changed(&mut self, cx: &mut Context<Self>) {
+        let mut actions = Vec::new();
+        if cx
+            .try_global::<PluginBus>()
+            .is_some_and(|bus| !bus.pending_nav.is_empty())
+        {
+            actions = PluginBus::update(cx, |bus| bus.drain_nav());
+        }
+
+        if let Some(active_views) = cx
+            .try_global::<PluginBus>()
+            .map(|bus| bus.sidebar_views.clone())
+        {
+            let evicted_keys: Vec<(String, String)> = self
+                .plugin_views
+                .keys()
+                .filter(|(pid, vid)| !is_plugin_view_reachable(pid, vid, &active_views, cx))
+                .cloned()
+                .collect();
+            for key in evicted_keys {
+                if let Some(view) = self.plugin_views.remove(&key) {
+                    view.update(cx, |view, cx| view.unmount(cx));
+                }
+            }
+            if PluginHost::global(cx).is_some()
+                && let Section::Plugin {
+                    ref plugin_id,
+                    ref view_id,
+                } = self.section
+                && !is_plugin_view_reachable(plugin_id.as_ref(), view_id.as_ref(), &active_views, cx)
+            {
+                self.section = first_enabled_task_section(self.features);
+            }
+        }
+
+        let mut deferred = Vec::new();
+        for action in actions {
+            match action {
+                PluginNavAction::RunCommand {
+                    plugin_id,
+                    command_id,
+                    arg,
+                } => {
+                    PluginHost::run_command_async(plugin_id, command_id, arg, cx);
+                }
+                other => deferred.push(other),
+            }
+        }
+        if !deferred.is_empty() && let Some(win) = self.window_handle {
+            cx.spawn(async move |_, cx| {
+                let _ = win.update(cx, |view, window, cx| {
+                    for action in deferred {
+                        view.handle_plugin_nav(action, window, cx);
+                    }
+                });
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    fn handle_plugin_nav(
+        &mut self,
+        action: PluginNavAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            PluginNavAction::OpenTask(id) => self.open_task(id, window, cx),
+            PluginNavAction::OpenPluginView { plugin_id, view_id } => {
+                let active_views = cx
+                    .try_global::<PluginBus>()
+                    .map(|bus| bus.sidebar_views.clone())
+                    .unwrap_or_default();
+                if is_plugin_view_reachable(&plugin_id, &view_id, &active_views, cx) {
+                    self.select(
+                        Section::Plugin {
+                            plugin_id: plugin_id.into(),
+                            view_id: view_id.into(),
+                        },
+                        window,
+                        cx,
+                    );
+                }
+            }
+            PluginNavAction::OpenSettingsPlugins => {
+                if let Some(plugin_id) = PluginHost::take_requested_settings_plugin(cx) {
+                    self.open_plugin_logs(plugin_id, window, cx);
+                } else {
+                    self.open_settings_page(settings_window::Page::Plugins, window, cx);
+                }
+            }
+            PluginNavAction::RunCommand {
+                plugin_id,
+                command_id,
+                arg,
+            } => {
+                PluginHost::run_command_async(plugin_id, command_id, arg, cx);
+            }
+        }
+    }
+
     fn dismiss_any_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if dismiss_plugin_modal(cx) {
+            return true;
+        }
         if self.cancel_rail_drag(window, cx) {
             return true;
         }
@@ -771,7 +1275,7 @@ impl AppView {
             self.set_notices_open(false, cx);
             return true;
         }
-        if self.search.take().is_some() {
+        if self.close_search(cx) {
             cx.notify();
             return true;
         }
@@ -781,12 +1285,16 @@ impl AppView {
             }
             self.statistics_open = false;
             self.focus.update(cx, |focus, cx| focus.close_stats(cx));
+            self.sync_title_bar_appearance(cx);
             cx.notify();
             return true;
         }
-        match self.section {
+        match &self.section {
             Section::Tasks | Section::Search => {
                 self.todo.update(cx, |todo, cx| todo.dismiss_transient(window, cx))
+            }
+            Section::Things => {
+                self.things.update(cx, |things, cx| things.dismiss_transient(window, cx))
             }
             Section::Calendar => {
                 self.calendar.update(cx, |cal, cx| cal.try_dismiss_transient(window, cx))
@@ -799,6 +1307,17 @@ impl AppView {
             Section::Countdown => {
                 self.countdown.update(cx, |countdown, cx| countdown.dismiss_transient(cx))
             }
+            Section::LifeClock => {
+                if self.life_clock.update(cx, |view, cx| view.dismiss_transient(cx)) {
+                    true
+                } else if self.life_clock_rail_hidden {
+                    self.set_life_clock_rail_hidden(false, cx);
+                    true
+                } else {
+                    false
+                }
+            }
+            Section::Plugin { .. } => false,
         }
     }
 
@@ -1037,18 +1556,21 @@ impl AppView {
     fn reload_all(&mut self, cx: &mut Context<Self>) {
         let prefs = self.store.preferences().unwrap_or_default();
         self.features = prefs.features;
-        self.rail_order = prefs.rail_order;
+        self.rail_items = prefs.rail_items;
         self.has_sync_config = self.store.sync_config().ok().flatten().is_some();
         crate::calendar::set_week_start(prefs.week_start);
         crate::calendar::set_hour12(prefs.hour12);
         crate::calendar::set_date_format(prefs.date_format);
         crate::calendar::set_week_numbers(prefs.week_numbers);
         self.todo.update(cx, |view, cx| view.reload(cx));
+        self.things.update(cx, |view, cx| view.reload(cx));
         self.calendar.update(cx, |view, cx| view.reload(cx));
         self.matrix.update(cx, |view, cx| view.reload(cx));
         self.countdown.update(cx, |view, cx| view.reload(cx));
+        self.life_clock.update(cx, |view, cx| view.reload(cx));
         self.habits.update(cx, |view, cx| view.reload(cx));
         self.focus.update(cx, |view, cx| view.reload(cx));
+        self.sync_title_bar_appearance(cx);
         cx.notify();
     }
 
@@ -1113,6 +1635,25 @@ impl AppView {
         }
     }
 
+    fn complete_task_from_notice(
+        &mut self,
+        id: fern_core::Id,
+        notice: &Notice,
+        cx: &mut Context<Self>,
+    ) {
+        match self.store.complete(id, true) {
+            Ok(_) => desktop_common::sound::play_complete(&self.store),
+            Err(err) => eprintln!("failed to answer the reminder: {err:#}"),
+        }
+        self.notices.items.retain(|n| n != notice);
+        desktop_common::data_version::data_changed(cx.entity_id(), cx);
+        self.todo.update(cx, |todo, cx| todo.reload(cx));
+        self.things.update(cx, |things, cx| things.reload(cx));
+        self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
+        self.matrix.update(cx, |matrix, cx| matrix.reload(cx));
+        cx.notify();
+    }
+
     /// A click on a reminder, in the bell, floating banner, or desktop notification.
     pub fn answer_notice(&mut self, notice: &Notice, reply: Reply, window: &mut Window, cx: &mut Context<Self>) {
         self.active_alerts.retain(|n| n.target != notice.target);
@@ -1121,6 +1662,23 @@ impl AppView {
             self.open_notice(notice.target, window, cx);
             return;
         };
+        if let Target::Task(id) = notice.target
+            && action == NoticeAction::Complete
+            && let Some(mgr) = crate::quick_add_window::active_hook_manager(cx)
+            && let Ok(Some(task)) = self.store.task(id)
+        {
+            let weak = cx.weak_entity();
+            let notice_clone = notice.clone();
+            crate::quick_add_window::run_before_task_complete(mgr, &task, cx, move |allowed, cx| {
+                if allowed {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.complete_task_from_notice(id, &notice_clone, cx);
+                    });
+                }
+            });
+            cx.notify();
+            return;
+        }
         let now = chrono::Local::now().naive_local();
         let snooze_minutes = match action {
             NoticeAction::Snooze5m => Some(5),
@@ -1200,6 +1758,7 @@ impl AppView {
         desktop_common::data_version::data_changed(cx.entity_id(), cx);
         if touched_tasks {
             self.todo.update(cx, |todo, cx| todo.reload(cx));
+            self.things.update(cx, |things, cx| things.reload(cx));
             self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
             self.matrix.update(cx, |matrix, cx| matrix.reload(cx));
         }
@@ -1459,7 +2018,7 @@ impl Render for AppView {
         if !cx.has_active_drag() && self.dragging_rail.take().is_some()
             && let Some(origin) = self.rail_drag_origin.take()
         {
-            self.rail_order = origin;
+            self.rail_items = origin;
         }
         let this = cx.entity().downgrade();
         let on_select = move |section, window: &mut Window, cx: &mut App| {
@@ -1469,7 +2028,11 @@ impl Render for AppView {
         let on_nav_hover = move |section: Section, hovered: bool, cx: &mut App| {
             hover_target
                 .update(cx, |this, cx| {
-                    let now = if hovered { Some(section) } else { this.nav_hovered.filter(|s| *s != section) };
+                    let now = if hovered {
+                        Some(section)
+                    } else {
+                        this.nav_hovered.take().filter(|s| s != &section)
+                    };
                     if this.nav_hovered != now {
                         this.nav_hovered = now;
                         cx.notify();
@@ -1508,6 +2071,63 @@ impl Render for AppView {
                 this.set_notices_open(open, cx)
             })),
             menu: bell_panel.map(|panel| PopoverAttachment::new(Placement::RightBottom, panel).into_any_element()),
+        };
+
+        let main_panel = if !self.statistics_open {
+            let focus_clock = self.focus.read(cx).running_clock();
+            let plugin_view_entity = if let Section::Plugin {
+                ref plugin_id,
+                ref view_id,
+            } = self.section
+            {
+                self.plugin_views
+                    .get(&(plugin_id.to_string(), view_id.to_string()))
+                    .cloned()
+            } else {
+                None
+            };
+            let hide_rail = self.section == Section::LifeClock && self.life_clock_rail_hidden;
+            let rail = (!hide_rail).then(|| {
+                sidebar::render(
+                    &self.section,
+                    self.nav_hovered.as_ref(),
+                    &self.rail_items,
+                    self.dragging_rail.as_ref(),
+                    &self.rail_scroll,
+                    on_nav_hover,
+                    on_select,
+                    on_start_rail_drag,
+                    on_avatar,
+                    account_menu,
+                    bell,
+                    sync_button,
+                    focus_clock,
+                    features,
+                    cx,
+                )
+            });
+            let body = match &self.section {
+                Section::Tasks | Section::Search => {
+                    div().flex_1().min_w_0().h_full().child(self.todo.clone())
+                }
+                Section::Things => div().flex_1().min_w_0().h_full().child(self.things.clone()),
+                Section::Calendar => div().flex_1().min_w_0().h_full().child(self.calendar.clone()),
+                Section::Matrix => div().flex_1().min_w_0().h_full().child(self.matrix.clone()),
+                Section::Countdown => div().flex_1().min_w_0().h_full().child(self.countdown.clone()),
+                Section::LifeClock => div().flex_1().min_w_0().h_full().child(self.life_clock.clone()),
+                Section::Habits => div().flex_1().min_w_0().h_full().child(self.habits.clone()),
+                Section::Pomodoro => div().flex_1().min_w_0().h_full().child(self.focus.clone()),
+                Section::Plugin { .. } => {
+                    let mut el = div().flex_1().min_w_0().h_full();
+                    if let Some(view) = plugin_view_entity {
+                        el = el.child(view);
+                    }
+                    el
+                }
+            };
+            Some((rail, body))
+        } else {
+            None
         };
 
         let content = h_flex()
@@ -1563,34 +2183,7 @@ impl Render for AppView {
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .when(self.statistics_open, |el| el.child(div().size_full().child(self.focus.clone())))
-            .when(!self.statistics_open, |el| {
-                let focus_clock = self.focus.read(cx).running_clock();
-                el.child(sidebar::render(
-                    self.section,
-                    self.nav_hovered,
-                    &self.rail_order,
-                    self.dragging_rail,
-                    &self.rail_scroll,
-                    on_nav_hover,
-                    on_select,
-                    on_start_rail_drag,
-                    on_avatar,
-                    account_menu,
-                    bell,
-                    sync_button,
-                    focus_clock,
-                    features,
-                    cx,
-                ))
-                .child(match self.section {
-                    Section::Tasks | Section::Search => div().flex_1().min_w_0().h_full().child(self.todo.clone()),
-                    Section::Calendar => div().flex_1().min_w_0().h_full().child(self.calendar.clone()),
-                    Section::Matrix => div().flex_1().min_w_0().h_full().child(self.matrix.clone()),
-                    Section::Countdown => div().flex_1().min_w_0().h_full().child(self.countdown.clone()),
-                    Section::Habits => div().flex_1().min_w_0().h_full().child(self.habits.clone()),
-                    Section::Pomodoro => div().flex_1().min_w_0().h_full().child(self.focus.clone()),
-                })
-            })
+            .when_some(main_panel, |el, (rail, body)| el.children(rail).child(body))
             .when_some(self.search.clone(), |el, search| {
                 el.child(div().absolute().top(px(160.)).left_0().right_0().flex().justify_center().child(search))
             });
@@ -1606,6 +2199,7 @@ impl Render for AppView {
             .child(content)
             .child(self.title_bar.clone())
             .children(self.render_active_alerts(cx))
+            .child(render_plugin_overlays(window, cx))
             // A ring under a finger held long enough: lifting it opens the context menu.
             .when_some(crate::touch::held(), |el, at| {
                 let accent = theme.colors().accent;
@@ -2027,8 +2621,9 @@ mod tests {
 
         cx.update(|_, cx| {
             assert_eq!(app.read(cx).section, Section::Habits, "dragging does not switch active section");
-            assert_eq!(app.read(cx).rail_order[0], RailSection::Calendar);
-            assert_eq!(app.read(cx).rail_order[1], RailSection::Tasks);
+            let builtins = builtins_of(&app.read(cx).rail_items);
+            assert_eq!(builtins[0], RailSection::Calendar);
+            assert_eq!(builtins[1], RailSection::Tasks);
         });
         assert_eq!(store.preferences().unwrap().rail_order[0], RailSection::Calendar);
 
@@ -2040,12 +2635,12 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_mouse_move(point(cal.center().x, cal.center().y + px(120.)), Some(MouseButton::Left), modifiers);
         cx.run_until_parked();
-        cx.update(|_, cx| assert_ne!(app.read(cx).rail_order[0], RailSection::Calendar));
+        cx.update(|_, cx| assert_ne!(builtins_of(&app.read(cx).rail_items)[0], RailSection::Calendar));
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         cx.update(|_, cx| {
             assert!(app.read(cx).dragging_rail.is_none());
-            assert_eq!(app.read(cx).rail_order[0], RailSection::Calendar);
+            assert_eq!(builtins_of(&app.read(cx).rail_items)[0], RailSection::Calendar);
         });
     }
 
@@ -2183,5 +2778,429 @@ mod tests {
                 &crate::sync::SyncStatus::Failed(i18n::EN.sync_e2ee_wrong_passphrase.to_owned())
             );
         });
+    }
+
+    #[gpui::test]
+    fn open_task_routes_to_things_when_active_or_when_tasks_disabled(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            let _ = crate::keymap::load_default(&assets::Assets, cx);
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Route test task").unwrap();
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store.clone(), false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        // Enable Things and turn off Classic Tasks: apply_settings_changes switches to Things.
+        store
+            .update_preferences(|p| {
+                p.features.tasks = false;
+                p.features.things = true;
+            })
+            .unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.apply_settings_changes(window, cx);
+                assert_eq!(app.section, Section::Things);
+                app.open_task(task.id, window, cx);
+                assert_eq!(app.section, Section::Things);
+            });
+        });
+        cx.run_until_parked();
+
+        // Turn Classic Tasks back on and turn Things off: auto-switches to Tasks.
+        store
+            .update_preferences(|p| {
+                p.features.tasks = true;
+                p.features.things = false;
+            })
+            .unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.apply_settings_changes(window, cx);
+                assert_eq!(app.section, Section::Tasks);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn plugin_bus_nav_actions_and_rail_reordering_work_with_plugins(cx: &mut gpui::TestAppContext) {
+        use desktop_common::plugin_bus::PluginSidebarViewSpec;
+
+        cx.update(|cx| {
+            theme::init(cx);
+            let _ = crate::keymap::load_default(&assets::Assets, cx);
+            PluginBus::update(cx, |bus| {
+                bus.sidebar_views.push(PluginSidebarViewSpec {
+                    plugin_id: "demo".into(),
+                    view_id: "panel".into(),
+                    title: "Demo Panel".into(),
+                    icon_svg: None,
+                });
+            });
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Bus task").unwrap();
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store.clone(), false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        // Rail visible items includes active plugin view and supports reordering it.
+        cx.update(|_, cx| {
+            let views = cx.global::<PluginBus>().sidebar_views.clone();
+            let items = app.read(cx).rail_items.clone();
+            let visible = sidebar::visible_rail_items(&items, app.read(cx).features, &views);
+            let plugin_item = RailItemId::Plugin {
+                plugin_id: "demo".into(),
+                view_id: "panel".into(),
+            };
+            assert!(visible.contains(&plugin_item));
+            let last = visible.len() - 1;
+            let reordered = reorder_visible_rail_items(&items, &visible, last, 0);
+            assert_eq!(reordered[0], plugin_item);
+        });
+
+        // PluginBus OpenPluginView and OpenTask drain and dispatch cleanly.
+        cx.update(|_, cx| {
+            PluginBus::update(cx, |bus| {
+                bus.pending_nav.push_back(PluginNavAction::OpenPluginView {
+                    plugin_id: "demo".into(),
+                    view_id: "panel".into(),
+                });
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                app.read(cx).section,
+                Section::Plugin {
+                    plugin_id: "demo".into(),
+                    view_id: "panel".into(),
+                }
+            );
+            assert!(app.read(cx).plugin_views.contains_key(&("demo".into(), "panel".into())));
+            PluginBus::update(cx, |bus| {
+                bus.pending_nav.push_back(PluginNavAction::OpenTask(task.id));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(app.read(cx).section, Section::Tasks));
+    }
+
+    #[gpui::test]
+    fn settings_window_reopen_while_closing_spawns_fresh_window_and_ignores_stale_dismiss(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+
+        let first = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_settings(None, window, cx);
+                app.settings.unwrap()
+            })
+        });
+
+        // Start closing the first Settings window (`closing = true`, deferred `remove_window()`),
+        // then immediately reopen before deferred removal executes.
+        let second = cx.update(|window, cx| {
+            first
+                .update(cx, |settings, settings_win, cx| {
+                    settings.close(settings_win, cx);
+                })
+                .unwrap();
+            app.update(cx, |app, cx| {
+                app.open_settings_page(settings_window::Page::Plugins, window, cx);
+                app.settings.unwrap()
+            })
+        });
+        assert_ne!(first, second, "must not reuse a closing SettingsWindow handle");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).settings, Some(second));
+            assert_eq!(
+                second.read_with(cx, |s, _| s.current_page()).unwrap(),
+                settings_window::Page::Plugins
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn show_view_and_quick_add_do_not_jump_into_disabled_tasks_section(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            theme::init(cx);
+            let _ = crate::keymap::load_default(&assets::Assets, cx);
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        store
+            .update_preferences(|p| {
+                p.features.tasks = false;
+                p.features.things = true;
+            })
+            .unwrap();
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                assert_eq!(app.section, Section::Things);
+                app.show_view(fern_core::View::Today, window, cx);
+                assert_eq!(app.section, Section::Things);
+                assert_eq!(app.things.read(cx).view(), things_ui::ThingsViewKind::Today);
+
+                app.show_view(fern_core::View::Inbox, window, cx);
+                assert_eq!(app.section, Section::Things);
+                assert_eq!(app.things.read(cx).view(), things_ui::ThingsViewKind::Inbox);
+
+                app.show_view(fern_core::View::Trash, window, cx);
+                assert_eq!(app.section, Section::Things, "Trash must not jump to disabled Tasks");
+
+                app.quick_add(window, cx);
+                assert_eq!(app.section, Section::Things);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn open_plugin_view_validates_target_and_escape_dismisses_plugin_modal_first(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            theme::init(cx);
+            let _ = crate::keymap::load_default(&assets::Assets, cx);
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+
+        // Unknown plugin view target must be ignored (not switched to).
+        cx.update(|_, cx| {
+            PluginBus::update(cx, |bus| {
+                bus.pending_nav.push_back(PluginNavAction::OpenPluginView {
+                    plugin_id: "nonexistent".into(),
+                    view_id: "ghost".into(),
+                });
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).section, Section::Tasks);
+            assert!(app.read(cx).plugin_views.is_empty());
+        });
+
+        // Open a plugin modal while notices popover is also open -> Escape closes modal first.
+        cx.update(|_, cx| {
+            use desktop_common::plugin_bus::{PluginModalKind, PluginModalSpec};
+            app.update(cx, |app, cx| app.set_notices_open(true, cx));
+            PluginBus::update(cx, |bus| {
+                bus.open_modal(PluginModalSpec {
+                    plugin_id: "demo".into(),
+                    view_id: "panel".into(),
+                    title: "Confirm".into(),
+                    kind: PluginModalKind::Confirm {
+                        body: "Proceed?".into(),
+                        request_id: 7,
+                    },
+                });
+            });
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(cx.global::<PluginBus>().active_modal.is_none());
+            assert!(app.read(cx).notices_open, "notices must remain open after Escape closes modal");
+        });
+    }
+
+    #[gpui::test]
+    fn life_clock_title_bar_appearance_tracks_palette_section_and_statistics(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).title_bar.read(cx).caption_appearance(), None);
+        });
+
+        // Entering Life Clock in default Classic B&W mode sets Light caption appearance.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| assert!(app.select(Section::LifeClock, window, cx)));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).section, Section::LifeClock);
+            assert_eq!(
+                app.read(cx).title_bar.read(cx).caption_appearance(),
+                Some(theme::Appearance::Light)
+            );
+        });
+
+        // Opening Statistics over Life Clock resets caption appearance; closing restores it.
+        cx.update(|window, cx| app.update(cx, |app, cx| app.open_statistics(window, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(app.read(cx).statistics_open);
+            assert_eq!(app.read(cx).title_bar.read(cx).caption_appearance(), None);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(!app.read(cx).statistics_open);
+            assert_eq!(
+                app.read(cx).title_bar.read(cx).caption_appearance(),
+                Some(theme::Appearance::Light)
+            );
+        });
+
+        // Switching to FernTheme clears the light override; switching back to Classic restores it.
+        cx.update(|_, cx| {
+            let lc = app.read(cx).life_clock.clone();
+            lc.update(cx, |view, cx| view.dev_set_palette(LifeClockPaletteMode::FernTheme, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).title_bar.read(cx).caption_appearance(), None);
+        });
+        cx.update(|_, cx| {
+            let lc = app.read(cx).life_clock.clone();
+            lc.update(cx, |view, cx| view.dev_set_palette(LifeClockPaletteMode::Classic, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                app.read(cx).title_bar.read(cx).caption_appearance(),
+                Some(theme::Appearance::Light)
+            );
+        });
+
+        // Leaving Life Clock clears the override.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| assert!(app.select(Section::Tasks, window, cx)));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).title_bar.read(cx).caption_appearance(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn life_clock_sidebar_toggle_and_escape_restore(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| assert!(app.select(Section::LifeClock, window, cx)));
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sidebar").is_some());
+        cx.update(|_, cx| assert!(!app.read(cx).life_clock_rail_hidden));
+
+        // ToggleSidebar action hides the left rail on Life Clock.
+        cx.update(|window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx));
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(app.read(cx).life_clock_rail_hidden));
+        assert!(cx.debug_bounds("sidebar").is_none());
+
+        // Escape restores the hidden rail via DismissTransient.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(!app.read(cx).life_clock_rail_hidden));
+        assert!(cx.debug_bounds("sidebar").is_some());
+
+        // Clicking the in-view sidebar toggle emits LifeClockEvent::ToggleSidebar.
+        let toggle = cx.debug_bounds("life-clock-sidebar-toggle").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(app.read(cx).life_clock_rail_hidden));
+        assert!(cx.debug_bounds("sidebar").is_none());
+
+        // With popover open and rail hidden, first Escape closes popover and second restores rail.
+        cx.update(|_, cx| {
+            let lc = app.read(cx).life_clock.clone();
+            lc.update(cx, |view, cx| view.dev_open_popover(true, cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(app.read(cx).life_clock_rail_hidden));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(!app.read(cx).life_clock_rail_hidden));
+        assert!(cx.debug_bounds("sidebar").is_some());
+
+        // Leaving Life Clock while rail is hidden resets rail visibility cleanly.
+        cx.update(|window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sidebar").is_none());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| assert!(app.select(Section::Tasks, window, cx)));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(!app.read(cx).life_clock_rail_hidden));
+        assert!(cx.debug_bounds("sidebar").is_some());
+    }
+
+    #[gpui::test]
+    fn disabling_life_clock_feature_falls_back_to_task_section(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("section-life-clock").is_some());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| assert!(app.select(Section::LifeClock, window, cx)));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).section, Section::LifeClock);
+            assert_eq!(
+                app.read(cx).title_bar.read(cx).caption_appearance(),
+                Some(theme::Appearance::Light)
+            );
+        });
+
+        let settings_window = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_settings_page(settings_window::Page::Features, window, cx);
+                app.settings.unwrap()
+            })
+        });
+        let mut settings_cx = gpui::VisualTestContext::from_window(settings_window.into(), cx);
+        settings_cx.simulate_resize(gpui::size(px(900.), px(780.)));
+        settings_cx.run_until_parked();
+
+        let life_clock_toggle = settings_cx.debug_bounds("settings-feature-5").unwrap();
+        settings_cx.simulate_click(life_clock_toggle.center(), gpui::Modifiers::default());
+        settings_cx.run_until_parked();
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert!(!app.read(cx).features.life_clock);
+            assert_eq!(app.read(cx).section, Section::Tasks);
+            assert_eq!(app.read(cx).title_bar.read(cx).caption_appearance(), None);
+        });
+        assert!(cx.debug_bounds("section-life-clock").is_none());
     }
 }

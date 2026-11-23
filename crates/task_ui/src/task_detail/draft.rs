@@ -141,6 +141,8 @@ impl TaskDetail {
             modified_at: None,
             reminders: defaults.all_day_reminder.into_iter().collect(),
             estimate: None,
+            start_date: None,
+            schedule_bucket: fern_core::ScheduleBucket::None,
             created_at: chrono::Utc::now().timestamp_millis(),
         };
         self.show(Some(task), cx);
@@ -348,6 +350,8 @@ impl TaskDetail {
             timezone: due.timezone,
             is_floating: due.is_floating,
             constant_reminder,
+            start_date: None,
+            schedule_bucket: fern_core::ScheduleBucket::None,
         };
         let top = !preferences.task_defaults.add_to_bottom;
         let task = if draft.attachments.is_empty() {

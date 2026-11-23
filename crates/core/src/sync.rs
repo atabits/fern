@@ -474,7 +474,9 @@ impl Store {
             let mut conflict_relogs: Vec<(String, i64)> = Vec::new();
 
             for change in ordered {
-                let keys = keys_of(&change.entity)?;
+                let Ok(keys) = keys_of(&change.entity) else {
+                    continue;
+                };
                 let local: Option<i64> = self
                     .conn
                     .prepare_cached(
@@ -902,7 +904,14 @@ mod tests {
     fn foreign_input_is_checked() {
         let store = Store::open_in_memory().unwrap();
         let unknown = Change { entity: "settings".into(), key: "theme".into(), at: 1, row: None };
-        assert!(store.apply_changes(&[unknown]).is_err(), "only synced tables take changes");
+        assert_eq!(store.apply_changes(&[unknown]).unwrap(), 0, "unknown/non-synced tables are safely skipped");
+        let future = Change {
+            entity: "plugin_kv".into(),
+            key: "p1\x1fk".into(),
+            at: 2,
+            row: Some(Map::from_iter([("value".into(), Json::from("v"))])),
+        };
+        assert_eq!(store.apply_changes(&[future]).unwrap(), 0, "future synced entities are safely skipped");
         let mut row = Map::new();
         row.insert("id; DROP TABLE tasks".into(), Json::from("x"));
         row.insert("id".into(), Json::from("00000000-0000-0000-0000-000000000000"));
@@ -1042,8 +1051,8 @@ mod tests {
                     "row": { "id": good_list_id, "name": "Partial", "created_at": 100 }
                 },
                 {
-                    "entity": "not_a_synced_table",
-                    "key": "x",
+                    "entity": "task_tags",
+                    "key": "malformed_key_missing_separator",
                     "at": 100,
                     "row": null
                 }

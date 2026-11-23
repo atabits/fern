@@ -221,12 +221,12 @@ pub fn connect(
                         .ok()
                         .and_then(|dir| crate::single_instance::take_pending_link(&dir));
                     #[cfg(not(windows))]
-                    let link: Option<fern_core::Id> = None;
+                    let link: Option<fern_core::link::DeepLink> = None;
                     let _ = main_window.update(cx, |view, window, cx| {
                         restore_main_window();
                         window.activate_window();
-                        if let Some(task_id) = link {
-                            view.open_task(task_id, window, cx);
+                        if let Some(link) = link {
+                            view.open_deep_link(link, window, cx);
                         }
                     });
                 }

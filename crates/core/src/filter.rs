@@ -507,11 +507,12 @@ impl FilterRules {
                 );
                 let mut condition = c.clone();
                 condition.join = Join::And;
-                *normal
+                let slot = normal
                     .conditions
                     .iter_mut()
                     .find(|n| n.value.field() == c.value.field())
-                    .unwrap() = condition;
+                    .context("missing normal condition slot for filter field")?;
+                *slot = condition;
             }
             self.conditions = normal.conditions;
         }

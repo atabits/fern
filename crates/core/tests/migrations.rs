@@ -73,6 +73,7 @@ fn migrate_v1_fixture_data_survives() {
     let store = Store::open(&path).expect("migrate v1");
     assert_eq!(store.schema_version().expect("schema_version"), SCHEMA_VERSION);
     assert_eq!(store.integrity_check().expect("integrity_check"), vec!["ok"]);
+    assert_eq!(store.quick_check().expect("quick_check"), vec!["ok"]);
     assert_eq!(
         store.table_counts().expect("counts"),
         TableCounts { tasks: 2, ..Default::default() }

@@ -6,6 +6,7 @@ use anyhow::Result;
 use chrono::NaiveDate;
 use rusqlite::params;
 
+use crate::horizon::Horizon;
 use crate::model::{Id, List, ScheduleBucket, Task};
 use crate::store::{DATE_FORMAT, Store, parse_uuid};
 
@@ -75,6 +76,7 @@ fn matches_things_view(
                 && task.list_id.is_none()
                 && task.start_date.is_none()
                 && task.due_date.is_none()
+                && task.horizon.is_none()
                 && task.schedule_bucket == ScheduleBucket::None
         }
         ThingsViewKind::Today => {
@@ -99,14 +101,32 @@ fn matches_things_view(
             !task.is_closed()
                 && !in_hidden_list
                 && task.schedule_bucket != ScheduleBucket::Someday
+                && !matches!(
+                    task.horizon,
+                    Some(Horizon::Year(_) | Horizon::Decade(_) | Horizon::Life)
+                )
                 && task.start_date.is_none_or(|d| d <= today)
                 && (task.list_id.is_some()
                     || task.start_date.is_some()
                     || task.due_date.is_some_and(|d| d <= today)
-                    || task.schedule_bucket == ScheduleBucket::Evening)
+                    || task.schedule_bucket == ScheduleBucket::Evening
+                    || matches!(
+                        task.horizon,
+                        Some(
+                            Horizon::Week { .. }
+                                | Horizon::Month { .. }
+                                | Horizon::Quarter { .. }
+                        )
+                    ))
         }
         ThingsViewKind::Someday => {
-            !task.is_closed() && !in_hidden_list && task.schedule_bucket == ScheduleBucket::Someday
+            !task.is_closed()
+                && !in_hidden_list
+                && (task.schedule_bucket == ScheduleBucket::Someday
+                    || matches!(
+                        task.horizon,
+                        Some(Horizon::Year(_) | Horizon::Decade(_) | Horizon::Life)
+                    ))
         }
         ThingsViewKind::Logbook => task.is_closed(),
         ThingsViewKind::Project(list_id) => task.list_id == Some(*list_id),
@@ -246,10 +266,17 @@ impl Store {
         bucket: ScheduleBucket,
     ) -> Result<()> {
         let date_str = start_date.map(|d| d.format(DATE_FORMAT).to_string());
-        self.conn.execute(
-            "UPDATE tasks SET start_date = ?2, schedule_bucket = ?3 WHERE id = ?1",
-            params![id.to_string(), date_str, bucket.as_str()],
-        )?;
+        if start_date.is_some() || bucket != ScheduleBucket::None {
+            self.conn.execute(
+                "UPDATE tasks SET start_date = ?2, schedule_bucket = ?3, horizon = NULL WHERE id = ?1",
+                params![id.to_string(), date_str, bucket.as_str()],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE tasks SET start_date = ?2, schedule_bucket = ?3 WHERE id = ?1",
+                params![id.to_string(), date_str, bucket.as_str()],
+            )?;
+        }
         Ok(())
     }
 
@@ -421,6 +448,88 @@ mod tests {
 
         assert!(in_view(ThingsViewKind::Upcoming, future_due_project.id)?);
         assert!(in_view(ThingsViewKind::Anytime, future_due_project.id)?);
+        Ok(())
+    }
+
+    #[test]
+    fn horizon_task_isolated_from_things_inbox_and_cleared_on_schedule() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = d(2026, 11, 23);
+        let proj = store.add_list(&ListDraft { name: "Roadmap".into(), ..Default::default() })?;
+        let w48 = Horizon::Week { year: 2026, week: 48 };
+        let m11 = Horizon::Month { year: 2026, month: 11 };
+        let q4 = Horizon::Quarter { year: 2026, quarter: 4 };
+        let y26 = Horizon::Year(2026);
+        let d20 = Horizon::Decade(2020);
+
+        let t_week = store.create_task(
+            TaskDraft { title: "Week goal".into(), horizon: Some(w48), ..Default::default() },
+            true,
+        )?;
+        let t_month = store.create_task(
+            TaskDraft { title: "Month goal".into(), horizon: Some(m11), ..Default::default() },
+            true,
+        )?;
+        let t_quarter = store.create_task(
+            TaskDraft { title: "Quarter goal".into(), horizon: Some(q4), ..Default::default() },
+            true,
+        )?;
+        let t_year = store.create_task(
+            TaskDraft { title: "Year goal".into(), horizon: Some(y26), ..Default::default() },
+            true,
+        )?;
+        let t_decade = store.create_task(
+            TaskDraft { title: "Decade goal".into(), horizon: Some(d20), ..Default::default() },
+            true,
+        )?;
+        let t_life = store.create_task(
+            TaskDraft {
+                title: "Life goal".into(),
+                list_id: Some(proj.id),
+                horizon: Some(Horizon::Life),
+                ..Default::default()
+            },
+            true,
+        )?;
+
+        let in_view = |view: ThingsViewKind, id: Id| -> Result<bool> {
+            Ok(store.things_tasks(&view, today)?.into_iter().any(|t| t.id == id))
+        };
+
+        // Zero tasks leak into Things Inbox.
+        assert_eq!(store.things_counts(today)?.inbox, 0);
+        for id in [t_week.id, t_month.id, t_quarter.id, t_year.id, t_decade.id, t_life.id] {
+            assert!(!in_view(ThingsViewKind::Inbox, id)?);
+        }
+
+        // Near-term horizons (Week/Month/Quarter) appear in Anytime, NOT Someday.
+        for id in [t_week.id, t_month.id, t_quarter.id] {
+            assert!(in_view(ThingsViewKind::Anytime, id)?);
+            assert!(!in_view(ThingsViewKind::Someday, id)?);
+        }
+
+        // Long-term horizons (Year/Decade/Life) appear in Someday, NOT Anytime (even in a project).
+        for id in [t_year.id, t_decade.id, t_life.id] {
+            assert!(in_view(ThingsViewKind::Someday, id)?);
+            assert!(!in_view(ThingsViewKind::Anytime, id)?);
+        }
+        assert!(in_view(ThingsViewKind::Project(proj.id), t_life.id)?);
+        assert_eq!(store.things_counts(today)?.anytime, 3);
+        assert_eq!(store.things_counts(today)?.someday, 3);
+
+        // Scheduling in Things clears horizon.
+        store.set_task_schedule(t_week.id, Some(today), ScheduleBucket::None)?;
+        let scheduled = store.task(t_week.id)?.unwrap();
+        assert_eq!(scheduled.horizon, None);
+        assert_eq!(scheduled.start_date, Some(today));
+        assert!(in_view(ThingsViewKind::Today, t_week.id)?);
+
+        // Setting Someday bucket also clears horizon.
+        store.set_horizon(t_week.id, Some(w48))?;
+        store.set_task_schedule(t_week.id, None, ScheduleBucket::Someday)?;
+        let someday = store.task(t_week.id)?.unwrap();
+        assert_eq!(someday.horizon, None);
+        assert_eq!(someday.schedule_bucket, ScheduleBucket::Someday);
         Ok(())
     }
 }

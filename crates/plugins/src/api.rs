@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use chrono::{Local, NaiveDate, NaiveTime};
-use fern_core::Store;
+use fern_core::{Horizon, Store};
 use fern_core::countdown::CountdownKind;
 use fern_core::focus::focus_stats;
 use fern_core::model::{Id, Kind, ListDraft, Priority, ScheduleBucket, Task, TaskDraft, View};
@@ -3003,6 +3003,17 @@ fn load_filtered_tasks(store: &Store, filter: &JsonValue) -> Result<Vec<Task>> {
     if let Some(completed) = filter.get("completed").and_then(JsonValue::as_bool) {
         tasks.retain(|t| t.is_completed() == completed);
     }
+    if let Some(h_val) = filter.get("horizon") {
+        match h_val {
+            JsonValue::Null => tasks.retain(|t| t.horizon.is_none()),
+            JsonValue::String(s) if s.trim().is_empty() => {}
+            JsonValue::String(s) => {
+                let target = Horizon::parse(s).with_context(|| format!("invalid horizon {s:?}"))?;
+                tasks.retain(|t| t.horizon == Some(target));
+            }
+            _ => bail!("invalid horizon filter"),
+        }
+    }
     if let Some(search) = filter.get("search").and_then(JsonValue::as_str) {
         let q = search.trim().to_lowercase();
         if !q.is_empty() {
@@ -3042,6 +3053,7 @@ pub fn task_to_json(task: &Task) -> JsonValue {
         "endTime": task.end_time.map(|t| t.format("%H:%M").to_string()),
         "startDate": task.start_date.map(|d| d.format("%Y-%m-%d").to_string()),
         "scheduleBucket": bucket,
+        "horizon": task.horizon.map(|h| h.as_code()),
         "repeat": task.repeat.as_ref().map(ToString::to_string),
         "tags": task.tags,
         "checklist": task.checklist.map(|(done, total)| json!({ "done": done, "total": total })),
@@ -3153,6 +3165,18 @@ pub fn parse_task_draft(input: &JsonValue) -> Result<(TaskDraft, bool)> {
     }
     if let Some(b) = obj.get("scheduleBucket").and_then(JsonValue::as_str) {
         draft.schedule_bucket = parse_schedule_bucket(b)?;
+    }
+    if let Some(h_val) = obj.get("horizon") {
+        match h_val {
+            JsonValue::Null => {}
+            JsonValue::String(s) if s.trim().is_empty() => {}
+            JsonValue::String(s) => {
+                draft.horizon = Some(
+                    Horizon::parse(s).with_context(|| format!("invalid horizon {s:?}"))?,
+                );
+            }
+            _ => bail!("invalid horizon"),
+        }
     }
     if let Some(rep) = obj.get("repeat").and_then(JsonValue::as_str)
         && !rep.trim().is_empty()
@@ -3291,6 +3315,17 @@ fn apply_task_patch(store: &Store, id: Id, patch: &JsonValue) -> Result<Task> {
             None => existing.schedule_bucket,
         };
         store.set_task_schedule(id, next_start, next_bucket)?;
+    }
+    if let Some(h_val) = obj.get("horizon") {
+        let next_horizon = match h_val {
+            JsonValue::Null => None,
+            JsonValue::String(s) if s.trim().is_empty() => None,
+            JsonValue::String(s) => {
+                Some(Horizon::parse(s).with_context(|| format!("invalid horizon {s:?}"))?)
+            }
+            _ => bail!("invalid horizon"),
+        };
+        store.set_horizon(id, next_horizon)?;
     }
     if let Some(rep_val) = obj.get("repeat") {
         let today = Local::now().date_naive();
@@ -3550,5 +3585,47 @@ mod tests {
         let any_perms = PermissionSet::new(&[Permission::Network(vec!["127.0.0.1".to_owned()])]);
         let loopback: ureq::http::Uri = "http://127.0.0.1:8080/secret".parse().unwrap();
         assert!(validate_target_uri_syntax(&loopback, &any_perms).is_err());
+    }
+
+    #[test]
+    fn task_horizon_json_draft_patch_and_filter() {
+        let store = Store::open_in_memory().unwrap();
+        let w48 = Horizon::Week { year: 2026, week: 48 };
+        let q4 = Horizon::Quarter { year: 2026, quarter: 4 };
+
+        let (draft, top) = parse_task_draft(&json!({
+            "title": "Plugin horizon task",
+            "horizon": "W2026-48",
+        }))
+        .unwrap();
+        assert!(top);
+        assert_eq!(draft.horizon, Some(w48));
+        let created = store.create_task(draft, top).unwrap();
+        assert_eq!(task_to_json(&created)["horizon"], "W2026-48");
+
+        // Invalid horizon rejected on draft and patch.
+        assert!(parse_task_draft(&json!({"title": "Bad", "horizon": "W2025-53"})).is_err());
+        assert!(apply_task_patch(&store, created.id, &json!({"horizon": "D2025"})).is_err());
+
+        // Patching horizon updates cleanly and filtering by horizon finds it.
+        let updated = apply_task_patch(&store, created.id, &json!({"horizon": "Q2026-4"})).unwrap();
+        assert_eq!(updated.horizon, Some(q4));
+        assert_eq!(task_to_json(&updated)["horizon"], "Q2026-4");
+
+        let plain = store.add_task("Plain").unwrap();
+        let only_q4 = load_filtered_tasks(&store, &json!({"horizon": "Q2026-4"})).unwrap();
+        assert_eq!(only_q4.iter().map(|t| t.id).collect::<Vec<_>>(), vec![created.id]);
+        let only_none = load_filtered_tasks(&store, &json!({"horizon": null})).unwrap();
+        assert_eq!(only_none.iter().map(|t| t.id).collect::<Vec<_>>(), vec![plain.id]);
+
+        // Patching dueDate clears horizon; patching horizon back to null clears it.
+        let dated = apply_task_patch(&store, created.id, &json!({"dueDate": "2026-11-23"})).unwrap();
+        assert_eq!(dated.horizon, None);
+        assert_eq!(task_to_json(&dated)["horizon"], JsonValue::Null);
+        let re_horizon = apply_task_patch(&store, created.id, &json!({"horizon": "LIFE"})).unwrap();
+        assert_eq!(re_horizon.horizon, Some(Horizon::Life));
+        assert_eq!(re_horizon.due_date, None);
+        let cleared = apply_task_patch(&store, created.id, &json!({"horizon": null})).unwrap();
+        assert_eq!(cleared.horizon, None);
     }
 }

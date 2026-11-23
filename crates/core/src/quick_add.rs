@@ -14,6 +14,7 @@
 
 use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, Weekday};
 
+use crate::horizon::Horizon;
 use crate::model::Priority;
 use crate::recurrence::{Frequency, Recurrence};
 
@@ -27,6 +28,8 @@ pub struct ParsedTask {
     pub priority: Option<Priority>,
     pub tags: Vec<String>,
     pub repeat: Option<Recurrence>,
+    /// Natural-language horizon bucket (`"this week"`, `"next month"`, `"this year"`, `"in life"`, etc.).
+    pub horizon: Option<Horizon>,
     /// The list name as the user spelled it when creating the list.
     pub list: Option<String>,
     /// Byte ranges of the recognized words in the input, neighbouring words joined, for
@@ -52,20 +55,39 @@ impl Default for Recognition {
 }
 
 pub fn parse_quick_add(input: &str, today: NaiveDate, lists: &[String]) -> ParsedTask {
-    parse_quick_add_with(input, today, lists, Recognition::default())
+    parse_quick_add_with_horizons(input, today, lists, Recognition::default(), true)
 }
 
 pub fn parse_quick_add_with(input: &str, today: NaiveDate, lists: &[String], recognition: Recognition) -> ParsedTask {
-    parse_quick_add_context(input, today, lists, recognition, false)
+    parse_quick_add_with_horizons(input, today, lists, recognition, true)
+}
+
+/// Like [`parse_quick_add_with`], allowing callers to gate natural-language horizon recognition
+/// on the master `Features.horizons` switch.
+pub fn parse_quick_add_with_horizons(
+    input: &str,
+    today: NaiveDate,
+    lists: &[String],
+    recognition: Recognition,
+    recognize_horizons: bool,
+) -> ParsedTask {
+    parse_quick_add_context(input, today, lists, recognition, false, recognize_horizons)
 }
 
 /// A calendar cell already supplies the date. Recognize time without replacing that date
-/// or consuming date/repeat words from the title, as the calendar's time-only editor does.
+/// or consuming date/repeat/horizon words from the title, as the calendar's time-only editor does.
 pub fn parse_quick_add_on_day(input: &str, day: NaiveDate, lists: &[String], recognition: Recognition) -> ParsedTask {
-    parse_quick_add_context(input, day, lists, recognition, true)
+    parse_quick_add_context(input, day, lists, recognition, true, false)
 }
 
-fn parse_quick_add_context(input: &str, today: NaiveDate, lists: &[String], recognition: Recognition, time_only: bool) -> ParsedTask {
+fn parse_quick_add_context(
+    input: &str,
+    today: NaiveDate,
+    lists: &[String],
+    recognition: Recognition,
+    time_only: bool,
+    recognize_horizons: bool,
+) -> ParsedTask {
     let words: Vec<&str> = input.split_whitespace().collect();
     let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
     let mut used = vec![false; words.len()];
@@ -125,6 +147,22 @@ fn parse_quick_add_context(input: &str, today: NaiveDate, lists: &[String], reco
             parsed.due_time = Some(time);
             mark_with_preposition(if recognition.remove_date_text { &mut used } else { &mut dates_used }, &lower, i, 1);
         } else if recognition.dates
+            && recognize_horizons
+            && !time_only
+            && parsed.due_date.is_none()
+            && parsed.horizon.is_none()
+            && let Some((horizon, len)) = parse_horizon(&lower[i..], today)
+        {
+            parsed.horizon = Some(horizon);
+            let target = if recognition.remove_date_text { &mut used } else { &mut dates_used };
+            if matches!(lower[i].as_str(), "в" | "на" | "in") {
+                target[i..i + len].iter_mut().for_each(|u| *u = true);
+            } else {
+                mark_with_preposition(target, &lower, i, len);
+            }
+            i += len;
+            continue;
+        } else if recognition.dates
             && !time_only
             && parsed.due_date.is_none()
             && let Some((date, len)) = parse_date(&lower[i..], today)
@@ -141,6 +179,10 @@ fn parse_quick_add_context(input: &str, today: NaiveDate, lists: &[String], reco
     // A time without a date means today, as in TickTick.
     if parsed.due_time.is_some() && parsed.due_date.is_none() {
         parsed.due_date = Some(today);
+    }
+    // Exact due dates take precedence over a horizon bucket.
+    if parsed.due_date.is_some() {
+        parsed.horizon = None;
     }
 
     // Recognized words are those marked used, and kept date words; tags kept in the title too.
@@ -320,6 +362,69 @@ fn parse_time(word: &str) -> Option<NaiveTime> {
         };
     }
     NaiveTime::from_hms_opt(hours, minutes, 0)
+}
+
+/// Natural-language horizon phrases (EN / RU / ZH_CN) at the start of `words`.
+/// Intentionally leaves `"next week"`, `"через неделю"`, and `"下周"` to exact-date parsing.
+fn parse_horizon(words: &[String], today: NaiveDate) -> Option<(Horizon, usize)> {
+    let w0 = words.first()?.as_str();
+    let w1 = words.get(1).map(String::as_str);
+    let w2 = words.get(2).map(String::as_str);
+
+    if let (Some(a), Some(b)) = (w1, w2) {
+        match (w0, a, b) {
+            ("на", "этой", "неделе") => return Some((Horizon::current_week(today), 3)),
+            ("в", "этом", "месяце") => return Some((Horizon::current_month(today), 3)),
+            ("в", "следующем", "месяце") => return Some((Horizon::current_month(today).shift(1), 3)),
+            ("в", "этом", "квартале") => return Some((Horizon::current_quarter(today), 3)),
+            ("в", "следующем", "квартале") => return Some((Horizon::current_quarter(today).shift(1), 3)),
+            ("в", "этом", "году") => return Some((Horizon::current_year(today), 3)),
+            ("в", "следующем", "году") => return Some((Horizon::current_year(today).shift(1), 3)),
+            _ => {}
+        }
+    }
+
+    if let Some(a) = w1 {
+        match (w0, a) {
+            ("this", "week") | ("эта", "неделя") | ("эту", "неделю") | ("этой", "неделе") => {
+                return Some((Horizon::current_week(today), 2));
+            }
+            ("this", "month") | ("этот", "месяц") | ("этом", "месяце") => {
+                return Some((Horizon::current_month(today), 2));
+            }
+            ("next", "month") | ("следующий", "месяц") | ("следующем", "месяце") => {
+                return Some((Horizon::current_month(today).shift(1), 2));
+            }
+            ("this", "quarter") | ("этот", "квартал") | ("этом", "квартале") => {
+                return Some((Horizon::current_quarter(today), 2));
+            }
+            ("next", "quarter") | ("следующий", "квартал") | ("следующем", "квартале") => {
+                return Some((Horizon::current_quarter(today).shift(1), 2));
+            }
+            ("this", "year") | ("этот", "год") | ("этом", "году") => {
+                return Some((Horizon::current_year(today), 2));
+            }
+            ("next", "year") | ("следующий", "год") | ("следующем", "году") => {
+                return Some((Horizon::current_year(today).shift(1), 2));
+            }
+            ("in", "life") | ("на", "жизнь") | ("цель", "жизни") => {
+                return Some((Horizon::Life, 2));
+            }
+            _ => {}
+        }
+    }
+
+    match w0 {
+        "本周" => Some((Horizon::current_week(today), 1)),
+        "本月" => Some((Horizon::current_month(today), 1)),
+        "下个月" => Some((Horizon::current_month(today).shift(1), 1)),
+        "本季度" => Some((Horizon::current_quarter(today), 1)),
+        "下季度" => Some((Horizon::current_quarter(today).shift(1), 1)),
+        "今年" => Some((Horizon::current_year(today), 1)),
+        "明年" => Some((Horizon::current_year(today).shift(1), 1)),
+        "人生目标" => Some((Horizon::Life, 1)),
+        _ => None,
+    }
 }
 
 /// A date at the start of `words` and how many words it took.
@@ -613,9 +718,13 @@ mod tests {
         assert_eq!(date("x nov 13th"), Some(d(2026, 11, 13)));
         assert_eq!(date("x march 5"), Some(d(2027, 3, 5)));
         assert_eq!(date("x by 5 march"), Some(d(2027, 3, 5)));
-        assert_eq!(date("x next month"), Some(d(2026, 11, 18)));
-        assert_eq!(date("x следующий месяц"), Some(d(2026, 11, 18)));
-        assert_eq!(date("x 下个月"), Some(d(2026, 11, 18)));
+        // When horizons are disabled, "next month" / "следующий месяц" / "下个月" parse as +1 month exact dates.
+        let date_no_h = |input: &str| {
+            parse_quick_add_with_horizons(input, today(), &[], Recognition::default(), false).due_date
+        };
+        assert_eq!(date_no_h("x next month"), Some(d(2026, 11, 18)));
+        assert_eq!(date_no_h("x следующий месяц"), Some(d(2026, 11, 18)));
+        assert_eq!(date_no_h("x 下个月"), Some(d(2026, 11, 18)));
         // 2026-10-18 is Sunday, so upcoming Saturday is 2026-10-24.
         assert_eq!(date("x this weekend"), Some(d(2026, 10, 24)));
         assert_eq!(date("x выходные"), Some(d(2026, 10, 24)));
@@ -752,8 +861,14 @@ mod tests {
         assert_eq!(parse_quick_add("Trip 11/25", today(), &[]).due_date, Some(d(2026, 11, 25)));
         assert_eq!(parse_quick_add("Trip 11/25/2027", today(), &[]).due_date, Some(d(2027, 11, 25)));
         assert_eq!(parse_quick_add("Event 13th nov", today(), &[]).due_date, Some(d(2026, 11, 13)));
-        assert_eq!(parse_quick_add("Renew next year", today(), &[]).due_date, Some(d(2027, 10, 18)));
-        assert_eq!(parse_quick_add("Renew 明年", today(), &[]).due_date, Some(d(2027, 10, 18)));
+        assert_eq!(
+            parse_quick_add_with_horizons("Renew next year", today(), &[], Recognition::default(), false).due_date,
+            Some(d(2027, 10, 18))
+        );
+        assert_eq!(
+            parse_quick_add_with_horizons("Renew 明年", today(), &[], Recognition::default(), false).due_date,
+            Some(d(2027, 10, 18))
+        );
         assert_eq!(parse_quick_add("汇报 3天后", today(), &[]).due_date, Some(d(2026, 10, 21)));
         assert_eq!(parse_quick_add("复盘 2周后", today(), &[]).due_date, Some(d(2026, 11, 1)));
         assert_eq!(parse_quick_add("体检 1个月后", today(), &[]).due_date, Some(d(2026, 11, 18)));
@@ -847,5 +962,81 @@ mod tests {
         );
         // Invalid calendar dates still do not parse.
         assert_eq!(parse_quick_add("Bad 31 feb", non_leap, &[]).due_date, None);
+    }
+
+    #[test]
+    fn recognizes_natural_language_horizons_in_en_ru_zh_and_respects_flags() {
+        let day = d(2026, 11, 23); // Mon of 2026-W48, Q4
+        let cases = [
+            ("Ship v2 this week", "Ship v2", Horizon::current_week(day), "this week"),
+            ("Сделать отчёт на этой неделе", "Сделать отчёт", Horizon::current_week(day), "на этой неделе"),
+            ("Обзор эта неделя", "Обзор", Horizon::current_week(day), "эта неделя"),
+            ("发布新版本 本周", "发布新版本", Horizon::current_week(day), "本周"),
+            ("Pay taxes this month", "Pay taxes", Horizon::current_month(day), "this month"),
+            ("Оплатить в этом месяце", "Оплатить", Horizon::current_month(day), "в этом месяце"),
+            ("Бюджет этот месяц", "Бюджет", Horizon::current_month(day), "этот месяц"),
+            ("整理财务 本月", "整理财务", Horizon::current_month(day), "本月"),
+            ("Plan trip next month", "Plan trip", Horizon::current_month(day).shift(1), "next month"),
+            ("Поездка в следующем месяце", "Поездка", Horizon::current_month(day).shift(1), "в следующем месяце"),
+            ("Ремонт следующий месяц", "Ремонт", Horizon::current_month(day).shift(1), "следующий месяц"),
+            ("体检 下个月", "体检", Horizon::current_month(day).shift(1), "下个月"),
+            ("Launch API this quarter", "Launch API", Horizon::current_quarter(day), "this quarter"),
+            ("Релиз в этом квартале", "Релиз", Horizon::current_quarter(day), "в этом квартале"),
+            ("План этот квартал", "План", Horizon::current_quarter(day), "этот квартал"),
+            ("完成目标 本季度", "完成目标", Horizon::current_quarter(day), "本季度"),
+            ("Hiring next quarter", "Hiring", Horizon::current_quarter(day).shift(1), "next quarter"),
+            ("Найм в следующем квартале", "Найм", Horizon::current_quarter(day).shift(1), "в следующем квартале"),
+            ("复盘 下季度", "复盘", Horizon::current_quarter(day).shift(1), "下季度"),
+            ("Run marathon this year", "Run marathon", Horizon::current_year(day), "this year"),
+            ("Марафон в этом году", "Марафон", Horizon::current_year(day), "в этом году"),
+            ("Цель этот год", "Цель", Horizon::current_year(day), "этот год"),
+            ("读完十本书 今年", "读完十本书", Horizon::current_year(day), "今年"),
+            ("Renew passport next year", "Renew passport", Horizon::current_year(day).shift(1), "next year"),
+            ("Паспорт в следующем году", "Паспорт", Horizon::current_year(day).shift(1), "в следующем году"),
+            ("Покупка следующий год", "Покупка", Horizon::current_year(day).shift(1), "следующий год"),
+            ("旅行 明年", "旅行", Horizon::current_year(day).shift(1), "明年"),
+            ("Write a book in life", "Write a book", Horizon::Life, "in life"),
+            ("Написать книгу на жизнь", "Написать книгу", Horizon::Life, "на жизнь"),
+            ("Выучить японский цель жизни", "Выучить японский", Horizon::Life, "цель жизни"),
+            ("环游世界 人生目标", "环游世界", Horizon::Life, "人生目标"),
+        ];
+        for (input, expected_title, expected_horizon, expected_span) in cases {
+            let parsed = parse_quick_add(input, day, &[]);
+            assert_eq!(parsed.title, expected_title, "title mismatch for {input:?}");
+            assert_eq!(parsed.horizon, Some(expected_horizon), "horizon mismatch for {input:?}");
+            assert_eq!(parsed.due_date, None, "due_date must stay None for {input:?}");
+            let spans: Vec<&str> = parsed.spans.iter().map(|r| &input[r.clone()]).collect();
+            assert_eq!(spans, vec![expected_span], "span mismatch for {input:?}");
+        }
+
+        // remove_date_text = false keeps horizon text in title while still highlighting its span.
+        let keep = Recognition { remove_date_text: false, ..Default::default() };
+        let kept_input = "Ship v2 this week #work";
+        let kept = parse_quick_add_with_horizons(kept_input, day, &[], keep, true);
+        assert_eq!(kept.title, "Ship v2 this week");
+        assert_eq!(kept.horizon, Some(Horizon::current_week(day)));
+        let kept_spans: Vec<&str> = kept.spans.iter().map(|r| &kept_input[r.clone()]).collect();
+        assert_eq!(kept_spans, vec!["this week", "#work"]);
+
+        // recognize_horizons = false leaves horizon-only phrases untouched.
+        let disabled = parse_quick_add_with_horizons("Ship v2 this week", day, &[], Recognition::default(), false);
+        assert_eq!(disabled.title, "Ship v2 this week");
+        assert_eq!(disabled.horizon, None);
+        assert_eq!(disabled.due_date, None);
+        assert!(disabled.spans.is_empty());
+
+        // parse_quick_add_on_day also passes recognize_horizons = false.
+        let on_day = parse_quick_add_on_day("Review this week 9am", day, &[], Recognition::default());
+        assert_eq!(on_day.title, "Review this week");
+        assert_eq!(on_day.horizon, None);
+        assert_eq!(on_day.due_date, Some(day));
+
+        // "next week" and "через неделю" remain exact dates (+7 days), never intercepted as horizons.
+        let nw = parse_quick_add("Sprint next week", day, &[]);
+        assert_eq!(nw.horizon, None);
+        assert_eq!(nw.due_date, Some(day + Duration::days(7)));
+        let ru_nw = parse_quick_add("Созвон через неделю", day, &[]);
+        assert_eq!(ru_nw.horizon, None);
+        assert_eq!(ru_nw.due_date, Some(day + Duration::days(7)));
     }
 }

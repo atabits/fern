@@ -1,6 +1,7 @@
 use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone as _};
 use uuid::Uuid;
 
+use crate::horizon::Horizon;
 use crate::recurrence::Recurrence;
 
 pub type Id = Uuid;
@@ -112,6 +113,7 @@ pub struct TaskDraft {
     pub constant_reminder: bool,
     pub start_date: Option<NaiveDate>,
     pub schedule_bucket: ScheduleBucket,
+    pub horizon: Option<Horizon>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -166,6 +168,8 @@ pub struct Task {
     pub start_date: Option<NaiveDate>,
     /// Things-style schedule bucket (`None`, `Evening`, `Someday`).
     pub schedule_bucket: ScheduleBucket,
+    /// Optional horizon planning bucket (`Week`, `Month`, `Quarter`, `Year`, `Decade`, `Life`).
+    pub horizon: Option<Horizon>,
     pub created_at: i64,
 }
 
@@ -427,6 +431,8 @@ pub enum View {
     Search(String),
     /// A saved filter ("Filters" in the lists column).
     Filter(Id),
+    /// The panoramic Horizons board; it lists no tasks of its own.
+    Horizons,
     /// The Summary report; it lists no tasks of its own.
     Summary,
     /// A day picked in the mini calendar: the tasks due that day.
@@ -437,7 +443,7 @@ impl View {
     /// Whether the view gathers tasks from several lists, so that its rows name each task's list
     /// after the tags, as the original's smart lists, tags and searches do.
     pub fn shows_list_names(&self) -> bool {
-        !matches!(self, Self::Inbox | Self::List(_) | Self::Summary)
+        !matches!(self, Self::Inbox | Self::List(_) | Self::Horizons | Self::Summary)
     }
 }
 

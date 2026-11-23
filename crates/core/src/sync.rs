@@ -1246,4 +1246,79 @@ mod tests {
         assert!(!b.has_unsent_changes()?);
         Ok(())
     }
+
+    #[test]
+    fn horizon_sync_and_legacy_client_preservation() -> Result<()> {
+        use crate::horizon::Horizon;
+
+        let a = Store::open_in_memory()?;
+        let b = Store::open_in_memory()?;
+
+        let w48 = Horizon::Week { year: 2026, week: 48 };
+        let m12 = Horizon::Month { year: 2026, month: 12 };
+
+        // Device A creates a horizon task and syncs to Device B.
+        let task = a.create_task(
+            crate::model::TaskDraft {
+                title: "Ship Horizons".into(),
+                horizon: Some(w48),
+                ..Default::default()
+            },
+            true,
+        )?;
+        let pos_a1 = relay(&a, 0, &b);
+        assert_eq!(b.task(task.id)?.unwrap().horizon, Some(w48));
+
+        // Device A updates horizon to Month and syncs.
+        a.set_horizon(task.id, Some(m12))?;
+        let pos_a2 = relay(&a, pos_a1, &b);
+        assert_eq!(b.task(task.id)?.unwrap().horizon, Some(m12));
+
+        // Simulated older client sends a newer row WITHOUT the `horizon` column key.
+        // Local `horizon` on Device B must NOT be erased!
+        let (changes, _) = b.changes_since(0)?;
+        let mut legacy_row = changes
+            .into_iter()
+            .find(|c| c.entity == "tasks" && c.key == task.id.to_string())
+            .and_then(|c| c.row)
+            .unwrap_or_else(|| {
+                // Grab directly from A's last change if B had no local log entries.
+                a.changes_since(0)
+                    .unwrap()
+                    .0
+                    .into_iter()
+                    .find(|c| c.entity == "tasks" && c.key == task.id.to_string())
+                    .unwrap()
+                    .row
+                    .unwrap()
+            });
+        assert!(legacy_row.remove("horizon").is_some(), "new client row must contain horizon");
+        legacy_row.insert("title".into(), Json::from("Ship Horizons (edited on legacy client)"));
+        let future_at = chrono::Utc::now().timestamp_millis() + 60_000;
+        let legacy_change = Change {
+            entity: "tasks".into(),
+            key: task.id.to_string(),
+            at: future_at,
+            row: Some(legacy_row),
+        };
+        assert_eq!(b.apply_changes(&[legacy_change])?, 1);
+        let after_legacy = b.task(task.id)?.unwrap();
+        assert_eq!(after_legacy.title, "Ship Horizons (edited on legacy client)");
+        assert_eq!(
+            after_legacy.horizon,
+            Some(m12),
+            "legacy client row omitting horizon must preserve local horizon"
+        );
+
+        // Device A explicitly clears horizon (`horizon: null`) at an even later timestamp -> clears on B.
+        a.set_horizon(task.id, None)?;
+        let clear_at = future_at + 60_000;
+        a.conn.execute(
+            "UPDATE sync_log SET at = ?2 WHERE entity = 'tasks' AND key = ?1",
+            params![task.id.to_string(), clear_at],
+        )?;
+        relay(&a, pos_a2, &b);
+        assert_eq!(b.task(task.id)?.unwrap().horizon, None);
+        Ok(())
+    }
 }

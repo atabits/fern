@@ -28,6 +28,7 @@ pub const FERN_D_TS: &str = r#"declare module "fern" {
     endTime: string | null;
     startDate: string | null;
     scheduleBucket: ScheduleBucket;
+    horizon: string | null;
     repeat: string | null;
     tags: string[];
     checklist: { done: number; total: number } | null;
@@ -59,6 +60,7 @@ pub const FERN_D_TS: &str = r#"declare module "fern" {
     endTime?: string | null;
     startDate?: string | null;
     scheduleBucket?: ScheduleBucket | "";
+    horizon?: string | null;
     repeat?: string | null;
     tags?: string[];
     checklist?: Array<string | { title: string; completed?: boolean }>;

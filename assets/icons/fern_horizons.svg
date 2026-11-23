@@ -1,0 +1,6 @@
+<!-- Fern's own glyph (AGPL-3.0-or-later): three rounded vertical horizon columns of increasing width. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="black">
+  <rect x="3" y="3" width="3.5" height="18" rx="1.5"/>
+  <rect x="8.5" y="3" width="4.5" height="18" rx="1.75"/>
+  <rect x="15" y="3" width="6" height="18" rx="2"/>
+</svg>

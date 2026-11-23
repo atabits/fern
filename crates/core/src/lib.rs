@@ -10,6 +10,7 @@ pub mod e2ee;
 pub mod filter;
 pub mod focus;
 pub mod habit;
+pub mod horizon;
 pub mod ical;
 pub mod import;
 pub mod life_clock;
@@ -42,10 +43,11 @@ pub use habit::{
     HabitDraft, HabitSection, HabitStats, MonthStats,
 };
 pub use habit::Frequency as HabitFrequency;
+pub use horizon::{Horizon, HorizonGranularity};
 pub use matrix::{DEFAULT_MATRIX_PROFILE_ID, MatrixProfile};
 pub use model::{Activity, Attachment, Comment, Estimate, ChecklistItem, ListSection, Template, Id, Kind, List, ListDraft, ListFolder, Priority, ScheduleBucket, Tag, Task, TaskDraft, View, ViewCounts};
 pub use preferences::{DURATIONS, Features, Notifications, DateFormat, DefaultDate, Preferences, QuickDate, RailItemId, RailSection, SidebarSection, TaskDefaults, SmartList, ThemeMode, ThemeSelection, Visibility, WEEK_STARTS, next_week_date};
-pub use quick_add::{ParsedTask, Recognition, parse_quick_add, parse_quick_add_on_day, parse_quick_add_with};
+pub use quick_add::{ParsedTask, Recognition, parse_quick_add, parse_quick_add_on_day, parse_quick_add_with, parse_quick_add_with_horizons};
 pub use recurrence::{Frequency, Recurrence};
 pub use store::{BackupEntry, FolderDropTarget, MAX_SUBTASK_DEPTH, SCHEMA_VERSION, Store, TableCounts, list_backups};
 pub use task_tree::TaskTree;

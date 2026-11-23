@@ -13,6 +13,7 @@ use crate::attachment::PreparedAttachment;
 use crate::countdown::{Countdown, CountdownKind};
 use crate::focus::FocusSession;
 use crate::habit::{Checkin, CheckinMode, CheckinStatus, Goal, Habit, HabitDraft, HabitSection, MAX_CUSTOM_SECTIONS, MAX_LOG_NOTE_CHARS, MAX_REMINDERS, MOODS, polish_amount};
+use crate::horizon::Horizon;
 use crate::model::{Attachment, ChecklistItem, Id, Kind, List, ListDraft, ListFolder, Priority, ScheduleBucket, Tag, Task, TaskDraft, View, ViewCounts};
 use crate::recurrence::Recurrence;
 
@@ -1530,6 +1531,62 @@ const MIGRATIONS: &[&str] = &[
         );
     END;
     ",
+    // Horizon planning bucket column, index, modified_at trigger, and plugin outbox trigger update.
+    "
+    ALTER TABLE tasks ADD COLUMN horizon TEXT;
+    CREATE INDEX IF NOT EXISTS idx_tasks_horizon ON tasks(horizon) WHERE horizon IS NOT NULL;
+    CREATE TRIGGER tasks_modified_horizon AFTER UPDATE OF horizon ON tasks
+    WHEN OLD.horizon IS NOT NEW.horizon
+    BEGIN
+        UPDATE tasks SET modified_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = NEW.id;
+    END;
+    DROP TRIGGER IF EXISTS outbox_tasks_updated;
+    CREATE TRIGGER outbox_tasks_updated AFTER UPDATE OF
+        title, notes, priority, due_date, due_time, end_date, end_time,
+        list_id, section_id, parent_id, repeat, reminders, wont_do_at, start_date, schedule_bucket, horizon ON tasks
+    WHEN (
+            OLD.title IS NOT NEW.title
+            OR OLD.notes IS NOT NEW.notes
+            OR OLD.priority IS NOT NEW.priority
+            OR OLD.due_date IS NOT NEW.due_date
+            OR OLD.due_time IS NOT NEW.due_time
+            OR OLD.end_date IS NOT NEW.end_date
+            OR OLD.end_time IS NOT NEW.end_time
+            OR OLD.list_id IS NOT NEW.list_id
+            OR OLD.section_id IS NOT NEW.section_id
+            OR OLD.parent_id IS NOT NEW.parent_id
+            OR OLD.repeat IS NOT NEW.repeat
+            OR OLD.reminders IS NOT NEW.reminders
+            OR OLD.wont_do_at IS NOT NEW.wont_do_at
+            OR OLD.start_date IS NOT NEW.start_date
+            OR OLD.schedule_bucket IS NOT NEW.schedule_bucket
+            OR OLD.horizon IS NOT NEW.horizon
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.updated',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    ",
+    // Targeted indexes for open dated tasks, focus session ordering/FKs, and task attachments
+    // (habit_checkins already has PRIMARY KEY (habit_id, date)).
+    "
+    CREATE INDEX IF NOT EXISTS idx_tasks_open_due ON tasks(due_date)
+        WHERE deleted_at IS NULL AND completed_at IS NULL AND due_date IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_focus_sessions_started ON focus_sessions(started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_focus_sessions_task ON focus_sessions(task_id);
+    CREATE INDEX IF NOT EXISTS idx_task_attachments_task ON task_attachments(task_id, created_at);
+    ",
 ];
 
 /// Current SQLite schema version (`PRAGMA user_version`).
@@ -1709,10 +1766,88 @@ pub enum FolderDropTarget {
 const TAG_ORDER_KEY: &str = "tag_order";
 const FILTER_ORDER_KEY: &str = "filter_order";
 
-const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
-                            completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders, end_date, end_time, modified_at, \
-                            pinned_at, section_id, estimate, in_progress_at, location, timezone, is_floating, snoozed_until, constant_reminder, \
-                            start_date, schedule_bucket";
+macro_rules! task_columns {
+    () => {
+        "id, parent_id, kind, title, notes, priority, due_date, due_time, \
+         completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders, end_date, end_time, modified_at, \
+         pinned_at, section_id, estimate, in_progress_at, location, timezone, is_floating, snoozed_until, constant_reminder, \
+         start_date, schedule_bucket, horizon"
+    };
+}
+
+const SELECT_ALL_TASKS_SQL: &str = concat!(
+    "SELECT ",
+    task_columns!(),
+    " FROM tasks ORDER BY completed_at IS NOT NULL, completed_at DESC, sort_order, rowid DESC"
+);
+
+const SELECT_TASK_BY_ID_SQL: &str =
+    concat!("SELECT ", task_columns!(), " FROM tasks WHERE id = ?1");
+
+const INSERT_REPEAT_SNAPSHOT_SQL: &str = concat!(
+    "INSERT INTO tasks (",
+    task_columns!(),
+    ") SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time, \
+       ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time, ?3, NULL, \
+       section_id, estimate, NULL, location, timezone, is_floating, NULL, 0, \
+       start_date, schedule_bucket, horizon \
+     FROM tasks WHERE id = ?1"
+);
+
+macro_rules! insert_task_full_sql {
+    ($order:literal) => {
+        concat!(
+            "INSERT INTO tasks (id, title, notes, list_id, kind, priority, due_date, due_time, \
+             repeat, reminders, created_at, end_date, end_time, location, timezone, is_floating, \
+             constant_reminder, start_date, schedule_bucket, horizon, sort_order) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ",
+            $order,
+            ")"
+        )
+    };
+}
+
+macro_rules! insert_task_basic_sql {
+    ($order:literal) => {
+        concat!(
+            "INSERT INTO tasks (id, title, notes, list_id, kind, priority, due_date, due_time, \
+             repeat, reminders, created_at, end_date, end_time, sort_order) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ",
+            $order,
+            ")"
+        )
+    };
+}
+
+const INSERT_TASK_FULL_TOP_SQL: &str =
+    insert_task_full_sql!("(SELECT COALESCE(MIN(sort_order), 0) - 1024 FROM tasks)");
+const INSERT_TASK_FULL_BOTTOM_SQL: &str =
+    insert_task_full_sql!("(SELECT COALESCE(MAX(sort_order), 0) + 1024 FROM tasks)");
+const INSERT_TASK_BASIC_TOP_SQL: &str =
+    insert_task_basic_sql!("(SELECT COALESCE(MIN(sort_order), 0) - 1024 FROM tasks)");
+const INSERT_TASK_BASIC_BOTTOM_SQL: &str =
+    insert_task_basic_sql!("(SELECT COALESCE(MAX(sort_order), 0) + 1024 FROM tasks)");
+
+#[derive(Clone, Copy)]
+enum SortTable {
+    Lists,
+    ListSections,
+    ListFolders,
+}
+
+impl SortTable {
+    const fn update_sql(self) -> &'static str {
+        match self {
+            Self::Lists => "UPDATE lists SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2",
+            Self::ListSections => {
+                "UPDATE list_sections SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2"
+            }
+            Self::ListFolders => {
+                "UPDATE list_folders SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2"
+            }
+        }
+    }
+}
 
 pub(crate) const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
@@ -1779,9 +1914,8 @@ impl Store {
         }
     }
 
-    fn write_sort_order(&self, table: &'static str, ids: &[Id]) -> Result<()> {
-        let sql = format!("UPDATE {table} SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2");
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+    fn write_sort_order(&self, table: SortTable, ids: &[Id]) -> Result<()> {
+        let mut stmt = self.conn.prepare_cached(table.update_sql())?;
         for (i, id) in ids.iter().enumerate() {
             stmt.execute(params![id.to_string(), i as i64])?;
         }
@@ -1808,8 +1942,12 @@ impl Store {
         // last changes but never corrupts the file.
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // Keep temp B-trees in memory and raise page cache from 2 MiB default to 8 MiB (negative = KiB).
+        // Intentionally do NOT enable mmap_size (causes file-locking hazards on Windows backup/restore/rename).
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "cache_size", -8000_i64)?;
         // The views run the same queries on every change; parse each once.
-        conn.set_prepared_statement_cache_capacity(64);
+        conn.set_prepared_statement_cache_capacity(128);
         Self::migrate(&conn)?;
         Ok(Self { conn, attachments_dir })
     }
@@ -1827,6 +1965,16 @@ impl Store {
         Ok(rows)
     }
 
+    /// Runs `PRAGMA quick_check(10)` and returns the resulting messages (`["ok"]` when healthy).
+    /// Much faster than [`Self::integrity_check`] for routine startup checks.
+    pub fn quick_check(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("PRAGMA quick_check(10)")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Returns the database's current `PRAGMA user_version`.
     pub fn schema_version(&self) -> Result<usize> {
         Ok(self.conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -1834,16 +1982,16 @@ impl Store {
 
     /// Returns row counts for the primary user-facing tables.
     pub fn table_counts(&self) -> Result<TableCounts> {
-        let count = |table: &str| -> Result<usize> {
-            let n: i64 = self.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+        let count = |sql: &str| -> Result<usize> {
+            let n: i64 = self.conn.query_row(sql, [], |r| r.get(0))?;
             Ok(usize::try_from(n).unwrap_or(0))
         };
         Ok(TableCounts {
-            tasks: count("tasks")?,
-            lists: count("lists")?,
-            habits: count("habits")?,
-            attachments: count("task_attachments")?,
-            countdowns: count("countdowns")?,
+            tasks: count("SELECT COUNT(*) FROM tasks")?,
+            lists: count("SELECT COUNT(*) FROM lists")?,
+            habits: count("SELECT COUNT(*) FROM habits")?,
+            attachments: count("SELECT COUNT(*) FROM task_attachments")?,
+            countdowns: count("SELECT COUNT(*) FROM countdowns")?,
         })
     }
 
@@ -1943,10 +2091,7 @@ impl Store {
 
     /// All tasks: open ones first (newest on top), then completed ones (most recent on top).
     pub fn tasks(&self) -> Result<Vec<Task>> {
-        let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT {TASK_COLUMNS} FROM tasks
-             ORDER BY completed_at IS NOT NULL, completed_at DESC, sort_order, rowid DESC"
-        ))?;
+        let mut stmt = self.conn.prepare_cached(SELECT_ALL_TASKS_SQL)?;
         let mut tasks: Vec<Task> = stmt.query_map([], task_from_row)?.collect::<Result<_, _>>()?;
 
         let mut tags: HashMap<Id, Vec<String>> = HashMap::new();
@@ -1991,7 +2136,7 @@ impl Store {
             let family = self.tag_family(tag)?;
             return Ok(tasks
                 .into_iter()
-                .filter(|task| family.iter().any(|t| matches_view(task, &View::Tag(t.clone()), today)))
+                .filter(|task| matches_tag_family(task, &family))
                 .collect());
         }
         let hidden = if is_smart(view) { self.hidden_lists()? } else { HashSet::new() };
@@ -2015,6 +2160,9 @@ impl Store {
                         }
                         View::Next7Days => {
                             return task.due_date.is_some_and(|d| d >= today && d < today + Duration::days(7))
+                                || task.horizon.is_some_and(|h| {
+                                    matches!(h, Horizon::Week { .. }) && h == Horizon::current_week(today)
+                                })
                                 || completed_today;
                         }
                         _ => {}
@@ -2146,23 +2294,20 @@ impl Store {
     }
 
     pub fn task(&self, id: Id) -> Result<Option<Task>> {
+        let id_str = id.to_string();
         let task = self
             .conn
-            .query_row(
-                &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
-                [id.to_string()],
-                task_from_row,
-            )
+            .prepare_cached(SELECT_TASK_BY_ID_SQL)?
+            .query_row([&id_str], task_from_row)
             .optional()?;
         let Some(mut task) = task else { return Ok(None) };
         let mut stmt =
             self.conn.prepare_cached("SELECT tag FROM task_tags WHERE task_id = ?1 ORDER BY tag")?;
-        task.tags = stmt.query_map([id.to_string()], |row| row.get(0))?.collect::<Result<_, _>>()?;
-        let (done, total): (i64, i64) = self.conn.query_row(
-            "SELECT COUNT(completed_at), COUNT(*) FROM checklist_items WHERE task_id = ?1",
-            [id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        task.tags = stmt.query_map([&id_str], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        let (done, total): (i64, i64) = self
+            .conn
+            .prepare_cached("SELECT COUNT(completed_at), COUNT(*) FROM checklist_items WHERE task_id = ?1")?
+            .query_row([&id_str], |row| Ok((row.get(0)?, row.get(1)?)))?;
         task.checklist = (total > 0).then_some((done as usize, total as usize));
         Ok(Some(task))
     }
@@ -2244,6 +2389,16 @@ impl Store {
             .map(str::trim)
             .filter(|s| !s.is_empty() && chrono_tz::Tz::from_str(s).is_ok())
             .map(str::to_owned);
+        let horizon = if draft.due_date.is_some() || draft.start_date.is_some() {
+            None
+        } else {
+            draft.horizon
+        };
+        let schedule_bucket = if horizon.is_some() {
+            ScheduleBucket::None
+        } else {
+            draft.schedule_bucket
+        };
         let task = Task {
             id: Uuid::now_v7(),
             list_id: draft.list_id,
@@ -2274,13 +2429,9 @@ impl Store {
             reminders: draft.reminders,
             estimate: None,
             start_date: draft.start_date,
-            schedule_bucket: draft.schedule_bucket,
+            schedule_bucket,
+            horizon,
             created_at: now_ms(),
-        };
-        let order = if top {
-            "(SELECT COALESCE(MIN(sort_order), 0) - 1024 FROM tasks)"
-        } else {
-            "(SELECT COALESCE(MAX(sort_order), 0) + 1024 FROM tasks)"
         };
         if task.location.is_some()
             || task.timezone.is_some()
@@ -2288,45 +2439,38 @@ impl Store {
             || task.constant_reminder
             || task.start_date.is_some()
             || task.schedule_bucket != ScheduleBucket::None
+            || task.horizon.is_some()
         {
-            self.conn.execute(
-                &format!("INSERT INTO tasks (id, title, notes, list_id, kind, priority, due_date, due_time,
-                          repeat, reminders, created_at, end_date, end_time, location, timezone, is_floating,
-                          constant_reminder, start_date, schedule_bucket, sort_order)
-                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, {order})"),
-                params![
-                    task.id.to_string(), task.title, task.notes, task.list_id.map(|id| id.to_string()),
-                    task.kind.as_str(), task.priority.to_i64(),
-                    task.due_date.map(|date| date.format(DATE_FORMAT).to_string()),
-                    task.due_time.map(|time| time.format(TIME_FORMAT).to_string()),
-                    task.repeat.as_ref().map(ToString::to_string), crate::reminder::format(&task.reminders),
-                    task.created_at,
-                    task.end_date.map(|date| date.format(DATE_FORMAT).to_string()),
-                    task.end_time.map(|time| time.format(TIME_FORMAT).to_string()),
-                    task.location,
-                    task.timezone,
-                    task.is_floating,
-                    task.constant_reminder,
-                    task.start_date.map(|date| date.format(DATE_FORMAT).to_string()),
-                    task.schedule_bucket.as_str(),
-                ],
-            )?;
+            let sql = if top { INSERT_TASK_FULL_TOP_SQL } else { INSERT_TASK_FULL_BOTTOM_SQL };
+            self.conn.prepare_cached(sql)?.execute(params![
+                task.id.to_string(), task.title, task.notes, task.list_id.map(|id| id.to_string()),
+                task.kind.as_str(), task.priority.to_i64(),
+                task.due_date.map(|date| date.format(DATE_FORMAT).to_string()),
+                task.due_time.map(|time| time.format(TIME_FORMAT).to_string()),
+                task.repeat.as_ref().map(ToString::to_string), crate::reminder::format(&task.reminders),
+                task.created_at,
+                task.end_date.map(|date| date.format(DATE_FORMAT).to_string()),
+                task.end_time.map(|time| time.format(TIME_FORMAT).to_string()),
+                task.location,
+                task.timezone,
+                task.is_floating,
+                task.constant_reminder,
+                task.start_date.map(|date| date.format(DATE_FORMAT).to_string()),
+                task.schedule_bucket.as_str(),
+                task.horizon.map(|h| h.as_code()),
+            ])?;
         } else {
-            self.conn.execute(
-                &format!("INSERT INTO tasks (id, title, notes, list_id, kind, priority, due_date, due_time,
-                          repeat, reminders, created_at, end_date, end_time, sort_order)
-                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, {order})"),
-                params![
-                    task.id.to_string(), task.title, task.notes, task.list_id.map(|id| id.to_string()),
-                    task.kind.as_str(), task.priority.to_i64(),
-                    task.due_date.map(|date| date.format(DATE_FORMAT).to_string()),
-                    task.due_time.map(|time| time.format(TIME_FORMAT).to_string()),
-                    task.repeat.as_ref().map(ToString::to_string), crate::reminder::format(&task.reminders),
-                    task.created_at,
-                    task.end_date.map(|date| date.format(DATE_FORMAT).to_string()),
-                    task.end_time.map(|time| time.format(TIME_FORMAT).to_string()),
-                ],
-            )?;
+            let sql = if top { INSERT_TASK_BASIC_TOP_SQL } else { INSERT_TASK_BASIC_BOTTOM_SQL };
+            self.conn.prepare_cached(sql)?.execute(params![
+                task.id.to_string(), task.title, task.notes, task.list_id.map(|id| id.to_string()),
+                task.kind.as_str(), task.priority.to_i64(),
+                task.due_date.map(|date| date.format(DATE_FORMAT).to_string()),
+                task.due_time.map(|time| time.format(TIME_FORMAT).to_string()),
+                task.repeat.as_ref().map(ToString::to_string), crate::reminder::format(&task.reminders),
+                task.created_at,
+                task.end_date.map(|date| date.format(DATE_FORMAT).to_string()),
+                task.end_time.map(|time| time.format(TIME_FORMAT).to_string()),
+            ])?;
         }
         Ok(task)
     }
@@ -2425,6 +2569,7 @@ impl Store {
                 estimate: None,
                 start_date: None,
                 schedule_bucket: ScheduleBucket::None,
+                horizon: None,
                 created_at: now_ms(),
             };
             self.conn.execute(
@@ -2457,93 +2602,107 @@ impl Store {
         self.complete_with_cascaded(id, completed).map(|(copy, _)| copy)
     }
 
+    fn snapshot_repeat_copy(&self, id: Id) -> Result<Id> {
+        let copy = Uuid::now_v7();
+        self.conn
+            .prepare_cached(INSERT_REPEAT_SNAPSHOT_SQL)?
+            .execute(params![id.to_string(), copy.to_string(), now_ms()])?;
+        self.conn.execute(
+            "INSERT INTO task_tags (task_id, tag) SELECT ?2, tag FROM task_tags WHERE task_id = ?1",
+            params![id.to_string(), copy.to_string()],
+        )?;
+        // The completed occurrence owns a snapshot of the checklist. Besides preserving
+        // its history, this lets Undo restore the exact checked state transactionally.
+        let items = {
+            let mut statement = self.conn.prepare(
+                "SELECT id, title, sort_order, completed_at, created_at FROM checklist_items WHERE task_id = ?1",
+            )?;
+            statement
+                .query_map([id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (source_id, title, order, completed_at, created_at) in items {
+            let copy_id = Uuid::now_v7().to_string();
+            self.conn.execute(
+                "INSERT INTO checklist_items (id, task_id, title, sort_order, completed_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![copy_id, copy.to_string(), title, order, completed_at, created_at],
+            )?;
+            self.conn.execute(
+                "INSERT INTO repeat_checklist_copies (copy_id, source_id) VALUES (?1, ?2)",
+                params![copy_id, source_id],
+            )?;
+        }
+        Ok(copy)
+    }
+
     /// Completes or reopens a task, cascading completion to open descendants and reopening closed
     /// ancestors when a subtask is reopened. Returns the repeating copy (if
     /// any) and the list of descendants newly completed alongside `id`.
     pub fn complete_with_cascaded(&self, id: Id, completed: bool) -> Result<(Option<Id>, Vec<Id>)> {
-        if completed
-            && let Some(task) = self.task(id)?
-            && let (Some(repeat), Some(anchor_date)) = (task.repeat.clone(), task.due_date.or(task.start_date))
-        {
-            let today = chrono::Local::now().date_naive();
-            let holidays = if repeat.skip_holidays {
-                let anchor = if repeat.from_completion { today } else { anchor_date };
-                self.holiday_dates(anchor, anchor + Duration::days(400))?
-            } else {
-                HashSet::new()
-            };
-            if let Some(next) = repeat.next_for_with_holidays(anchor_date, today, |d| holidays.contains(&d)) {
+        if completed && let Some(task) = self.task(id)? {
+            if let (Some(repeat), Some(anchor_date)) = (task.repeat.clone(), task.due_date.or(task.start_date)) {
+                let today = chrono::Local::now().date_naive();
+                let holidays = if repeat.skip_holidays {
+                    let anchor = if repeat.from_completion { today } else { anchor_date };
+                    self.holiday_dates(anchor, anchor + Duration::days(400))?
+                } else {
+                    HashSet::new()
+                };
+                if let Some(next) = repeat.next_for_with_holidays(anchor_date, today, |d| holidays.contains(&d)) {
+                    let copy = self.in_tx(|| {
+                        let copy = self.snapshot_repeat_copy(id)?;
+                        // Shift due_date, end_date, and start_date together by the same recurrence delta.
+                        let delta = next - anchor_date;
+                        let next_due = task.due_date.map(|d| (d + delta).format(DATE_FORMAT).to_string());
+                        let next_end = task.end_date.map(|end| (end + delta).format(DATE_FORMAT).to_string());
+                        let next_start = task.start_date.map(|start| (start + delta).format(DATE_FORMAT).to_string());
+                        let next_bucket = if task.start_date.is_none()
+                            && task.schedule_bucket == ScheduleBucket::Evening
+                        {
+                            ScheduleBucket::None
+                        } else {
+                            task.schedule_bucket
+                        };
+                        let next_repeat = repeat.forgetting_curve.then(|| repeat.advance().to_string());
+                        self.conn.execute(
+                            "UPDATE tasks SET due_date = ?2, end_date = ?3, start_date = ?4, schedule_bucket = ?5,
+                                    snoozed_until = NULL, in_progress_at = NULL,
+                                    repeat = COALESCE(?6, repeat) WHERE id = ?1",
+                            params![
+                                id.to_string(),
+                                next_due,
+                                next_end,
+                                next_start,
+                                next_bucket.as_str(),
+                                next_repeat,
+                            ],
+                        )?;
+                        self.conn.execute(
+                            "UPDATE checklist_items SET completed_at = NULL WHERE task_id = ?1",
+                            [id.to_string()],
+                        )?;
+                        Ok(copy)
+                    })?;
+                    return Ok((Some(copy), Vec::new()));
+                }
+            } else if task.due_date.is_none()
+                && task.start_date.is_none()
+                && let (Some(repeat), Some(horizon)) = (task.repeat.clone(), task.horizon)
+                && let Some(next_horizon) = horizon.advance_for_recurrence(&repeat)
+            {
                 let copy = self.in_tx(|| {
-                    let copy = Uuid::now_v7();
+                    let copy = self.snapshot_repeat_copy(id)?;
                     self.conn.execute(
-                        &format!(
-                            "INSERT INTO tasks ({TASK_COLUMNS})
-                             SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
-                                    ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time, ?3, NULL,
-                                    section_id, estimate, NULL, location, timezone, is_floating, NULL, 0,
-                                    start_date, schedule_bucket
-                             FROM tasks WHERE id = ?1"
-                        ),
-                        params![id.to_string(), copy.to_string(), now_ms()],
-                    )?;
-                    self.conn.execute(
-                        "INSERT INTO task_tags (task_id, tag) SELECT ?2, tag FROM task_tags WHERE task_id = ?1",
-                        params![id.to_string(), copy.to_string()],
-                    )?;
-                    // The completed occurrence owns a snapshot of the checklist. Besides preserving
-                    // its history, this lets Undo restore the exact checked state transactionally.
-                    let items = {
-                        let mut statement = self.conn.prepare(
-                            "SELECT id, title, sort_order, completed_at, created_at FROM checklist_items WHERE task_id = ?1",
-                        )?;
-                        statement
-                            .query_map([id.to_string()], |row| {
-                                Ok((
-                                    row.get::<_, String>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, i64>(2)?,
-                                    row.get::<_, Option<i64>>(3)?,
-                                    row.get::<_, i64>(4)?,
-                                ))
-                            })?
-                            .collect::<rusqlite::Result<Vec<_>>>()?
-                    };
-                    for (source_id, title, order, completed_at, created_at) in items {
-                        let copy_id = Uuid::now_v7().to_string();
-                        self.conn.execute(
-                            "INSERT INTO checklist_items (id, task_id, title, sort_order, completed_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            params![copy_id, copy.to_string(), title, order, completed_at, created_at],
-                        )?;
-                        self.conn.execute(
-                            "INSERT INTO repeat_checklist_copies (copy_id, source_id) VALUES (?1, ?2)",
-                            params![copy_id, source_id],
-                        )?;
-                    }
-                    // Shift due_date, end_date, and start_date together by the same recurrence delta.
-                    let delta = next - anchor_date;
-                    let next_due = task.due_date.map(|d| (d + delta).format(DATE_FORMAT).to_string());
-                    let next_end = task.end_date.map(|end| (end + delta).format(DATE_FORMAT).to_string());
-                    let next_start = task.start_date.map(|start| (start + delta).format(DATE_FORMAT).to_string());
-                    let next_bucket = if task.start_date.is_none()
-                        && task.schedule_bucket == ScheduleBucket::Evening
-                    {
-                        ScheduleBucket::None
-                    } else {
-                        task.schedule_bucket
-                    };
-                    let next_repeat = repeat.forgetting_curve.then(|| repeat.advance().to_string());
-                    self.conn.execute(
-                        "UPDATE tasks SET due_date = ?2, end_date = ?3, start_date = ?4, schedule_bucket = ?5,
-                                snoozed_until = NULL, in_progress_at = NULL,
-                                repeat = COALESCE(?6, repeat) WHERE id = ?1",
-                        params![
-                            id.to_string(),
-                            next_due,
-                            next_end,
-                            next_start,
-                            next_bucket.as_str(),
-                            next_repeat,
-                        ],
+                        "UPDATE tasks SET horizon = ?2, snoozed_until = NULL, in_progress_at = NULL WHERE id = ?1",
+                        params![id.to_string(), next_horizon.as_code()],
                     )?;
                     self.conn.execute(
                         "UPDATE checklist_items SET completed_at = NULL WHERE task_id = ?1",
@@ -2629,13 +2788,39 @@ impl Store {
     }
 
     /// Undoes completing a repeating task: removes the completed copy and puts the task back on
-    /// its earlier dates (and repeat rule if stateful, e.g. forgetting curve).
+    /// its earlier dates or horizon (and repeat rule if stateful, e.g. forgetting curve).
     pub fn undo_repeat(
         &self,
         id: Id,
         copy: Id,
         due: Option<NaiveDate>,
         end: Option<NaiveDate>,
+        repeat: Option<&Recurrence>,
+    ) -> Result<()> {
+        self.undo_repeat_inner(id, copy, due, end, None, repeat)
+    }
+
+    /// Like [`Self::undo_repeat`], also explicitly restoring `horizon` even if the completed copy
+    /// row is no longer present.
+    pub fn undo_repeat_with_horizon(
+        &self,
+        id: Id,
+        copy: Id,
+        due: Option<NaiveDate>,
+        end: Option<NaiveDate>,
+        horizon: Option<Horizon>,
+        repeat: Option<&Recurrence>,
+    ) -> Result<()> {
+        self.undo_repeat_inner(id, copy, due, end, Some(horizon), repeat)
+    }
+
+    fn undo_repeat_inner(
+        &self,
+        id: Id,
+        copy: Id,
+        due: Option<NaiveDate>,
+        end: Option<NaiveDate>,
+        explicit_horizon: Option<Option<Horizon>>,
         repeat: Option<&Recurrence>,
     ) -> Result<()> {
         self.in_tx(|| {
@@ -2651,12 +2836,12 @@ impl Store {
             if !parent_alive {
                 return Ok(());
             }
-            let copy_schedule: Option<(Option<String>, String)> = self
+            let copy_schedule: Option<(Option<String>, String, Option<String>)> = self
                 .conn
                 .query_row(
-                    "SELECT start_date, schedule_bucket FROM tasks WHERE id = ?1",
+                    "SELECT start_date, schedule_bucket, horizon FROM tasks WHERE id = ?1",
                     [copy.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
             self.conn.execute(
@@ -2666,10 +2851,14 @@ impl Store {
                 params![id.to_string(), copy.to_string()],
             )?;
             self.conn.execute("DELETE FROM tasks WHERE id = ?1", [copy.to_string()])?;
-            if let Some((start_date, schedule_bucket)) = copy_schedule {
+            if let Some((start_date, schedule_bucket, copy_horizon)) = copy_schedule {
+                let restored_horizon = match explicit_horizon {
+                    Some(h) => h.map(|v| v.as_code()),
+                    None => copy_horizon,
+                };
                 self.conn.execute(
                     "UPDATE tasks SET due_date = ?2, end_date = ?3, repeat = COALESCE(?4, repeat),
-                            start_date = ?5, schedule_bucket = ?6 WHERE id = ?1",
+                            start_date = ?5, schedule_bucket = ?6, horizon = ?7 WHERE id = ?1",
                     params![
                         id.to_string(),
                         due.map(|d| d.format(DATE_FORMAT).to_string()),
@@ -2677,6 +2866,19 @@ impl Store {
                         repeat.map(ToString::to_string),
                         start_date,
                         schedule_bucket,
+                        restored_horizon,
+                    ],
+                )?;
+            } else if let Some(h) = explicit_horizon {
+                self.conn.execute(
+                    "UPDATE tasks SET due_date = ?2, end_date = ?3, repeat = COALESCE(?4, repeat),
+                            horizon = ?5 WHERE id = ?1",
+                    params![
+                        id.to_string(),
+                        due.map(|d| d.format(DATE_FORMAT).to_string()),
+                        end.map(|d| d.format(DATE_FORMAT).to_string()),
+                        repeat.map(ToString::to_string),
+                        h.map(|v| v.as_code()),
                     ],
                 )?;
             } else {
@@ -2694,12 +2896,13 @@ impl Store {
         })
     }
 
-    /// Sets or clears the repeat rule. A repeating task needs a due date; `today` is used when
-    /// the task has none.
+    /// Sets or clears the repeat rule. A repeating task needs a due date or matching horizon;
+    /// `today` is used when the task has neither.
     pub fn set_repeat(&self, id: Id, repeat: Option<Recurrence>, today: NaiveDate) -> Result<()> {
-        if repeat.is_some()
+        if let Some(ref rule) = repeat
             && let Some(task) = self.task(id)?
             && task.due_date.is_none()
+            && !task.horizon.is_some_and(|h| h.advance_for_recurrence(rule).is_some())
         {
             self.set_due(id, Some(today), task.due_time)?;
         }
@@ -2727,7 +2930,8 @@ impl Store {
                      reminders = o.reminders, end_date = o.end_date, end_time = o.end_time,
                      estimate = o.estimate, location = o.location, timezone = o.timezone,
                      is_floating = o.is_floating, constant_reminder = o.constant_reminder,
-                     start_date = o.start_date, schedule_bucket = o.schedule_bucket
+                     start_date = o.start_date, schedule_bucket = o.schedule_bucket,
+                     horizon = o.horizon
                  FROM (SELECT * FROM tasks WHERE id = ?2) AS o WHERE tasks.id = ?1",
                 params![copy.id.to_string(), id.to_string()],
             )?;
@@ -2800,7 +3004,7 @@ impl Store {
             _ => None,
         };
         self.conn.execute(
-            "UPDATE tasks SET due_date = ?2, end_date = ?3, end_time = ?4 WHERE id = ?1",
+            "UPDATE tasks SET due_date = ?2, end_date = ?3, end_time = ?4, horizon = NULL WHERE id = ?1",
             params![
                 id.to_string(),
                 date.format(DATE_FORMAT).to_string(),
@@ -2822,7 +3026,7 @@ impl Store {
             task.end_time.filter(|et| task.due_time.is_none_or(|st| *et > st))
         };
         self.conn.execute(
-            "UPDATE tasks SET due_date = ?2, end_date = ?3, end_time = ?4 WHERE id = ?1",
+            "UPDATE tasks SET due_date = ?2, end_date = ?3, end_time = ?4, horizon = NULL WHERE id = ?1",
             params![
                 id.to_string(),
                 start.format(DATE_FORMAT).to_string(),
@@ -2844,7 +3048,7 @@ impl Store {
             end
         };
         self.conn.execute(
-            "UPDATE tasks SET due_date = ?2, due_time = ?3, end_date = ?4, end_time = ?5 WHERE id = ?1",
+            "UPDATE tasks SET due_date = ?2, due_time = ?3, end_date = ?4, end_time = ?5, horizon = NULL WHERE id = ?1",
             params![
                 id.to_string(),
                 date.format(DATE_FORMAT).to_string(),
@@ -2959,7 +3163,7 @@ impl Store {
                 "INSERT INTO list_sections (id, list_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
                 params![section.id.to_string(), list.map(|l| l.to_string()), section.name, now_ms()],
             )?;
-            self.write_sort_order("list_sections", &order)?;
+            self.write_sort_order(SortTable::ListSections, &order)?;
             Ok(())
         })?;
         Ok(section)
@@ -3013,7 +3217,7 @@ impl Store {
             let Some(to) = order.iter().position(|&id| id == target) else { return Ok(()) };
             let id = order.remove(from);
             order.insert(to, id);
-            self.write_sort_order("list_sections", &order)
+            self.write_sort_order(SortTable::ListSections, &order)
         })
     }
 
@@ -3078,11 +3282,93 @@ impl Store {
     pub fn set_due(&self, id: Id, date: Option<NaiveDate>, time: Option<NaiveTime>) -> Result<()> {
         let date_str = date.map(|d| d.format(DATE_FORMAT).to_string());
         let time_str = date.and(time).map(|t| t.format(TIME_FORMAT).to_string());
-        self.conn.execute(
-            "UPDATE tasks SET due_date = ?2, due_time = ?3, snoozed_until = NULL WHERE id = ?1",
-            params![id.to_string(), date_str, time_str],
-        )?;
+        if date.is_some() {
+            self.conn.execute(
+                "UPDATE tasks SET due_date = ?2, due_time = ?3, snoozed_until = NULL, horizon = NULL WHERE id = ?1",
+                params![id.to_string(), date_str, time_str],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE tasks SET due_date = ?2, due_time = ?3, snoozed_until = NULL WHERE id = ?1",
+                params![id.to_string(), date_str, time_str],
+            )?;
+        }
         Ok(())
+    }
+
+    /// Assigns or clears a task's horizon bucket. Assigning a horizon clears exact dates,
+    /// snooze timestamp, and Things schedule bucket to maintain mutual exclusion.
+    pub fn set_horizon(&self, id: Id, horizon: Option<Horizon>) -> Result<()> {
+        match horizon {
+            Some(h) => {
+                self.conn.execute(
+                    "UPDATE tasks
+                     SET horizon = ?2, due_date = NULL, due_time = NULL,
+                         end_date = NULL, end_time = NULL, start_date = NULL,
+                         snoozed_until = NULL, schedule_bucket = ''
+                     WHERE id = ?1",
+                    params![id.to_string(), h.as_code()],
+                )?;
+            }
+            None => {
+                self.conn.execute("UPDATE tasks SET horizon = NULL WHERE id = ?1", [id.to_string()])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Transactionally moves open non-deleted tasks in `ids` to `target` horizon, clearing exact dates.
+    pub fn rollover_horizon_tasks(&self, ids: &[Id], target: Horizon) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let code = target.as_code();
+        self.in_tx(|| {
+            let mut stmt = self.conn.prepare_cached(
+                "UPDATE tasks
+                 SET horizon = ?2, due_date = NULL, due_time = NULL,
+                     end_date = NULL, end_time = NULL, start_date = NULL,
+                     snoozed_until = NULL, schedule_bucket = ''
+                 WHERE id = ?1 AND deleted_at IS NULL AND completed_at IS NULL AND wont_do_at IS NULL",
+            )?;
+            for id in ids {
+                stmt.execute(params![id.to_string(), &code])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Transactionally moves open non-deleted overdue tasks in `ids` to `day`, preserving `due_time`
+    /// and shifting `end_date` by the same delta when present, while clearing `horizon` and `snoozed_until`.
+    pub fn rollover_overdue_to_day(&self, ids: &[Id], day: NaiveDate) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let day_str = day.format(DATE_FORMAT).to_string();
+        self.in_tx(|| {
+            let mut stmt = self.conn.prepare_cached(
+                "UPDATE tasks
+                 SET due_date = ?2, end_date = ?3, horizon = NULL, snoozed_until = NULL
+                 WHERE id = ?1 AND deleted_at IS NULL AND completed_at IS NULL AND wont_do_at IS NULL",
+            )?;
+            for &id in ids {
+                let Some(task) = self.task(id)? else {
+                    continue;
+                };
+                if task.is_deleted() || task.is_closed() {
+                    continue;
+                }
+                let next_end = match (task.due_date, task.end_date) {
+                    (Some(old_due), Some(old_end)) => old_end
+                        .checked_add_signed(day - old_due)
+                        .map(|d| d.format(DATE_FORMAT).to_string()),
+                    (_, Some(old_end)) => Some(old_end.format(DATE_FORMAT).to_string()),
+                    _ => None,
+                };
+                stmt.execute(params![id.to_string(), &day_str, next_end])?;
+            }
+            Ok(())
+        })
     }
 
     /// Marks a task explicitly "In Progress" (reopening it if closed), or clears that status.
@@ -3928,7 +4214,7 @@ impl Store {
             let mut order: Vec<Id> = lists.into_iter().map(|l| l.id).filter(|l| *l != id).collect();
             let at = after.and_then(|a| order.iter().position(|l| *l == a)).map_or(0, |i| i + 1);
             order.insert(at, id);
-            self.write_sort_order("lists", &order)?;
+            self.write_sort_order(SortTable::Lists, &order)?;
             self.conn.execute(
                 "UPDATE lists SET folder_id = ?2 WHERE id = ?1",
                 params![id.to_string(), folder.map(|f| f.to_string())],
@@ -3981,7 +4267,7 @@ impl Store {
                 return self.place_list(id, None, folder);
             };
             order.insert(pos + usize::from(after), id);
-            self.write_sort_order("lists", &order)?;
+            self.write_sort_order(SortTable::Lists, &order)?;
             self.conn.execute(
                 "UPDATE lists SET folder_id = ?2 WHERE id = ?1",
                 params![id.to_string(), folder.map(|f| f.to_string())],
@@ -4014,7 +4300,7 @@ impl Store {
                     .map_or(0, |p| p + 1),
             };
             remaining.insert(insert_at, id);
-            self.write_sort_order("lists", &remaining)?;
+            self.write_sort_order(SortTable::Lists, &remaining)?;
             self.conn.execute("UPDATE lists SET folder_id = NULL WHERE id = ?1", [id.to_string()])?;
             Ok(())
         })
@@ -4044,7 +4330,7 @@ impl Store {
                 "INSERT INTO list_folders (id, name, created_at, sort_order) VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM list_folders))",
                 params![folder.id.to_string(), folder.name, now_ms()],
             )?;
-            self.write_sort_order("lists", &order)?;
+            self.write_sort_order(SortTable::Lists, &order)?;
             let folder_id_str = folder.id.to_string();
             self.conn.execute(
                 "UPDATE lists SET folder_id = ?1 WHERE id IN (?2, ?3)",
@@ -4101,7 +4387,7 @@ impl Store {
                     }
                 };
                 visual.splice(insert_at..insert_at, moving);
-                self.write_sort_order("lists", &visual)?;
+                self.write_sort_order(SortTable::Lists, &visual)?;
             }
 
             let mut folder_order: Vec<Id> = folders.iter().map(|f| f.id).filter(|&id| id != dragged).collect();
@@ -4113,7 +4399,7 @@ impl Store {
                 FolderDropTarget::List(_) => if after { folder_order.len() } else { 0 },
             };
             folder_order.insert(folder_insert, dragged);
-            self.write_sort_order("list_folders", &folder_order)?;
+            self.write_sort_order(SortTable::ListFolders, &folder_order)?;
             Ok(())
         })
     }
@@ -4136,7 +4422,7 @@ impl Store {
                 }
             }
             let folder_ids: Vec<Id> = folders.iter().map(|f| f.id).collect();
-            self.write_sort_order("list_folders", &folder_ids)?;
+            self.write_sort_order(SortTable::ListFolders, &folder_ids)?;
             Ok(())
         })
     }
@@ -6405,6 +6691,24 @@ fn is_smart(view: &View) -> bool {
     matches!(view, View::All | View::Today | View::Tomorrow | View::Next7Days | View::Day(_))
 }
 
+/// Checks whether `task` belongs to a `View::Tag` whose lowercased tag family is `family`.
+/// Preserves exact [`matches_view`] semantics for `View::Tag` (excludes deleted and won't-do tasks,
+/// keeps completed tasks, and matches tag names case-insensitively without cloning family strings).
+fn matches_tag_family(task: &Task, family: &HashSet<String>) -> bool {
+    if task.is_deleted() || task.is_wont_do() {
+        return false;
+    }
+    task.tags.iter().any(|t| {
+        if family.contains(t.as_str()) {
+            return true;
+        }
+        if t.is_ascii() && !t.bytes().any(|b| b.is_ascii_uppercase()) {
+            return false;
+        }
+        family.contains(&t.to_lowercase())
+    })
+}
+
 fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
     if task.is_deleted() != (*view == View::Trash) {
         return false;
@@ -6422,13 +6726,19 @@ fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
         View::Tomorrow => {
             !task.is_completed() && task.due_date == Some(today + Duration::days(1))
         }
-        View::Next7Days => !task.is_completed() && due_before(7),
+        View::Next7Days => {
+            !task.is_completed()
+                && (due_before(7)
+                    || task.horizon.is_some_and(|h| {
+                        matches!(h, Horizon::Week { .. }) && h <= Horizon::current_week(today)
+                    }))
+        }
         View::Completed => task.is_completed(),
         View::WontDo => task.is_wont_do(),
         View::Trash => true,
         View::Tag(tag) => task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()),
         // Filters are matched in `Store::tasks_in`, which knows their conditions.
-        View::Filter(_) | View::Summary => false,
+        View::Filter(_) | View::Horizons | View::Summary => false,
         View::Day(day) => task.due_date == Some(*day),
         View::Search(query) => {
             let query = query.trim().to_lowercase();
@@ -6483,6 +6793,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         constant_reminder: row.get::<_, i64>(26)? != 0,
         start_date: row.get::<_, Option<String>>(27)?.and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()),
         schedule_bucket: ScheduleBucket::parse(&row.get::<_, String>(28)?),
+        horizon: row.get::<_, Option<String>>(29)?.and_then(|h| Horizon::parse(&h)),
     })
 }
 
@@ -8737,6 +9048,23 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, task.id);
 
+        // Exact matches_view semantics for View::Tag: completed stays included; deleted and won't-do excluded.
+        let done_task = store.add_task("Shipped compiler")?;
+        store.set_tags(done_task.id, &["rust".into()])?;
+        store.set_completed(done_task.id, true)?;
+        let wont_do_task = store.add_task("Dropped")?;
+        store.set_tags(wont_do_task.id, &["Backend".into()])?;
+        store.set_wont_do(wont_do_task.id, true)?;
+        let trashed_task = store.add_task("Deleted")?;
+        store.set_tags(trashed_task.id, &["Work".into()])?;
+        store.delete_task(trashed_task.id)?;
+        let found_ids: HashSet<Id> = store
+            .tasks_in(&View::Tag("Work".into()), d(2026, 10, 18))?
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(found_ids, HashSet::from([task.id, done_task.id]));
+
         // Cycle guard: A -> B -> A must terminate cleanly.
         store.conn.execute("INSERT INTO tags (name, parent, created_at) VALUES ('CycleA', 'CycleB', 4)", [])?;
         store.conn.execute("INSERT INTO tags (name, parent, created_at) VALUES ('CycleB', 'CycleA', 5)", [])?;
@@ -8912,20 +9240,332 @@ mod tests {
         for _ in 0..4 {
             let path = db_path.clone();
             let b = std::sync::Arc::clone(&barrier);
-            handles.push(std::thread::spawn(move || -> Result<(usize, bool)> {
+            handles.push(std::thread::spawn(move || -> Result<(usize, bool, i64, i64, Vec<String>)> {
                 b.wait();
                 let store = Store::open(&path)?;
                 let ver = store.schema_version()?;
                 let fk: bool = store.conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
-                Ok((ver, fk))
+                let temp_store: i64 = store.conn.pragma_query_value(None, "temp_store", |r| r.get(0))?;
+                let cache_size: i64 = store.conn.pragma_query_value(None, "cache_size", |r| r.get(0))?;
+                let quick = store.quick_check()?;
+                Ok((ver, fk, temp_store, cache_size, quick))
             }));
         }
         for handle in handles {
-            let (ver, fk) = handle.join().expect("thread must not panic")?;
+            let (ver, fk, temp_store, cache_size, quick) = handle.join().expect("thread must not panic")?;
             assert_eq!(ver, SCHEMA_VERSION);
             assert!(fk, "foreign_keys must remain enabled after concurrent migrations");
+            assert_eq!(temp_store, 2, "temp_store must be MEMORY (2)");
+            assert_eq!(cache_size, -8000, "cache_size must be -8000 KiB");
+            assert_eq!(quick, vec!["ok"]);
         }
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn horizon_mutual_exclusion_and_inbox_isolation() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let t = |h| NaiveTime::from_hms_opt(h, 0, 0).unwrap();
+        let today = d(2026, 11, 23);
+        let w48 = Horizon::Week { year: 2026, week: 48 };
+        let m12 = Horizon::Month { year: 2026, month: 12 };
+
+        // Creating a task with both due_date and horizon drops horizon (date wins).
+        let dated = store.create_task(
+            TaskDraft {
+                title: "Dated wins".into(),
+                due_date: Some(today),
+                horizon: Some(w48),
+                ..Default::default()
+            },
+            true,
+        )?;
+        assert_eq!(dated.due_date, Some(today));
+        assert_eq!(dated.horizon, None);
+        assert_eq!(store.task(dated.id)?.unwrap().horizon, None);
+
+        // Creating a task with start_date and horizon drops horizon.
+        let started = store.create_task(
+            TaskDraft {
+                title: "Start wins".into(),
+                start_date: Some(today),
+                horizon: Some(w48),
+                ..Default::default()
+            },
+            true,
+        )?;
+        assert_eq!(started.start_date, Some(today));
+        assert_eq!(started.horizon, None);
+
+        // Creating a task with horizon + schedule_bucket clears schedule_bucket.
+        let h_task = store.create_task(
+            TaskDraft {
+                title: "Horizon task".into(),
+                horizon: Some(w48),
+                schedule_bucket: ScheduleBucket::Evening,
+                ..Default::default()
+            },
+            true,
+        )?;
+        assert_eq!(h_task.horizon, Some(w48));
+        assert_eq!(h_task.schedule_bucket, ScheduleBucket::None);
+        let loaded = store.task(h_task.id)?.unwrap();
+        assert_eq!(loaded.horizon, Some(w48));
+        assert_eq!(loaded.schedule_bucket, ScheduleBucket::None);
+
+        // Duplicate preserves horizon.
+        let dup = store.duplicate_task(h_task.id)?;
+        assert_eq!(dup.horizon, Some(w48));
+
+        // Inbox behavior: in classic Tasks, Inbox means "no list", so ungrouped horizon tasks
+        // stay visible in View::Inbox and View::All; ThingsViewKind::Inbox stays GTD-clean.
+        let inbox_plain = store.add_task("Plain inbox")?;
+        let inbox_ids: Vec<Id> = store.tasks_in(&View::Inbox, today)?.into_iter().map(|t| t.id).collect();
+        assert!(inbox_ids.contains(&inbox_plain.id));
+        assert!(inbox_ids.contains(&h_task.id));
+        assert!(store.tasks_in(&View::All, today)?.iter().any(|t| t.id == h_task.id));
+        assert!(store.tasks_in(&View::Horizons, today)?.is_empty());
+        assert!(!store
+            .things_tasks(&crate::things::ThingsViewKind::Inbox, today)?
+            .iter()
+            .any(|t| t.id == h_task.id));
+
+        // set_due(Some) clears horizon; set_due(None) leaves horizon intact.
+        store.set_due(h_task.id, None, None)?;
+        assert_eq!(store.task(h_task.id)?.unwrap().horizon, Some(w48));
+        store.set_due(h_task.id, Some(today), Some(t(9)))?;
+        let after_due = store.task(h_task.id)?.unwrap();
+        assert_eq!(after_due.horizon, None);
+        assert_eq!(after_due.due_date, Some(today));
+        assert_eq!(after_due.due_time, Some(t(9)));
+
+        // set_horizon(Some) clears due_date, due_time, end_date, end_time, start_date, snoozed_until, schedule_bucket.
+        store.set_due_end(h_task.id, Some((d(2026, 11, 25), Some(t(17)))))?;
+        store.set_task_schedule(h_task.id, Some(today), ScheduleBucket::Evening)?;
+        store.snooze_task(h_task.id, today.and_hms_opt(11, 0, 0).unwrap())?;
+        store.set_horizon(h_task.id, Some(m12))?;
+        let after_h = store.task(h_task.id)?.unwrap();
+        assert_eq!(after_h.horizon, Some(m12));
+        assert_eq!(after_h.due_date, None);
+        assert_eq!(after_h.due_time, None);
+        assert_eq!(after_h.end_date, None);
+        assert_eq!(after_h.end_time, None);
+        assert_eq!(after_h.start_date, None);
+        assert_eq!(after_h.snoozed_until, None);
+        assert_eq!(after_h.schedule_bucket, ScheduleBucket::None);
+
+        // move_dates, resize_dates, resize_timed_range, and set_task_schedule clear horizon.
+        store.move_dates(h_task.id, today)?;
+        assert_eq!(store.task(h_task.id)?.unwrap().horizon, None);
+        store.set_horizon(h_task.id, Some(m12))?;
+        store.resize_dates(h_task.id, today, d(2026, 11, 25))?;
+        assert_eq!(store.task(h_task.id)?.unwrap().horizon, None);
+        store.set_horizon(h_task.id, Some(m12))?;
+        store.resize_timed_range(h_task.id, today, t(9), t(10), None)?;
+        assert_eq!(store.task(h_task.id)?.unwrap().horizon, None);
+        store.set_horizon(h_task.id, Some(m12))?;
+        store.set_task_schedule(h_task.id, None, ScheduleBucket::Someday)?;
+        assert_eq!(store.task(h_task.id)?.unwrap().horizon, None);
+
+        // set_horizon(None) returns ungrouped task back to Inbox.
+        store.set_horizon(dup.id, None)?;
+        assert_eq!(store.task(dup.id)?.unwrap().horizon, None);
+        assert!(store.tasks_in(&View::Inbox, today)?.iter().any(|t| t.id == dup.id));
+        Ok(())
+    }
+
+    #[test]
+    fn horizon_recurrence_and_undo_restores_bucket_and_checklist() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = d(2026, 11, 23);
+        let w53 = Horizon::Week { year: 2026, week: 53 };
+        let w01_next = Horizon::Week { year: 2027, week: 1 };
+
+        // Weekly repeat on 2026-W53 advances across ISO 53-week boundary to 2027-W01.
+        let weekly = store.create_task(
+            TaskDraft {
+                title: "Weekly review".into(),
+                horizon: Some(w53),
+                checklist: vec![("Inbox zero".into(), true), ("Plan next week".into(), false)],
+                ..Default::default()
+            },
+            true,
+        )?;
+        // set_repeat with compatible Weekly rule preserves horizon (does not overwrite with due_date).
+        store.set_repeat(weekly.id, Some(Recurrence::new(crate::Frequency::Weekly, 1)), today)?;
+        let before = store.task(weekly.id)?.unwrap();
+        assert_eq!(before.horizon, Some(w53));
+        assert_eq!(before.due_date, None);
+
+        let copy_id = store.complete(weekly.id, true)?.expect("repeating horizon task creates copy");
+        let after = store.task(weekly.id)?.unwrap();
+        assert!(!after.is_completed());
+        assert_eq!(after.horizon, Some(w01_next));
+        assert_eq!(after.due_date, None);
+        assert!(store.checklist(weekly.id)?.iter().all(|c| !c.completed));
+
+        let copy = store.task(copy_id)?.unwrap();
+        assert!(copy.is_completed());
+        assert_eq!(copy.horizon, Some(w53));
+        assert_eq!(copy.repeat, None);
+
+        // undo_repeat restores horizon from copy and restores checklist checkmarks.
+        store.undo_repeat(weekly.id, copy_id, None, None, None)?;
+        let undone = store.task(weekly.id)?.unwrap();
+        assert_eq!(undone.horizon, Some(w53));
+        assert!(store.task(copy_id)?.is_none());
+        let restored_cl = store.checklist(weekly.id)?;
+        assert_eq!(restored_cl.iter().map(|c| c.completed).collect::<Vec<_>>(), vec![true, false]);
+
+        // undo_repeat_with_horizon restores explicit horizon even if copy is already gone.
+        let copy2 = store.complete(weekly.id, true)?.expect("second completion creates copy");
+        store.purge_task(copy2)?;
+        store.undo_repeat_with_horizon(weekly.id, copy2, None, None, Some(w53), None)?;
+        assert_eq!(store.task(weekly.id)?.unwrap().horizon, Some(w53));
+
+        // Quarter + Monthly(interval=3) advances by 1 quarter.
+        let q_task = store.create_task(
+            TaskDraft {
+                title: "Quarterly OKRs".into(),
+                horizon: Some(Horizon::Quarter { year: 2026, quarter: 4 }),
+                repeat: Some(Recurrence::new(crate::Frequency::Monthly, 3)),
+                ..Default::default()
+            },
+            true,
+        )?;
+        assert!(store.complete(q_task.id, true)?.is_some());
+        assert_eq!(
+            store.task(q_task.id)?.unwrap().horizon,
+            Some(Horizon::Quarter { year: 2027, quarter: 1 })
+        );
+
+        // Incompatible granularity (Life + Weekly) closes normally instead of advancing.
+        let life_task = store.create_task(
+            TaskDraft {
+                title: "Write a book".into(),
+                horizon: Some(Horizon::Life),
+                repeat: Some(Recurrence::new(crate::Frequency::Weekly, 1)),
+                ..Default::default()
+            },
+            true,
+        )?;
+        assert_eq!(store.complete(life_task.id, true)?, None);
+        assert!(store.task(life_task.id)?.unwrap().is_completed());
+        Ok(())
+    }
+
+    #[test]
+    fn horizon_rollover_helpers_update_open_tasks_transactionally() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let t = |h| NaiveTime::from_hms_opt(h, 0, 0).unwrap();
+        let today = d(2026, 11, 23);
+        let past_due = d(2026, 11, 20);
+        let past_end = d(2026, 11, 22);
+        let w47 = Horizon::Week { year: 2026, week: 47 };
+        let w48 = Horizon::Week { year: 2026, week: 48 };
+
+        let open_past = store.create_task(
+            TaskDraft { title: "Open past week".into(), horizon: Some(w47), ..Default::default() },
+            true,
+        )?;
+        let done_past = store.create_task(
+            TaskDraft { title: "Done past week".into(), horizon: Some(w47), ..Default::default() },
+            true,
+        )?;
+        store.set_completed(done_past.id, true)?;
+        let trashed_past = store.create_task(
+            TaskDraft { title: "Trashed past week".into(), horizon: Some(w47), ..Default::default() },
+            true,
+        )?;
+        store.delete_task(trashed_past.id)?;
+
+        store.rollover_horizon_tasks(&[open_past.id, done_past.id, trashed_past.id], w48)?;
+        assert_eq!(store.task(open_past.id)?.unwrap().horizon, Some(w48));
+        assert_eq!(store.task(done_past.id)?.unwrap().horizon, Some(w47));
+        assert_eq!(store.task(trashed_past.id)?.unwrap().horizon, Some(w47));
+
+        // Overdue rollover shifts due_date and end_date together, preserving due_time and clearing snooze.
+        let overdue = store.create_task(
+            TaskDraft {
+                title: "Overdue span".into(),
+                due_date: Some(past_due),
+                due_time: Some(t(10)),
+                end_date: Some(past_end),
+                end_time: Some(t(14)),
+                ..Default::default()
+            },
+            true,
+        )?;
+        store.snooze_task(overdue.id, past_due.and_hms_opt(11, 0, 0).unwrap())?;
+        let overdue_done = store.create_task(
+            TaskDraft { title: "Done overdue".into(), due_date: Some(past_due), ..Default::default() },
+            true,
+        )?;
+        store.set_completed(overdue_done.id, true)?;
+
+        store.rollover_overdue_to_day(&[overdue.id, overdue_done.id], today)?;
+        let rolled = store.task(overdue.id)?.unwrap();
+        assert_eq!(rolled.due_date, Some(today));
+        assert_eq!(rolled.due_time, Some(t(10)));
+        assert_eq!(rolled.end_date, Some(d(2026, 11, 25)));
+        assert_eq!(rolled.end_time, Some(t(14)));
+        assert_eq!(rolled.snoozed_until, None);
+        assert_eq!(rolled.horizon, None);
+        assert_eq!(store.task(overdue_done.id)?.unwrap().due_date, Some(past_due));
+        Ok(())
+    }
+
+    #[test]
+    fn next_7_days_includes_current_and_past_week_horizons_only() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = d(2026, 11, 23); // 2026-W48
+        let cur_w = Horizon::current_week(today);
+        let past_w = cur_w.shift(-1);
+        let next_w = cur_w.shift(1);
+
+        let t_cur_w = store.create_task(
+            TaskDraft { title: "Current week".into(), horizon: Some(cur_w), ..Default::default() },
+            true,
+        )?;
+        let t_past_w = store.create_task(
+            TaskDraft { title: "Past week".into(), horizon: Some(past_w), ..Default::default() },
+            true,
+        )?;
+        let t_done_w = store.create_task(
+            TaskDraft { title: "Done week".into(), horizon: Some(cur_w), ..Default::default() },
+            true,
+        )?;
+        store.set_completed(t_done_w.id, true)?;
+        let t_next_w = store.create_task(
+            TaskDraft { title: "Next week".into(), horizon: Some(next_w), ..Default::default() },
+            true,
+        )?;
+        let t_month = store.create_task(
+            TaskDraft {
+                title: "This month".into(),
+                horizon: Some(Horizon::current_month(today)),
+                ..Default::default()
+            },
+            true,
+        )?;
+        let t_year = store.create_task(
+            TaskDraft {
+                title: "This year".into(),
+                horizon: Some(Horizon::current_year(today)),
+                ..Default::default()
+            },
+            true,
+        )?;
+
+        let ids: Vec<Id> = store.tasks_in(&View::Next7Days, today)?.into_iter().map(|t| t.id).collect();
+        assert!(ids.contains(&t_cur_w.id));
+        assert!(ids.contains(&t_past_w.id));
+        assert!(!ids.contains(&t_done_w.id));
+        assert!(!ids.contains(&t_next_w.id));
+        assert!(!ids.contains(&t_month.id));
+        assert!(!ids.contains(&t_year.id));
+        assert_eq!(store.counts(today)?.next_7_days, 2);
         Ok(())
     }
 }

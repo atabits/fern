@@ -160,12 +160,15 @@ fn existing_prefix(line: &str, format: Format) -> Option<usize> {
 }
 
 fn prefix_lines(text: &str, selection: Range<usize>, format: Format) -> (String, Range<usize>) {
+    let Some(first_prefix) = format.prefix(1) else {
+        return (text.to_owned(), selection);
+    };
     let start = text[..selection.start].rfind('\n').map_or(0, |i| i + 1);
     let end = text[selection.end..].find('\n').map_or(text.len(), |i| selection.end + i);
     let lines: Vec<&str> = text[start..end].split('\n').collect();
     // A heading of the same level, or every line already formatted, is taken off.
     let remove = lines.iter().all(|line| match format {
-        Format::Heading(_) => existing_prefix(line, format).is_some_and(|len| line[..len] == *format.prefix(1).unwrap()),
+        Format::Heading(_) => existing_prefix(line, format).is_some_and(|len| line[..len] == first_prefix),
         _ => existing_prefix(line, format).is_some(),
     });
     let mut n = 0;
@@ -178,7 +181,8 @@ fn prefix_lines(text: &str, selection: Range<usize>, format: Format) -> (String,
             n += 1;
             // A line formatted already, or a heading of another level, is not formatted twice.
             let rest = &line[existing_prefix(line, format).unwrap_or(0)..];
-            format!("{}{rest}", format.prefix(n).unwrap())
+            let prefix = format.prefix(n).unwrap_or_default();
+            format!("{prefix}{rest}")
         })
         .collect();
     let block = changed.join("\n");

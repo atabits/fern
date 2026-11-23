@@ -57,6 +57,7 @@ pub enum SmartList {
     Tomorrow,
     Next7Days,
     Inbox,
+    Horizons,
     Summary,
     Tags,
     Filters,
@@ -67,12 +68,13 @@ pub enum SmartList {
 
 impl SmartList {
     /// In the order of the Settings page, grouped as there.
-    pub const ALL: [SmartList; 11] = [
+    pub const ALL: [SmartList; 12] = [
         SmartList::All,
         SmartList::Today,
         SmartList::Tomorrow,
         SmartList::Next7Days,
         SmartList::Inbox,
+        SmartList::Horizons,
         SmartList::Summary,
         SmartList::Tags,
         SmartList::Filters,
@@ -82,12 +84,13 @@ impl SmartList {
     ];
 
     /// The top smart lists in the lists column, in default display order; draggable to reorder.
-    pub const TOP_DRAGGABLE: [SmartList; 6] = [
+    pub const TOP_DRAGGABLE: [SmartList; 7] = [
         SmartList::Inbox,
         SmartList::All,
         SmartList::Today,
         SmartList::Tomorrow,
         SmartList::Next7Days,
+        SmartList::Horizons,
         SmartList::Summary,
     ];
 
@@ -98,6 +101,7 @@ impl SmartList {
             SmartList::Tomorrow => "tomorrow",
             SmartList::Next7Days => "next_7_days",
             SmartList::Inbox => "inbox",
+            SmartList::Horizons => "horizons",
             SmartList::Summary => "summary",
             SmartList::Tags => "tags",
             SmartList::Filters => "filters",
@@ -115,9 +119,12 @@ impl SmartList {
     /// omit tags without open tasks, and the closed-task lists are only shown or hidden.
     pub fn options(self) -> &'static [Visibility] {
         match self {
-            SmartList::Completed | SmartList::WontDo | SmartList::Trash | SmartList::Filters | SmartList::Summary => {
-                &[Visibility::Show, Visibility::Hide]
-            }
+            SmartList::Completed
+            | SmartList::WontDo
+            | SmartList::Trash
+            | SmartList::Filters
+            | SmartList::Horizons
+            | SmartList::Summary => &[Visibility::Show, Visibility::Hide],
             SmartList::Tags => &[Visibility::Show, Visibility::IfNotEmpty, Visibility::Hide],
             _ => &[Visibility::IfNotEmpty, Visibility::Show, Visibility::Hide],
         }
@@ -533,7 +540,7 @@ pub struct Preferences {
     /// Where tasks added outside a list go (smart lists, tags, filters); `None` is the Inbox.
     pub default_list: Option<Id>,
     /// Settings → Smart List, in the order of `SmartList::ALL`.
-    pub smart_lists: [Visibility; 11],
+    pub smart_lists: [Visibility; 12],
     /// Order of the top draggable smart lists in the lists column.
     pub smart_list_order: Vec<SmartList>,
     /// Order of the middle sections (`Lists`, `Tags`, `Filters`) in the lists column.
@@ -620,7 +627,7 @@ impl Default for Preferences {
             recognition: Recognition::default(),
             task_defaults: TaskDefaults::default(),
             default_list: None,
-            smart_lists: [Visibility::Show; 11],
+            smart_lists: [Visibility::Show; 12],
             smart_list_order: SmartList::TOP_DRAGGABLE.to_vec(),
             sidebar_section_order: SidebarSection::ALL.to_vec(),
             rail_order: RailSection::ALL.to_vec(),
@@ -683,6 +690,7 @@ pub struct Features {
     pub focus: bool,
     pub countdown: bool,
     pub life_clock: bool,
+    pub horizons: bool,
 }
 
 impl Default for Features {
@@ -696,6 +704,7 @@ impl Default for Features {
             focus: true,
             countdown: true,
             life_clock: true,
+            horizons: true,
         }
     }
 }
@@ -724,6 +733,7 @@ impl Features {
             ("focus", self.focus),
             ("countdown", self.countdown),
             ("life_clock", self.life_clock),
+            ("horizons", self.horizons),
         ]
         .into_iter()
         .filter(|(_, on)| !on)
@@ -746,6 +756,7 @@ impl Features {
             focus: !tokens.contains(&"focus"),
             countdown: !tokens.contains(&"countdown"),
             life_clock: !tokens.contains(&"life_clock"),
+            horizons: !tokens.contains(&"horizons"),
         };
         features.sanitize();
         features
@@ -1275,6 +1286,55 @@ mod tests {
         // Re-enabling persists back to true.
         store.update_preferences(|p| p.features.life_clock = true)?;
         assert!(store.preferences()?.features.life_clock);
+        Ok(())
+    }
+
+    #[test]
+    fn horizons_feature_and_smart_list_roundtrip_and_compat() -> Result<()> {
+        let store = Store::open_in_memory()?;
+
+        // SmartList::Horizons sits right before SmartList::Summary in both ALL and TOP_DRAGGABLE.
+        let all_h = SmartList::ALL.iter().position(|s| *s == SmartList::Horizons);
+        let all_s = SmartList::ALL.iter().position(|s| *s == SmartList::Summary);
+        assert_eq!(all_s, all_h.map(|i| i + 1));
+        let top_h = SmartList::TOP_DRAGGABLE.iter().position(|s| *s == SmartList::Horizons);
+        let top_s = SmartList::TOP_DRAGGABLE.iter().position(|s| *s == SmartList::Summary);
+        assert_eq!(top_s, top_h.map(|i| i + 1));
+        assert_eq!(SmartList::Horizons.code(), "horizons");
+        assert_eq!(SmartList::from_code("horizons"), Some(SmartList::Horizons));
+        assert_eq!(SmartList::Horizons.options(), &[Visibility::Show, Visibility::Hide]);
+        // No duplicate RailSection::Horizons in the navigation rail.
+        assert_eq!(RailSection::from_code("horizons"), None);
+
+        // Legacy storage without `horizons` token defaults `features.horizons` to `true`,
+        // and legacy smart_list_order without `horizons` appends it during normalization.
+        store.set_setting(FEATURES, "matrix,countdown")?;
+        store.set_setting(SMART_LIST_ORDER, "inbox,all,today,tomorrow,next_7_days,summary")?;
+        let legacy = store.preferences()?;
+        assert!(legacy.features.horizons);
+        assert_eq!(legacy.visibility(SmartList::Horizons), Visibility::Show);
+        assert!(legacy.smart_list_order.contains(&SmartList::Horizons));
+
+        // Disabling `features.horizons`, hiding `SmartList::Horizons`, and reordering persist cleanly.
+        store.update_preferences(|p| {
+            p.features.horizons = false;
+            p.set_visibility(SmartList::Horizons, Visibility::Hide);
+            p.move_smart_list(SmartList::Horizons, SmartList::Inbox, false);
+        })?;
+        let disabled = store.preferences()?;
+        assert!(!disabled.features.horizons);
+        assert_eq!(disabled.visibility(SmartList::Horizons), Visibility::Hide);
+        assert_eq!(disabled.smart_list_order[0], SmartList::Horizons);
+
+        // `IfNotEmpty` is ignored for SmartList::Horizons (only Show/Hide offered).
+        store.update_preferences(|p| {
+            p.features.horizons = true;
+            p.set_visibility(SmartList::Horizons, Visibility::Show);
+            p.set_visibility(SmartList::Horizons, Visibility::IfNotEmpty);
+        })?;
+        let reloaded = store.preferences()?;
+        assert!(reloaded.features.horizons);
+        assert_eq!(reloaded.visibility(SmartList::Horizons), Visibility::Show);
         Ok(())
     }
 }

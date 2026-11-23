@@ -315,8 +315,9 @@ impl HorizonsView {
                                                 colors.panel_background.opacity(0.6)
                                             })
                                             .when(!active, |el| el.hover(|s| s.bg(colors.ghost_element_hover)))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                            .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.assign_drawer_destination(task_id, dest, cx);
+                                                window.focus(&this.focus_handle, cx);
                                             }))
                                             .child(
                                                 Label::new(label)

@@ -60,6 +60,7 @@ pub struct QuickAddWindow {
     preferences: Preferences,
     picked_date: Option<NaiveDate>,
     parsed_due: Option<(NaiveDate, Option<NaiveTime>)>,
+    parsed_horizon: Option<fern_core::Horizon>,
     parsed_repeat: bool,
     parsed_tags: Vec<String>,
     parsed_priority: Option<Priority>,
@@ -111,6 +112,7 @@ impl QuickAddWindow {
             preferences,
             picked_date: None,
             parsed_due: None,
+            parsed_horizon: None,
             parsed_repeat: false,
             parsed_tags: Vec::new(),
             parsed_priority: None,
@@ -125,8 +127,17 @@ impl QuickAddWindow {
         let text = self.input.read(cx).text().to_owned();
         let today = Local::now().date_naive();
         let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
-        let parsed = fern_core::parse_quick_add_with(&text, today, &list_names, self.preferences.recognition);
+        let recognize_horizons =
+            self.preferences.features.horizons && crate::calendar::horizons_enabled();
+        let parsed = fern_core::parse_quick_add_with_horizons(
+            &text,
+            today,
+            &list_names,
+            self.preferences.recognition,
+            recognize_horizons,
+        );
         self.parsed_due = parsed.due_date.map(|d| (d, parsed.due_time));
+        self.parsed_horizon = parsed.horizon;
         self.parsed_repeat = parsed.repeat.is_some();
         self.parsed_tags = parsed.tags;
         self.parsed_priority = parsed.priority.filter(|p| *p != Priority::None);
@@ -303,6 +314,23 @@ impl Render for QuickAddWindow {
                                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Accent)),
                         )
                     })
+                    .when_some(shown_due.is_none().then_some(self.parsed_horizon).flatten(), |el, horizon| {
+                        let label = crate::calendar::format_horizon_badge(horizon, strings);
+                        el.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_1()
+                                .px_2()
+                                .h(px(22.))
+                                .rounded(px(5.))
+                                .bg(theme.colors().accent.opacity(0.12))
+                                .child(Icon::new(IconName::FernHorizons).size(IconSize::XSmall).color(Color::Accent))
+                                .when(self.parsed_repeat, |el| {
+                                    el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent))
+                                })
+                                .child(Label::new(label).size(LabelSize::XSmall).color(Color::Accent)),
+                        )
+                    })
                     .children(self.parsed_tags.iter().take(3).map(|tag| {
                         h_flex()
                             .flex_none()
@@ -339,7 +367,7 @@ impl Render for QuickAddWindow {
                                 ),
                         )
                     })
-                    .when(shown_due.is_none() && self.parsed_repeat, |el| {
+                    .when(shown_due.is_none() && self.parsed_horizon.is_none() && self.parsed_repeat, |el| {
                         el.child(
                             h_flex()
                                 .h(px(22.))
@@ -454,19 +482,32 @@ fn build_quick_add_draft_json(
 ) -> serde_json::Value {
     let today = Local::now().date_naive();
     let list_names: Vec<String> = lists.iter().map(|l| l.name.clone()).collect();
-    let parsed = fern_core::parse_quick_add_with(text, today, &list_names, preferences.recognition);
+    let recognize_horizons = preferences.features.horizons && crate::calendar::horizons_enabled();
+    let parsed = fern_core::parse_quick_add_with_horizons(
+        text,
+        today,
+        &list_names,
+        preferences.recognition,
+        recognize_horizons,
+    );
     let defaults = &preferences.task_defaults;
     let title = if parsed.title.trim().is_empty() {
         text.trim().to_owned()
     } else {
         parsed.title
     };
-    // Match `TodoView::add_task_as`: typed date wins over picked date, then task_defaults.date.
+    // Match `TodoView::add_task_as`: typed date wins over picked date, then typed horizon,
+    // then task_defaults.date.
     let from_picker = parsed.due_date.is_none() && picked_date.is_some();
     let due_date = parsed
         .due_date
         .or(picked_date)
-        .or_else(|| defaults.date.map(|d| d.date(today)));
+        .or_else(|| parsed.horizon.is_none().then(|| defaults.date.map(|d| d.date(today))).flatten());
+    let horizon = if due_date.is_some() {
+        None
+    } else {
+        parsed.horizon
+    };
     let due_time = if from_picker { None } else { parsed.due_time };
     let reminders: Vec<i64> = if due_date.is_some() {
         let offset = if due_time.is_some() {
@@ -545,6 +586,9 @@ fn build_quick_add_draft_json(
     }
     if let Some(rep) = parsed.repeat {
         obj.insert("repeat".to_owned(), serde_json::Value::String(rep.to_string()));
+    }
+    if let Some(horizon) = horizon {
+        obj.insert("horizon".to_owned(), serde_json::Value::String(horizon.as_code()));
     }
     serde_json::Value::Object(obj)
 }
@@ -860,5 +904,82 @@ mod tests {
                 "Custom reason"
             );
         }
+    }
+
+    #[test]
+    fn quick_add_draft_parses_horizon_when_enabled_and_ignores_when_disabled() {
+        let _horizons_guard = crate::app_view::lock_horizons_flag();
+        let today = Local::now().date_naive();
+        let mut prefs = Preferences::default();
+        prefs.task_defaults.date = Some(fern_core::DefaultDate::Today);
+
+        // When Horizons is enabled, a horizon phrase wins over task_defaults.date and serializes "horizon".
+        let json = build_quick_add_draft_json("Ship roadmap this month", None, None, None, &[], &prefs);
+        let (draft, _) = plugins::api::parse_task_draft(&json).unwrap();
+        assert_eq!(draft.title, "Ship roadmap");
+        assert_eq!(draft.due_date, None);
+        assert_eq!(draft.horizon, Some(fern_core::Horizon::current_month(today)));
+
+        // When Horizons is disabled, the phrase stays in the title and no horizon is parsed.
+        prefs.features.horizons = false;
+        let disabled_json = build_quick_add_draft_json("Ship roadmap this month", None, None, None, &[], &prefs);
+        let (disabled_draft, _) = plugins::api::parse_task_draft(&disabled_json).unwrap();
+        assert_eq!(disabled_draft.title, "Ship roadmap this month");
+        assert_eq!(disabled_draft.horizon, None);
+        assert_eq!(disabled_draft.due_date, Some(today));
+    }
+
+    #[gpui::test]
+    fn quick_add_window_creates_horizon_task_when_enabled_and_plain_when_disabled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _horizons_guard = crate::app_view::lock_horizons_flag();
+        cx.update(theme::init);
+        let today = Local::now().date_naive();
+
+        // Enabled: Global Quick Add creates a horizon task.
+        let store = Rc::new(fern_core::Store::open_in_memory().unwrap());
+        let (main, main_cx) = cx.add_window_view(|window, cx| AppView::new(store.clone(), false, window, cx));
+        let main_handle = main_cx.window_handle().downcast::<AppView>().unwrap();
+        let (qa, qa_cx) = cx.add_window_view(|window, cx| QuickAddWindow::new(main_handle, window, cx));
+        qa_cx.update(|window, cx| {
+            qa.update(cx, |qa, cx| {
+                qa.input.update(cx, |input, cx| input.set_text("Plan Q4 offsite this month", cx));
+                qa.update_parsed_due(cx);
+                assert_eq!(qa.parsed_horizon, Some(fern_core::Horizon::current_month(today)));
+                qa.submit(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let tasks = store.tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "Plan Q4 offsite");
+        assert_eq!(tasks[0].due_date, None);
+        assert_eq!(tasks[0].horizon, Some(fern_core::Horizon::current_month(today)));
+        let _ = main;
+
+        // Disabled: Global Quick Add ignores horizon phrases.
+        let disabled_store = Rc::new(fern_core::Store::open_in_memory().unwrap());
+        disabled_store
+            .update_preferences(|p| p.features.horizons = false)
+            .unwrap();
+        let (main2, main2_cx) =
+            cx.add_window_view(|window, cx| AppView::new(disabled_store.clone(), false, window, cx));
+        let main2_handle = main2_cx.window_handle().downcast::<AppView>().unwrap();
+        let (qa2, qa2_cx) = cx.add_window_view(|window, cx| QuickAddWindow::new(main2_handle, window, cx));
+        qa2_cx.update(|window, cx| {
+            qa2.update(cx, |qa, cx| {
+                qa.input.update(cx, |input, cx| input.set_text("Plan Q4 offsite this month", cx));
+                qa.update_parsed_due(cx);
+                assert_eq!(qa.parsed_horizon, None);
+                qa.submit(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let disabled_tasks = disabled_store.tasks().unwrap();
+        assert_eq!(disabled_tasks.len(), 1);
+        assert_eq!(disabled_tasks[0].title, "Plan Q4 offsite this month");
+        assert_eq!(disabled_tasks[0].horizon, None);
+        let _ = main2;
     }
 }

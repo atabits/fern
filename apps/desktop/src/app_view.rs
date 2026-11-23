@@ -161,6 +161,9 @@ pub struct AppView {
     pub(crate) has_sync_config: bool,
     /// Cached `tray::always_on_top` so `render_account_menu` never queries SQLite every frame.
     always_on_top: bool,
+    /// Cached tray tooltip derived from `focus.running_clock()` so unchanged notifications
+    /// skip redundant Win32 `Shell_NotifyIconW` calls and full `AppView` re-renders.
+    last_tray_tooltip: String,
     /// Settings → Features: the sections shown in the sidebar.
     pub(crate) features: fern_core::Features,
     /// Full rail item order including plugin sidebar views.
@@ -241,7 +244,19 @@ impl AppView {
         });
     }
 
+    #[cfg(test)]
     pub fn new(store: Rc<Store>, first_start: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let initial_prefs = store.preferences().unwrap_or_default();
+        Self::new_with_preferences(store, initial_prefs, first_start, window, cx)
+    }
+
+    pub fn new_with_preferences(
+        store: Rc<Store>,
+        initial_prefs: fern_core::Preferences,
+        first_start: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let app_view = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             #[cfg(not(windows))]
@@ -256,6 +271,7 @@ impl AppView {
                 true
             }).unwrap_or(true)
         });
+        set_horizons_enabled(initial_prefs.features.horizons);
         let todo = cx.new(|cx| TodoView::new(store.clone(), window, cx));
         let things = cx.new(|cx| ThingsView::new(store.clone(), window, cx));
         cx.subscribe_in(&things, window, |this, _, event: &ThingsEvent, window, cx| match event {
@@ -366,18 +382,22 @@ impl AppView {
         })
         .detach();
         let focus = cx.new(|cx| FocusView::new(store.clone(), cx));
-        cx.observe(&focus, |_, focus, cx| {
+        cx.observe(&focus, |this, focus, cx| {
             let tip = match focus.read(cx).running_clock() {
                 Some((clock, true)) => format!("Fern — {clock} (Paused)"),
                 Some((clock, false)) => format!("Fern — {clock}"),
                 None => "Fern".to_owned(),
             };
-            crate::tray::set_tooltip(&tip);
-            cx.notify();
+            if this.last_tray_tooltip != tip {
+                crate::tray::set_tooltip(&tip);
+                this.last_tray_tooltip = tip;
+                cx.notify();
+            }
         })
         .detach();
         cx.subscribe_in(&focus, window, |this, _, crate::focus_view::StatsClosed, window, cx| {
             this.statistics_open = false;
+            this.sync_active_section(cx);
             if this.section == Section::LifeClock {
                 window.focus(&this.life_clock.focus_handle(cx), cx);
             }
@@ -385,9 +405,8 @@ impl AppView {
             cx.notify();
         })
         .detach();
-        let initial_prefs = store.preferences().unwrap_or_default();
         let store_features = initial_prefs.features;
-        let rail_items = initial_prefs.rail_items;
+        let rail_items = initial_prefs.rail_items.clone();
         let initial_section = first_enabled_task_section(store_features);
         let window_handle = window.window_handle().downcast::<Self>();
         let has_sync_config = store.sync_config().ok().flatten().is_some();
@@ -448,6 +467,7 @@ impl AppView {
             sync: crate::sync::SyncStatus::Off,
             has_sync_config,
             always_on_top,
+            last_tray_tooltip: "Fern".to_owned(),
             features: store_features,
             rail_items,
             rail_scroll: gpui::ScrollHandle::new(),
@@ -464,7 +484,7 @@ impl AppView {
         reminders::start(this.store.clone(), window.window_handle(), cx);
         cx.set_global(crate::LiveSyncStatus(this.sync.clone()));
         this.start_sync(cx);
-        settings_window::apply(&this.store.preferences().unwrap_or_default(), window, cx);
+        settings_window::apply(&initial_prefs, window, cx);
         // "Follow System Dark Mode" tracks the system's appearance while the app runs.
         cx.observe_window_appearance(window, |this, window, cx| {
             let preferences = this.store.preferences().unwrap_or_default();
@@ -475,6 +495,7 @@ impl AppView {
         .detach();
         #[cfg(debug_assertions)]
         crate::dev_state::apply(&mut this, window, cx);
+        this.sync_active_section(cx);
         this.sync_title_bar_appearance(cx);
         this
     }
@@ -505,6 +526,37 @@ impl AppView {
         }
         window.focus(&self.calendar.focus_handle(cx), cx);
         false
+    }
+
+    fn sync_active_section(&mut self, cx: &mut Context<Self>) {
+        let stats = self.statistics_open;
+        let todo_active = !stats && matches!(self.section, Section::Tasks | Section::Search);
+        let things_active = !stats && self.section == Section::Things;
+        let calendar_active = !stats && self.section == Section::Calendar;
+        let matrix_active = !stats && self.section == Section::Matrix;
+        let countdown_active = !stats && self.section == Section::Countdown;
+        let life_clock_active = !stats && self.section == Section::LifeClock;
+        let habits_active = !stats && self.section == Section::Habits;
+        let focus_active = stats || self.section == Section::Pomodoro;
+        self.todo.update(cx, |view, cx| view.set_active(todo_active, cx));
+        self.things.update(cx, |view, cx| view.set_active(things_active, cx));
+        self.calendar.update(cx, |view, cx| view.set_active(calendar_active, cx));
+        self.matrix.update(cx, |view, cx| view.set_active(matrix_active, cx));
+        self.countdown.update(cx, |view, cx| view.set_active(countdown_active, cx));
+        self.life_clock.update(cx, |view, cx| view.set_active(life_clock_active, cx));
+        self.habits.update(cx, |view, cx| view.set_active(habits_active, cx));
+        self.focus.update(cx, |view, cx| view.set_active(focus_active, cx));
+    }
+
+    fn sync_external_all(&self, cx: &mut Context<Self>) {
+        self.todo.update(cx, |view, cx| view.sync_external(cx));
+        self.things.update(cx, |view, cx| view.sync_external(cx));
+        self.calendar.update(cx, |view, cx| view.sync_external(cx));
+        self.matrix.update(cx, |view, cx| view.sync_external(cx));
+        self.countdown.update(cx, |view, cx| view.sync_external(cx));
+        self.life_clock.update(cx, |view, cx| view.sync_external(cx));
+        self.habits.update(cx, |view, cx| view.sync_external(cx));
+        self.focus.update(cx, |view, cx| view.sync_external(cx));
     }
 
     pub(crate) fn sync_title_bar_appearance(&self, cx: &mut Context<Self>) {
@@ -554,47 +606,27 @@ impl AppView {
             }
         }
         self.todo.update(cx, |todo, cx| todo.stop_search(cx));
-        // Other sections change tasks and check habits in.
-        if section == Section::Tasks && self.section != Section::Tasks {
-            self.todo.update(cx, |todo, cx| todo.reload(cx));
-        }
-        if section == Section::Things {
-            self.things.update(cx, |things, cx| things.reload(cx));
-            window.focus(&self.things.focus_handle(cx), cx);
-        }
-        if section == Section::Calendar {
-            self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
-            window.focus(&self.calendar.focus_handle(cx), cx);
-        }
-        if section == Section::Matrix {
-            self.matrix.update(cx, |matrix, cx| matrix.reload(cx));
-            window.focus(&self.matrix.focus_handle(cx), cx);
-        }
-        if section == Section::Pomodoro {
-            self.focus.update(cx, |focus, cx| focus.reload(cx));
-            window.focus(&self.focus.focus_handle(cx), cx);
-        }
-        if section == Section::Habits {
-            self.habits.update(cx, |habits, cx| habits.reload(cx));
-            window.focus(&self.habits.focus_handle(cx), cx);
-        }
-        if section == Section::Countdown {
-            self.countdown.update(cx, |countdown, cx| countdown.reload(cx));
-            window.focus(&self.countdown.focus_handle(cx), cx);
-        }
-        if section == Section::LifeClock {
-            self.life_clock.update(cx, |life_clock, cx| life_clock.reload(cx));
-            window.focus(&self.life_clock.focus_handle(cx), cx);
-        }
-        if let Section::Plugin {
-            ref plugin_id,
-            ref view_id,
-        } = section
-        {
-            let view = self.ensure_plugin_view(plugin_id, view_id, window, cx);
-            window.focus(&view.focus_handle(cx), cx);
-        }
+        let plugin_target = match &section {
+            Section::Plugin { plugin_id, view_id } => Some((plugin_id.clone(), view_id.clone())),
+            _ => None,
+        };
         self.section = section;
+        self.sync_active_section(cx);
+        if let Some((plugin_id, view_id)) = plugin_target {
+            let view = self.ensure_plugin_view(plugin_id.as_ref(), view_id.as_ref(), window, cx);
+            window.focus(&view.focus_handle(cx), cx);
+        } else {
+            match &self.section {
+                Section::Tasks | Section::Search | Section::Plugin { .. } => {}
+                Section::Things => window.focus(&self.things.focus_handle(cx), cx),
+                Section::Calendar => window.focus(&self.calendar.focus_handle(cx), cx),
+                Section::Matrix => window.focus(&self.matrix.focus_handle(cx), cx),
+                Section::Pomodoro => window.focus(&self.focus.focus_handle(cx), cx),
+                Section::Habits => window.focus(&self.habits.focus_handle(cx), cx),
+                Section::Countdown => window.focus(&self.countdown.focus_handle(cx), cx),
+                Section::LifeClock => window.focus(&self.life_clock.focus_handle(cx), cx),
+            }
+        }
         self.sync_title_bar_appearance(cx);
         cx.notify();
         true
@@ -778,7 +810,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         self.todo.update(cx, |todo, cx| todo.add_quick_with(text, date, priority, list, cx));
-        self.things.update(cx, |things, cx| things.reload(cx));
+        self.things.update(cx, |things, cx| things.sync_external(cx));
     }
 
     /// Creates a task from a plugin-modified `beforeTaskCreate` draft.
@@ -828,8 +860,13 @@ impl AppView {
 
     fn show_view(&mut self, view: fern_core::View, window: &mut Window, cx: &mut Context<Self>) {
         if self.features.tasks {
+            let target = if view == fern_core::View::Horizons && !self.features.horizons {
+                fern_core::View::Today
+            } else {
+                view
+            };
             if self.select(Section::Tasks, window, cx) {
-                self.todo.update(cx, |todo, cx| todo.select_view(view, window, cx));
+                self.todo.update(cx, |todo, cx| todo.select_view(target, window, cx));
             }
         } else if self.features.things {
             let things_view = match view {
@@ -846,6 +883,7 @@ impl AppView {
                 | fern_core::View::Tag(_)
                 | fern_core::View::Search(_)
                 | fern_core::View::Filter(_)
+                | fern_core::View::Horizons
                 | fern_core::View::Summary => Some(things_ui::ThingsViewKind::Anytime),
                 fern_core::View::Trash => None,
             };
@@ -909,6 +947,7 @@ impl AppView {
     pub(crate) fn open_statistics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.account_menu_open = false;
         self.statistics_open = true;
+        self.sync_active_section(cx);
         self.focus.update(cx, |focus, cx| focus.open_stats_overview(cx));
         window.focus(&self.focus.focus_handle(cx), cx);
         self.sync_title_bar_appearance(cx);
@@ -922,14 +961,13 @@ impl AppView {
     }
 
     fn apply_settings_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The default list, smart list visibility, mini calendar and week start show up in the views.
-        self.todo.update(cx, |todo, cx| todo.reload(cx));
-        self.things.update(cx, |things, cx| things.reload(cx));
-        self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
-        // A section turned off in Features closes.
+        // Sync preferences and feature flags before reloading views so every view sees them live.
         let prefs = self.store.preferences().unwrap_or_default();
         self.features = prefs.features;
         self.rail_items = prefs.rail_items;
+        set_horizons_enabled(prefs.features.horizons);
+        // The default list, smart list visibility, mini calendar, week start and horizons flag show up in the views.
+        self.sync_external_all(cx);
         self.has_sync_config = self.store.sync_config().ok().flatten().is_some();
         if !self.has_sync_config && self.sync != crate::sync::SyncStatus::Off {
             self.set_sync_status(crate::sync::SyncStatus::Off, cx);
@@ -1190,6 +1228,7 @@ impl AppView {
                 && !is_plugin_view_reachable(plugin_id.as_ref(), view_id.as_ref(), &active_views, cx)
             {
                 self.section = first_enabled_task_section(self.features);
+                self.sync_active_section(cx);
             }
         }
 
@@ -1285,6 +1324,7 @@ impl AppView {
             }
             self.statistics_open = false;
             self.focus.update(cx, |focus, cx| focus.close_stats(cx));
+            self.sync_active_section(cx);
             self.sync_title_bar_appearance(cx);
             cx.notify();
             return true;
@@ -1562,14 +1602,8 @@ impl AppView {
         crate::calendar::set_hour12(prefs.hour12);
         crate::calendar::set_date_format(prefs.date_format);
         crate::calendar::set_week_numbers(prefs.week_numbers);
-        self.todo.update(cx, |view, cx| view.reload(cx));
-        self.things.update(cx, |view, cx| view.reload(cx));
-        self.calendar.update(cx, |view, cx| view.reload(cx));
-        self.matrix.update(cx, |view, cx| view.reload(cx));
-        self.countdown.update(cx, |view, cx| view.reload(cx));
-        self.life_clock.update(cx, |view, cx| view.reload(cx));
-        self.habits.update(cx, |view, cx| view.reload(cx));
-        self.focus.update(cx, |view, cx| view.reload(cx));
+        set_horizons_enabled(prefs.features.horizons);
+        self.sync_external_all(cx);
         self.sync_title_bar_appearance(cx);
         cx.notify();
     }
@@ -1647,10 +1681,10 @@ impl AppView {
         }
         self.notices.items.retain(|n| n != notice);
         desktop_common::data_version::data_changed(cx.entity_id(), cx);
-        self.todo.update(cx, |todo, cx| todo.reload(cx));
-        self.things.update(cx, |things, cx| things.reload(cx));
-        self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
-        self.matrix.update(cx, |matrix, cx| matrix.reload(cx));
+        self.todo.update(cx, |todo, cx| todo.sync_external(cx));
+        self.things.update(cx, |things, cx| things.sync_external(cx));
+        self.calendar.update(cx, |calendar, cx| calendar.sync_external(cx));
+        self.matrix.update(cx, |matrix, cx| matrix.sync_external(cx));
         cx.notify();
     }
 
@@ -1757,13 +1791,13 @@ impl AppView {
         self.notices.items.retain(|n| n != notice);
         desktop_common::data_version::data_changed(cx.entity_id(), cx);
         if touched_tasks {
-            self.todo.update(cx, |todo, cx| todo.reload(cx));
-            self.things.update(cx, |things, cx| things.reload(cx));
-            self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
-            self.matrix.update(cx, |matrix, cx| matrix.reload(cx));
+            self.todo.update(cx, |todo, cx| todo.sync_external(cx));
+            self.things.update(cx, |things, cx| things.sync_external(cx));
+            self.calendar.update(cx, |calendar, cx| calendar.sync_external(cx));
+            self.matrix.update(cx, |matrix, cx| matrix.sync_external(cx));
         }
         if touched_habits {
-            self.habits.update(cx, |habits, cx| habits.reload(cx));
+            self.habits.update(cx, |habits, cx| habits.sync_external(cx));
         }
         cx.notify();
     }
@@ -2217,6 +2251,47 @@ impl Render for AppView {
             });
         title_bar::window_frame(root, window, cx)
     }
+}
+
+#[cfg(test)]
+static HORIZONS_FLAG_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(test)]
+thread_local! {
+    static HOLDS_HORIZONS_WRITE_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_horizons_enabled(enabled: bool) {
+    #[cfg(test)]
+    {
+        if HOLDS_HORIZONS_WRITE_LOCK.with(std::cell::Cell::get) {
+            crate::calendar::set_horizons_enabled(enabled);
+        } else {
+            let _read = HORIZONS_FLAG_LOCK.read().unwrap_or_else(|err| err.into_inner());
+            crate::calendar::set_horizons_enabled(enabled);
+        }
+    }
+    #[cfg(not(test))]
+    crate::calendar::set_horizons_enabled(enabled);
+}
+
+#[cfg(test)]
+pub(crate) struct HorizonsFlagGuard(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+
+#[cfg(test)]
+impl Drop for HorizonsFlagGuard {
+    fn drop(&mut self) {
+        crate::calendar::set_horizons_enabled(true);
+        HOLDS_HORIZONS_WRITE_LOCK.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_horizons_flag() -> HorizonsFlagGuard {
+    let guard = HORIZONS_FLAG_LOCK.write().unwrap_or_else(|err| err.into_inner());
+    HOLDS_HORIZONS_WRITE_LOCK.with(|flag| flag.set(true));
+    crate::calendar::set_horizons_enabled(true);
+    HorizonsFlagGuard(guard)
 }
 
 #[cfg(all(test, debug_assertions))]
@@ -3202,5 +3277,79 @@ mod tests {
             assert_eq!(app.read(cx).title_bar.read(cx).caption_appearance(), None);
         });
         assert!(cx.debug_bounds("section-life-clock").is_none());
+    }
+
+    #[gpui::test]
+    fn horizons_view_embeds_in_tasks_and_disabling_feature_falls_back_cleanly(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _horizons_guard = lock_horizons_flag();
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(760.)));
+        cx.run_until_parked();
+
+        // Horizons has no duplicate left-rail icon; it lives inside Tasks as View::Horizons.
+        assert!(cx.debug_bounds("section-horizons").is_none());
+        assert!(crate::calendar::horizons_enabled());
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.show_view(fern_core::View::Horizons, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).section, Section::Tasks);
+        });
+        assert!(cx.debug_bounds("lists-column").is_some());
+        assert!(cx.debug_bounds("horizons-view").is_some());
+
+        // ToggleSidebar collapses and restores the unified Tasks sidebar while on View::Horizons.
+        cx.update(|window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("lists-column").is_none());
+        assert!(cx.debug_bounds("horizons-view").is_some());
+        cx.update(|window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("lists-column").is_some());
+
+        // Turning off Settings -> Features -> Horizons syncs calendar::horizons_enabled() == false
+        // and falls back out of View::Horizons cleanly.
+        let settings_window = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_settings_page(settings_window::Page::Features, window, cx);
+                app.settings.unwrap()
+            })
+        });
+        let mut settings_cx = gpui::VisualTestContext::from_window(settings_window.into(), cx);
+        settings_cx.simulate_resize(gpui::size(px(900.), px(880.)));
+        settings_cx.run_until_parked();
+
+        let horizons_toggle = settings_cx.debug_bounds("settings-feature-6").unwrap();
+        settings_cx.simulate_click(horizons_toggle.center(), gpui::Modifiers::default());
+        settings_cx.run_until_parked();
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert!(!app.read(cx).features.horizons);
+            assert!(!crate::calendar::horizons_enabled());
+            assert_eq!(app.read(cx).section, Section::Tasks);
+        });
+        assert!(cx.debug_bounds("horizons-view").is_none());
+
+        // Re-enabling Features -> Horizons restores calendar::horizons_enabled() == true.
+        let horizons_toggle = settings_cx.debug_bounds("settings-feature-6").unwrap();
+        settings_cx.simulate_click(horizons_toggle.center(), gpui::Modifiers::default());
+        settings_cx.run_until_parked();
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(app.read(cx).features.horizons);
+            assert!(crate::calendar::horizons_enabled());
+        });
     }
 }

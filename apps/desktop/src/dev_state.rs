@@ -210,6 +210,21 @@ pub(crate) fn apply(this: &mut AppView, window: &mut Window, cx: &mut Context<Ap
     if state.split(';').any(|part| matches!(part, "life-clock-hide-rail" | "life-clock-hide-rail=true")) {
         this.set_life_clock_rail_hidden(true, cx);
     }
+    if state.split(';').any(|part| part == "horizons-seed") {
+        seed_horizons(&this.store);
+        this.todo.update(cx, |view, cx| view.reload(cx));
+        this.things.update(cx, |view, cx| view.reload(cx));
+        this.calendar.update(cx, |view, cx| view.reload(cx));
+        this.matrix.update(cx, |view, cx| view.reload(cx));
+    }
+    if state.split(';').any(|part| part == "view=horizons")
+        && this.select(Section::Tasks, window, cx)
+    {
+        this.todo.update(cx, |todo, cx| todo.select_view(fern_core::View::Horizons, window, cx));
+    }
+    if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("horizons-mode=")) {
+        this.todo.update(cx, |todo, cx| todo.dev_horizons_mode(spec, cx));
+    }
     // `countdown-header=title|more`: the header's "Countdown ▾" or "…" menu.
     if let Some(menu) = state.split(';').find_map(|part| part.strip_prefix("countdown-header=")) {
         this.countdown.update(cx, |view, cx| view.dev_header_menu(menu == "more", cx));
@@ -321,11 +336,17 @@ pub(crate) fn apply(this: &mut AppView, window: &mut Window, cx: &mut Context<Ap
                 "focus" => preferences.features.focus = false,
                 "countdown" => preferences.features.countdown = false,
                 "life-clock" | "life_clock" => preferences.features.life_clock = false,
+                "horizons" => preferences.features.horizons = false,
                 _ => {}
             }
         }
         this.store.save_preferences(&preferences).ok();
         this.features = preferences.features;
+        crate::calendar::set_horizons_enabled(preferences.features.horizons);
+        this.todo.update(cx, |view, cx| view.reload(cx));
+        this.things.update(cx, |view, cx| view.reload(cx));
+        this.calendar.update(cx, |view, cx| view.reload(cx));
+        this.matrix.update(cx, |view, cx| view.reload(cx));
     }
     // `sync-config=<server>|<token>`: Settings → Sync filled in.
     if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("sync-config=")) {
@@ -381,5 +402,185 @@ pub(crate) fn apply(this: &mut AppView, window: &mut Window, cx: &mut Context<Ap
         ) {
             search.update(cx, |search, cx| search.dev_filter(spec, cx));
         }
+    }
+}
+
+/// Seeds a rich TimeStripe-style sample dataset for visual QA across Today (including a timed
+/// 11:00–11:30 meeting), current ISO Week, current Month, past Month (rollover demo), Quarter,
+/// Year, Decade, Life, Inbox, and the sample `"Comagic"` board.
+fn seed_horizons(store: &fern_core::Store) {
+    use chrono::NaiveTime;
+    use fern_core::{Horizon, ListDraft, Priority, TaskDraft};
+
+    let today = chrono::Local::now().date_naive();
+    let current_week = Horizon::current_week(today);
+    let current_month = Horizon::current_month(today);
+    let past_month = current_month.shift(-1);
+    let current_quarter = Horizon::current_quarter(today);
+    let current_year = Horizon::current_year(today);
+    let current_decade = Horizon::current_decade(today);
+
+    let board_id = store
+        .add_list(&ListDraft {
+            name: "Comagic".to_owned(),
+            color: Some("#4F7DF3".to_owned()),
+            ..Default::default()
+        })
+        .ok()
+        .map(|l| l.id);
+    let in_progress_sec = board_id
+        .and_then(|id| store.add_list_section(Some(id), "In Progress").ok())
+        .map(|s| s.id);
+    let review_sec = board_id
+        .and_then(|id| store.add_list_section(Some(id), "Review").ok())
+        .map(|s| s.id);
+
+    let meeting_start = NaiveTime::from_hms_opt(11, 0, 0);
+    let meeting_end = NaiveTime::from_hms_opt(11, 30, 0);
+
+    let drafts = [
+        // Inbox
+        TaskDraft {
+            title: "Capture Q1 roadmap notes".to_owned(),
+            tags: vec!["notes".to_owned()],
+            ..Default::default()
+        },
+        TaskDraft {
+            title: "Order standing desk mat".to_owned(),
+            ..Default::default()
+        },
+        // Today (including timed 11:00-11:30 meeting)
+        TaskDraft {
+            title: "Design sync with team".to_owned(),
+            due_date: Some(today),
+            due_time: meeting_start,
+            end_date: Some(today),
+            end_time: meeting_end,
+            priority: Priority::High,
+            tags: vec!["work".to_owned()],
+            notes: "Walk through Horizons layout, rollover UX, and dark mode contrast.".to_owned(),
+            ..Default::default()
+        },
+        TaskDraft {
+            title: "Finalize sprint release checklist".to_owned(),
+            due_date: Some(today),
+            priority: Priority::Medium,
+            list_id: board_id,
+            checklist: vec![
+                ("Verify migrations".to_owned(), true),
+                ("Run clippy and tests".to_owned(), false),
+                ("Tag release notes".to_owned(), false),
+            ],
+            ..Default::default()
+        },
+        TaskDraft {
+            title: "Evening run — 5 km".to_owned(),
+            due_date: Some(today),
+            tags: vec!["health".to_owned()],
+            ..Default::default()
+        },
+        // Current ISO Week
+        TaskDraft {
+            title: "Prepare weekly product metrics digest".to_owned(),
+            horizon: Some(current_week),
+            priority: Priority::Medium,
+            list_id: board_id,
+            tags: vec!["work".to_owned()],
+            ..Default::default()
+        },
+        TaskDraft {
+            title: "Clean up archived project boards".to_owned(),
+            horizon: Some(current_week),
+            ..Default::default()
+        },
+        // Current Month
+        TaskDraft {
+            title: "Ship Horizons panoramic planner".to_owned(),
+            horizon: Some(current_month),
+            priority: Priority::High,
+            list_id: board_id,
+            tags: vec!["launch".to_owned()],
+            ..Default::default()
+        },
+        TaskDraft {
+            title: "Rebalance monthly budget & subscriptions".to_owned(),
+            horizon: Some(current_month),
+            tags: vec!["finance".to_owned()],
+            ..Default::default()
+        },
+        // Past Month (for rollover demo in current Month column)
+        TaskDraft {
+            title: "Audit analytics retention funnel".to_owned(),
+            horizon: Some(past_month),
+            priority: Priority::Low,
+            list_id: board_id,
+            ..Default::default()
+        },
+        TaskDraft {
+            title: "Renew passport appointment".to_owned(),
+            horizon: Some(past_month),
+            ..Default::default()
+        },
+        // Current Quarter
+        TaskDraft {
+            title: "Complete annual security review".to_owned(),
+            horizon: Some(current_quarter),
+            priority: Priority::Medium,
+            ..Default::default()
+        },
+        // Current Year
+        TaskDraft {
+            title: "Run a half marathon under 1h 50m".to_owned(),
+            horizon: Some(current_year),
+            tags: vec!["health".to_owned()],
+            ..Default::default()
+        },
+        TaskDraft {
+            title: "Launch Fern 2.0 across Windows, macOS & Linux".to_owned(),
+            horizon: Some(current_year),
+            priority: Priority::High,
+            ..Default::default()
+        },
+        // Current Decade
+        TaskDraft {
+            title: "Build a self-sustaining indie studio".to_owned(),
+            horizon: Some(current_decade),
+            ..Default::default()
+        },
+        // Life
+        TaskDraft {
+            title: "Write and publish a technical book".to_owned(),
+            horizon: Some(Horizon::Life),
+            ..Default::default()
+        },
+        TaskDraft {
+            title: "Learn conversational Japanese".to_owned(),
+            horizon: Some(Horizon::Life),
+            tags: vec!["personal".to_owned()],
+            ..Default::default()
+        },
+        // Board "Comagic" tasks across default + named sections
+        TaskDraft {
+            title: "Draft onboarding tour copy".to_owned(),
+            list_id: board_id,
+            ..Default::default()
+        },
+        TaskDraft {
+            title: "Build webhook retry monitor".to_owned(),
+            list_id: board_id,
+            section_id: in_progress_sec,
+            priority: Priority::Medium,
+            ..Default::default()
+        },
+        TaskDraft {
+            title: "QA dark mode contrast on call logs".to_owned(),
+            list_id: board_id,
+            section_id: review_sec,
+            ..Default::default()
+        },
+    ];
+
+    for draft in drafts {
+        let _ = store.create_task(draft, false);
     }
 }

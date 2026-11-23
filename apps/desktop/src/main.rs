@@ -140,7 +140,7 @@ fn open_store(dir: &Path) -> Result<(Store, bool, PathBuf, desktop_common::diagn
     }
     let db_health = match recovered_health {
         Some(health) => health,
-        None => match store.integrity_check() {
+        None => match store.quick_check() {
             Ok(msgs) if msgs.len() == 1 && msgs[0].eq_ignore_ascii_case("ok") => {
                 desktop_common::diagnostics::DbHealth {
                     healthy: true,
@@ -150,10 +150,10 @@ fn open_store(dir: &Path) -> Result<(Store, bool, PathBuf, desktop_common::diagn
             }
             Ok(msgs) => {
                 if msgs.is_empty() {
-                    desktop_common::diagnostics::log_event("db", "integrity check returned no rows");
+                    desktop_common::diagnostics::log_event("db", "quick check returned no rows");
                 } else {
                     for msg in &msgs {
-                        desktop_common::diagnostics::log_event("db", format!("integrity check: {msg}"));
+                        desktop_common::diagnostics::log_event("db", format!("quick check: {msg}"));
                     }
                 }
                 desktop_common::diagnostics::DbHealth {
@@ -163,7 +163,7 @@ fn open_store(dir: &Path) -> Result<(Store, bool, PathBuf, desktop_common::diagn
                 }
             }
             Err(err) => {
-                let msg = format!("integrity check failed: {err:#}");
+                let msg = format!("quick check failed: {err:#}");
                 desktop_common::diagnostics::log_event("db", &msg);
                 desktop_common::diagnostics::DbHealth {
                     healthy: false,
@@ -273,13 +273,6 @@ fn main() -> Result<()> {
     if first_start && let Err(err) = add_welcome_tasks(&store, locale.strings()) {
         eprintln!("failed to add the welcome tasks: {err:#}");
     }
-    // Fern keeps the data on this device only, so it saves a copy of it once a day (but not
-    // the throwaway data of the debug build's screenshots).
-    if std::env::var_os("FERN_DEV_STATE").is_none()
-        && let Err(err) = backups_dir().and_then(|dir| store.daily_backup(&dir, chrono::Local::now().date_naive(), DAILY_BACKUPS))
-    {
-        eprintln!("failed to back up the data: {err:#}");
-    }
 
     let platform = gpui_platform::current_platform(false);
     let text_system = platform.text_system();
@@ -309,12 +302,12 @@ fn main() -> Result<()> {
         ui::init_label_metrics(text_system, cx);
         theme::init(cx);
         user_themes::load(cx);
-        let initial_theme_selection = store.preferences().unwrap_or_default().theme;
+        let initial_prefs = store.preferences().unwrap_or_default();
         let system_dark = matches!(
             cx.window_appearance(),
             gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
         );
-        apply_initial_theme(&initial_theme_selection, system_dark, cx);
+        apply_initial_theme(&initial_prefs.theme, system_dark, cx);
         cx.set_http_client(http::UreqHttpClient::new());
         if let Err(err) = Assets.load_fonts(cx) {
             eprintln!("failed to load the fonts: {err:#}");
@@ -352,7 +345,8 @@ fn main() -> Result<()> {
                 touch::init(window, cx);
                 tray::init(window, &store, cx);
                 cx.new(|cx| {
-                    let mut view = AppView::new(store, first_start, window, cx);
+                    let mut view =
+                        AppView::new_with_preferences(store, initial_prefs, first_start, window, cx);
                     if let Some(link) = initial_link {
                         view.open_deep_link(link, window, cx);
                     }
@@ -361,6 +355,23 @@ fn main() -> Result<()> {
             },
         )
         .expect("failed to open the main window");
+        // Fern keeps the data on this device only, so it saves a copy of it once a day (but not
+        // the throwaway data of the debug build's screenshots). Run off the UI thread after the
+        // main window is open so cold startup stays instant even with a large tasks.db.
+        if std::env::var_os("FERN_DEV_STATE").is_none() {
+            let backup_db_path = cx.global::<DbPath>().0.clone();
+            cx.background_spawn(async move {
+                let today = chrono::Local::now().date_naive();
+                let res = backups_dir().and_then(|dir| {
+                    let backup_store = Store::open(&backup_db_path)?;
+                    backup_store.daily_backup(&dir, today, DAILY_BACKUPS)
+                });
+                if let Err(err) = res {
+                    eprintln!("failed to back up the data: {err:#}");
+                }
+            })
+            .detach();
+        }
         if !safe_mode
             && let Some(mgr) = plugin_ui::PluginHost::global(cx).and_then(|h| h.manager().cloned())
         {

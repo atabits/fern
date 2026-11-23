@@ -258,7 +258,7 @@ impl SettingsWindow {
                 .role(gpui::Role::RadioButton)
                 .aria_toggled(selected.into())
                 .aria_label(label.clone())
-                .w(px(72.))
+                .w(px(88.))
                 .flex_none()
                 .items_center()
                 .py_1()
@@ -416,7 +416,8 @@ impl SettingsWindow {
                 h_flex()
                     .flex_wrap()
                     .items_start()
-                    .gap_1()
+                    .gap_x_1()
+                    .gap_y_2()
                     .children(custom_themes.into_iter().map(|theme| {
                         let id = SharedString::from(format!("custom-theme-{}", theme.id()));
                         let selected = active.id() == theme.id();
@@ -498,7 +499,8 @@ impl SettingsWindow {
                         h_flex()
                             .flex_wrap()
                             .items_start()
-                            .gap_1()
+                            .gap_x_1()
+                            .gap_y_2()
                             .children(bundled_light.into_iter().enumerate().map(
                                 |(idx, theme)| {
                                     let selected = active.id() == theme.id();

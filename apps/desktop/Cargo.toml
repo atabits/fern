@@ -25,7 +25,6 @@ life_clock_ui.workspace = true
 matrix_ui.workspace = true
 plugins.workspace = true
 plugin_ui.workspace = true
-resvg.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -35,15 +34,16 @@ theme.workspace = true
 things_ui.workspace = true
 todo_ui.workspace = true
 ui.workspace = true
-usvg.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 futures.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
-notify-rust.workspace = true
 raw-window-handle.workspace = true
 ureq.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+notify-rust.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
@@ -60,6 +60,7 @@ objc2-user-notifications.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 async-io.workspace = true
 ksni.workspace = true
+resvg.workspace = true
 x11rb.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]

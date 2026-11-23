@@ -20,7 +20,7 @@ use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 /// How many tasks the popover lists before "View more".
 const TASK_LIMIT: usize = 5;
 /// Delay before querying SQLite while the user is actively typing.
-const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(40);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Filter {
@@ -69,6 +69,7 @@ pub struct SearchModal {
     all_lists: Vec<List>,
     all_tags: Vec<Tag>,
     search_task: Option<gpui::Task<()>>,
+    pending_search: bool,
     /// The Task filter's choices, the open dropdown, and the choices being made in it (applied
     /// with OK, as the original's), with the Custom dates' fields.
     task_filter: TaskFilter,
@@ -138,6 +139,7 @@ impl SearchModal {
             all_lists,
             all_tags,
             search_task: None,
+            pending_search: false,
             task_filter: TaskFilter::default(),
             menu: None,
             draft: TaskFilter::default(),
@@ -168,6 +170,12 @@ impl SearchModal {
     }
 
     fn schedule_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.query(cx).is_empty() {
+            self.pending_search = false;
+            self.refresh(cx);
+            return;
+        }
+        self.pending_search = true;
         self.search_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
             this.update(cx, |this, cx| this.refresh(cx)).ok();
@@ -176,6 +184,7 @@ impl SearchModal {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.search_task = None;
+        self.pending_search = false;
         let query = self.query(cx);
         let today = Local::now().date_naive();
         self.tasks = self.store.tasks_in(&View::Search(query.clone()), today).unwrap_or_default();
@@ -724,6 +733,9 @@ impl Render for SearchModal {
                         .and_then(|id| self.all_lists.iter().find(|l| l.id == id))
                         .map_or(SharedString::new_static(strings.inbox), |l| l.name.clone().into());
                     let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
+                    let horizon = crate::calendar::horizons_enabled()
+                        .then(|| task_rows::horizon_badge(task, today, strings))
+                        .flatten();
                     let title_matches = !task_rows::match_ranges(&task.title, &query).is_empty();
                     let note = (!title_matches).then(|| task_rows::snippet(&task.notes, &query, 30)).flatten();
                     let location_match = task
@@ -779,6 +791,25 @@ impl Render for SearchModal {
                                         Label::new(label)
                                             .size(LabelSize::XSmall)
                                             .color(if overdue && !task.is_completed() { Color::Error } else { Color::Accent }),
+                                    )
+                                })
+                                .when_some(horizon, |el, (label, past)| {
+                                    let (fg, bg, border) =
+                                        task_rows::horizon_badge_style(past, task.is_closed(), &theme);
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .px(px(6.))
+                                            .py(px(1.))
+                                            .rounded(px(4.))
+                                            .bg(bg)
+                                            .border_1()
+                                            .border_color(border)
+                                            .child(
+                                                Label::new(label)
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Custom(fg)),
+                                            ),
                                     )
                                 })
                                 .child(Label::new(list).size(LabelSize::XSmall).color(Color::Muted)),
@@ -960,6 +991,7 @@ impl Render for SearchModal {
             Vec::new()
         };
         let nothing = has_query
+            && !self.pending_search
             && task_rows.is_empty()
             && habit_rows.is_empty()
             && tag_rows.is_empty()

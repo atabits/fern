@@ -212,6 +212,7 @@ pub fn apply(preferences: &Preferences, window: &Window, cx: &mut App) {
     calendar::set_hour12(preferences.hour12);
     calendar::set_date_format(preferences.date_format);
     calendar::set_week_numbers(preferences.week_numbers);
+    crate::app_view::set_horizons_enabled(preferences.features.horizons);
     if !refreshed {
         cx.refresh_windows();
     }
@@ -2056,9 +2057,14 @@ impl SettingsWindow {
                         cx,
                     )
                 };
-                let [all, today, tomorrow, next7, inbox, summary, tags, filters, completed, wont_do, trash] = SmartList::ALL;
+                let [all, today, tomorrow, next7, inbox, horizons, summary, tags, filters, completed, wont_do, trash] = SmartList::ALL;
+                let mut top_lists = vec![all, today, tomorrow, next7, inbox];
+                if self.preferences.features.horizons {
+                    top_lists.push(horizons);
+                }
+                top_lists.push(summary);
                 body.child(title(strings.settings_pages[0]))
-                    .child(group().children([all, today, tomorrow, next7, inbox, summary].map(|l| row(self, l, cx))))
+                    .child(group().children(top_lists.into_iter().map(|l| row(self, l, cx))))
                     .child(group().children([tags, filters].map(|l| row(self, l, cx))))
                     .child(group().children([completed, wont_do, trash].map(|l| row(self, l, cx))))
                     .into_any_element()
@@ -2524,14 +2530,16 @@ impl SettingsWindow {
                     features.focus,
                     features.countdown,
                     features.life_clock,
+                    features.horizons,
                 ];
-                let toggles: [fn(&mut fern_core::Features); 6] = [
+                let toggles: [fn(&mut fern_core::Features); 7] = [
                     |f| f.calendar = !f.calendar,
                     |f| f.matrix = !f.matrix,
                     |f| f.habits = !f.habits,
                     |f| f.focus = !f.focus,
                     |f| f.countdown = !f.countdown,
                     |f| f.life_clock = !f.life_clock,
+                    |f| f.horizons = !f.horizons,
                 ];
                 body.child(title(strings.features))
                     .child(
@@ -2877,6 +2885,7 @@ fn smart_list_label(list: SmartList, strings: &i18n::Strings) -> (IconName, &'st
         SmartList::Tomorrow => (IconName::Sunrise, strings.tomorrow),
         SmartList::Next7Days => (IconName::CalendarRange, strings.next_7_days_short),
         SmartList::Inbox => (IconName::Inbox, strings.inbox),
+        SmartList::Horizons => (IconName::FernHorizons, strings.section_horizons),
         SmartList::Summary => (IconName::FileText, strings.summary),
         SmartList::Tags => (IconName::Tag, strings.tags),
         SmartList::Filters => (IconName::Funnel, strings.filters),

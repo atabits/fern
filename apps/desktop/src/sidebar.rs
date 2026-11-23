@@ -590,49 +590,6 @@ fn side_tooltip(text: impl Into<SharedString>, beta: bool, cx: &App) -> impl Int
     ))
 }
 
-fn usvg_safe_options() -> usvg::Options<'static> {
-    usvg::Options {
-        image_href_resolver: usvg::ImageHrefResolver {
-            resolve_data: Box::new(|_, _, _| None),
-            resolve_string: Box::new(|_, _| None),
-        },
-        ..Default::default()
-    }
-}
-
-fn rasterize_rail_svg_uncached(
-    raw_svg: &str,
-    r: u8,
-    g: u8,
-    b: u8,
-    cx: &mut App,
-) -> Option<Arc<RenderImage>> {
-    let sanitized = plugins::ui_ast::sanitize_svg(raw_svg).ok()?;
-    let resolved_svg = if sanitized.to_ascii_lowercase().contains("currentcolor") {
-        let hex = format!("#{r:02x}{g:02x}{b:02x}");
-        replace_ascii_case_insensitive(&sanitized, "currentcolor", &hex)
-    } else {
-        sanitized
-    };
-
-    let opts = usvg_safe_options();
-    let tree = usvg::Tree::from_str(&resolved_svg, &opts).ok()?;
-    let svg_size = tree.size();
-    let sx = RAIL_ICON_PX as f32 / svg_size.width().max(1.0);
-    let sy = RAIL_ICON_PX as f32 / svg_size.height().max(1.0);
-    let scale = sx.min(sy);
-    let dx = (RAIL_ICON_PX as f32 - svg_size.width() * scale) * 0.5;
-    let dy = (RAIL_ICON_PX as f32 - svg_size.height() * scale) * 0.5;
-
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(RAIL_ICON_PX, RAIL_ICON_PX)?;
-    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(dx, dy);
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
-
-    let png = pixmap.encode_png().ok()?;
-    let gpui_img = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
-    gpui_img.to_image_data(cx.svg_renderer()).ok()
-}
-
 fn rasterize_rail_svg(
     raw_svg: &str,
     color: Hsla,
@@ -651,7 +608,7 @@ fn rasterize_rail_svg(
         return cached;
     }
 
-    let render_img = rasterize_rail_svg_uncached(raw_svg, r, g, b, cx);
+    let render_img = plugin_ui::rasterize_svg(raw_svg, RAIL_ICON_PX, RAIL_ICON_PX, (r, g, b), cx);
     if cx.try_global::<RailSvgCache>().is_none() {
         cx.set_global(RailSvgCache::default());
     }
@@ -671,24 +628,6 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
-}
-
-fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
-    let lower = haystack.to_ascii_lowercase();
-    let needle_lower = needle.to_ascii_lowercase();
-    let mut out = String::with_capacity(haystack.len());
-    let mut last = 0;
-    for (idx, _) in lower.match_indices(&needle_lower) {
-        if let Some(prefix) = haystack.get(last..idx) {
-            out.push_str(prefix);
-        }
-        out.push_str(replacement);
-        last = idx + needle_lower.len();
-    }
-    if let Some(tail) = haystack.get(last..) {
-        out.push_str(tail);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -773,7 +712,7 @@ mod tests {
 
     #[test]
     fn usvg_safe_options_disables_external_and_data_image_resolvers() {
-        let opts = usvg_safe_options();
+        let opts = plugin_ui::safe_usvg_options();
         assert!((opts.image_href_resolver.resolve_string)("C:\\Windows\\win.ini", &opts).is_none());
         assert!((opts.image_href_resolver.resolve_string)("\\\\attacker\\share\\a.png", &opts).is_none());
         assert!((opts.image_href_resolver.resolve_data)("image/svg+xml", Arc::new(Vec::new()), &opts).is_none());

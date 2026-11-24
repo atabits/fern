@@ -1607,8 +1607,10 @@ pub fn apply_migrations_up_to(conn: &Connection, target_version: usize) -> Resul
         "target schema version {target_version} exceeds {}",
         MIGRATIONS.len()
     );
-    let mut version: usize =
-        retry_sqlite_busy(|| conn.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+    let mut version: usize = usize::try_from(retry_sqlite_busy(|| {
+        conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+    })?)
+    .unwrap_or(0);
     anyhow::ensure!(version <= MIGRATIONS.len(), "the data comes from a newer version of Fern");
     while version < target_version {
         let i = version;
@@ -1636,14 +1638,17 @@ pub fn apply_migrations_up_to(conn: &Connection, target_version: usize) -> Resul
                 let tx = retry_sqlite_busy(|| {
                     Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
                 })?;
-                let current: usize = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+                let current: usize = usize::try_from(
+                    tx.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))?,
+                )
+                .unwrap_or(0);
                 anyhow::ensure!(
                     current <= MIGRATIONS.len(),
                     "the data comes from a newer version of Fern"
                 );
                 let outcome = if current <= i {
                     tx.execute_batch(sql)?;
-                    tx.pragma_update(None, "user_version", i + 1)?;
+                    tx.pragma_update(None, "user_version", (i + 1) as i64)?;
                     (i + 1, true)
                 } else {
                     (current, false)
@@ -1660,7 +1665,10 @@ pub fn apply_migrations_up_to(conn: &Connection, target_version: usize) -> Resul
             let tx = retry_sqlite_busy(|| {
                 Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
             })?;
-            let mut current: usize = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            let mut current: usize = usize::try_from(
+                tx.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))?,
+            )
+            .unwrap_or(0);
             anyhow::ensure!(
                 current <= MIGRATIONS.len(),
                 "the data comes from a newer version of Fern"
@@ -1668,7 +1676,7 @@ pub fn apply_migrations_up_to(conn: &Connection, target_version: usize) -> Resul
             while current < target_version && !MIGRATIONS[current].contains("PRAGMA foreign_keys = OFF") {
                 tx.execute_batch(MIGRATIONS[current])?;
                 current += 1;
-                tx.pragma_update(None, "user_version", current)?;
+                tx.pragma_update(None, "user_version", current as i64)?;
             }
             tx.commit()?;
             version = current;

@@ -3,7 +3,8 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use chrono::{Datelike, NaiveDate};
 use gpui::{

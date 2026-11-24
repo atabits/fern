@@ -15,7 +15,7 @@ pub(crate) use desktop_common::paths::{
     DAILY_BACKUPS, attachments_dir, backups_dir, data_dir, pending_restore_path, scratch_dir,
 };
 pub(crate) use task_ui::{
-    lists_panel, task_detail, task_rows,
+    lists_panel, search_modal, task_detail, task_rows,
 };
 pub(crate) use calendar_ui as calendar_view;
 pub(crate) use countdown_ui as countdown_view;
@@ -31,7 +31,6 @@ pub(crate) use fern_i18n as i18n;
 mod release_notes;
 mod quick_add_window;
 mod reminders;
-mod search_modal;
 mod settings_window;
 mod sidebar;
 #[cfg(windows)]

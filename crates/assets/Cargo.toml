@@ -14,3 +14,6 @@ path = "src/assets.rs"
 anyhow.workspace = true
 gpui.workspace = true
 rust-embed.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rust-embed = { workspace = true, features = ["debug-embed"] }

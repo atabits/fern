@@ -433,7 +433,7 @@ impl Store {
         anyhow::ensure!(parts.len() == keys.len(), "malformed sync key for {entity}");
         let condition: Vec<String> = keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 1)).collect();
         let mut stmt = self.conn.prepare_cached(&format!("SELECT * FROM {entity} WHERE {}", condition.join(" AND ")))?;
-        let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
+        let names: Vec<String> = stmt.column_names().map(str::to_owned).collect();
         let mut row = stmt
             .query_row(params_from_iter(parts), |row| {
                 let mut map = Map::new();

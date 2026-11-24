@@ -16,6 +16,7 @@ icons.workspace = true
 smallvec.workspace = true
 theme.workspace = true
 usvg.workspace = true
+web-time.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

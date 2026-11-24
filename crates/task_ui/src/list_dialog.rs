@@ -264,7 +264,7 @@ impl ListDialog {
                     .child(div().mx_1().w(px(1.)).h(px(14.)).bg(theme.colors().border))
                     .child(div().flex_1())
                     .child(text_button("emoji-random", strings.emoji_random).on_click(cx.listener(|this, _, _, cx| {
-                        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+                        let seed = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
                         this.update(cx, |this| this.draft.icon = Some(crate::emoji::pick(seed / 1000).to_owned()))
                     })))
                     .child(text_button("emoji-reset", strings.emoji_reset).on_click(cx.listener(|this, _, _, cx| {

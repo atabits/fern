@@ -9,7 +9,9 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use chrono::{Local, NaiveDate, TimeZone};
 use fern_core::caldav;
-use fern_core::ical::{self, CalendarKind, CalendarProvider, Event, EventDirty, EventDraft, StoredEvent, Subscription};
+#[cfg(not(target_arch = "wasm32"))]
+use fern_core::ical::EventDirty;
+use fern_core::ical::{self, CalendarKind, CalendarProvider, Event, EventDraft, StoredEvent, Subscription};
 use fern_core::{Id, Store};
 use gpui::{App, AppContext as _, Context, Entity, Global};
 
@@ -17,6 +19,7 @@ use gpui::{App, AppContext as _, Context, Entity, Global};
 const FIRST_READ_AFTER: Duration = Duration::from_secs(5);
 const READ_EVERY: Duration = Duration::from_secs(30 * 60);
 /// The largest feed read, so that a wrong address cannot fill the memory.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_FEED: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -552,6 +555,7 @@ struct CalDavSyncOutcome {
     errors: Vec<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn dav_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(30)))
@@ -562,6 +566,7 @@ fn dav_agent() -> ureq::Agent {
 }
 
 /// Discovers CalDAV calendars under `url` via `PROPFIND` principal -> calendar-home-set -> calendars.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn discover_caldav_calendars(url: &str, username: &str, password: &str) -> Result<Vec<DiscoveredCalendar>> {
     let base_url = normalize_https_url(url);
     anyhow::ensure!(!base_url.is_empty(), "a CalDAV URL is required");
@@ -646,6 +651,7 @@ pub fn discover_caldav_calendars(url: &str, username: &str, password: &str) -> R
     Ok(listed)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn push_caldav_upsert(
     agent: &ureq::Agent,
     base_url: &str,
@@ -700,6 +706,7 @@ fn push_caldav_upsert(
     anyhow::bail!("CalDAV PUT {target} returned HTTP {status}");
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn push_caldav_delete(
     agent: &ureq::Agent,
     base_url: &str,
@@ -733,6 +740,7 @@ fn push_caldav_delete(
     anyhow::bail!("CalDAV DELETE {target} returned HTTP {status}");
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn pull_caldav_remote(
     agent: &ureq::Agent,
     sub: &Subscription,
@@ -836,6 +844,7 @@ fn pull_caldav_remote(
     Ok(remote)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn sync_caldav_remote(sub: &Subscription, local_events: &[StoredEvent]) -> CalDavSyncOutcome {
     let base_url = normalize_https_url(&sub.url);
     let auth = caldav::auth_header(&sub.username, &sub.password);
@@ -871,6 +880,7 @@ fn sync_caldav_remote(sub: &Subscription, local_events: &[StoredEvent]) -> CalDa
     CalDavSyncOutcome { upserts_pushed, deletes_pushed, remote, sync_token: None, errors }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn first_event_uid(ics: &str, fallback_href: &str) -> Option<String> {
     let parsed = ical::parse(ics);
     if let Some(ev) = parsed.first()
@@ -886,6 +896,7 @@ fn first_event_uid(ics: &str, fallback_href: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn normalize_https_url(url: &str) -> String {
     let url = url.trim();
     match url.strip_prefix("webcal://") {
@@ -894,6 +905,7 @@ fn normalize_https_url(url: &str) -> String {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn dav_request(
     agent: &ureq::Agent,
@@ -930,6 +942,7 @@ fn dav_request(
 }
 
 /// Reads a feed; `webcal://` addresses are read over HTTPS, as calendar apps do.
+#[cfg(not(target_arch = "wasm32"))]
 fn fetch(url: &str) -> Result<String> {
     let url = url.trim();
     let url = match url.strip_prefix("webcal://") {
@@ -947,6 +960,27 @@ fn fetch(url: &str) -> Result<String> {
     let text = response.body_mut().with_config().limit(MAX_FEED).read_to_string()?;
     anyhow::ensure!(text.contains("BEGIN:VCALENDAR"), "the address gives no calendar");
     Ok(text)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn discover_caldav_calendars(_url: &str, _username: &str, _password: &str) -> Result<Vec<DiscoveredCalendar>> {
+    anyhow::bail!("CalDAV discovery is unavailable in the browser build")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn sync_caldav_remote(_sub: &Subscription, _local_events: &[StoredEvent]) -> CalDavSyncOutcome {
+    CalDavSyncOutcome {
+        upserts_pushed: Vec::new(),
+        deletes_pushed: Vec::new(),
+        remote: None,
+        sync_token: None,
+        errors: vec!["CalDAV sync is unavailable in the browser build".to_owned()],
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fetch(_url: &str) -> Result<String> {
+    anyhow::bail!("remote iCal feeds are unavailable in the browser build")
 }
 
 #[cfg(test)]

@@ -583,7 +583,7 @@ fn inbox_sections_migration_keeps_tasks_in_their_sections() -> Result<()> {
     for sql in &MIGRATIONS[..before] {
         conn.execute_batch(sql)?;
     }
-    conn.pragma_update(None, "user_version", before)?;
+    conn.pragma_update(None, "user_version", before as i64)?;
     conn.execute_batch(
         "INSERT INTO lists (id, name, created_at) VALUES ('l', 'Home', 0);
          INSERT INTO list_sections (id, list_id, name, created_at) VALUES ('s', 'l', 'Kitchen', 0);",

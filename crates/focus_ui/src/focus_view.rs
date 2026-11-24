@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Local, NaiveDate};
 #[cfg(debug_assertions)]

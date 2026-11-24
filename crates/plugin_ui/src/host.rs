@@ -261,6 +261,7 @@ fn sync_hooks_global(
     let Some(mgr) = mgr else {
         hooks_active.store(false, Ordering::Release);
         PluginHooksGlobal::clear_global(cx);
+        desktop_common::plugin_bus::set_plugin_search_dispatcher(None, cx);
         return;
     };
     let mgr_create = mgr.clone();
@@ -286,6 +287,10 @@ fn sync_hooks_global(
     )
     .with_active_check(Arc::new(move || hooks_active.load(Ordering::Acquire)));
     PluginHooksGlobal::set_global(hooks, cx);
+    desktop_common::plugin_bus::set_plugin_search_dispatcher(
+        Some(std::rc::Rc::new(PluginHost::search_async)),
+        cx,
+    );
 }
 
 impl Global for PluginHost {}
@@ -549,6 +554,7 @@ impl PluginHost {
     pub fn shutdown(cx: &mut App) {
         dismiss_active_modal_on_shutdown(cx);
         PluginHooksGlobal::clear_global(cx);
+        desktop_common::plugin_bus::set_plugin_search_dispatcher(None, cx);
         if cx.has_global::<Self>() {
             cx.update_global::<Self, _>(|host, _| {
                 host.shutdown_inner();

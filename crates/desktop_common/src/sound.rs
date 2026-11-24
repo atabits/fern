@@ -64,13 +64,25 @@ pub fn set_white_noise(store: &Store, preset: WhiteNoise) -> anyhow::Result<()> 
 /// PCM synthesis and OS audio playback run on a dedicated background audio thread so
 /// the UI thread never stalls.
 pub fn sync_white_noise(active: bool, preset: WhiteNoise) {
-    #[cfg(not(test))]
+    #[cfg(all(not(test), not(target_arch = "wasm32")))]
     {
         let desired = if active { preset } else { WhiteNoise::Off };
         if desired == WhiteNoise::Off && AUDIO_TX.get().is_none() {
             return;
         }
         send_audio(AudioCommand::SetWhiteNoise(desired));
+    }
+    #[cfg(all(not(test), target_arch = "wasm32"))]
+    {
+        let desired = if active { preset } else { WhiteNoise::Off };
+        if desired == WhiteNoise::Off {
+            wasm_audio::stop_loop();
+        } else {
+            let wav = white_noise_wav(desired);
+            if !wav.is_empty() {
+                wasm_audio::play_loop(wav);
+            }
+        }
     }
     #[cfg(test)]
     {
@@ -94,25 +106,60 @@ pub fn set_enabled(store: &Store, on: bool) -> anyhow::Result<()> {
 /// Plays a short, crisp chime when a task or habit is completed.
 pub fn play_complete(store: &Store) {
     if enabled(store) {
-        #[cfg(not(test))]
+        #[cfg(all(not(test), not(target_arch = "wasm32")))]
         send_audio(AudioCommand::PlayChime(Chime::Complete));
+        #[cfg(all(not(test), target_arch = "wasm32"))]
+        wasm_audio::play_once(complete_wav());
     }
 }
 
 /// Plays a warm three-note chime when a Pomodoro session finishes.
 pub fn play_focus_done(store: &Store) {
     if enabled(store) {
-        #[cfg(not(test))]
+        #[cfg(all(not(test), not(target_arch = "wasm32")))]
         send_audio(AudioCommand::PlayChime(Chime::FocusDone));
+        #[cfg(all(not(test), target_arch = "wasm32"))]
+        wasm_audio::play_once(focus_done_wav());
     }
 }
 
+#[cfg(all(not(test), target_arch = "wasm32"))]
+mod wasm_audio {
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_namespace = ["window", "__fernAudio"], js_name = playOnce, catch)]
+        fn js_play_once(wav: &[u8]) -> Result<(), JsValue>;
+
+        #[wasm_bindgen(js_namespace = ["window", "__fernAudio"], js_name = playLoop, catch)]
+        fn js_play_loop(wav: &[u8]) -> Result<(), JsValue>;
+
+        #[wasm_bindgen(js_namespace = ["window", "__fernAudio"], js_name = stopLoop, catch)]
+        fn js_stop_loop() -> Result<(), JsValue>;
+    }
+
+    pub(super) fn play_once(wav: &[u8]) {
+        let _ = js_play_once(wav);
+    }
+
+    pub(super) fn play_loop(wav: &[u8]) {
+        let _ = js_play_loop(wav);
+    }
+
+    pub(super) fn stop_loop() {
+        let _ = js_stop_loop();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Chime {
     Complete,
     FocusDone,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Chime {
     fn duration(self) -> std::time::Duration {
         // Slightly longer than the synthesized chime tail (0.21s / 0.52s) so looping ambient
@@ -124,12 +171,14 @@ impl Chime {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AudioCommand {
     SetWhiteNoise(WhiteNoise),
     PlayChime(Chime),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AudioEffect {
     None,
@@ -141,12 +190,14 @@ enum AudioEffect {
 /// Pure single-channel playback coordinator: because single-stream backends replace active
 /// looping ambient audio when a chime plays, this state machine tracks the desired ambient preset
 /// and schedules an automatic resume once the chime ends.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct AudioState {
     desired_ambient: WhiteNoise,
     resume_at: Option<std::time::Instant>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl AudioState {
     fn handle(&mut self, cmd: AudioCommand, now: std::time::Instant) -> AudioEffect {
         match cmd {
@@ -179,11 +230,11 @@ impl AudioState {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
 static AUDIO_TX: std::sync::OnceLock<std::sync::mpsc::Sender<AudioCommand>> =
     std::sync::OnceLock::new();
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
 fn send_audio(cmd: AudioCommand) {
     let tx = AUDIO_TX.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<AudioCommand>();
@@ -195,7 +246,7 @@ fn send_audio(cmd: AudioCommand) {
     let _ = tx.send(cmd);
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
 fn apply_effect(backend: &mut AudioBackend, effect: AudioEffect) {
     match effect {
         AudioEffect::None => {}
@@ -206,7 +257,7 @@ fn apply_effect(backend: &mut AudioBackend, effect: AudioEffect) {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
 fn audio_worker(rx: std::sync::mpsc::Receiver<AudioCommand>) {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
@@ -736,10 +787,10 @@ impl AudioBackend {
     }
 }
 
-#[cfg(all(not(any(windows, target_os = "macos", target_os = "linux")), not(test)))]
+#[cfg(all(not(any(windows, target_os = "macos", target_os = "linux", target_arch = "wasm32")), not(test)))]
 struct AudioBackend;
 
-#[cfg(all(not(any(windows, target_os = "macos", target_os = "linux")), not(test)))]
+#[cfg(all(not(any(windows, target_os = "macos", target_os = "linux", target_arch = "wasm32")), not(test)))]
 impl AudioBackend {
     fn new() -> Self {
         Self

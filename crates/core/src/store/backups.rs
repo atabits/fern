@@ -79,7 +79,8 @@ impl Store {
 
     /// Returns the database's current `PRAGMA user_version`.
     pub fn schema_version(&self) -> Result<usize> {
-        Ok(self.conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
+        let v: i64 = self.conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        Ok(usize::try_from(v).unwrap_or(0))
     }
 
     /// Returns row counts for the primary user-facing tables.
@@ -105,8 +106,11 @@ impl Store {
             .optional()?
             .unwrap_or(false);
         anyhow::ensure!(is_fern, "not a Fern backup");
-        let version: usize = backup.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        anyhow::ensure!(version <= SCHEMA_VERSION, "the backup comes from a newer version of Fern");
+        let version: i64 = backup.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        anyhow::ensure!(
+            usize::try_from(version).is_ok_and(|v| v <= SCHEMA_VERSION),
+            "the backup comes from a newer version of Fern"
+        );
         Ok(())
     }
 
@@ -114,7 +118,7 @@ impl Store {
     /// (the attachment folder), the attached files go into the copy too, in a `backup_files`
     /// table, so that the backup stays one file.
     pub fn backup_to(&self, path: &std::path::Path, attachments: Option<&std::path::Path>) -> Result<()> {
-        self.conn.backup(rusqlite::MAIN_DB, path, None)?;
+        self.conn.backup(rusqlite::MAIN_DB, path, None::<fn(rusqlite::backup::Progress)>)?;
         if let Some(dir) = attachments.filter(|dir| dir.is_dir()) {
             let copy = Connection::open(path)?;
             copy.execute_batch("CREATE TABLE backup_files (name TEXT PRIMARY KEY, data BLOB NOT NULL);")?;

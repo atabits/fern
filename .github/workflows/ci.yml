@@ -49,3 +49,27 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  wasm-check:
+    name: WASM shared crates check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32-check
+
+      - name: Check shared crates for wasm32
+        run: >-
+          cargo check --target wasm32-unknown-unknown --locked
+          -p fern_core -p assets -p calendar_ui -p countdown_ui
+          -p desktop_common -p desktop_sync -p fern_i18n -p focus_ui
+          -p habit_ui -p horizons_ui -p icons -p life_clock_ui
+          -p matrix_ui -p sticky_ui -p summary_ui -p task_ui
+          -p theme -p things_ui -p todo_ui -p ui

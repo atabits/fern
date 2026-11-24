@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
@@ -102,6 +102,29 @@ impl Store {
 
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?, None)
+    }
+
+    /// Opens a writable in-memory database hydrated from a previously serialized SQLite image.
+    pub fn open_from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut conn = Connection::open_in_memory()?;
+        conn.deserialize_read_exact(
+            rusqlite::MAIN_DB,
+            std::io::Cursor::new(bytes),
+            bytes.len(),
+            false,
+        )?;
+        Self::init(conn, None)
+    }
+
+    /// Exports the current database into a standalone SQLite byte image.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut copy = Connection::open_in_memory()?;
+        {
+            let backup = rusqlite::backup::Backup::new(&self.conn, &mut copy)?;
+            backup.step(-1)?;
+        }
+        let data = copy.serialize(rusqlite::MAIN_DB)?;
+        Ok(data.to_vec())
     }
 
     /// Overrides the attachment folder used when purging tasks/lists unlinks orphaned files.

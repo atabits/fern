@@ -3,6 +3,7 @@ pub mod due_picker;
 pub mod list_dialog;
 pub mod lists_panel;
 pub mod print;
+pub mod search_modal;
 pub mod tag_dialog;
 pub mod task_detail;
 pub mod task_menu;

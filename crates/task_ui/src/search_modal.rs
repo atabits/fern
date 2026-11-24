@@ -254,7 +254,7 @@ impl SearchModal {
             self.plugin_hits.clear();
             Self::clear_plugin_search_hits(cx);
             self.sync_plugin_results(cx);
-            plugin_ui::PluginHost::search_async(query, cx);
+            desktop_common::plugin_bus::dispatch_plugin_search(query, cx);
         } else {
             self.sync_plugin_results(cx);
         }
@@ -745,23 +745,31 @@ impl SearchModal {
             if !self.pending_complete.insert(task.id) {
                 return;
             }
-            if let Some(mgr) = crate::quick_add_window::active_hook_manager(cx) {
+            let has_hooks = desktop_common::plugin_bus::PluginHooksGlobal::global(cx)
+                .is_some_and(|hooks| hooks.is_active());
+            if has_hooks {
                 let store = self.store.clone();
                 let task_snapshot = task.clone();
                 let task_id = task.id;
                 let entity_id = cx.entity_id();
                 let weak = cx.weak_entity();
-                crate::quick_add_window::run_before_task_complete(mgr, task, cx, move |allowed, cx| {
-                    let _ = weak.update(cx, |this, _| {
-                        this.pending_complete.remove(&task_id);
-                    });
-                    if allowed && Self::finish_complete_task(&store, &task_snapshot, entity_id, cx) {
-                        let _ = weak.update(cx, |this, cx| {
-                            this.reload_cache();
-                            this.refresh(cx);
+                desktop_common::plugin_bus::run_before_task_complete_hook(
+                    task,
+                    cx,
+                    move |allowed, cx| {
+                        let _ = weak.update(cx, |this, _| {
+                            this.pending_complete.remove(&task_id);
                         });
-                    }
-                });
+                        if allowed
+                            && Self::finish_complete_task(&store, &task_snapshot, entity_id, cx)
+                        {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.reload_cache();
+                                this.refresh(cx);
+                            });
+                        }
+                    },
+                );
                 return;
             }
             self.pending_complete.remove(&task.id);

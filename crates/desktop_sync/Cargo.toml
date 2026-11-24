@@ -18,6 +18,8 @@ fern_core.workspace = true
 fern_i18n.workspace = true
 gpui.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ureq.workspace = true
 
 [dev-dependencies]

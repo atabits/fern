@@ -32,10 +32,10 @@ fn migrate_forward_from_every_historical_schema_version() {
             conn.pragma_update(None, "foreign_keys", true).expect("enable fk");
             apply_migrations_up_to(&conn, start_version)
                 .unwrap_or_else(|err| panic!("failed applying up to v{start_version}: {err:#}"));
-            let current: usize = conn
+            let current: i64 = conn
                 .pragma_query_value(None, "user_version", |r| r.get(0))
                 .expect("read user_version");
-            assert_eq!(current, start_version);
+            assert_eq!(usize::try_from(current).ok(), Some(start_version));
         }
 
         let store = Store::open(&path)

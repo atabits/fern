@@ -21,6 +21,7 @@ serde_json.workspace = true
 task_ui.workspace = true
 theme.workspace = true
 ui.workspace = true
+web-time.workspace = true
 
 [dev-dependencies]
 assets.workspace = true

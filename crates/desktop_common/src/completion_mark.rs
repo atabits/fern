@@ -1,4 +1,5 @@
-use std::{collections::HashMap, time::{Duration, Instant}};
+use std::{collections::HashMap, time::Duration};
+use web_time::Instant;
 
 use fern_core::Id;
 use gpui::{App, Global};

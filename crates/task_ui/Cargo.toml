@@ -20,6 +20,7 @@ gpui.workspace = true
 icons.workspace = true
 theme.workspace = true
 ui.workspace = true
+web-time.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

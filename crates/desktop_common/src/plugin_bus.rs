@@ -404,6 +404,31 @@ pub fn run_before_task_complete_hook(
     .detach();
 }
 
+/// Callback type for dispatching asynchronous plugin search queries without coupling UI crates to `plugin_ui`.
+pub type PluginSearchFn = std::rc::Rc<dyn Fn(String, &mut App)>;
+
+/// Global dispatcher registered by `PluginHost` so `SearchModal` can trigger plugin searches cleanly.
+pub struct PluginSearchDispatcher(pub PluginSearchFn);
+
+impl Global for PluginSearchDispatcher {}
+
+pub fn set_plugin_search_dispatcher(dispatcher: Option<PluginSearchFn>, cx: &mut App) {
+    match dispatcher {
+        Some(f) => cx.set_global(PluginSearchDispatcher(f)),
+        None => {
+            if cx.has_global::<PluginSearchDispatcher>() {
+                cx.remove_global::<PluginSearchDispatcher>();
+            }
+        }
+    }
+}
+
+pub fn dispatch_plugin_search(query: String, cx: &mut App) {
+    if let Some(dispatcher) = cx.try_global::<PluginSearchDispatcher>().map(|g| g.0.clone()) {
+        dispatcher(query, cx);
+    }
+}
+
 /// Extracts a transformed quick-add string returned by a `quickAddTransform` plugin hook.
 pub fn extract_transformed_quick_add(val: &serde_json::Value) -> Option<String> {
     if let Some(s) = val.as_str() {

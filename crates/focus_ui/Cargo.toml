@@ -18,6 +18,7 @@ fern_i18n.workspace = true
 gpui.workspace = true
 theme.workspace = true
 ui.workspace = true
+web-time.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

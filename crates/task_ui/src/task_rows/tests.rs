@@ -181,35 +181,35 @@ fn sorting_and_grouping() {
     sort_tasks(&mut sorted, SortBy::Modified);
     assert_eq!(sorted[0].modified_at, Some(10));
 
-    assert_eq!(shape(&grouped_rows(&tasks, GroupBy::Date, today, false, &EN)), [
+    assert_eq!(shape(&grouped_rows_with(&tasks, GroupBy::Date, today, false, true, &EN)), [
         "## Overdue 1", "banana", "## Today 1", "Apple", "## No Date 1", "cherry", "## Completed 1", "done"
     ]);
-    assert_eq!(shape(&grouped_rows(&tasks, GroupBy::Tag, today, false, &EN)), [
+    assert_eq!(shape(&grouped_rows_with(&tasks, GroupBy::Tag, today, false, true, &EN)), [
         "## home 1", "cherry", "## work 1", "Apple", "## No Tags 1", "banana", "## Completed 1", "done"
     ]);
-    assert_eq!(shape(&grouped_rows(&tasks, GroupBy::None, today, false, &EN)), ["banana", "Apple", "cherry", "done"]);
+    assert_eq!(shape(&grouped_rows_with(&tasks, GroupBy::None, today, false, true, &EN)), ["banana", "Apple", "cherry", "done"]);
     let work = fern_core::Id::now_v7();
     let mut in_work = tasks.clone();
     in_work[0].list_id = Some(work);
-    let by_list = shape(&grouped_rows_in(&in_work, GroupBy::List, today, false, &[(work, "Work".into())], &EN));
+    let by_list = shape(&grouped_rows_in_with(&in_work, GroupBy::List, today, false, true, &[(work, "Work".into())], &EN));
     assert!(by_list[0].starts_with("## Inbox"), "the Inbox first, then the lists in their order");
     assert!(by_list.iter().any(|l| l == "## Work 1"));
     // "Overdue Section shows at: Bottom of List".
-    assert_eq!(shape(&grouped_rows(&tasks, GroupBy::Date, today, true, &EN)), [
+    assert_eq!(shape(&grouped_rows_with(&tasks, GroupBy::Date, today, true, true, &EN)), [
         "## Today 1", "Apple", "## No Date 1", "cherry", "## Overdue 1", "banana", "## Completed 1", "done"
     ]);
     let drops = |rows: Vec<Row>| -> Vec<Option<DropTarget>> {
         rows.into_iter().filter_map(|r| match r { Row::Day { drop, .. } => Some(drop), _ => None }).collect()
     };
-    let targets = drops(grouped_rows_in(&in_work, GroupBy::List, today, false, &[(work, "Work".into())], &EN));
+    let targets = drops(grouped_rows_in_with(&in_work, GroupBy::List, today, false, true, &[(work, "Work".into())], &EN));
     assert!(targets.contains(&Some(DropTarget::List(Some(work)))) && targets.contains(&Some(DropTarget::List(None))), "a list column takes cards into its list");
-    assert_eq!(drops(grouped_rows(&tasks, GroupBy::Date, today, false, &EN)), [
+    assert_eq!(drops(grouped_rows_with(&tasks, GroupBy::Date, today, false, true, &EN)), [
         None,
         Some(DropTarget::Due(Some(today))),
         Some(DropTarget::Due(None)),
         Some(DropTarget::Complete),
     ]);
-    assert_eq!(drops(grouped_rows(&tasks, GroupBy::Tag, today, false, &EN))[..2], [
+    assert_eq!(drops(grouped_rows_with(&tasks, GroupBy::Tag, today, false, true, &EN))[..2], [
         Some(DropTarget::Tag(Some("home".into()))),
         Some(DropTarget::Tag(Some("work".into()))),
     ]);
@@ -220,7 +220,7 @@ fn sorting_and_grouping() {
 #[test]
 fn closed_ranges() {
     let today = d(2026, 10, 18); // a Sunday
-    let r = |range: ClosedRange, day| range.contains(day, today);
+    let r = |range: ClosedRange, day| range.contains(day, today, chrono::Weekday::Mon);
     assert!(r(ClosedRange::ThisWeek, d(2026, 10, 12)) && !r(ClosedRange::ThisWeek, d(2026, 10, 11)));
     assert!(r(ClosedRange::LastWeek, d(2026, 10, 5)) && r(ClosedRange::LastWeek, d(2026, 10, 11)));
     assert!(!r(ClosedRange::LastWeek, d(2026, 10, 12)) && !r(ClosedRange::LastWeek, d(2026, 10, 4)));
@@ -251,7 +251,7 @@ fn next_days_groups() {
     late.due_date = Some(d(2026, 10, 17));
     let mut sat = task("sat");
     sat.due_date = Some(d(2026, 10, 24));
-    assert_eq!(shape(&next_days_rows(&[sat, late], today, mon, &EN)), ["## Overdue 1", "late", "## Next Saturday, October 24 1", "sat"]);
+    assert_eq!(shape(&next_days_rows_with(&[sat, late], today, mon, true, &EN)), ["## Overdue 1", "late", "## Next Saturday, October 24 1", "sat"]);
 }
 
 #[test]
@@ -276,7 +276,7 @@ fn child_in_other_section_goes_top_level() {
 #[test]
 fn due_labels_english() {
     let today = d(2026, 10, 18); // a Sunday
-    let label = |date| due_label(date, None, today, &EN);
+    let label = |date| due_label_with(date, None, today, &EN, false);
     assert_eq!(label(today), ("Today".into(), false));
     assert_eq!(label(d(2026, 10, 19)), ("Tomorrow".into(), false));
     assert_eq!(label(d(2026, 10, 17)), ("Yesterday".into(), true));
@@ -285,7 +285,7 @@ fn due_labels_english() {
     assert_eq!(label(d(2026, 10, 1)), ("Oct 1".into(), true));
     assert_eq!(label(d(2027, 1, 5)), ("Jan 5 2027".into(), false));
     assert_eq!(
-        due_label(today, NaiveTime::from_hms_opt(18, 30, 0), today, &EN),
+        due_label_with(today, NaiveTime::from_hms_opt(18, 30, 0), today, &EN, false),
         ("Today 18:30".into(), false)
     );
 }
@@ -302,21 +302,21 @@ fn detail_due_labels() {
 #[test]
 fn card_due_labels() {
     let today = d(2026, 10, 18);
-    assert_eq!(card_due_label(d(2026, 10, 24), None, today, &EN), "Sat, Oct 24");
-    assert_eq!(card_due_label(d(2027, 1, 4), None, today, &EN), "Mon, Jan 4, 2027");
+    assert_eq!(card_due_label_with(d(2026, 10, 24), None, today, &EN, false), "Sat, Oct 24");
+    assert_eq!(card_due_label_with(d(2027, 1, 4), None, today, &EN, false), "Mon, Jan 4, 2027");
 }
 
 #[test]
 fn due_labels_russian() {
     let today = d(2026, 10, 18);
-    assert_eq!(row_due_label(today + chrono::Duration::days(3), None, today, &EN, true).0, "in 3 days");
-    assert_eq!(row_due_label(today - chrono::Duration::days(2), None, today, &EN, true), ("2 days ago".to_owned(), true));
-    assert_eq!(row_due_label(today, None, today, &EN, true).0, "Today");
+    assert_eq!(row_due_label_with(today + chrono::Duration::days(3), None, today, &EN, true, false).0, "in 3 days");
+    assert_eq!(row_due_label_with(today - chrono::Duration::days(2), None, today, &EN, true, false), ("2 days ago".to_owned(), true));
+    assert_eq!(row_due_label_with(today, None, today, &EN, true, false).0, "Today");
     assert_eq!(closed_due_label(today, today, &EN), "Oct 18", "a closed task shows the date itself");
     assert_eq!(closed_due_label(d(2025, 9, 26), today, &EN), "Sep 26, 2025");
     assert_eq!(closed_due_label(d(2025, 9, 24), today, &RU), "24.09.2025", "as the Russian original");
     assert_eq!(closed_day(d(2026, 10, 17), today, &RU), "17 окт Сб");
-    let label = |date| due_label(date, None, today, &RU).0;
+    let label = |date| due_label_with(date, None, today, &RU, false).0;
     assert_eq!(label(today), "Сегодня");
     assert_eq!(label(d(2026, 10, 24)), "Сб");
     assert_eq!(label(d(2026, 11, 13)), "13 ноя");
@@ -486,7 +486,7 @@ fn date_grouping_and_next_days_group_horizons_chronologically() {
     t_life.horizon = Some(fern_core::Horizon::Life);
     let t_nodate = task("Undated item");
 
-    let rows = grouped_rows(
+    let rows = grouped_rows_with(
         &[
             t_nodate,
             t_life,
@@ -500,6 +500,7 @@ fn date_grouping_and_next_days_group_horizons_chronologically() {
         GroupBy::Date,
         today,
         false,
+        true,
         &EN,
     );
     assert_eq!(
@@ -524,7 +525,7 @@ fn date_grouping_and_next_days_group_horizons_chronologically() {
         ]
     );
 
-    let next7 = next_days_rows(&[t_today, t_week], today, chrono::Weekday::Mon, &EN);
+    let next7 = next_days_rows_with(&[t_today, t_week], today, chrono::Weekday::Mon, true, &EN);
     assert_eq!(
         shape(&next7),
         [

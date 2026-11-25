@@ -31,7 +31,7 @@ impl MatrixView {
         self.editing = None;
         self.emoji_picker_open = false;
         if let Err(err) = self.store.set_active_matrix_profile(id) {
-            eprintln!("failed to switch matrix profile: {err:#}");
+            desktop_common::logging::log_error("matrix_ui", format!("failed to switch matrix profile: {err:#}"));
             return;
         }
         self.reload(cx);
@@ -73,10 +73,13 @@ impl MatrixView {
         match editing {
             Some(id) => {
                 if let Err(err) = self.store.rename_matrix_profile(id, &name) {
-                    eprintln!("failed to rename matrix profile: {err:#}");
+                    desktop_common::logging::log_error("matrix_ui", format!("failed to rename matrix profile: {err:#}"));
                 } else {
-                    self.text_edit_sync_task = None;
-                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                    desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::PREFS,
+                        cx,
+                    );
                 }
             }
             None => match self.store.create_matrix_profile(&name, None) {
@@ -84,10 +87,13 @@ impl MatrixView {
                     self.editing = None;
                     self.emoji_picker_open = false;
                     let _ = self.store.set_active_matrix_profile(profile.id);
-                    self.text_edit_sync_task = None;
-                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                    desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::PREFS,
+                        cx,
+                    );
                 }
-                Err(err) => eprintln!("failed to create matrix profile: {err:#}"),
+                Err(err) => desktop_common::logging::log_error("matrix_ui", format!("failed to create matrix profile: {err:#}")),
             },
         }
         self.reload(cx);
@@ -99,11 +105,14 @@ impl MatrixView {
         self.emoji_picker_open = false;
         match self.store.delete_matrix_profile(id) {
             Ok(true) => {
-                self.text_edit_sync_task = None;
-                desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::PREFS,
+                        cx,
+                    );
             }
             Ok(false) => {}
-            Err(err) => eprintln!("failed to delete matrix profile: {err:#}"),
+            Err(err) => desktop_common::logging::log_error("matrix_ui", format!("failed to delete matrix profile: {err:#}")),
         }
         self.reload(cx);
     }
@@ -169,8 +178,11 @@ impl MatrixView {
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.task_menu = None;
                                             let _ = this.store.set_priority(id, p);
-                                            this.text_edit_sync_task = None;
-                                            desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                            desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::PREFS,
+                        cx,
+                    );
                                             this.reload(cx);
                                         }))
                                 }),
@@ -186,8 +198,11 @@ impl MatrixView {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.task_menu = None;
                                     let _ = this.store.move_dates(id, today);
-                                    this.text_edit_sync_task = None;
-                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                    desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::PREFS,
+                        cx,
+                    );
                                     this.reload(cx);
                                 })),
                         )
@@ -199,8 +214,11 @@ impl MatrixView {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.task_menu = None;
                                     let _ = this.store.move_dates(id, today + Duration::days(1));
-                                    this.text_edit_sync_task = None;
-                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                    desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::PREFS,
+                        cx,
+                    );
                                     this.reload(cx);
                                 })),
                         )
@@ -212,8 +230,11 @@ impl MatrixView {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.task_menu = None;
                                     let _ = this.store.set_due(id, None, None);
-                                    this.text_edit_sync_task = None;
-                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                    desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::PREFS,
+                        cx,
+                    );
                                     this.reload(cx);
                                 })),
                         )
@@ -401,7 +422,7 @@ impl MatrixView {
                                     this.header_menu = false;
                                     let value = if this.show_completed { "0" } else { "1" };
                                     if let Err(err) = this.store.set_setting("matrix_show_completed", value) {
-                                        eprintln!("failed to save the setting: {err:#}");
+                                        desktop_common::logging::log_error("matrix_ui", format!("failed to save the setting: {err:#}"));
                                     }
                                     this.reload(cx);
                                 })),
@@ -419,7 +440,7 @@ impl MatrixView {
                                     this.header_menu = false;
                                     let value = if this.show_subtasks { "0" } else { "1" };
                                     if let Err(err) = this.store.set_setting("matrix_show_subtasks", value) {
-                                        eprintln!("failed to save the setting: {err:#}");
+                                        desktop_common::logging::log_error("matrix_ui", format!("failed to save the setting: {err:#}"));
                                     }
                                     this.reload(cx);
                                 })),
@@ -436,10 +457,13 @@ impl MatrixView {
                                         None => this.store.apply_matrix_date_template().map(|_| ()),
                                     };
                                     if let Err(err) = res {
-                                        eprintln!("failed to apply date template: {err:#}");
+                                        desktop_common::logging::log_error("matrix_ui", format!("failed to apply date template: {err:#}"));
                                     } else {
-                                        this.text_edit_sync_task = None;
-                                        desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                        desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::PREFS,
+                        cx,
+                    );
                                     }
                                     this.reload(cx);
                                 })),
@@ -508,10 +532,13 @@ impl MatrixView {
     pub(super) fn render_confirm_delete_profile(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let strings = i18n::t(cx);
         self.confirm_delete_profile.clone().map(|(id, name)| {
-            ConfirmDialog::new("matrix-delete-profile-modal", format!("{} \"{name}\"?", strings.delete))
+            ConfirmDialog::new(
+                "matrix-delete-profile-modal",
+                format!("{} \"{name}\"?", strings.delete),
+                strings.cancel,
+                strings.delete,
+            )
                 .width(px(340.))
-                .cancel_label(strings.cancel)
-                .confirm_label(strings.delete)
                 .destructive(true)
                 .on_cancel(cx.listener(|this, _, window, cx| {
                     this.confirm_delete_profile = None;

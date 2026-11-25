@@ -76,15 +76,46 @@ pub(crate) fn project_donut(
 
 pub fn render_sidebar<V: 'static>(
     props: SidebarProps<'_>,
+    window: &Window,
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, SidebarAction, &mut Window, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
-    let theme = cx.theme().clone();
-    let theme_colors = theme.colors().clone();
-    let status = theme.status().clone();
+    let (
+        accent,
+        list_hover,
+        list_selected,
+        list_text,
+        list_text_muted,
+        list_count,
+        lists_background,
+        lists_border,
+        border_variant,
+        info,
+        warning,
+        error,
+        success,
+    ) = {
+        let t = cx.theme();
+        let c = t.colors();
+        let s = t.status();
+        (
+            c.accent,
+            c.list_hover,
+            c.list_selected,
+            c.list_text,
+            c.list_text_muted,
+            c.list_count,
+            c.lists_background,
+            c.lists_border,
+            c.border_variant,
+            s.info,
+            s.warning,
+            s.error,
+            s.success,
+        )
+    };
     let strings = props.strings;
     let active = *props.active;
-    let accent = theme_colors.accent;
 
     let smart_row = |id: &'static str,
                      selector: &'static str,
@@ -100,22 +131,22 @@ pub fn render_sidebar<V: 'static>(
         let on_drop = on_action.clone();
         let row = ListItem::new(id)
             .height(px(32.))
-            .hover_color(theme_colors.list_hover)
-            .selected_color(theme_colors.list_selected)
+            .hover_color(list_hover)
+            .selected_color(list_selected)
             .toggle_state(selected)
             .start_slot(Icon::new(icon).size(IconSize::Small).color(icon_color))
             .child(
                 Label::new(label)
                     .size(LabelSize::Small)
                     .weight(if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL })
-                    .color(theme_colors.list_text)
+                    .color(list_text)
                     .truncate(),
             )
             .when(count > 0, |item| {
                 item.end_slot(
                     Label::new(count.to_string())
                         .size(LabelSize::XSmall)
-                        .color(theme_colors.list_count),
+                        .color(list_count),
                 )
             })
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -157,8 +188,8 @@ pub fn render_sidebar<V: 'static>(
         let on_drop = on_action.clone();
         let row = ListItem::new(SharedString::from(format!("things-project-{id}")))
             .height(px(30.))
-            .hover_color(theme_colors.list_hover)
-            .selected_color(theme_colors.list_selected)
+            .hover_color(list_hover)
+            .selected_color(list_selected)
             .toggle_state(selected)
             .start_slot(project_donut(prog, list.completed_at.is_some(), ring_color, px(15.), px(2.3)))
             .child(
@@ -166,9 +197,9 @@ pub fn render_sidebar<V: 'static>(
                     .size(LabelSize::Small)
                     .weight(if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL })
                     .color(if list.completed_at.is_some() {
-                        theme_colors.list_text_muted
+                        list_text_muted
                     } else {
-                        theme_colors.list_text
+                        list_text
                     })
                     .truncate(),
             )
@@ -176,7 +207,7 @@ pub fn render_sidebar<V: 'static>(
                 item.end_slot(
                     Label::new(remaining.to_string())
                         .size(LabelSize::XSmall)
-                        .color(theme_colors.list_count),
+                        .color(list_count),
                 )
             })
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -230,8 +261,8 @@ pub fn render_sidebar<V: 'static>(
 
         let area_header = ListItem::new(SharedString::from(format!("things-area-{folder_id}")))
             .height(px(30.))
-            .hover_color(theme_colors.list_hover)
-            .selected_color(theme_colors.list_selected)
+            .hover_color(list_hover)
+            .selected_color(list_selected)
             .toggle_state(selected)
             .start_slot(
                 h_flex()
@@ -247,7 +278,7 @@ pub fn render_sidebar<V: 'static>(
                         )
                         .size(px(18.))
                         .icon_size(IconSize::XSmall)
-                        .icon_color(theme_colors.list_text_muted)
+                        .icon_color(list_text_muted)
                         .tooltip(Tooltip::text(if collapsed {
                             strings.habit_expand
                         } else {
@@ -261,14 +292,14 @@ pub fn render_sidebar<V: 'static>(
                     .child(
                         Icon::new(IconName::Folder)
                             .size(IconSize::Small)
-                            .color(theme_colors.list_text),
+                            .color(list_text),
                     ),
             )
             .child(
                 Label::new(folder.name.clone())
                     .size(LabelSize::Small)
                     .weight(FontWeight::MEDIUM)
-                    .color(theme_colors.list_text)
+                    .color(list_text)
                     .truncate(),
             )
             .end_slot(
@@ -278,7 +309,7 @@ pub fn render_sidebar<V: 'static>(
                 )
                 .size(px(20.))
                 .icon_size(IconSize::XSmall)
-                .icon_color(theme_colors.list_text_muted)
+                .icon_color(list_text_muted)
                 .tooltip(Tooltip::text(strings.things_new_project))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
@@ -311,10 +342,10 @@ pub fn render_sidebar<V: 'static>(
         .w(px(SIDEBAR_WIDTH))
         .flex_none()
         .h_full()
-        .bg(theme_colors.lists_background)
+        .bg(lists_background)
         .border_r_1()
-        .border_color(theme_colors.lists_border)
-        .pt(layout::header_inset())
+        .border_color(lists_border)
+        .pt(layout::header_inset(window, cx))
         .child(
             v_scroll(
                 "things-sidebar-scroll",
@@ -329,7 +360,7 @@ pub fn render_sidebar<V: 'static>(
                         ThingsViewKind::Inbox,
                         strings.things_inbox,
                         IconName::Inbox,
-                        status.info,
+                        info,
                         props.counts.inbox,
                         Some(DropDestination::Inbox),
                         cx,
@@ -341,7 +372,7 @@ pub fn render_sidebar<V: 'static>(
                         ThingsViewKind::Today,
                         strings.things_today,
                         IconName::Sun,
-                        status.warning,
+                        warning,
                         props.counts.today,
                         Some(DropDestination::Today),
                         cx,
@@ -352,7 +383,7 @@ pub fn render_sidebar<V: 'static>(
                         ThingsViewKind::Upcoming,
                         strings.things_upcoming,
                         IconName::CalendarDays,
-                        status.error,
+                        error,
                         props.counts.upcoming,
                         Some(DropDestination::Upcoming),
                         cx,
@@ -374,7 +405,7 @@ pub fn render_sidebar<V: 'static>(
                         ThingsViewKind::Someday,
                         strings.things_someday,
                         IconName::Archive,
-                        theme_colors.list_text_muted,
+                        list_text_muted,
                         props.counts.someday,
                         Some(DropDestination::Someday),
                         cx,
@@ -386,7 +417,7 @@ pub fn render_sidebar<V: 'static>(
                         ThingsViewKind::Logbook,
                         strings.things_logbook,
                         IconName::CircleCheck,
-                        status.success,
+                        success,
                         props.counts.logbook,
                         None,
                         cx,
@@ -398,7 +429,7 @@ pub fn render_sidebar<V: 'static>(
                                     Label::new(format!("{} · {}", strings.things_areas, strings.things_projects))
                                         .size(LabelSize::XSmall)
                                         .weight(FontWeight::SEMIBOLD)
-                                        .color(theme_colors.list_text_muted),
+                                        .color(list_text_muted),
                                 ),
                             )
                             .children(areas_and_projects)
@@ -415,7 +446,7 @@ pub fn render_sidebar<V: 'static>(
                 .px_2p5()
                 .py_2()
                 .border_t_1()
-                .border_color(theme_colors.border_variant)
+                .border_color(border_variant)
                 .child(
                     div()
                         .when(cfg!(test), |el| el.debug_selector(|| "things-sidebar-add".to_owned()))

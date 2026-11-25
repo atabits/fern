@@ -460,8 +460,10 @@ pub(crate) fn render_timeline_canvas(
     months_short: [&'static str; 12],
     palette: LifeClockPalette,
     glyph_cache: GlyphCache,
+    window: &Window,
+    cx: &App,
 ) -> impl IntoElement {
-    let title_bar_h = f32::from(desktop_common::layout::title_bar_height());
+    let title_bar_h = f32::from(desktop_common::layout::title_bar_height(window, cx));
     let ltag = locale_tag(locale);
     canvas(
         |_, _, _| {},

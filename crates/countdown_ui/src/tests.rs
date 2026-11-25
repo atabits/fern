@@ -5,7 +5,6 @@ use fern_core::{CountdownKind, DateFormat, Frequency, Store};
 use gpui::{Focusable as _, Modifiers, TestAppContext, size};
 use ui::prelude::*;
 
-use desktop_common::calendar;
 use desktop_common::data_version::{DataVersion, changed_elsewhere};
 use desktop_common::keymap;
 use fern_i18n as i18n;
@@ -18,7 +17,7 @@ fn save_click_keeps_invalid_dates_until_corrected_for_every_countdown_kind(cx: &
     let store = Rc::new(Store::open_in_memory().unwrap());
     cx.update(|cx| {
         theme::init(cx);
-        calendar::set_date_format(Some(DateFormat::IsoYearMonthDay));
+        desktop_common::ActivePreferences::update(cx, |p| p.date_format = Some(DateFormat::IsoYearMonthDay));
         assert!(keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
     });
     let (view, cx) = cx.add_window_view(|_, cx| CountdownView::new(store.clone(), cx));
@@ -86,7 +85,7 @@ fn save_click_keeps_invalid_dates_until_corrected_for_every_countdown_kind(cx: &
             NaiveDate::from_ymd_opt(2026, 12, 16).unwrap()
         );
     }
-    cx.update(|_, _| calendar::set_date_format(None));
+    cx.update(|_, cx| desktop_common::ActivePreferences::update(cx, |p| p.date_format = None));
 }
 
 #[gpui::test]
@@ -95,7 +94,7 @@ fn countdown_kinds_share_the_ordered_date_editor(cx: &mut TestAppContext) {
     cx.update(|cx| {
         theme::init(cx);
         cx.set_global(i18n::CurrentLocale(i18n::Locale::ZhCn));
-        calendar::set_date_format(None);
+        desktop_common::ActivePreferences::update(cx, |p| p.date_format = None);
         assert!(keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
     });
     let (view, cx) = cx.add_window_view(|_, cx| CountdownView::new(store, cx));
@@ -120,14 +119,14 @@ fn countdown_kinds_share_the_ordered_date_editor(cx: &mut TestAppContext) {
     }
 
     cx.update(|window, cx| {
-        calendar::set_date_format(Some(DateFormat::DayMonthYear));
+        desktop_common::ActivePreferences::update(cx, |p| p.date_format = Some(DateFormat::DayMonthYear));
         view.update(cx, |view, cx| view.start_new_kind(CountdownKind::Anniversary, window, cx));
     });
     let year = cx.debug_bounds(DateField::Year.id()).unwrap();
     let month = cx.debug_bounds(DateField::Month.id()).unwrap();
     let day = cx.debug_bounds(DateField::Day.id()).unwrap();
     assert!(day.right() <= month.left() && month.right() <= year.left());
-    cx.update(|_, _| calendar::set_date_format(None));
+    cx.update(|_, cx| desktop_common::ActivePreferences::update(cx, |p| p.date_format = None));
 }
 
 #[gpui::test]
@@ -135,7 +134,7 @@ fn birthday_accepts_a_distant_year_and_keeps_leap_day_valid(cx: &mut TestAppCont
     let store = Rc::new(Store::open_in_memory().unwrap());
     cx.update(|cx| {
         theme::init(cx);
-        calendar::set_date_format(Some(DateFormat::IsoYearMonthDay));
+        desktop_common::ActivePreferences::update(cx, |p| p.date_format = Some(DateFormat::IsoYearMonthDay));
         assert!(keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
     });
     let (view, cx) = cx.add_window_view(|window, cx| {
@@ -177,7 +176,7 @@ fn birthday_accepts_a_distant_year_and_keeps_leap_day_valid(cx: &mut TestAppCont
     assert!(cx.debug_bounds(DateField::Year.id()).is_none());
     cx.update(|_, cx| {
         view.update(cx, |view, cx| view.save_draft(cx));
-        calendar::set_date_format(None);
+        desktop_common::ActivePreferences::update(cx, |p| p.date_format = None);
     });
     let countdowns = store.countdowns().unwrap();
     assert_eq!(countdowns.len(), 1);
@@ -275,15 +274,15 @@ fn new_inactive_skips_initial_reload_until_activated(cx: &mut TestAppContext) {
         let view = cx.new(|cx| CountdownView::new_inactive(store.clone(), cx));
         {
             let v = view.read(cx);
-            assert!(!v.active);
-            assert!(v.dirty);
+            assert!(!v.refresh.is_active());
+            assert!(v.refresh.is_dirty());
             assert!(v.countdowns.is_empty());
         }
 
         view.update(cx, |v, cx| v.set_active(true, cx));
         let v = view.read(cx);
-        assert!(v.active);
-        assert!(!v.dirty);
+        assert!(v.refresh.is_active());
+        assert!(!v.refresh.is_dirty());
         assert_eq!(v.countdowns.len(), 1);
         assert_eq!(v.countdowns[0].name, "Year End");
     });
@@ -410,7 +409,7 @@ fn russian_countdown_modal_preserves_input_column_and_saves_every_kind(cx: &mut 
     cx.update(|cx| {
         theme::init(cx);
         cx.set_global(i18n::CurrentLocale(i18n::Locale::Ru));
-        calendar::set_date_format(Some(DateFormat::DayMonthYear));
+        desktop_common::ActivePreferences::update(cx, |p| p.date_format = Some(DateFormat::DayMonthYear));
         assert!(keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
     });
     let (view, cx) = cx.add_window_view(|_, cx| CountdownView::new(store.clone(), cx));
@@ -445,5 +444,5 @@ fn russian_countdown_modal_preserves_input_column_and_saves_every_kind(cx: &mut 
     }
 
     assert_eq!(store.countdowns().unwrap().len(), 4);
-    cx.update(|_, _| calendar::set_date_format(None));
+    cx.update(|_, cx| desktop_common::ActivePreferences::update(cx, |p| p.date_format = None));
 }

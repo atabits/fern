@@ -51,24 +51,24 @@ pub fn drag_zone(bounds: Bounds<Pixels>) {
 #[cfg(windows)]
 mod imp {
     use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::time::{Duration, Instant};
 
     use futures::StreamExt as _;
     use futures::channel::mpsc::{UnboundedSender, unbounded};
     use gpui::{App, Bounds, Pixels, Point, Window, point, px};
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
     use windows::Win32::UI::Input::Pointer::GetPointerType;
-    use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetMessageExtraInfo, KillTimer, PT_TOUCH, SPI_GETWHEELSCROLLCHARS, SPI_GETWHEELSCROLLLINES,
         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetTimer, SystemParametersInfoW, WHEEL_DELTA,
-        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_POINTERCAPTURECHANGED,
-        WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
+        WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONDOWN,
+        WM_RBUTTONUP, WM_TIMER,
     };
 
     /// How far a finger moves, in logical pixels, before a press becomes a swipe or a drag.
@@ -150,15 +150,33 @@ mod imp {
         last_tap: Option<(Instant, POINT)>,
     }
 
+    struct WindowTouchState {
+        state: State,
+        held: Option<Point<Pixels>>,
+        line_height: f32,
+        zones: Vec<Bounds<Pixels>>,
+        last_mouse: isize,
+        refresh: Option<UnboundedSender<()>>,
+    }
+
+    impl Default for WindowTouchState {
+        fn default() -> Self {
+            Self {
+                state: State::default(),
+                held: None,
+                line_height: 20.,
+                zones: Vec::new(),
+                last_mouse: -1,
+                refresh: None,
+            }
+        }
+    }
+
     thread_local! {
-        static STATE: RefCell<State> = RefCell::default();
+        static WINDOWS: RefCell<HashMap<isize, WindowTouchState>> = RefCell::new(HashMap::new());
+        static CURRENT_RENDER_HWND: Cell<isize> = const { Cell::new(0) };
         static ACTIVE: Cell<bool> = const { Cell::new(false) };
         static TAPPING: Cell<bool> = const { Cell::new(false) };
-        static HELD: Cell<Option<Point<Pixels>>> = const { Cell::new(None) };
-        static LINE_HEIGHT: Cell<f32> = const { Cell::new(20.) };
-        static ZONES: RefCell<Vec<Bounds<Pixels>>> = const { RefCell::new(Vec::new()) };
-        static LAST_MOUSE: Cell<isize> = const { Cell::new(-1) };
-        static REFRESH: RefCell<Option<UnboundedSender<()>>> = const { RefCell::new(None) };
     }
 
     /// What a message turns into, sent once the state is no longer borrowed: GPUI handles the
@@ -169,24 +187,31 @@ mod imp {
     }
 
     pub fn init(window: &Window, cx: &mut App) {
-        // The trait's method: `Window` has an inherent `window_handle` too.
-        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        let Some(hwnd) = crate::win32::hwnd_from_window(window) else {
             return;
         };
-        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        let key = hwnd.0 as isize;
+        let already = WINDOWS.with_borrow(|map| map.contains_key(&key));
+        if already {
             return;
-        };
-        let hwnd = HWND(handle.hwnd.get() as _);
+        }
         if !unsafe { SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0) }.as_bool() {
-            eprintln!("touch: failed to subclass the window");
+            crate::logging::log_error("touch", "failed to subclass the window");
             return;
         }
         // Switching between the finger and the mouse, and the hold's ring, redraw the window.
         let (sender, mut changes) = unbounded();
-        REFRESH.set(Some(sender));
+        WINDOWS.with_borrow_mut(|map| {
+            let entry = map.entry(key).or_default();
+            entry.line_height = f32::from(window.line_height());
+            entry.refresh = Some(sender);
+        });
+        let window_handle = window.window_handle();
         cx.spawn(async move |cx| {
             while changes.next().await.is_some() {
-                cx.update(|cx| cx.refresh_windows());
+                if window_handle.update(cx, |_, window, _| window.refresh()).is_err() {
+                    cx.update(|cx| cx.refresh_windows());
+                }
             }
         })
         .detach();
@@ -201,35 +226,73 @@ mod imp {
     }
 
     pub fn held() -> Option<Point<Pixels>> {
-        HELD.get()
+        let key = CURRENT_RENDER_HWND.get();
+        WINDOWS.with_borrow(|map| {
+            if key != 0 {
+                map.get(&key).and_then(|w| w.held)
+            } else {
+                map.values().find_map(|w| w.held)
+            }
+        })
     }
 
     pub fn begin_frame(window: &Window) {
-        LINE_HEIGHT.set(f32::from(window.line_height()));
-        ZONES.with_borrow_mut(Vec::clear);
+        let key = crate::win32::hwnd_isize(window).unwrap_or(0);
+        CURRENT_RENDER_HWND.set(key);
+        if key == 0 {
+            return;
+        }
+        WINDOWS.with_borrow_mut(|map| {
+            if let Some(entry) = map.get_mut(&key) {
+                entry.line_height = f32::from(window.line_height());
+                entry.zones.clear();
+            }
+        });
     }
 
     pub fn drag_zone(bounds: Bounds<Pixels>) {
-        ZONES.with_borrow_mut(|zones| zones.push(bounds));
+        let key = CURRENT_RENDER_HWND.get();
+        if key == 0 {
+            return;
+        }
+        WINDOWS.with_borrow_mut(|map| {
+            if let Some(entry) = map.get_mut(&key) {
+                entry.zones.push(bounds);
+            }
+        });
     }
 
-    fn refresh() {
-        REFRESH.with_borrow(|sender| {
-            if let Some(sender) = sender {
+    fn refresh_hwnd(key: isize) {
+        WINDOWS.with_borrow(|map| {
+            if let Some(sender) = map.get(&key).and_then(|w| w.refresh.as_ref()) {
                 sender.unbounded_send(()).ok();
+            }
+        });
+    }
+
+    fn refresh_all() {
+        WINDOWS.with_borrow(|map| {
+            for win in map.values() {
+                if let Some(sender) = &win.refresh {
+                    sender.unbounded_send(()).ok();
+                }
             }
         });
     }
 
     fn set_active(active: bool) {
         if ACTIVE.replace(active) != active {
-            refresh();
+            refresh_all();
         }
     }
 
-    fn set_held(held: Option<Point<Pixels>>) {
-        if HELD.replace(held) != held {
-            refresh();
+    fn set_held(key: isize, held: Option<Point<Pixels>>) {
+        let changed = WINDOWS.with_borrow_mut(|map| {
+            map.get_mut(&key)
+                .is_some_and(|w| std::mem::replace(&mut w.held, held) != held)
+        });
+        if changed {
+            refresh_hwnd(key);
         }
     }
 
@@ -241,6 +304,7 @@ mod imp {
         _id: usize,
         _data: usize,
     ) -> LRESULT {
+        let key = hwnd.0 as isize;
         match msg {
             WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP | WM_POINTERCAPTURECHANGED => {
                 let pointer = (wparam.0 & 0xFFFF) as u32;
@@ -260,10 +324,28 @@ mod imp {
             WM_MOUSEMOVE
                 if !TAPPING.get()
                     && unsafe { GetMessageExtraInfo() }.0 & SIGNATURE_MASK != MI_WP_SIGNATURE
-                    && LAST_MOUSE.replace(lparam.0) != lparam.0
                     && ACTIVE.get() =>
             {
-                set_active(false);
+                let moved = WINDOWS.with_borrow_mut(|map| {
+                    map.get_mut(&key)
+                        .is_some_and(|w| std::mem::replace(&mut w.last_mouse, lparam.0) != lparam.0)
+                });
+                if moved {
+                    set_active(false);
+                }
+            }
+            WM_NCDESTROY => {
+                unsafe {
+                    KillTimer(Some(hwnd), HOLD_TIMER).ok();
+                    KillTimer(Some(hwnd), MOMENTUM_TIMER).ok();
+                    let _ = RemoveWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID);
+                }
+                WINDOWS.with_borrow_mut(|map| {
+                    map.remove(&key);
+                });
+                if CURRENT_RENDER_HWND.get() == key {
+                    CURRENT_RENDER_HWND.set(0);
+                }
             }
             _ => {}
         }
@@ -271,12 +353,21 @@ mod imp {
     }
 
     fn on_pointer(hwnd: HWND, msg: u32, pointer: u32, wparam: WPARAM, lparam: LPARAM) {
+        let key = hwnd.0 as isize;
         let at = POINT { x: lparam.0 as i16 as i32, y: (lparam.0 >> 16) as i16 as i32 };
         let primary = (wparam.0 >> 16) as u32 & POINTER_FLAG_PRIMARY != 0;
         let scale = scale(hwnd);
+        let in_zone_hit = if msg == WM_POINTERDOWN && primary {
+            in_zone(hwnd, at, scale)
+        } else {
+            false
+        };
         let mut out = Vec::new();
-        let mut held = HELD.get();
-        STATE.with_borrow_mut(|state| {
+        let mut held = WINDOWS.with_borrow(|map| map.get(&key).and_then(|w| w.held));
+        WINDOWS.with_borrow_mut(|map| {
+            let win = map.entry(key).or_default();
+            let line = win.line_height.max(1.);
+            let state = &mut win.state;
             match msg {
                 WM_POINTERDOWN if !primary => {
                     // A second finger on a press is a two-finger tap; other fingers are left
@@ -301,7 +392,7 @@ mod imp {
                         phase: Phase::Pressed,
                         start: at,
                         last: at,
-                        in_zone: in_zone(hwnd, at, scale),
+                        in_zone: in_zone_hit,
                         halted,
                         samples: VecDeque::from([(Instant::now(), at)]),
                     });
@@ -334,7 +425,7 @@ mod imp {
                                 };
                                 gesture.phase = Phase::Panning(axis);
                                 let delta = along(axis, at.x - gesture.start.x, at.y - gesture.start.y);
-                                scroll(&mut state.remainder, gesture.start, delta, scale, &mut out);
+                                scroll(&mut state.remainder, gesture.start, delta, line, scale, &mut out);
                             }
                         }
                         Phase::Held if moved => {
@@ -345,7 +436,7 @@ mod imp {
                         Phase::TwoFingers if moved => gesture.phase = Phase::Dropped,
                         Phase::Panning(axis) => {
                             let delta = along(axis, at.x - gesture.last.x, at.y - gesture.last.y);
-                            scroll(&mut state.remainder, gesture.start, delta, scale, &mut out);
+                            scroll(&mut state.remainder, gesture.start, delta, line, scale, &mut out);
                         }
                         Phase::Dragging => out.push(Out::Mouse(WM_MOUSEMOVE, MK_LBUTTON, at)),
                         Phase::Pressed | Phase::Held | Phase::TwoFingers | Phase::Dropped => {}
@@ -403,15 +494,22 @@ mod imp {
                 }
             }
         });
-        set_held(held);
+        set_held(key, held);
         send(hwnd, out);
     }
 
     fn on_timer(hwnd: HWND, timer: usize) {
+        let key = hwnd.0 as isize;
         let scale = scale(hwnd);
         let mut out = Vec::new();
-        let mut held = HELD.get();
-        STATE.with_borrow_mut(|state| {
+        let mut held = WINDOWS.with_borrow(|map| map.get(&key).and_then(|w| w.held));
+        WINDOWS.with_borrow_mut(|map| {
+            let Some(win) = map.get_mut(&key) else {
+                unsafe { KillTimer(Some(hwnd), timer) }.ok();
+                return;
+            };
+            let line = win.line_height.max(1.);
+            let state = &mut win.state;
             if timer == HOLD_TIMER {
                 unsafe { KillTimer(Some(hwnd), HOLD_TIMER) }.ok();
                 if let Some(gesture) = state.gesture.as_mut().filter(|g| g.phase == Phase::Pressed) {
@@ -436,9 +534,9 @@ mod imp {
                 state.momentum = None;
                 unsafe { KillTimer(Some(hwnd), MOMENTUM_TIMER) }.ok();
             }
-            scroll(&mut state.remainder, at, delta, scale, &mut out);
+            scroll(&mut state.remainder, at, delta, line, scale, &mut out);
         });
-        set_held(held);
+        set_held(key, held);
         send(hwnd, out);
     }
 
@@ -492,8 +590,14 @@ mod imp {
     /// Scrolls what is under `at` by the finger's `delta` in physical pixels. GPUI turns a wheel
     /// step into the system's lines (or characters, sideways) times the line height, so the
     /// finger's distance is turned back into steps; what is less than a step waits for the next.
-    fn scroll(remainder: &mut (f32, f32), at: POINT, (dx, dy): (i32, i32), scale: f32, out: &mut Vec<Out>) {
-        let line = LINE_HEIGHT.get().max(1.);
+    fn scroll(
+        remainder: &mut (f32, f32),
+        at: POINT,
+        (dx, dy): (i32, i32),
+        line: f32,
+        scale: f32,
+        out: &mut Vec<Out>,
+    ) {
         let per_step = |action, fallback: u32| {
             let mut value = 0u32;
             let ok = unsafe {
@@ -560,7 +664,11 @@ mod imp {
         let Some(position) = client_point(hwnd, at, scale) else {
             return false;
         };
-        ZONES.with_borrow(|zones| zones.iter().any(|zone| zone.contains(&position)))
+        let key = hwnd.0 as isize;
+        WINDOWS.with_borrow(|map| {
+            map.get(&key)
+                .is_some_and(|w| w.zones.iter().any(|zone| zone.contains(&position)))
+        })
     }
 }
 

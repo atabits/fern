@@ -16,6 +16,7 @@ members = [
     "crates/matrix_ui",
     "crates/plugin_ui",
     "crates/plugins",
+    "crates/settings_ui",
     "crates/sticky_ui",
     "crates/summary_ui",
     "crates/task_ui",
@@ -47,6 +48,7 @@ desktop_common = { path = "crates/desktop_common" }
 desktop_sync = { path = "crates/desktop_sync" }
 fern_core = { path = "crates/core" }
 fern_i18n = { path = "crates/i18n" }
+fern_server = { path = "apps/server" }
 focus_ui = { path = "crates/focus_ui" }
 habit_ui = { path = "crates/habit_ui" }
 horizons_ui = { path = "crates/horizons_ui" }
@@ -55,6 +57,7 @@ life_clock_ui = { path = "crates/life_clock_ui" }
 matrix_ui = { path = "crates/matrix_ui" }
 plugin_ui = { path = "crates/plugin_ui" }
 plugins = { path = "crates/plugins" }
+settings_ui = { path = "crates/settings_ui" }
 sticky_ui = { path = "crates/sticky_ui" }
 summary_ui = { path = "crates/summary_ui" }
 task_ui = { path = "crates/task_ui" }

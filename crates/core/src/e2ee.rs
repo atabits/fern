@@ -14,6 +14,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const PBKDF2_ITERATIONS: u32 = 200_000;
 const DOMAIN_SALT: &[u8] = b"fern-e2ee-v1";
@@ -49,7 +50,7 @@ impl fmt::Display for E2eeError {
 impl std::error::Error for E2eeError {}
 
 /// Symmetric key derived from a user passphrase for row and attachment encryption.
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct E2eeKey([u8; 32]);
 
 impl fmt::Debug for E2eeKey {
@@ -65,13 +66,31 @@ fn key_cache() -> &'static KeyCache {
     CACHE.get_or_init(|| Mutex::new(Vec::with_capacity(KEY_CACHE_CAPACITY)))
 }
 
+fn cache_tag(passphrase: &str, salt: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update([0]);
+    hasher.update(passphrase.as_bytes());
+    hasher.finalize().into()
+}
+
 impl E2eeKey {
-    /// Derives (or retrieves from the in-memory LRU cache) the 256-bit key for `passphrase`.
+    /// Derives (or retrieves from the in-memory LRU cache) the 256-bit key for `passphrase`
+    /// using the default domain salt.
     pub fn from_passphrase(passphrase: &str) -> Result<Self, E2eeError> {
+        Self::derive_key_with_salt(passphrase, DOMAIN_SALT)
+    }
+
+    /// Derives (or retrieves from the in-memory LRU cache) a 256-bit key bound to an explicit
+    /// per-vault/account `salt` (must be non-empty).
+    pub fn derive_key_with_salt(passphrase: &str, salt: &[u8]) -> Result<Self, E2eeError> {
         if passphrase.is_empty() {
             return Err(E2eeError::PassphraseRequired);
         }
-        let digest: [u8; 32] = Sha256::digest(passphrase.as_bytes()).into();
+        if salt.is_empty() {
+            return Err(E2eeError::Malformed("KDF salt must not be empty".into()));
+        }
+        let digest = cache_tag(passphrase, salt);
         if let Ok(mut cache) = key_cache().lock()
             && let Some(pos) = cache.iter().position(|(d, _)| *d == digest)
         {
@@ -81,12 +100,14 @@ impl E2eeKey {
             return Ok(Self(key));
         }
         let mut key = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), DOMAIN_SALT, PBKDF2_ITERATIONS, &mut key);
+        pbkdf2::pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, PBKDF2_ITERATIONS, &mut key);
         if let Ok(mut cache) = key_cache().lock() {
             if let Some(pos) = cache.iter().position(|(d, _)| *d == digest) {
-                cache.remove(pos);
+                let mut prev = cache.remove(pos);
+                prev.1.zeroize();
             } else if cache.len() >= KEY_CACHE_CAPACITY {
-                cache.remove(0);
+                let mut evicted = cache.remove(0);
+                evicted.1.zeroize();
             }
             cache.push((digest, key));
         }

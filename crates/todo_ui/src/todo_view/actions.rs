@@ -9,30 +9,30 @@ use crate::actions::{
 
 impl TodoView {
     /// Task ids in the order they are shown, for keyboard navigation.
-    pub(super) fn visible_task_ids(&self, strings: &Strings) -> Vec<Id> {
-        if self.kanban && !self.timeline && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_)) {
+    pub(super) fn visible_task_ids(&self, strings: &Strings, cx: &App) -> Vec<Id> {
+        if self.kanban.enabled && !self.timeline.enabled && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_)) {
             let mut ids = Vec::new();
             let push_cards = |cards: &[BoardCard], ids: &mut Vec<Id>| {
                 ids.extend(self.kanban_visible_rows(cards).into_iter().map(|r| r.task.id));
             };
-            for col in self.board_columns(strings).iter() {
+            for col in self.board_columns(strings, cx).iter() {
                 if !col.pinned_cards.is_empty() {
-                    if !self.kanban_folded_sub.contains(&format!("{}:pinned", col.key)) {
+                    if !self.kanban.folded_sub.contains(&format!("{}:pinned", col.key)) {
                         push_cards(&col.pinned_cards, &mut ids);
                     }
-                    if !col.open_cards.is_empty() && !self.kanban_folded_sub.contains(&format!("{}:unpinned", col.key)) {
+                    if !col.open_cards.is_empty() && !self.kanban.folded_sub.contains(&format!("{}:unpinned", col.key)) {
                         push_cards(&col.open_cards, &mut ids);
                     }
                 } else {
                     push_cards(&col.open_cards, &mut ids);
                 }
-                if !col.completed_cards.is_empty() && !self.kanban_folded_sub.contains(&format!("{}:completed", col.key)) {
+                if !col.completed_cards.is_empty() && !self.kanban.folded_sub.contains(&format!("{}:completed", col.key)) {
                     push_cards(&col.completed_cards, &mut ids);
                 }
             }
             return ids;
         }
-        self.rows_rc(strings)
+        self.rows_rc(strings, cx)
             .iter()
             .filter_map(|row| match row {
                 Row::Task { task, .. } => Some(task.id),
@@ -42,10 +42,16 @@ impl TodoView {
     }
 
     pub fn print_list(&mut self, cx: &mut Context<Self>) {
-        self.header_menu_open = false;
+        self.overlays.header_menu_open = false;
         let strings = i18n::t(cx);
-        let title = self.view_title(strings);
-        let html = crate::print::list_html(&title, &self.tasks, Self::today(), strings);
+        let title = self.view_title(strings, cx);
+        let html = crate::print::list_html(
+            &title,
+            &self.tasks,
+            Self::today(),
+            strings,
+            crate::calendar::hour12(cx),
+        );
         let task = crate::print::open_async("list", html, cx);
         cx.spawn(async move |this, cx| {
             if let Err(err) = task.await {
@@ -73,7 +79,7 @@ impl TodoView {
     }
 
     pub(super) fn select_in_current_layout(&mut self, id: Id, cx: &mut Context<Self>) {
-        if self.kanban && !self.timeline && self.selected.is_none() {
+        if self.kanban.enabled && !self.timeline.enabled && self.selected.is_none() {
             self.open_card(id, cx);
         } else {
             self.select(id, cx);
@@ -81,7 +87,7 @@ impl TodoView {
     }
 
     pub(super) fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
-        let ids = self.visible_task_ids(i18n::t(cx));
+        let ids = self.visible_task_ids(i18n::t(cx), cx);
         if ids.is_empty() {
             return;
         }
@@ -227,7 +233,7 @@ impl TodoView {
             return;
         }
         // Keep a selection so repeated presses keep working down the list.
-        let ids = self.visible_task_ids(i18n::t(cx));
+        let ids = self.visible_task_ids(i18n::t(cx), cx);
         let neighbor = ids
             .iter()
             .position(|i| *i == id)
@@ -243,30 +249,30 @@ impl TodoView {
         self.multi_selected.clear();
         self.selection_anchor = None;
         self.batch_menu = None;
-        self.header_menu_open = false;
+        self.overlays.header_menu_open = false;
         self.list_activity = None;
         self.close_card(cx);
-        self.context_menu = None;
-        self.context_side = None;
-        self.closed_menu = None;
-        self.sort_menu = None;
-        self.sort_menu_return_focus = None;
-        self.scale_menu_open = false;
-        self.timeline_tz_menu = false;
-        self.arrange_open = false;
+        self.overlays.context_menu = None;
+        self.overlays.context_side = None;
+        self.overlays.closed_menu = None;
+        self.overlays.sort_menu = None;
+        self.overlays.sort_menu_return_focus = None;
+        self.timeline.scale_menu_open = false;
+        self.timeline.tz_menu = false;
+        self.timeline.arrange_open = false;
         self.suggestions_open = None;
-        self.section_menu = None;
-        self.postpone_menu = false;
-        self.column_menu = None;
-        self.column_add = None;
-        self.kanban_folded_sub.clear();
+        self.overlays.section_menu = None;
+        self.overlays.postpone_menu = false;
+        self.kanban.column_menu = None;
+        self.kanban.column_add = None;
+        self.kanban.folded_sub.clear();
         self.new_section = None;
         self.new_section_index = None;
         self.section_rename = None;
         self.title_edit = None;
-        self.kanban_pan = None;
+        self.kanban.pan = None;
         self.clear_kanban_quick_adds();
-        self.kanban_col_scrolls.clear();
+        self.kanban.col_scrolls.clear();
         self.clear_task_drag_state();
         self.completing.clear();
         self.invalidate_rows();
@@ -291,21 +297,21 @@ impl TodoView {
     }
 
     pub fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
-        self.header_menu_open = false;
+        self.overlays.header_menu_open = false;
         self.list_activity = None;
         if self.view != view {
             self.finish_title_edit(true, cx);
             self.reset_view_transients(cx);
             self.view = view;
             self.reload_inner(true, false, cx);
-        } else if self.dirty {
+        } else if self.refresh.is_dirty() {
             self.reload_inner(true, false, cx);
         }
     }
 
     /// Switches to `View::All` and selects `id` directly without loading the first row's details twice.
     pub fn open_task_in_all(&mut self, id: Id, cx: &mut Context<Self>) {
-        self.header_menu_open = false;
+        self.overlays.header_menu_open = false;
         self.list_activity = None;
         if self.view != View::All {
             self.finish_title_edit(true, cx);
@@ -315,7 +321,7 @@ impl TodoView {
             self.list_entries.clear();
             self.selected = Some(id);
             self.reload_inner(false, false, cx);
-        } else if self.dirty {
+        } else if self.refresh.is_dirty() {
             self.selected = Some(id);
             self.reload_inner(false, false, cx);
         } else {
@@ -462,7 +468,7 @@ impl TodoView {
             let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
             self.offer_undo(action, label, cx);
             crate::completion_mark::record(task.id, cx);
-            desktop_common::sound::play_complete(&self.store);
+            desktop_common::sound::play_complete(cx);
         }
     }
 
@@ -689,8 +695,8 @@ impl TodoView {
     }
 
     /// Parents in the current view that have at least one visible subtask.
-    pub(super) fn parent_task_ids(&self, strings: &Strings) -> Vec<Id> {
-        self.rows_with(strings, &HashSet::new(), &HashSet::new())
+    pub(super) fn parent_task_ids(&self, strings: &Strings, cx: &App) -> Vec<Id> {
+        self.rows_with(strings, &HashSet::new(), &HashSet::new(), cx)
             .into_iter()
             .filter_map(|row| match row {
                 Row::Task { task, has_children: true, .. } => Some(task.id),
@@ -700,7 +706,7 @@ impl TodoView {
     }
 
     pub(super) fn toggle_all_subtasks_now(&mut self, cx: &mut Context<Self>) {
-        let parents = self.parent_task_ids(i18n::t(cx));
+        let parents = self.parent_task_ids(i18n::t(cx), cx);
         if parents.is_empty() {
             return;
         }
@@ -725,7 +731,7 @@ impl TodoView {
             return;
         }
         let strings = i18n::t(cx);
-        let rows = self.rows_with(strings, &self.collapsed_tasks, &HashSet::new());
+        let rows = self.rows_with(strings, &self.collapsed_tasks, &HashSet::new(), cx);
         let mut sections: Vec<Section> = Vec::new();
         let mut days: Vec<String> = Vec::new();
         for row in rows {
@@ -796,7 +802,7 @@ impl TodoView {
 
     /// The details' own picker for a task, for the right-click menu and the calendar's.
     pub fn start_detail(&mut self, id: Id, what: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.kanban && !self.timeline && self.selected.is_none() {
+        if self.kanban.enabled && !self.timeline.enabled && self.selected.is_none() {
             self.open_card(id, cx);
             self.card_detail.update(cx, |detail, cx| detail.start(what, window, cx));
         } else {

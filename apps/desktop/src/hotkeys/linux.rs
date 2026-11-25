@@ -3,7 +3,6 @@
 //! Runs on a dedicated background thread and handles CapsLock/NumLock modifier variants cleanly.
 //! On pure Wayland sessions without an X11 display, exits gracefully without panicking.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,8 +20,6 @@ use super::{Binding, COUNT, Event, Hotkey, Shared};
 const CMD_RELOAD: u32 = 1;
 const CMD_QUIT: u32 = 2;
 
-static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
-
 fn lock_variants() -> [ModMask; 4] {
     [
         ModMask::from(0u16),
@@ -33,7 +30,7 @@ fn lock_variants() -> [ModMask; 4] {
 }
 
 pub(super) fn start(shared: Arc<Mutex<Shared>>, stopped_cv: Arc<Condvar>, tx: UnboundedSender<Event>) {
-    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    shared.lock().unwrap_or_else(|e| e.into_inner()).quit_requested = false;
     let shared_thread = Arc::clone(&shared);
     let stopped_thread = Arc::clone(&stopped_cv);
     if std::thread::Builder::new()
@@ -64,13 +61,14 @@ pub(super) fn reload(shared: &Arc<Mutex<Shared>>) {
 }
 
 pub(super) fn shutdown(shared: &Arc<Mutex<Shared>>, stopped_cv: &Arc<Condvar>) {
-    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
-    let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.stopped {
-        return;
-    }
-    let win = guard.wake_window;
-    drop(guard);
+    let win = {
+        let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+        guard.quit_requested = true;
+        if guard.stopped {
+            return;
+        }
+        guard.wake_window
+    };
     if let Some(win) = win {
         send_wake(Some(win), CMD_QUIT);
     }
@@ -151,8 +149,12 @@ fn event_clean_mods(state: KeyButMask) -> u16 {
     u16::from(state) & relevant
 }
 
+fn quit_requested(shared: &Mutex<Shared>) -> bool {
+    shared.lock().unwrap_or_else(|e| e.into_inner()).quit_requested
+}
+
 fn listen(shared: Arc<Mutex<Shared>>, stopped_cv: Arc<Condvar>, tx: UnboundedSender<Event>) {
-    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+    if quit_requested(&shared) {
         let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         guard.stopped = true;
         stopped_cv.notify_all();
@@ -193,7 +195,7 @@ fn listen(shared: Arc<Mutex<Shared>>, stopped_cv: Arc<Condvar>, tx: UnboundedSen
     let _ = conn.flush();
     let should_stop = {
         let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        if guard.quit_requested {
             true
         } else {
             guard.wake_window = Some(wake_win);
@@ -256,10 +258,10 @@ fn listen(shared: Arc<Mutex<Shared>>, stopped_cv: Arc<Condvar>, tx: UnboundedSen
         shared.lock().unwrap_or_else(|e| e.into_inner()).taken = taken;
     };
 
-    if !should_stop && !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+    if !should_stop && !quit_requested(&shared) {
         register(&conn, &shared, &mut active);
-        if !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) && tx.unbounded_send(Event::Registered).is_ok() {
-            while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        if !quit_requested(&shared) && tx.unbounded_send(Event::Registered).is_ok() {
+            while !quit_requested(&shared) {
                 let Ok(ev) = conn.wait_for_event() else { break };
                 match ev {
                     XEvent::KeyPress(key_ev) => {

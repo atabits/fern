@@ -8,7 +8,7 @@ use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight};
 use ui::prelude::*;
 
 use crate::task_detail::{DraftClosed, TaskDetail};
-use crate::{calendar, i18n};
+use crate::i18n;
 
 pub(super) enum EditorEvent {
     Saved(Id),
@@ -118,67 +118,51 @@ pub(super) fn month_picker(
     let today = Local::now().date_naive();
     let shift = Rc::new(shift);
     let pick = Rc::new(pick);
-    let arrow = |id, icon, delta, tip: &'static str| {
-        let shift = shift.clone();
-        IconButton::new(id, icon)
-            .size(px(22.))
-            .icon_size(IconSize::XSmall)
-            .icon_color(colors.list_text_muted)
-            .hover_icon_color(colors.list_text)
-            .hover_color(colors.list_hover)
-            .tooltip(Tooltip::text(tip))
-            .on_click(move |_, window, cx| shift(&delta, window, cx))
-    };
     let short_title = format!("{} {}", strings.months_short[month.month0() as usize], month.year());
+    let mut header_cfg = desktop_common::month_calendar::MonthHeaderConfig::surface(
+        month,
+        strings,
+        "calendar-picker-prev",
+        "calendar-picker-next",
+    );
+    header_cfg.custom_title = Some(short_title);
+    header_cfg.today_id = Some("calendar-picker-today");
+    header_cfg.today_tooltip = Some(strings.today);
+    header_cfg.sidebar_palette = true;
+    header_cfg.header_height = Some(px(24.));
     v_flex()
         .gap_1()
-        .child(
-            h_flex()
-                .h(px(24.))
-                .px_1()
-                .gap(px(2.))
+        .child(div().px_1().child(desktop_common::month_calendar::render_month_header(
+            header_cfg,
+            cx,
+            move |delta, window, cx| shift(&delta, window, cx),
+            Some(Box::new(move |window, cx| go_today(&(), window, cx))),
+        )))
+        .child(div().h(px(22.)).child(desktop_common::month_calendar::render_weekday_row(
+            strings,
+            desktop_common::month_calendar::WeekdayStyle::Short,
+            true,
+            cx,
+        )))
+        .children(desktop_common::month_calendar::render_month_weeks(month, cx, |date, in_month| {
+            let pick = pick.clone();
+            let is_today = date == today;
+            let is_selected = selected == Some(date);
+            let has_dot = !is_today && busy.contains(&date);
+            let color = if is_today {
+                Color::OnAccent
+            } else if !in_month {
+                Color::Custom(colors.list_text_muted)
+            } else {
+                Color::Custom(colors.list_text)
+            };
+            div()
+                .flex_1()
+                .h(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Label::new(short_title).weight(FontWeight::SEMIBOLD).color(colors.list_text).truncate()),
-                )
-                .child(arrow("calendar-picker-prev", IconName::ChevronLeft, -1, "←"))
-                .child(
-                    IconButton::new("calendar-picker-today", IconName::Circle)
-                        .size(px(22.))
-                        .icon_size(IconSize::Custom(px(8.)))
-                        .icon_color(colors.list_text_muted)
-                        .hover_icon_color(colors.list_text)
-                        .hover_color(colors.list_hover)
-                        .tooltip(Tooltip::text(strings.today))
-                        .on_click(move |_, window, cx| go_today(&(), window, cx)),
-                )
-                .child(arrow("calendar-picker-next", IconName::ChevronRight, 1, "→")),
-        )
-        .child(h_flex().h(px(22.)).children(
-            calendar::weekday_labels(&strings.weekdays_short).map(|day| {
-                div()
-                    .flex_1()
-                    .flex()
-                    .justify_center()
-                    .child(Label::new(day).size(LabelSize::XSmall).color(colors.list_text_muted))
-            }),
-        ))
-        .children(calendar::month_grid(month).chunks(7).map(|week| {
-            h_flex().children(week.iter().map(|&date| {
-                let pick = pick.clone();
-                let is_today = date == today;
-                let is_selected = selected == Some(date);
-                let has_dot = !is_today && busy.contains(&date);
-                let color = if is_today {
-                    Color::OnAccent
-                } else if date.month() != month.month() {
-                    Color::Custom(colors.list_text_muted)
-                } else {
-                    Color::Custom(colors.list_text)
-                };
-                div().flex_1().h(px(30.)).flex().items_center().justify_center().child(
                     v_flex()
                         .id(SharedString::from(format!("calendar-picker-{date}")))
                         .w(px(26.))
@@ -214,6 +198,6 @@ pub(super) fn month_picker(
                         )
                         .on_click(move |_, window, cx| pick(&date, window, cx)),
                 )
-            }))
+                .into_any_element()
         }))
 }

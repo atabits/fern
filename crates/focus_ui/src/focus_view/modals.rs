@@ -48,14 +48,18 @@ impl FocusView {
         let Some(started) = started else { return };
         let ended = started + self.add_minutes * 60_000;
         if let Err(err) = self.store.add_focus_session(None, &title, started, ended) {
-            eprintln!("failed to add the focus record: {err:#}");
+            desktop_common::logging::log_error("focus_ui", format!("failed to add the focus record: {err:#}"));
             return;
         }
         self.add_title.update(cx, |input, cx| input.set_text("", cx));
         self.add_start.update(cx, |input, cx| input.set_text("", cx));
         self.record_menu = None;
         self.reload(cx);
-        desktop_common::data_version::data_changed(cx.entity_id(), cx);
+        desktop_common::data_version::data_changed_scoped(
+            cx.entity_id(),
+            desktop_common::data_version::DataScope::FOCUS,
+            cx,
+        );
     }
 
     /// Opens a focus record's dialog, its note in the field.
@@ -72,7 +76,7 @@ impl FocusView {
         if let Some(id) = self.open_record.take() {
             let note = self.record_note.read(cx).text().to_owned();
             if let Err(err) = self.store.set_focus_note(id, &note) {
-                eprintln!("failed to save the focus note: {err:#}");
+                desktop_common::logging::log_error("focus_ui", format!("failed to save the focus note: {err:#}"));
             }
             self.pending_focus = Some(PendingFocus::View);
             self.reload(cx);
@@ -90,8 +94,8 @@ impl FocusView {
         let when = format!(
             "{}, {} - {}",
             crate::task_rows::short_date(start.date_naive(), strings),
-            crate::calendar::format_time(start, strings),
-            crate::calendar::format_time(session.end_local(), strings)
+            crate::calendar::format_time(start, strings, cx),
+            crate::calendar::format_time(session.end_local(), strings, cx)
         );
         Some(
             Modal::new("focus-record-modal")
@@ -209,11 +213,14 @@ impl FocusView {
                 el.debug_selector(|| "focus-record-delete-modal".to_owned())
             })
             .child(
-                ConfirmDialog::new("focus-record-delete", strings.confirm_delete_focus_record)
+                ConfirmDialog::new(
+                    "focus-record-delete",
+                    strings.confirm_delete_focus_record,
+                    strings.cancel,
+                    strings.delete,
+                )
                     .width(px(360.))
                     .description(desc)
-                    .cancel_label(strings.cancel)
-                    .confirm_label(strings.delete)
                     .destructive(true)
                     .on_cancel(cx.listener(|this, _, window, cx| {
                         this.cancel_delete_record(Some(window), cx);
@@ -231,10 +238,14 @@ impl FocusView {
 
     pub(super) fn delete_record(&mut self, id: fern_core::Id, cx: &mut Context<Self>) {
         if let Err(err) = self.store.delete_focus_session(id) {
-            eprintln!("failed to delete the focus record: {err:#}");
+            desktop_common::logging::log_error("focus_ui", format!("failed to delete the focus record: {err:#}"));
         }
         self.reload(cx);
-        desktop_common::data_version::data_changed(cx.entity_id(), cx);
+        desktop_common::data_version::data_changed_scoped(
+            cx.entity_id(),
+            desktop_common::data_version::DataScope::FOCUS,
+            cx,
+        );
     }
 
     fn export(&mut self, cx: &mut Context<Self>) {
@@ -280,7 +291,7 @@ impl FocusView {
         if which == 0 {
             let today = Local::now().date_naive();
             let strings = i18n::t(cx);
-            let parse = |text: &str| crate::calendar::parse_date(text, today, strings);
+            let parse = |text: &str| crate::calendar::parse_date(text, today, strings, cx);
             let (Some(start), Some(end)) = (parse(&first), parse(&second)) else { return };
             self.batch_filter.date = 7;
             self.batch_filter.days = Some((start.min(end), start.max(end)));
@@ -370,7 +381,7 @@ impl FocusView {
         let today = chrono::Local::now().date_naive();
         let filter = self.batch_filter;
         let shown: Vec<&FocusSession> =
-            self.sessions.iter().filter(|s| filter.matches(s, today, crate::calendar::week_start())).collect();
+            self.sessions.iter().filter(|s| filter.matches(s, today, crate::calendar::week_start(cx))).collect();
         let mut days: Vec<(chrono::NaiveDate, Vec<&FocusSession>)> = Vec::new();
         for session in shown.iter().copied() {
             let day = session.start_local().date_naive();
@@ -491,8 +502,8 @@ impl FocusView {
                 let on = self.batch.contains(&id);
                 let span = format!(
                     "{} - {}",
-                    crate::calendar::format_time(session.start_local().time(), strings),
-                    crate::calendar::format_time(session.end_local().time(), strings)
+                    crate::calendar::format_time(session.start_local().time(), strings, cx),
+                    crate::calendar::format_time(session.end_local().time(), strings, cx)
                 );
                 rows.push(
                     h_flex()
@@ -619,7 +630,7 @@ impl FocusView {
         timer.minutes = minutes.unwrap_or(timer.minutes);
         timer.name = draft.name.read(cx).text().trim().to_owned();
         if let Err(err) = self.store.save_focus_timer(&timer) {
-            eprintln!("failed to save the timer: {err:#}");
+            desktop_common::logging::log_error("focus_ui", format!("failed to save the timer: {err:#}"));
             if !timer.name.is_empty() {
                 return;
             }

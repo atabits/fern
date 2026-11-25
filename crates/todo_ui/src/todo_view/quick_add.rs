@@ -30,7 +30,7 @@ impl TodoView {
     /// a due date in Today/Tomorrow, the tag in a tag view, the list in a list view.
     /// A task from a template, placed like a typed one: in the current list, tag or day.
     pub(super) fn add_from_template(&mut self, template: Id, cx: &mut Context<Self>) {
-        self.templates_open = false;
+        self.quick_add.templates_open = false;
         let today = Self::today();
         let result = (|| -> anyhow::Result<Task> {
             let task = self.store.add_from_template(template)?;
@@ -60,7 +60,7 @@ impl TodoView {
         popover(cx)
             .w(px(280.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.templates_open = false;
+                this.quick_add.templates_open = false;
                 cx.notify();
             }))
             .child(div().px_2().py_1().child(Label::new(strings.templates).weight(FontWeight::SEMIBOLD)))
@@ -105,8 +105,8 @@ impl TodoView {
                                     .tooltip(Tooltip::text(strings.delete))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.templates_open = false;
-                                        this.confirm_delete = Some(ConfirmDeleteTarget::Template(id, template_title.clone()));
+                                        this.quick_add.templates_open = false;
+                                        this.overlays.confirm_delete = Some(ConfirmDeleteTarget::Template(id, template_title.clone()));
                                         cx.notify();
                                     })),
                             ),
@@ -127,21 +127,26 @@ impl TodoView {
         list: Option<Option<Id>>,
         cx: &mut Context<Self>,
     ) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.preferences = self.store.preferences().unwrap_or_default();
             if let Some(lists) = self.check(self.store.lists()) {
                 self.lists = lists;
                 self.refresh_list_colors();
+                self.panel_dnd.lists_index_dirty = true;
             }
         }
         let draft = AddDraft { date, priority, list, ..Default::default() };
-        let result = self.add_task_as(text, &View::All, &draft);
+        let result = self.add_task_as(text, &View::All, &draft, cx);
         self.check(result);
-        if self.active {
+        if self.refresh.is_active() {
             self.reload(cx);
         } else {
-            crate::data_version::data_changed(cx.entity_id(), cx);
-            self.dirty = true;
+            crate::data_version::data_changed_scoped(
+                cx.entity_id(),
+                crate::data_version::DataScope::TASKS | crate::data_version::DataScope::LISTS,
+                cx,
+            );
+            let _ = self.refresh.mark_dirty_or_reload();
         }
     }
 
@@ -166,13 +171,13 @@ impl TodoView {
                 )
             })
             .collect();
-        self.add_attachment_error = (!errors.is_empty()).then(|| errors.join("\n"));
+        self.quick_add.attachment_error = (!errors.is_empty()).then(|| errors.join("\n"));
     }
 
     pub(super) fn add_task(&mut self, input: &str, cx: &App) -> Option<Task> {
-        let result = self.add_task_as(input, &self.view, &self.add_draft);
+        let result = self.add_task_as(input, &self.view, &self.quick_add.draft, cx);
         let task = self.check(result)?;
-        let files = std::mem::take(&mut self.add_draft.files);
+        let files = std::mem::take(&mut self.quick_add.draft.files);
         self.attach_draft_files(task.id, files, cx);
         Some(task)
     }
@@ -186,6 +191,7 @@ impl TodoView {
         lists: &[fern_core::List],
         preferences: &fern_core::Preferences,
         today: NaiveDate,
+        horizons_enabled: bool,
     ) -> (fern_core::TaskDraft, bool) {
         let list_names: Vec<String> = lists.iter().map(|l| l.name.clone()).collect();
         let parsed = fern_core::parse_quick_add_with_horizons(
@@ -193,7 +199,7 @@ impl TodoView {
             today,
             &list_names,
             preferences.recognition,
-            crate::calendar::horizons_enabled(),
+            horizons_enabled,
         );
         let title = if parsed.title.is_empty() { input.trim() } else { parsed.title.as_str() };
         let view_due = match view {
@@ -312,7 +318,17 @@ impl TodoView {
     }
 
     /// Adds a task from the add field's text as if typed in `view` with `draft`'s choices.
-    pub(super) fn add_task_as(&self, input: &str, view: &View, draft: &AddDraft) -> anyhow::Result<Task> {
+    pub(super) fn add_task_as(&self, input: &str, view: &View, draft: &AddDraft, cx: &App) -> anyhow::Result<Task> {
+        self.add_task_as_with(input, view, draft, crate::calendar::horizons_enabled(cx))
+    }
+
+    fn add_task_as_with(
+        &self,
+        input: &str,
+        view: &View,
+        draft: &AddDraft,
+        horizons_enabled: bool,
+    ) -> anyhow::Result<Task> {
         let today = Self::today();
         let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
         let parsed = fern_core::parse_quick_add_with_horizons(
@@ -320,7 +336,7 @@ impl TodoView {
             today,
             &list_names,
             self.preferences.recognition,
-            crate::calendar::horizons_enabled(),
+            horizons_enabled,
         );
         let title = if parsed.title.is_empty() { input.trim() } else { parsed.title.as_str() };
         let task = self.store.add_task_at(title, !self.preferences.task_defaults.add_to_bottom)?;
@@ -424,20 +440,20 @@ impl TodoView {
 
     /// Highlights what quick add recognizes in the field and shows the recognized date or horizon.
     pub(super) fn update_quick_add_hint(&mut self, cx: &mut Context<Self>) {
-        let text = self.input.read(cx).text().to_owned();
+        let text = self.quick_add.input.read(cx).text().to_owned();
         let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
         let parsed = fern_core::parse_quick_add_with_horizons(
             &text,
             Self::today(),
             &list_names,
             self.preferences.recognition,
-            crate::calendar::horizons_enabled(),
+            crate::calendar::horizons_enabled(cx),
         );
         let spans = parsed.spans.clone();
-        self.input.update(cx, |input, cx| input.set_highlights(spans, cx));
-        self.quick_add_due = parsed.due_date.map(|date| (date, parsed.due_time));
-        self.quick_add_horizon = if parsed.due_date.is_some() { None } else { parsed.horizon };
-        self.quick_add_repeat = parsed.repeat.is_some();
+        self.quick_add.input.update(cx, |input, cx| input.set_highlights(spans, cx));
+        self.quick_add.due = parsed.due_date.map(|date| (date, parsed.due_time));
+        self.quick_add.horizon = if parsed.due_date.is_some() { None } else { parsed.horizon };
+        self.quick_add.repeat = parsed.repeat.is_some();
         cx.notify();
     }
 
@@ -457,7 +473,7 @@ impl TodoView {
         } else {
             strings.add_task.into()
         };
-        self.input.update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+        self.quick_add.input.update(cx, |input, cx| input.set_placeholder(placeholder, cx));
     }
 
     /// Adds the typed task, as Enter in the add field or its "Add" button does.
@@ -468,16 +484,17 @@ impl TodoView {
         if let Some(hooks) = desktop_common::plugin_bus::PluginHooksGlobal::global(cx)
             .filter(desktop_common::plugin_bus::PluginHooksGlobal::is_active)
         {
-            if self.submitting_task {
+            if self.quick_add.submitting_task {
                 return;
             }
-            self.submitting_task = true;
+            self.quick_add.submitting_task = true;
             let raw_text = text.to_owned();
             let view = self.view.clone();
-            let draft_snapshot = self.add_draft.clone();
+            let draft_snapshot = self.quick_add.draft.clone();
             let lists = self.lists.clone();
             let preferences = self.preferences.clone();
             let today = Self::today();
+            let horizons_enabled = crate::calendar::horizons_enabled(cx);
             let window_handle = window.window_handle();
             cx.spawn(async move |this, cx| {
                 let hooks_t = hooks.clone();
@@ -492,7 +509,7 @@ impl TodoView {
                             desktop_common::plugin_bus::push_hook_cancel_toast(&reason, fallback, cx);
                         });
                         let _ = this.update(cx, |this, cx| {
-                            this.submitting_task = false;
+                            this.quick_add.submitting_task = false;
                             cx.notify();
                         });
                         return;
@@ -503,7 +520,10 @@ impl TodoView {
                     }
                     Ok(desktop_common::plugin_bus::PluginHookDecision::Allow) => raw_text,
                     Err(err) => {
-                        eprintln!("plugin quickAddTransform hook failed: {err:#}");
+                        desktop_common::logging::log_error(
+                            "todo_ui",
+                            format!("plugin quickAddTransform hook failed: {err:#}"),
+                        );
                         raw_text
                     }
                 };
@@ -515,6 +535,7 @@ impl TodoView {
                     &lists,
                     &preferences,
                     today,
+                    horizons_enabled,
                 );
                 let draft_json =
                     desktop_common::plugin_bus::task_draft_to_hook_json(&task_draft, default_top);
@@ -529,7 +550,7 @@ impl TodoView {
                             desktop_common::plugin_bus::push_hook_cancel_toast(&reason, fallback, cx);
                         });
                         let _ = this.update(cx, |this, cx| {
-                            this.submitting_task = false;
+                            this.quick_add.submitting_task = false;
                             cx.notify();
                         });
                     }
@@ -540,23 +561,31 @@ impl TodoView {
                         );
                         let mut input_to_clear = None;
                         let _ = this.update(cx, |this, cx| {
-                            this.submitting_task = false;
+                            this.quick_add.submitting_task = false;
                             let created = match parsed {
                                 Ok((modified_draft, top)) => {
                                     this.check(this.store.create_task(modified_draft, top))
                                 }
                                 Err(err) => {
-                                    eprintln!("plugin beforeTaskCreate returned invalid draft: {err:#}");
-                                    this.check(this.add_task_as(&transformed, &view, &draft_snapshot))
+                                    desktop_common::logging::log_error(
+                                        "todo_ui",
+                                        format!("plugin beforeTaskCreate returned invalid draft: {err:#}"),
+                                    );
+                                    this.check(this.add_task_as_with(
+                                        &transformed,
+                                        &view,
+                                        &draft_snapshot,
+                                        horizons_enabled,
+                                    ))
                                 }
                             };
                             if let Some(task) = created {
-                                let files = std::mem::take(&mut this.add_draft.files);
+                                let files = std::mem::take(&mut this.quick_add.draft.files);
                                 this.attach_draft_files(task.id, files, cx);
-                                this.quick_add_due = None;
-                                this.quick_add_horizon = None;
-                                this.add_draft = AddDraft::default();
-                                input_to_clear = Some(this.input.clone());
+                                this.quick_add.due = None;
+                                this.quick_add.horizon = None;
+                                this.quick_add.draft = AddDraft::default();
+                                input_to_clear = Some(this.quick_add.input.clone());
                                 this.reload(cx);
                             }
                         });
@@ -569,15 +598,20 @@ impl TodoView {
                     Ok(desktop_common::plugin_bus::PluginHookDecision::Allow) => {
                         let mut input_to_clear = None;
                         let _ = this.update(cx, |this, cx| {
-                            this.submitting_task = false;
-                            let created = this.check(this.add_task_as(&transformed, &view, &draft_snapshot));
+                            this.quick_add.submitting_task = false;
+                            let created = this.check(this.add_task_as_with(
+                                &transformed,
+                                &view,
+                                &draft_snapshot,
+                                horizons_enabled,
+                            ));
                             if let Some(task) = created {
-                                let files = std::mem::take(&mut this.add_draft.files);
+                                let files = std::mem::take(&mut this.quick_add.draft.files);
                                 this.attach_draft_files(task.id, files, cx);
-                                this.quick_add_due = None;
-                                this.quick_add_horizon = None;
-                                this.add_draft = AddDraft::default();
-                                input_to_clear = Some(this.input.clone());
+                                this.quick_add.due = None;
+                                this.quick_add.horizon = None;
+                                this.quick_add.draft = AddDraft::default();
+                                input_to_clear = Some(this.quick_add.input.clone());
                                 this.reload(cx);
                             }
                         });
@@ -588,18 +622,26 @@ impl TodoView {
                         }
                     }
                     Err(err) => {
-                        eprintln!("plugin beforeTaskCreate hook failed: {err:#}");
+                        desktop_common::logging::log_error(
+                            "todo_ui",
+                            format!("plugin beforeTaskCreate hook failed: {err:#}"),
+                        );
                         let mut input_to_clear = None;
                         let _ = this.update(cx, |this, cx| {
-                            this.submitting_task = false;
-                            let created = this.check(this.add_task_as(&transformed, &view, &draft_snapshot));
+                            this.quick_add.submitting_task = false;
+                            let created = this.check(this.add_task_as_with(
+                                &transformed,
+                                &view,
+                                &draft_snapshot,
+                                horizons_enabled,
+                            ));
                             if let Some(task) = created {
-                                let files = std::mem::take(&mut this.add_draft.files);
+                                let files = std::mem::take(&mut this.quick_add.draft.files);
                                 this.attach_draft_files(task.id, files, cx);
-                                this.quick_add_due = None;
-                                this.quick_add_horizon = None;
-                                this.add_draft = AddDraft::default();
-                                input_to_clear = Some(this.input.clone());
+                                this.quick_add.due = None;
+                                this.quick_add.horizon = None;
+                                this.quick_add.draft = AddDraft::default();
+                                input_to_clear = Some(this.quick_add.input.clone());
                                 this.reload(cx);
                             }
                         });
@@ -615,10 +657,10 @@ impl TodoView {
             return;
         }
         if self.add_task(text, cx).is_some() {
-            self.input.update(cx, |input, cx| input.clear(window, cx));
-            self.quick_add_due = None;
-            self.quick_add_horizon = None;
-            self.add_draft = AddDraft::default();
+            self.quick_add.input.update(cx, |input, cx| input.clear(window, cx));
+            self.quick_add.due = None;
+            self.quick_add.horizon = None;
+            self.quick_add.draft = AddDraft::default();
             self.reload(cx);
         }
     }
@@ -626,70 +668,70 @@ impl TodoView {
     /// The popovers the add field's buttons open: the "▾" menu, its Tags and Input Box Setting,
     /// and the templates.
     pub(super) fn add_field_popovers(&self, el: Div, strings: &'static Strings, cx: &mut Context<Self>) -> Div {
-        el.when(self.add_menu_open, |el| {
+        el.when(self.quick_add.menu_open, |el| {
             // As the original's, the menu hangs from the field's calendar button, opening rightwards.
             el.child(PopoverAttachment::new(Placement::BelowLeft, self.render_add_menu(strings, cx)))
         })
-        .when_some(self.add_tags.clone(), |el, picked| {
+        .when_some(self.quick_add.tags.clone(), |el, picked| {
             el.child(PopoverAttachment::new(Placement::BelowRight, self.render_add_tags(&picked, strings, cx)))
         })
-        .when(self.input_box_open, |el| {
+        .when(self.quick_add.input_box_open, |el| {
             el.child(PopoverAttachment::new(Placement::BelowRight, self.render_input_box_setting(strings, cx)))
         })
-        .when(self.templates_open, |el| {
+        .when(self.quick_add.templates_open, |el| {
             el.child(PopoverAttachment::new(Placement::BelowRight, self.render_templates(strings, cx)))
         })
     }
 
     /// The date the field shows: the typed one, or the one picked with its calendar button.
     pub(super) fn shown_add_due(&self) -> Option<(NaiveDate, Option<chrono::NaiveTime>)> {
-        self.quick_add_due.or(self.add_draft.date.map(|date| (date, self.add_draft.time)))
+        self.quick_add.due.or(self.quick_add.draft.date.map(|date| (date, self.quick_add.draft.time)))
     }
 
     /// The horizon the field shows when no concrete date is set.
-    pub(super) fn shown_add_horizon(&self) -> Option<fern_core::Horizon> {
-        if !crate::calendar::horizons_enabled() || self.shown_add_due().is_some() {
+    pub(super) fn shown_add_horizon(&self, cx: &App) -> Option<fern_core::Horizon> {
+        if !crate::calendar::horizons_enabled(cx) || self.shown_add_due().is_some() {
             return None;
         }
-        self.quick_add_horizon.or(self.add_draft.horizon)
+        self.quick_add.horizon.or(self.quick_add.draft.horizon)
     }
 
     /// The field's calendar button, as in the original: it opens a date picker for the next task,
     /// placed under the button.
     pub(super) fn add_date_button(&self, placement: Placement, strings: &'static Strings, cx: &mut Context<Self>) -> Div {
-        let picked = self.add_draft.date.is_some() || self.add_draft.horizon.is_some();
+        let picked = self.quick_add.draft.date.is_some() || self.quick_add.draft.horizon.is_some();
         let button = IconButton::new("add-date", IconName::CalendarDays)
             .size(px(24.))
             .icon_size(IconSize::Small)
             .icon_color(if picked { Color::Accent } else { Color::Muted })
             .tooltip(Tooltip::text(strings.due_date))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.add_date_month = match this.add_date_month {
+                this.quick_add.date_month = match this.quick_add.date_month {
                     Some(_) => None,
-                    None => Some(crate::calendar::month_start(this.add_draft.date.unwrap_or_else(Self::today))),
+                    None => Some(crate::calendar::month_start(this.quick_add.draft.date.unwrap_or_else(Self::today))),
                 };
                 cx.notify();
             }));
-        div().relative().child(button).when_some(self.add_date_month, |el, month| {
+        div().relative().child(button).when_some(self.quick_add.date_month, |el, month| {
             el.child(PopoverAttachment::new(placement, self.render_add_date(month, strings, cx)))
         })
     }
 
     /// Focuses the quick-add field (or, in kanban view, the first column's add input).
     pub fn focus_new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload_inner(false, false, cx);
         }
         if self.is_read_only_view() {
             self.set_view(View::Inbox, cx);
         }
-        if self.kanban && !self.timeline {
+        if self.kanban.enabled && !self.timeline.enabled {
             let strings = i18n::t(cx);
-            let columns = self.board_columns(strings);
-            if self.kanban_quick_add {
+            let columns = self.board_columns(strings, cx);
+            if self.kanban.quick_add {
                 self.sync_kanban_quick_adds(&columns, strings, cx);
                 if let Some(col) = columns.iter().find(|c| c.drop.as_ref().is_some_and(|t| !matches!(t, DropTarget::Complete)))
-                    && let Some((_, input)) = self.kanban_quick_adds.get(&col.key)
+                    && let Some((_, input)) = self.kanban.quick_adds.get(&col.key)
                 {
                     window.focus(&input.focus_handle(cx), cx);
                     return;
@@ -704,7 +746,7 @@ impl TodoView {
                 return;
             }
         }
-        window.focus(&self.input.focus_handle(cx), cx);
+        window.focus(&self.quick_add.input.focus_handle(cx), cx);
     }
 
 }

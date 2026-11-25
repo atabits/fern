@@ -14,7 +14,7 @@ use std::time::Duration;
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
 use desktop_common::actions::DismissTransient;
 use desktop_common::calendar;
-use desktop_common::data_version::{DataVersion, changed_elsewhere, data_changed};
+use desktop_common::data_version::{DataScope, DataVersion, ViewRefreshState, data_changed_scoped};
 use desktop_common::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 use fern_core::life_clock::{
     TimelineSnapshot, compute_age, format_birth_date, parse_birth_date,
@@ -95,8 +95,12 @@ enum BirthDatePart {
 }
 
 impl BirthDatePart {
-    fn ordered(strings: &Strings) -> [Self; 3] {
-        match calendar::effective_date_format(strings) {
+    fn ordered(strings: &Strings, cx: &App) -> [Self; 3] {
+        Self::ordered_for_format(calendar::effective_date_format(strings, cx))
+    }
+
+    fn ordered_for_format(format: DateFormat) -> [Self; 3] {
+        match format {
             DateFormat::MonthDayYear => [Self::Month, Self::Day, Self::Year],
             DateFormat::DayMonthYear => [Self::Day, Self::Month, Self::Year],
             DateFormat::YearMonthDay | DateFormat::IsoYearMonthDay => {
@@ -141,8 +145,7 @@ pub struct LifeClockView {
     _subscriptions: Vec<Subscription>,
     #[cfg(not(test))]
     tick_timer: Option<(u64, gpui::Task<()>)>,
-    active: bool,
-    dirty: bool,
+    refresh: ViewRefreshState,
 }
 
 impl EventEmitter<LifeClockEvent> for LifeClockView {}
@@ -189,12 +192,12 @@ impl LifeClockView {
         }
 
         subscriptions.push(cx.observe_global::<DataVersion>(|this, cx| {
-            if changed_elsewhere(cx.entity_id(), cx) {
-                this.sync_external(cx);
+            if this.refresh.on_data_version(cx.entity_id(), cx) {
+                this.reload(cx);
             }
         }));
 
-        let view = Self {
+        let mut view = Self {
             store,
             focus_handle: cx.focus_handle(),
             birth_date,
@@ -213,33 +216,29 @@ impl LifeClockView {
             _subscriptions: subscriptions,
             #[cfg(not(test))]
             tick_timer: None,
-            active: initial_active,
-            dirty: !initial_active,
+            refresh: ViewRefreshState::new(initial_active, DataScope::PREFS, cx),
         };
         if initial_active {
+            view.refresh.mark_clean(cx);
             view.sync_date_inputs(cx);
         }
         view
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
-        self.active = active;
-        if active && self.dirty {
-            self.dirty = false;
+        if self.refresh.set_active(active, cx) {
             self.reload(cx);
         }
     }
 
     pub fn sync_external(&mut self, cx: &mut Context<Self>) {
-        if self.active {
+        if self.refresh.mark_dirty_or_reload() {
             self.reload(cx);
-        } else {
-            self.dirty = true;
         }
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.dirty = false;
+        self.refresh.mark_clean(cx);
         let new_birth = load_birth_date(&self.store);
         let new_palette = load_palette_mode(&self.store);
         let birth_changed = self.birth_date != new_birth;
@@ -281,7 +280,7 @@ impl LifeClockView {
 
     #[cfg(debug_assertions)]
     pub fn dev_set_birth_date(&mut self, date: Option<NaiveDate>, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         self.invalid_date = false;
@@ -291,7 +290,7 @@ impl LifeClockView {
 
     #[cfg(debug_assertions)]
     pub fn dev_set_palette(&mut self, mode: LifeClockPaletteMode, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         self.set_palette(mode, cx);
@@ -307,7 +306,7 @@ impl LifeClockView {
     }
 
     fn open_popover(&mut self, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         if !self.popover_open {
@@ -337,7 +336,7 @@ impl LifeClockView {
         }
         self.palette_mode = mode;
         let _ = self.store.set_setting(SETTING_PALETTE, mode.as_storage());
-        data_changed(cx.entity_id(), cx);
+        data_changed_scoped(cx.entity_id(), DataScope::PREFS, cx);
         cx.emit(LifeClockEvent::PaletteChanged(mode));
         cx.notify();
     }
@@ -354,7 +353,7 @@ impl LifeClockView {
                 let _ = self.store.delete_setting(SETTING_BIRTH_DATE);
             }
         }
-        data_changed(cx.entity_id(), cx);
+        data_changed_scoped(cx.entity_id(), DataScope::PREFS, cx);
         cx.notify();
     }
 
@@ -558,6 +557,7 @@ impl LifeClockView {
         strings: &'static Strings,
         palette: LifeClockPalette,
         now: NaiveDateTime,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (age_heading, age_subtitle) = self.age_header_strings(locale, strings, now);
@@ -565,7 +565,7 @@ impl LifeClockView {
 
         h_flex()
             .absolute()
-            .top(desktop_common::layout::title_bar_height() + px(14.))
+            .top(desktop_common::layout::title_bar_height(window, cx) + px(14.))
             .left_0()
             .right_0()
             .w_full()
@@ -654,6 +654,7 @@ impl LifeClockView {
         &self,
         strings: &'static Strings,
         palette: LifeClockPalette,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let tip = if self.sidebar_hidden {
@@ -665,7 +666,7 @@ impl LifeClockView {
 
         div()
             .absolute()
-            .top(desktop_common::layout::title_bar_height() + px(14.))
+            .top(desktop_common::layout::title_bar_height(window, cx) + px(14.))
             .left(px(14.))
             .debug_selector(|| "life-clock-sidebar-toggle".to_owned())
             .child(
@@ -686,6 +687,7 @@ impl LifeClockView {
         &self,
         strings: &'static Strings,
         palette: LifeClockPalette,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let help_bounds = self.help_button_bounds.clone();
@@ -693,7 +695,7 @@ impl LifeClockView {
 
         div()
             .absolute()
-            .top(desktop_common::layout::title_bar_height() + px(14.))
+            .top(desktop_common::layout::title_bar_height(window, cx) + px(14.))
             .right(px(16.))
             .child(
                 div()
@@ -751,7 +753,7 @@ impl LifeClockView {
             colors.border
         };
         let help_bounds = self.help_button_bounds.clone();
-        let parts = BirthDatePart::ordered(strings);
+        let parts = BirthDatePart::ordered(strings, cx);
 
         popover(cx)
             .debug_selector(|| "life-clock-popover".to_owned())
@@ -938,10 +940,12 @@ impl Render for LifeClockView {
                 strings.life_clock_months,
                 palette,
                 self.glyph_cache.clone(),
+                window,
+                cx,
             ))
-            .child(self.render_header(locale, strings, palette, now, cx))
-            .child(self.render_sidebar_toggle(strings, palette, cx))
-            .child(self.render_help_corner(strings, palette, cx))
+            .child(self.render_header(locale, strings, palette, now, window, cx))
+            .child(self.render_sidebar_toggle(strings, palette, window, cx))
+            .child(self.render_help_corner(strings, palette, window, cx))
     }
 }
 

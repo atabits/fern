@@ -44,7 +44,10 @@ impl TaskbarButton {
         // When requested, GPUI creates this HWND invisible. Set its owner
         // synchronously, before GPUI applies the saved placement and shows it.
         if hidden && let Err(err) = button.window.apply(true) {
-            eprintln!("failed to prepare sticky note taskbar visibility: {err}");
+            desktop_common::logging::log_error(
+                "sticky_ui",
+                format!("failed to prepare sticky note taskbar visibility: {err}"),
+            );
             button.set_hidden(true, cx);
         }
         button
@@ -70,8 +73,11 @@ impl TaskbarButton {
                     return;
                 }
                 if let Err(err) = window.apply(hidden) {
-                    eprintln!(
-                        "failed to change sticky note taskbar visibility: {first}; retry: {err}"
+                    desktop_common::logging::log_error(
+                        "sticky_ui",
+                        format!(
+                            "failed to change sticky note taskbar visibility: {first}; retry: {err}"
+                        ),
                     );
                 }
             }
@@ -189,7 +195,10 @@ impl Drop for NoteHandle {
             && unsafe { GetWindow(self.note, GW_OWNER) }.ok() == Some(owner)
             && let Err(err) = set_window_long(self.note, GWLP_HWNDPARENT, 0)
         {
-            eprintln!("failed to detach sticky note from its taskbar owner: {err}");
+            desktop_common::logging::log_error(
+                "sticky_ui",
+                format!("failed to detach sticky note from its taskbar owner: {err}"),
+            );
         }
         if unsafe { IsWindow(Some(owner)) }.as_bool() {
             let _ = unsafe { DestroyWindow(owner) };
@@ -204,7 +213,10 @@ pub(super) fn show_inactive(note: HWND, bounds: Bounds<Pixels>, scale: f32, cx: 
                 return;
             }
             if let Err(err) = place_inactive(note, bounds, scale) {
-                eprintln!("failed to show restored sticky note: {err}");
+                desktop_common::logging::log_error(
+                    "sticky_ui",
+                    format!("failed to show restored sticky note: {err}"),
+                );
             }
         })
         .detach();

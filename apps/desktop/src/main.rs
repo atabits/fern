@@ -8,11 +8,11 @@ mod app_view;
 mod dev_state;
 
 pub(crate) use desktop_common::{
-    actions, calendar, export, keymap, portable, text_input, touch,
+    DbPath, actions, calendar, keymap, portable, release_notes, text_input, touch, user_themes,
 };
-pub(crate) use desktop_sync::{subscriptions, sync};
+pub(crate) use desktop_sync::{LiveSyncStatus, subscriptions, sync};
 pub(crate) use desktop_common::paths::{
-    DAILY_BACKUPS, attachments_dir, backups_dir, data_dir, pending_restore_path, scratch_dir,
+    DAILY_BACKUPS, attachments_dir, backups_dir, data_dir,
 };
 pub(crate) use task_ui::{
     lists_panel, search_modal, task_detail, task_rows,
@@ -28,40 +28,27 @@ pub(crate) use todo_ui as todo_view;
 mod hotkeys;
 mod http;
 pub(crate) use fern_i18n as i18n;
-mod release_notes;
 mod quick_add_window;
 mod reminders;
 mod settings_window;
+mod shutdown;
 mod sidebar;
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 mod single_instance;
 mod title_bar;
 mod tray;
 mod updater;
-mod user_themes;
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
 use fern_core::Store;
-use gpui::{App, Bounds, Global, WindowBounds, WindowOptions, prelude::*, px, size};
+use gpui::{App, WindowOptions, prelude::*, px, size};
 
 use crate::app_view::AppView;
 use assets::Assets;
 use crate::i18n::{CurrentLocale, Locale};
-
-/// Path to the on-disk SQLite database so background workers can open a WAL connection
-/// off the foreground UI thread.
-pub(crate) struct DbPath(pub PathBuf);
-
-impl Global for DbPath {}
-
-/// Latest sync status, shared globally so Settings diagnostics reflect live sync state.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct LiveSyncStatus(pub crate::sync::SyncStatus);
-
-impl Global for LiveSyncStatus {}
 
 fn preserve_corrupt_database(
     dir: &Path,
@@ -121,15 +108,10 @@ fn open_store(dir: &Path) -> Result<(Store, bool, PathBuf, desktop_common::diagn
         let attachments = dir.join("attachments");
         match store.restore_from(&pending, Some(&attachments)) {
             Ok(()) => {
-                eprintln!("restored the backup");
-                desktop_common::diagnostics::log_event("db", "restored pending backup on startup");
+                desktop_common::logging::log_info("db", "restored pending backup on startup");
             }
             Err(err) => {
-                eprintln!("failed to restore the backup: {err:#}");
-                desktop_common::diagnostics::log_event(
-                    "db",
-                    format!("failed to restore pending backup: {err:#}"),
-                );
+                desktop_common::logging::log_error("db", format!("failed to restore pending backup: {err:#}"));
             }
         }
         std::fs::remove_file(&pending).ok();
@@ -183,9 +165,31 @@ fn add_welcome_tasks(store: &Store, strings: &i18n::Strings) -> Result<()> {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CliOptions {
+    show_version: bool,
+    show_help: bool,
     safe_mode: bool,
+    quick_add: bool,
+    toggle: bool,
+    focus_mini: bool,
     deep_link: Option<fern_core::link::DeepLink>,
     deep_link_raw: Option<String>,
+}
+
+impl CliOptions {
+    #[cfg(any(windows, unix))]
+    fn ipc_command(&self) -> single_instance::IpcCommand {
+        if let Some(uri) = &self.deep_link_raw {
+            single_instance::IpcCommand::DeepLink(uri.clone())
+        } else if self.quick_add {
+            single_instance::IpcCommand::QuickAdd
+        } else if self.toggle {
+            single_instance::IpcCommand::Toggle
+        } else if self.focus_mini {
+            single_instance::IpcCommand::FocusMini
+        } else {
+            single_instance::IpcCommand::Activate
+        }
+    }
 }
 
 fn parse_cli_args<I, S>(args: I) -> CliOptions
@@ -196,16 +200,41 @@ where
     let mut out = CliOptions::default();
     for arg in args {
         let s = arg.as_ref();
-        if s == "--safe-mode" {
-            out.safe_mode = true;
-        } else if out.deep_link.is_none()
-            && let Some(link) = fern_core::link::parse_deep_link(s)
-        {
-            out.deep_link = Some(link);
-            out.deep_link_raw = Some(s.to_owned());
+        match s {
+            "--version" | "-V" => out.show_version = true,
+            "--help" | "-h" => out.show_help = true,
+            "--safe-mode" => out.safe_mode = true,
+            "--quick-add" => out.quick_add = true,
+            "--toggle" => out.toggle = true,
+            "--focus-mini" => out.focus_mini = true,
+            _ if out.deep_link.is_none() => {
+                if let Some(link) = fern_core::link::parse_deep_link(s) {
+                    out.deep_link = Some(link);
+                    out.deep_link_raw = Some(s.to_owned());
+                }
+            }
+            _ => {}
         }
     }
     out
+}
+
+fn print_help() {
+    println!(
+        "Fern {} — Tasks, calendar, habits and focus in one native app\n\n\
+         USAGE:\n\
+         \x20   fern [OPTIONS] [DEEP_LINK]\n\n\
+         OPTIONS:\n\
+         \x20   --quick-add     Open the Quick Add popup (forwards to running instance)\n\
+         \x20   --toggle        Show or hide the main Fern window (forwards to running instance)\n\
+         \x20   --focus-mini    Toggle the floating Focus timer mini window\n\
+         \x20   --safe-mode     Start with plugins disabled\n\
+         \x20   -V, --version   Print version information and exit\n\
+         \x20   -h, --help      Print this help message and exit\n\n\
+         WAYLAND SHORTCUTS:\n\
+         \x20   Bind compositor shortcuts directly to `fern --quick-add`, `fern --toggle`, or `fern --focus-mini`.",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -227,6 +256,13 @@ fn apply_initial_theme(selection: &fern_core::ThemeSelection, system_dark: bool,
 
 fn init_plugin_host(safe_mode: bool, db_path: PathBuf, locale: &str, cx: &mut App) {
     use theme::ActiveTheme as _;
+    user_themes::set_plugin_themes_provider(
+        |cx| {
+            let plugins = plugin_ui::PluginHost::global(cx)?.plugins_arc();
+            Some(Box::new(move || plugin_ui::collect_plugin_themes(&plugins)))
+        },
+        cx,
+    );
     let appearance = if cx.theme().is_dark() { "dark" } else { "light" };
     match plugin_ui::PluginHostConfig::from_desktop_paths(
         Some(db_path),
@@ -237,22 +273,33 @@ fn init_plugin_host(safe_mode: bool, db_path: PathBuf, locale: &str, cx: &mut Ap
     ) {
         Ok(config) => {
             if let Err(err) = plugin_ui::PluginHost::init(config, cx) {
-                eprintln!("failed to initialize plugin host: {err:#}");
+                desktop_common::logging::log_error("plugin", format!("failed to initialize plugin host: {err:#}"));
             }
         }
-        Err(err) => eprintln!("failed to configure plugin host: {err:#}"),
+        Err(err) => desktop_common::logging::log_error("plugin", format!("failed to configure plugin host: {err:#}")),
     }
 }
 
 fn main() -> Result<()> {
     // `fern fern://task/<id>` or `fern fern://plugin/<id>/<cmd>` handles deep links; `--safe-mode` disables plugins.
     let cli = parse_cli_args(std::env::args().skip(1));
+    if cli.show_version {
+        println!("fern {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if cli.show_help {
+        print_help();
+        return Ok(());
+    }
     let dir = data_dir()?;
-    #[cfg(windows)]
-    let _instance_guard = match single_instance::acquire(&dir, cli.deep_link_raw.as_deref())? {
+    #[cfg(any(windows, unix))]
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut instance_guard = match single_instance::acquire(&dir, cli.ipc_command())? {
         Some(guard) => guard,
         None => return Ok(()),
     };
+    #[cfg(unix)]
+    let ipc_rx = instance_guard.take_receiver();
 
     let (store, first_start, db_path, db_health) = open_store(&dir)?;
     let store = Rc::new(store);
@@ -267,7 +314,7 @@ fn main() -> Result<()> {
         .and_then(|code| Locale::from_code(&code))
         .unwrap_or_else(Locale::system);
     if first_start && let Err(err) = add_welcome_tasks(&store, locale.strings()) {
-        eprintln!("failed to add the welcome tasks: {err:#}");
+        desktop_common::logging::log_error("app", format!("failed to add the welcome tasks: {err:#}"));
     }
 
     let platform = gpui_platform::current_platform(false);
@@ -283,12 +330,10 @@ fn main() -> Result<()> {
         let _ = open_urls_tx.unbounded_send(urls);
     });
     app.run(move |cx: &mut App| {
+        let _keep_guard = &instance_guard;
+        desktop_common::RuntimeConfig::init(cx);
         cx.on_app_quit(|cx| {
-            hotkeys::shutdown(cx);
-            plugin_ui::PluginHost::shutdown(cx);
-            tray::prepare_quit();
-            #[cfg(windows)]
-            single_instance::release();
+            crate::shutdown::AppShutdown::run_once(cx);
             async {}
         })
         .detach();
@@ -299,6 +344,11 @@ fn main() -> Result<()> {
         theme::init(cx);
         user_themes::load(cx);
         let initial_prefs = store.preferences().unwrap_or_default();
+        desktop_common::ActivePreferences::sync_from_preferences(
+            &initial_prefs,
+            desktop_common::sound::enabled(&store),
+            cx,
+        );
         let system_dark = matches!(
             cx.window_appearance(),
             gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
@@ -306,35 +356,41 @@ fn main() -> Result<()> {
         apply_initial_theme(&initial_prefs.theme, system_dark, cx);
         cx.set_http_client(http::UreqHttpClient::new());
         if let Err(err) = Assets.load_fonts(cx) {
-            eprintln!("failed to load the fonts: {err:#}");
+            desktop_common::logging::log_error("app", format!("failed to load the fonts: {err:#}"));
         }
         cx.set_global(CurrentLocale(locale));
         // Initializes PluginHost and registers desktop_common's PluginHooksGlobal bridge.
         init_plugin_host(safe_mode, plugin_db_path, locale.code(), cx);
         match keymap::reload(&Assets, cx) {
-            Ok(errors) => errors.iter().for_each(|err| eprintln!("keymap: {err}")),
-            Err(err) => eprintln!("failed to load the keymap: {err:#}"),
+            Ok(errors) => errors
+                .iter()
+                .for_each(|err| desktop_common::logging::log_warn("keymap", err)),
+            Err(err) => desktop_common::logging::log_error("keymap", format!("failed to load the keymap: {err:#}")),
         }
         updater::init(store.clone(), cx);
         subscriptions::init(store.clone(), cx);
 
-        let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
+        let window_bounds = desktop_common::window_state::initial_window_bounds(&store, cx);
         let (titlebar, decorations) = title_bar::window_options();
         let store_for_hotkeys = store.clone();
         let store_for_tray = store.clone();
         let store_for_themes = store.clone();
+        let store_for_maint = store.clone();
         // Prepare the tray channel before creating the window/icon so early clicks are never dropped.
         let tray_rx = tray::prepare_channel();
         let main_window = cx.open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(window_bounds),
                 titlebar: Some(titlebar),
                 window_decorations: Some(decorations),
                 // macOS: the app moves the window from its own title bar.
                 app_owns_titlebar_drag: true,
                 // Overridable so that window-manager rules can target dev builds (used for UI screenshots).
-                app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),
-                window_min_size: Some(size(px(900.), px(400.))),
+                app_id: Some(desktop_common::app_id()),
+                window_min_size: Some(size(
+                    px(desktop_common::window_state::MIN_WIDTH),
+                    px(desktop_common::window_state::MIN_HEIGHT),
+                )),
                 ..Default::default()
             },
             |window, cx| {
@@ -354,26 +410,20 @@ fn main() -> Result<()> {
         // Fern keeps the data on this device only, so it saves a copy of it once a day (but not
         // the throwaway data of the debug build's screenshots). Run off the UI thread after the
         // main window is open so cold startup stays instant even with a large tasks.db.
-        if std::env::var_os("FERN_DEV_STATE").is_none() {
-            let maint_db_path = cx.global::<DbPath>().0.clone();
-            cx.background_spawn(async move {
-                match Store::open(&maint_db_path) {
-                    Ok(maint_store) => {
-                        // The sync log keeps one entry per row; without a server it would grow with every edit.
-                        if let Err(err) = maint_store.compact_sync_log() {
-                            eprintln!("failed to compact the sync log: {err:#}");
-                        }
-                        let today = chrono::Local::now().date_naive();
-                        if let Err(err) =
-                            backups_dir().and_then(|dir| maint_store.daily_backup(&dir, today, DAILY_BACKUPS))
-                        {
-                            eprintln!("failed to back up the data: {err:#}");
-                        }
-                    }
-                    Err(err) => {
-                        eprintln!("failed to back up the data: {err:#}");
-                    }
+        if !desktop_common::is_dev_state() {
+            let maint_task = desktop_common::DbRunner::run_global(&store_for_maint, cx, |maint_store| {
+                // The sync log keeps one entry per row; without a server it would grow with every edit.
+                if let Err(err) = maint_store.compact_sync_log() {
+                    desktop_common::logging::log_error("db", format!("failed to compact the sync log: {err:#}"));
                 }
+                let today = chrono::Local::now().date_naive();
+                backups_dir().and_then(|dir| maint_store.daily_backup(&dir, today, DAILY_BACKUPS))
+            });
+            cx.spawn(async move |cx| {
+                if let Err(err) = maint_task.await {
+                    desktop_common::logging::log_error("db", format!("failed to back up the data: {err:#}"));
+                }
+                let _ = cx;
             })
             .detach();
         }
@@ -382,7 +432,7 @@ fn main() -> Result<()> {
         {
             cx.background_spawn(async move {
                 if let Err(err) = mgr.emit_app_ready() {
-                    eprintln!("failed to emit app.ready to plugins: {err:#}");
+                    desktop_common::logging::log_error("plugin", format!("failed to emit app.ready to plugins: {err:#}"));
                 }
             })
             .detach();
@@ -406,6 +456,16 @@ fn main() -> Result<()> {
             }
         })
         .detach();
+        #[cfg(unix)]
+        if let Some(mut ipc_rx) = ipc_rx {
+            cx.spawn(async move |cx| {
+                use futures::StreamExt as _;
+                while let Some(cmd) = ipc_rx.next().await {
+                    handle_ipc_command(cmd, main_window, cx);
+                }
+            })
+            .detach();
+        }
         tray::connect(tray_rx, main_window, store_for_tray, cx);
         AppView::register_window_actions(main_window, cx);
         updater::set_before_restart_hook(
@@ -420,9 +480,58 @@ fn main() -> Result<()> {
         cx.set_global(desktop_common::StickyOpener(Rc::new(sticky_note::open)));
         sticky_note::restore(store_for_hotkeys.clone(), cx);
         hotkeys::init(main_window, store_for_hotkeys, cx);
+        if cli.quick_add {
+            quick_add_window::open(main_window, cx);
+        }
+        if cli.focus_mini {
+            let _ = main_window.update(cx, |view, _, cx| view.toggle_focus_mini(cx));
+        }
         cx.activate(true);
     });
     Ok(())
+}
+
+#[cfg(any(windows, unix))]
+pub(crate) fn handle_ipc_command(
+    cmd: single_instance::IpcCommand,
+    main_window: gpui::WindowHandle<AppView>,
+    cx: &mut gpui::AsyncApp,
+) {
+    match cmd {
+        single_instance::IpcCommand::Activate => {
+            let _ = main_window.update(cx, |_, window, _| {
+                tray::restore_main_window();
+                window.activate_window();
+            });
+        }
+        single_instance::IpcCommand::QuickAdd => {
+            cx.update(|cx| quick_add_window::open(main_window, cx));
+        }
+        single_instance::IpcCommand::Toggle => {
+            let _ = main_window.update(cx, |_, window, _| {
+                if window.is_window_active() {
+                    if !tray::hide_to_tray() {
+                        window.minimize_window();
+                    }
+                } else {
+                    tray::restore_main_window();
+                    window.activate_window();
+                }
+            });
+        }
+        single_instance::IpcCommand::FocusMini => {
+            let _ = main_window.update(cx, |view, _, cx| view.toggle_focus_mini(cx));
+        }
+        single_instance::IpcCommand::DeepLink(raw) => {
+            if let Some(link) = fern_core::link::parse_deep_link(&raw) {
+                let _ = main_window.update(cx, |view, window, cx| {
+                    tray::restore_main_window();
+                    window.activate_window();
+                    view.open_deep_link(link, window, cx);
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +656,13 @@ mod tests {
             })
         );
         assert_eq!(plugin_parsed.deep_link_raw.as_deref(), Some(plugin_uri));
+
+        let flags = parse_cli_args(["--quick-add", "--toggle", "--focus-mini", "-V", "-h"]);
+        assert!(flags.quick_add);
+        assert!(flags.toggle);
+        assert!(flags.focus_mini);
+        assert!(flags.show_version);
+        assert!(flags.show_help);
     }
 
     #[test]

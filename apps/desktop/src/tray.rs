@@ -211,23 +211,22 @@ pub fn connect(
                     cx.update(|cx| {
                         let next = !TrayPrefs::current(&store, cx).always_on_top;
                         if let Err(err) = set_always_on_top(&store, next, cx) {
-                            eprintln!("failed to save always_on_top setting: {err:#}");
+                            desktop_common::logging::log_error("tray", format!("failed to save always_on_top setting: {err:#}"));
                         }
                     });
                 }
                 TrayAction::Activate => {
                     #[cfg(windows)]
-                    let link = crate::data_dir()
+                    if let Some(cmd) = crate::data_dir()
                         .ok()
-                        .and_then(|dir| crate::single_instance::take_pending_link(&dir));
-                    #[cfg(not(windows))]
-                    let link: Option<fern_core::link::DeepLink> = None;
-                    let _ = main_window.update(cx, |view, window, cx| {
+                        .and_then(|dir| crate::single_instance::take_pending_command(&dir))
+                    {
+                        crate::handle_ipc_command(cmd, main_window, cx);
+                        continue;
+                    }
+                    let _ = main_window.update(cx, |_, window, _| {
                         restore_main_window();
                         window.activate_window();
-                        if let Some(link) = link {
-                            view.open_deep_link(link, window, cx);
-                        }
                     });
                 }
                 TrayAction::Quit => {

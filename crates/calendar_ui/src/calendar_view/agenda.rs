@@ -14,7 +14,7 @@ impl CalendarView {
     /// calendar's color, which opens the event's card.
     fn agenda_event_row(&self, event: EventBar, date: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let when = event.start_time.filter(|_| event.start == date).map_or(strings.range_all_day.to_owned(), |time| calendar::format_time(time, strings));
+        let when = event.start_time.filter(|_| event.start == date).map_or(strings.range_all_day.to_owned(), |time| calendar::format_time(time, strings, cx));
         let key = (event.key.clone(), event.start);
         let open = self.open_event.as_ref() == Some(&key);
         h_flex()
@@ -51,25 +51,24 @@ impl CalendarView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let start = self.agenda_start();
-        let mut days = self.agenda.clone();
-        if start == today && days.first().is_none_or(|(date, _)| *date != today) {
-            days.insert(0, (today, Vec::new()));
+        let mut days: std::collections::BTreeMap<
+            NaiveDate,
+            (Vec<fern_core::agenda::AgendaItem>, Vec<EventBar>),
+        > = std::collections::BTreeMap::new();
+        for (date, items) in &self.agenda {
+            days.entry(*date).or_default().0 = items.clone();
+        }
+        if start == today {
+            days.entry(today).or_default();
         }
         // The subscribed calendars' events on their first day (or the Agenda's first, for one
         // begun before), with a day of their own where there are no tasks.
-        let mut events: std::collections::BTreeMap<NaiveDate, Vec<EventBar>> = Default::default();
         for event in self.events_between(start, start + chrono::Duration::days(AGENDA_DAYS), cx) {
-            events.entry(event.start.max(start)).or_default().push(event);
+            days.entry(event.start.max(start)).or_default().1.push(event);
         }
-        for date in events.keys() {
-            if !days.iter().any(|(day, _)| day == date) {
-                days.push((*date, Vec::new()));
-            }
-        }
-        days.sort_by_key(|(date, _)| *date);
         let mut month = calendar::month_start(start);
         let mut rows: Vec<AnyElement> = Vec::new();
-        for (date, items) in days {
+        for (date, (items, day_events)) in days {
             if calendar::month_start(date) != month {
                 month = calendar::month_start(date);
                 rows.push(
@@ -105,7 +104,6 @@ impl CalendarView {
                             .color(if is_today { Color::Accent } else { Color::Muted }),
                     ),
                 );
-            let day_events = events.remove(&date).unwrap_or_default();
             let entries: Vec<AnyElement> = if items.is_empty() && day_events.is_empty() {
                 vec![
                     h_flex()
@@ -138,7 +136,7 @@ impl CalendarView {
                         } else {
                             task_rows::priority_color(item.priority, &theme).unwrap_or(theme.colors().accent)
                         };
-                        let when = item.time.map_or(strings.range_all_day.to_owned(), |time| calendar::format_time(time, strings));
+                        let when = item.time.map_or(strings.range_all_day.to_owned(), |time| calendar::format_time(time, strings, cx));
                         h_flex()
                             .gap_3()
                             .child(div().w(px(72.)).flex_none().child(Label::new(when).size(LabelSize::Small).color(Color::Muted)))

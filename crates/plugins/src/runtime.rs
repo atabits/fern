@@ -30,7 +30,7 @@ use rquickjs::{AsyncContext, AsyncRuntime, Function, Module, Persistent, Value};
 use serde_json::{Map, Value as JsonValue};
 
 use crate::api::{
-    EffectEmitterFn, LogEntry, LogLevel, OAuthConcurrencyLimiter, PluginApiState, PluginHooks,
+    EffectEmitterFn, LogEntry, LogLevel, OAuthConcurrencyLimiter, PluginApiInit, PluginApiState,
     PluginUiEffect, PromptSenders, ServiceCallerFn, ServiceRegistrarFn, ViewRefresherFn,
     install_fern_bindings, js_to_json, json_to_js,
 };
@@ -42,10 +42,10 @@ use crate::vault::SecretsVault;
 use commands::{fire_due_timers, handle_worker_cmd, perform_hot_reload, render_plugin_view};
 use events::schedule_outbox_drain;
 use gate::{
-    ClearPersistentGuard, DeactivateGateFuture, ExecGate, GateOptions, RuntimeDriverState, now_ms,
+    ClearPersistentGuard, ExecGate, GateOptions, RuntimeDriverState, SimpleGateFuture, now_ms,
     run_with_gate, runtime_driver_task,
 };
-use manager::{CmdQueue, ReplyTx, WorkerCmd, WorkerWake};
+use manager::{CmdQueue, ReplyTx, WorkerWake};
 pub use manager::{
     HostUpdate, HookDecision, PluginEngineConfig, PluginInfo, PluginManager, PluginMetrics,
     PluginStatus, ScriptRunResult, SearchHit,
@@ -277,10 +277,10 @@ impl WorkerEnv {
                         .insert(slot.loaded_manifest.manifest.id.clone(), slot);
                 }
                 Err(err) => {
-                    eprintln!(
+                    crate::log_host_warn(&format!(
                         "skipping invalid plugin directory {}: {err:#}",
                         path.display()
-                    );
+                    ));
                 }
             }
         }
@@ -530,7 +530,7 @@ pub(in crate::runtime) async fn unload_runtime_async(
         {
             let ctx = loaded.ctx.clone();
             let gate = Arc::clone(&loaded.gate);
-            DeactivateGateFuture {
+            SimpleGateFuture {
                 fut: ctx.with(|ctx| {
                     if let Ok(ns) = ns_pers.restore(&ctx)
                         && let Ok(Some(deact)) = ns.get::<_, Option<Function>>("deactivate")
@@ -540,6 +540,7 @@ pub(in crate::runtime) async fn unload_runtime_async(
                 }),
                 gate,
                 budget,
+                deactivate: true,
             }
             .await;
         }
@@ -701,15 +702,13 @@ pub(in crate::runtime) fn worker_main(
         }
 
         // 1. Drain commands.
-        let mut should_exit = false;
         for cmd in queue.pop_all() {
-            if matches!(cmd, WorkerCmd::Shutdown) {
-                should_exit = true;
+            handle_worker_cmd(&env, cmd);
+            if env.shutdown_flag.load(Ordering::Acquire) {
                 break;
             }
-            handle_worker_cmd(&env, cmd);
         }
-        if should_exit || env.shutdown_flag.load(Ordering::Acquire) {
+        if env.shutdown_flag.load(Ordering::Acquire) {
             break;
         }
 
@@ -751,8 +750,10 @@ pub(in crate::runtime) fn worker_main(
 
         // 6. Sleep until next command, async wakeup, timer, or hot-reload tick.
         if !wake.woken.swap(false, Ordering::AcqRel) && env.pending_tasks.borrow().is_empty() {
-            let timeout = next_wakeup_delay(&env, next_hot_reload);
-            thread::park_timeout(timeout);
+            match next_wakeup_delay(&env, next_hot_reload) {
+                Some(timeout) => thread::park_timeout(timeout),
+                None => thread::park(),
+            }
         }
     }
 
@@ -807,25 +808,114 @@ fn has_any_event_subscribers(env: &WorkerEnv) -> bool {
         .any(|s| s.enabled && s.trigger_kind == "event")
 }
 
-fn next_wakeup_delay(env: &WorkerEnv, next_hot_reload: Instant) -> Duration {
+fn next_wakeup_delay(env: &WorkerEnv, next_hot_reload: Instant) -> Option<Duration> {
     let now = Instant::now();
-    let mut earliest = if env.config.hot_reload {
-        next_hot_reload.saturating_duration_since(now)
-    } else {
-        Duration::from_millis(500)
-    };
+    let mut earliest: Option<Duration> = env
+        .config
+        .hot_reload
+        .then(|| next_hot_reload.saturating_duration_since(now));
     let slots = env.slots.borrow();
     for slot in slots.values() {
         if let Some(rt) = &slot.runtime {
             for timer in rt.api.timers.borrow().values() {
                 let d = timer.next_fire.saturating_duration_since(now);
-                if d < earliest {
-                    earliest = d;
-                }
+                earliest = Some(earliest.map_or(d, |cur| cur.min(d)));
             }
         }
     }
-    earliest.min(Duration::from_millis(500)).max(Duration::from_millis(5))
+    earliest.map(|d| d.max(Duration::from_millis(5)))
+}
+
+pub(in crate::runtime) fn make_service_caller(env: &Rc<WorkerEnv>) -> ServiceCallerFn {
+    let env_for_svc = Rc::clone(env);
+    Rc::new(move |svc_name, arg, depth| {
+        let (tx, rx) = oneshot::channel();
+        let env_call = Rc::clone(&env_for_svc);
+        env_for_svc.spawn_task(async move {
+            let res = invoke_service(&env_call, &svc_name, arg, depth).await;
+            let _ = tx.send(res);
+        });
+        rx
+    })
+}
+
+pub(in crate::runtime) fn make_effect_emitter(env: &Rc<WorkerEnv>) -> EffectEmitterFn {
+    let tx_for_eff = env.update_tx.clone();
+    let wake_for_eff = env.wake_callback.clone();
+    Arc::new(move |eff| {
+        let _ = tx_for_eff.send(HostUpdate::UiEffect(eff));
+        if let Some(cb) = &wake_for_eff {
+            cb();
+        }
+    })
+}
+
+pub(in crate::runtime) fn verify_manifest_permissions(
+    env: &WorkerEnv,
+    plugin_id: &str,
+    loaded: &LoadedManifest,
+    persist_disable_on_deny: bool,
+) -> Result<()> {
+    let db_state = env.store.plugin_state(plugin_id)?;
+    match loaded
+        .manifest
+        .check_permission_diff(&loaded.manifest_hash, db_state.as_ref())
+    {
+        PermissionApprovalStatus::NeedsApproval {
+            diff,
+            is_first_install,
+        } => {
+            if persist_disable_on_deny {
+                let _ = env.store.set_plugin_enabled(plugin_id, false);
+            }
+            if let Some(slot) = env.slots.borrow_mut().get_mut(plugin_id) {
+                slot.enabled = false;
+                slot.status = PluginStatus::NeedsApproval {
+                    added_permissions: diff.added,
+                    is_first_install,
+                };
+            }
+            env.emit(HostUpdate::RegistryChanged(env.plugin_infos()));
+            bail!("plugin {plugin_id:?} requires permission approval");
+        }
+        PermissionApprovalStatus::Approved => {
+            if let Some(narrowed) = loaded
+                .manifest
+                .narrowed_permissions_to_persist(&loaded.manifest_hash, db_state.as_ref())
+            {
+                let _ = env.store.set_plugin_permissions(
+                    plugin_id,
+                    &narrowed,
+                    &loaded.manifest_hash,
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+pub(in crate::runtime) async fn finish_plugin_call<T>(
+    env: &Rc<WorkerEnv>,
+    plugin_id: &str,
+    rt: &AsyncRuntime,
+    rt_gen: u64,
+    start: Instant,
+    res: Result<T>,
+) -> Result<T> {
+    let elapsed = start.elapsed().as_millis() as u64;
+    match res {
+        Ok(val) => {
+            let mem = rt.memory_usage().await.malloc_size.max(0) as u64;
+            env.record_success(plugin_id, Some(rt_gen), elapsed, mem);
+            env.flush_plugin_side_effects(plugin_id, Some(rt_gen));
+            Ok(val)
+        }
+        Err(err) => {
+            let msg = env.vault.scrub_secrets(plugin_id, &format!("{err:#}"));
+            env.record_failure(plugin_id, Some(rt_gen), &msg);
+            Err(anyhow!("{msg}"))
+        }
+    }
 }
 
 pub(in crate::runtime) async fn ensure_activated(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<()> {
@@ -927,39 +1017,7 @@ async fn ensure_activated_inner(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<
     };
 
     // Re-verify persisted permission approval right before launching the QuickJS runtime.
-    let db_state = env.store.plugin_state(plugin_id)?;
-    match loaded
-        .manifest
-        .check_permission_diff(&loaded.manifest_hash, db_state.as_ref())
-    {
-        PermissionApprovalStatus::NeedsApproval {
-            diff,
-            is_first_install,
-        } => {
-            let _ = env.store.set_plugin_enabled(plugin_id, false);
-            if let Some(slot) = env.slots.borrow_mut().get_mut(plugin_id) {
-                slot.enabled = false;
-                slot.status = PluginStatus::NeedsApproval {
-                    added_permissions: diff.added,
-                    is_first_install,
-                };
-            }
-            env.emit(HostUpdate::RegistryChanged(env.plugin_infos()));
-            bail!("plugin {plugin_id:?} requires permission approval");
-        }
-        PermissionApprovalStatus::Approved => {
-            if let Some(narrowed) = loaded
-                .manifest
-                .narrowed_permissions_to_persist(&loaded.manifest_hash, db_state.as_ref())
-            {
-                let _ = env.store.set_plugin_permissions(
-                    plugin_id,
-                    &narrowed,
-                    &loaded.manifest_hash,
-                );
-            }
-        }
-    }
+    verify_manifest_permissions(env, plugin_id, &loaded, true)?;
 
     let entry_source = fs::read_to_string(&loaded.entry_path).with_context(|| {
         format!("cannot read entry file {}", loaded.entry_path.display())
@@ -1017,20 +1075,17 @@ async fn ensure_activated_inner(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<
     let pid_reg = plugin_id.to_owned();
     let providers_reg = Rc::clone(&env.service_providers);
     let service_registrar: ServiceRegistrarFn = Rc::new(move |svc_name| {
-        providers_reg.borrow_mut().insert(svc_name, pid_reg.clone());
+        let mut providers = providers_reg.borrow_mut();
+        if let Some(owner) = providers.get(&svc_name)
+            && owner != &pid_reg
+        {
+            bail!("service {svc_name:?} is already registered by {owner:?}");
+        }
+        providers.insert(svc_name, pid_reg.clone());
+        Ok(())
     });
 
-    let env_for_svc = Rc::clone(env);
-    let service_caller: ServiceCallerFn = Rc::new(move |svc_name, arg, depth| {
-        let (tx, rx) = oneshot::channel();
-        let env_call = Rc::clone(&env_for_svc);
-        env_for_svc.spawn_task(async move {
-            let res = invoke_service(&env_call, &svc_name, arg, depth).await;
-            let _ = tx.send(res);
-        });
-        rx
-    });
-
+    let service_caller = make_service_caller(env);
     let env_for_view = Rc::clone(env);
     let pid_for_view = plugin_id.to_owned();
     let view_refresher: ViewRefresherFn = Rc::new(move |view_id| {
@@ -1040,47 +1095,23 @@ async fn ensure_activated_inner(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<
             let _ = render_plugin_view(&env_r, &pid_r, &view_id, false).await;
         });
     });
+    let effect_emitter = make_effect_emitter(env);
 
-    let tx_for_eff = env.update_tx.clone();
-    let wake_for_eff = env.wake_callback.clone();
-    let effect_emitter: EffectEmitterFn = Arc::new(move |eff| {
-        let _ = tx_for_eff.send(HostUpdate::UiEffect(eff));
-        if let Some(cb) = &wake_for_eff {
-            cb();
-        }
-    });
-
-    let api = Rc::new(PluginApiState {
+    let api = Rc::new(PluginApiState::new(PluginApiInit {
         plugin_id: plugin_id.to_owned(),
         permissions: loaded.permissions.clone(),
         store: Rc::clone(&env.store),
         vault: env.vault.clone(),
         http_pool: Arc::clone(&env.http_pool),
         oauth_limiter: Arc::clone(&env.oauth_limiter),
-        write_depth: Cell::new(0),
-        active_service_depth: Cell::new(0),
-        batch_dirty_stack: RefCell::new(Vec::new()),
-        data_dirty: Cell::new(false),
+        write_depth: 0,
+        enforce_declared_views: true,
         declared_views,
-        settings: RefCell::new(settings),
+        settings,
         secret_keys,
         locale: Rc::clone(&env.locale),
         theme_appearance: Rc::clone(&env.theme_appearance),
-        logs: RefCell::new(logs_prev),
-        active_render_scope: RefCell::new(None),
-        handlers: RefCell::new(HashMap::new()),
-        next_handler_id: Cell::new(1),
-        views: RefCell::new(HashMap::new()),
-        modal_view: RefCell::new(None),
-        commands: RefCell::new(HashMap::new()),
-        search_providers: RefCell::new(HashMap::new()),
-        event_listeners: RefCell::new(HashMap::new()),
-        next_listener_id: Cell::new(1),
-        settings_listeners: RefCell::new(Vec::new()),
-        hooks: RefCell::new(PluginHooks::default()),
-        timers: RefCell::new(HashMap::new()),
-        services: RefCell::new(HashMap::new()),
-        pending_ui_effects: RefCell::new(VecDeque::new()),
+        logs: logs_prev,
         prompt_senders: Rc::clone(&env.prompt_senders),
         next_prompt_id: Rc::clone(&env.next_prompt_id),
         service_registrar,
@@ -1088,7 +1119,7 @@ async fn ensure_activated_inner(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<
         view_refresher,
         effect_emitter,
         shutdown_flag: Arc::clone(&cancel_flag),
-    });
+    }));
 
     let mut clear_guard = ClearPersistentGuard::new(
         Rc::clone(&api),
@@ -1133,7 +1164,7 @@ async fn ensure_activated_inner(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<
             let gate_for_driver = Arc::clone(&gate);
             let driver_for_task = Rc::clone(&driver_state);
 
-            let still_valid = {
+            let dropped = {
                 let mut slots = env.slots.borrow_mut();
                 if let Some(slot) = slots.get_mut(plugin_id)
                     && slot.enabled
@@ -1151,19 +1182,19 @@ async fn ensure_activated_inner(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<
                         ctx,
                         rt,
                     });
-                    true
+                    None
                 } else {
-                    // Drop `module_ns` and clear `api` explicitly while `ctx`/`rt` are alive.
-                    drop(module_ns);
-                    drop(clear_guard);
-                    drop(api);
-                    drop(ctx);
-                    drop(rt);
-                    false
+                    Some((module_ns, clear_guard, api, ctx, rt))
                 }
             };
 
-            if !still_valid {
+            if let Some((module_ns, clear_guard, api, ctx, rt)) = dropped {
+                // Drop `module_ns` and clear `api` explicitly outside the `slots` borrow while `ctx`/`rt` are alive.
+                drop(module_ns);
+                drop(clear_guard);
+                drop(api);
+                drop(ctx);
+                drop(rt);
                 env.service_providers
                     .borrow_mut()
                     .retain(|_, owner| owner != plugin_id);
@@ -1256,21 +1287,7 @@ pub(in crate::runtime) async fn invoke_service(
     )
     .await;
 
-    let elapsed = start.elapsed().as_millis() as u64;
-    match res {
-        Ok(out) => {
-            let mem = rt.memory_usage().await.malloc_size.max(0) as u64;
-            env.record_success(&provider_id, Some(rt_gen), elapsed, mem);
-            env.flush_plugin_side_effects(&provider_id, Some(rt_gen));
-            Ok(out)
-        }
-        Err(err) => {
-            // Scrub provider secrets BEFORE returning error across plugin boundaries.
-            let scrubbed = env.vault.scrub_secrets(&provider_id, &format!("{err:#}"));
-            env.record_failure(&provider_id, Some(rt_gen), &scrubbed);
-            Err(anyhow!("{scrubbed}"))
-        }
-    }
+    finish_plugin_call(env, &provider_id, &rt, rt_gen, start, res).await
 }
 
 pub(in crate::runtime) type RuntimeHandles = (

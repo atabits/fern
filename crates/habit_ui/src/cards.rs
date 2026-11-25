@@ -100,7 +100,7 @@ impl HabitView {
         let done_set = self.checkins.get(&habit.id);
         let empty = HashSet::new();
         let is_skipped = habit.is_skipped(date);
-        let is_due = habit.is_due_on(date, done_set.unwrap_or(&empty), calendar::week_start());
+        let is_due = habit.is_due_on(date, done_set.unwrap_or(&empty), calendar::week_start(cx));
 
         let base = div().size(size).rounded_full().flex().items_center().justify_center();
 
@@ -385,7 +385,7 @@ impl HabitView {
         let id = habit.id;
         let empty = HashSet::new();
         let checked = self.checkins.get(&id).unwrap_or(&empty);
-        let stats = stats_with(&habit.frequency, checked, today, calendar::week_start());
+        let stats = stats_with(&habit.frequency, checked, today, calendar::week_start(cx));
         let compact = self.selected_date.is_some() || habit.archived;
         let list = self.list_layout;
         let target_single_day = self.selected_date.unwrap_or(today);
@@ -722,7 +722,7 @@ impl HabitView {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.day_menu = None;
                                     if let Err(err) = this.store.reset_checkin(id, date, true) {
-                                        eprintln!("failed to reset check-in: {err:#}");
+                                        desktop_common::logging::log_error("habit_ui", format!("failed to reset check-in: {err:#}"));
                                     }
                                     this.notify_data_changed(cx);
                                     this.reload(cx);

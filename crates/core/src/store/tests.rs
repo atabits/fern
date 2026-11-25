@@ -2732,3 +2732,50 @@ fn next_7_days_includes_current_and_past_week_horizons_only() -> Result<()> {
     assert_eq!(store.counts(today)?.next_7_days, 2);
     Ok(())
 }
+
+#[test]
+fn duplicate_list_preserves_sections_subtasks_tags_and_checklists() -> Result<()> {
+    let store = Store::open_in_memory()?;
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 25).unwrap();
+    let list = store.create_list("Project")?;
+    let sec = store.add_list_section(Some(list.id), "Phase 1")?;
+
+    let parent = store.add_task("Build feature")?;
+    store.set_list(parent.id, Some(list.id))?;
+    store.set_section(parent.id, Some(sec.id))?;
+    store.set_tags(parent.id, &["backend".into()])?;
+    store.add_checklist_item(parent.id, "Spec", None)?;
+
+    let child = store.add_subtask(parent.id, "Write tests")?;
+    store.set_tags(child.id, &["qa".into()])?;
+
+    let copy = store.duplicate_list(list.id, " Copy")?;
+    let copy_sections = store.list_sections(Some(copy.id))?;
+    assert_eq!(copy_sections.len(), 1);
+    assert_eq!(copy_sections[0].name, "Phase 1");
+    let copied_sec_id = copy_sections[0].id;
+
+    let copied_tasks = store.tasks_in(&View::List(copy.id), today)?;
+    assert_eq!(copied_tasks.len(), 2);
+    let copied_parent = copied_tasks.iter().find(|t| t.title == "Build feature").unwrap();
+    let copied_child = copied_tasks.iter().find(|t| t.title == "Write tests").unwrap();
+    assert_eq!(copied_parent.section_id, Some(copied_sec_id));
+    assert_eq!(copied_child.parent_id, Some(copied_parent.id));
+    assert_eq!(copied_child.section_id, Some(copied_sec_id));
+    assert_eq!(copied_parent.tags, ["backend"]);
+    assert_eq!(copied_child.tags, ["qa"]);
+    assert_eq!(store.checklist(copied_parent.id)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn safe_attachment_name_rejects_traversal_and_drive_prefixes() {
+    assert!(is_safe_attachment_name("report-2026.pdf"));
+    assert!(!is_safe_attachment_name(""));
+    assert!(!is_safe_attachment_name("."));
+    assert!(!is_safe_attachment_name(".."));
+    assert!(!is_safe_attachment_name("dir/file.txt"));
+    assert!(!is_safe_attachment_name(r"dir\file.txt"));
+    assert!(!is_safe_attachment_name("C:evil.txt"));
+    assert!(!is_safe_attachment_name("bad\0name.txt"));
+}

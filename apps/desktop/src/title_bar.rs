@@ -9,25 +9,22 @@
 //! - Linux asks the compositor for client-side decorations. When it draws its own (server-side),
 //!   the drag strip stays without duplicate window buttons.
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
-    Bounds, CursorStyle, Decorations, EventEmitter, Global, HitboxBehavior, MouseButton, Point, ResizeEdge, Size,
-    TitlebarOptions, Tiling, WindowButton, WindowButtonLayout, WindowControlArea, WindowDecorations, WindowId,
-    canvas, point, rgb, transparent_black,
+    Decorations, EventEmitter, MouseButton, Point, TitlebarOptions, WindowButton, WindowButtonLayout,
+    WindowControlArea, WindowDecorations, point, rgb,
 };
 use ui::prelude::*;
 
 use crate::actions::CloseWindow;
-use crate::release_notes::{ReleaseNotes, action_button};
+use crate::release_notes::ReleaseNotes;
 use crate::updater::Status;
 
-use desktop_common::layout::TITLE_BAR_SHADOW as SHADOW;
-pub use desktop_common::layout::title_bar_height as height;
-
-/// The radius of the window's corners with client-side decorations.
-const ROUNDING: Pixels = px(10.);
+pub use desktop_common::layout::{
+    LINUX_WINDOW_ROUNDING as ROUNDING, is_linux_compact_header as should_compact_linux_header,
+    title_bar_height as height,
+};
 /// macOS traffic lights: centered inside the 72 px sections rail.
 const TRAFFIC_LIGHTS: Point<Pixels> = point(px(10.), px(11.));
 
@@ -89,44 +86,40 @@ impl TitleBar {
             Status::Available(notes) => (notes.clone(), strings.update_to.replace("{version}", &notes.version)),
             _ => return None,
         };
-        let colors = cx.theme().colors();
-        let accent = colors.accent;
         Some(
             h_flex()
                 .flex_none()
                 .mr_1p5()
                 .gap_1()
                 .child(
-                    action_button("title-bar-update-notes", cx)
+                    div()
                         .debug_selector(|| "title-bar-update-notes".to_owned())
-                        .min_h(px(24.))
-                        .h(px(24.))
-                        .px_2()
-                        .bg(colors.elevated_surface_background)
-                        .border_color(colors.border)
                         .occlude()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(Label::new(strings.whats_new).size(LabelSize::Small))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.stop_propagation();
-                            cx.emit(ShowReleaseNotes(notes.clone()));
-                        })),
+                        .child(
+                            ui::Button::new("title-bar-update-notes", strings.whats_new)
+                                .variant(ui::ButtonVariant::Secondary)
+                                .size(ui::ButtonSize::Sm)
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(ShowReleaseNotes(notes.clone()));
+                                })),
+                        ),
                 )
                 .child(
-                    action_button("update-button", cx)
+                    div()
                         .debug_selector(|| "title-bar-restart-update".to_owned())
-                        .min_h(px(24.))
-                        .h(px(24.))
-                        .px_2()
-                        .bg(accent.opacity(0.12))
-                        .border_color(accent.opacity(0.35))
                         .occlude()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(Label::new(label).size(LabelSize::Small).weight(gpui::FontWeight::MEDIUM))
-                        .on_click(move |_, _, cx| {
-                            cx.stop_propagation();
-                            updater.update(cx, |updater, cx| updater.restart_to_update(cx));
-                        }),
+                        .child(
+                            ui::Button::new("update-button", label)
+                                .variant(ui::ButtonVariant::Primary)
+                                .size(ui::ButtonSize::Sm)
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    updater.update(cx, |updater, cx| updater.restart_to_update(cx));
+                                }),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -140,12 +133,28 @@ impl Render for TitleBar {
         let client_side = matches!(decorations, Decorations::Client { .. });
         let fullscreen = window.is_fullscreen();
         let linux = cfg!(any(target_os = "linux", target_os = "freebsd"));
+        let compact = should_compact_linux_header(window, cx);
         let mac = cfg!(target_os = "macos");
         let windows = cfg!(target_os = "windows");
+        let strip_height = if compact && update_buttons.is_none() {
+            height(window, cx)
+        } else {
+            px(32.)
+        };
         let buttons = if windows {
-            Some(WindowButtonLayout { left: [None; 3], right: [Some(WindowButton::Minimize), Some(WindowButton::Maximize), Some(WindowButton::Close)] })
+            Some(WindowButtonLayout {
+                left: [None; 3],
+                right: [Some(WindowButton::Minimize), Some(WindowButton::Maximize), Some(WindowButton::Close)],
+            })
         } else if linux && client_side {
-            Some(button_layout(cx))
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            {
+                Some(cx.button_layout().unwrap_or_else(WindowButtonLayout::linux_default))
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+            {
+                None
+            }
         } else {
             None
         };
@@ -173,7 +182,7 @@ impl Render for TitleBar {
             .top_0()
             .left_0()
             .right_0()
-            .h(height())
+            .h(strip_height)
             .when(!windows, |bar| {
                 bar.on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = true))
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = false))
@@ -205,20 +214,6 @@ impl Render for TitleBar {
     }
 }
 
-/// Linux: the desktop's order of the window buttons (GNOME's `button-layout`), or Minimize,
-/// Maximize, Close on the right.
-fn button_layout(cx: &App) -> WindowButtonLayout {
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    {
-        cx.button_layout().unwrap_or_else(WindowButtonLayout::linux_default)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    {
-        let _ = cx;
-        WindowButtonLayout { left: [None; 3], right: [Some(WindowButton::Minimize), Some(WindowButton::Maximize), Some(WindowButton::Close)] }
-    }
-}
-
 /// The minimize, maximize and close buttons on one side of the bar.
 #[derive(IntoElement)]
 struct WindowButtons {
@@ -237,6 +232,11 @@ impl RenderOnce for WindowButtons {
             .id(self.id)
             .h_full()
             .flex_none()
+            .when(cfg!(any(target_os = "linux", target_os = "freebsd")), |el| {
+                el.gap_1()
+                    .when(self.id == "left-window-buttons", |el| el.pl_1p5())
+                    .when(self.id == "right-window-buttons", |el| el.pr_1p5())
+            })
             .when(!cfg!(target_os = "windows"), |el| {
                 el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             })
@@ -296,12 +296,33 @@ fn window_button(
     let el = h_flex()
         .id(button.id())
         .group(button.id())
-        .h_full()
-        .w(px(46.))
         .justify_center()
         .occlude()
         .window_control_area(area)
-        .text_color(resting)
+        .text_color(resting);
+    #[cfg(not(target_os = "windows"))]
+    let hover_icon = if cfg!(any(target_os = "linux", target_os = "freebsd"))
+        && close
+        && caption_appearance != Some(theme::Appearance::Light)
+    {
+        close_red
+    } else {
+        hover_fg
+    };
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    let el = {
+        let close_hover_bg = close_red.opacity(0.16);
+        let close_active_bg = close_red.opacity(0.24);
+        el.size(px(26.))
+            .rounded_full()
+            .my_auto()
+            .hover(|el| el.bg(if close { close_hover_bg } else { hover_bg }).text_color(hover_icon))
+            .active(|el| el.bg(if close { close_active_bg } else { active_bg }).text_color(hover_icon))
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    let el = el
+        .h_full()
+        .w(px(46.))
         .hover(|el| el.bg(if close { close_red } else { hover_bg }).text_color(hover_fg))
         .active(|el| el.bg(if close { close_red.opacity(0.8) } else { active_bg }).text_color(hover_fg));
     #[cfg(target_os = "windows")]
@@ -328,9 +349,9 @@ fn window_button(
         el.child(
             gpui::svg()
                 .path(icon.path())
-                .size(px(14.))
+                .size(px(if cfg!(any(target_os = "linux", target_os = "freebsd")) { 15. } else { 14. }))
                 .text_color(resting)
-                .group_hover(button.id(), |svg| svg.text_color(hover_fg)),
+                .group_hover(button.id(), move |svg| svg.text_color(hover_icon)),
         )
     };
     el
@@ -355,144 +376,5 @@ fn window_button(
 /// rounded corners, a border, a shadow, and edges that resize the window. With server-side
 /// decorations, and on macOS and Windows, the content is returned as is.
 pub fn window_frame(content: impl IntoElement, window: &mut Window, cx: &mut App) -> Stateful<Div> {
-    let decorations = if cfg!(any(target_os = "linux", target_os = "freebsd")) { window.window_decorations() } else { Decorations::Server };
-    let resizable = window.is_resizable();
-    let tiling = match decorations {
-        Decorations::Server => Tiling::default(),
-        Decorations::Client { tiling } => tiling,
-    };
-    window.set_client_inset(match decorations {
-        Decorations::Client { .. } => SHADOW,
-        Decorations::Server => px(0.),
-    });
-
-    /// The edge under the mouse per window, to repaint the cursor when it changes.
-    #[derive(Default)]
-    struct HoveredEdges(HashMap<WindowId, ResizeEdge>);
-    impl Global for HoveredEdges {}
-
-    let window_id = window.window_handle().window_id();
-    let client = matches!(decorations, Decorations::Client { .. });
-    div()
-        .id("window-frame")
-        .size_full()
-        .bg(transparent_black())
-        .when(client, |frame| {
-            frame
-                .when(!tiling.top, |frame| frame.pt(SHADOW))
-                .when(!tiling.bottom, |frame| frame.pb(SHADOW))
-                .when(!tiling.left, |frame| frame.pl(SHADOW))
-                .when(!tiling.right, |frame| frame.pr(SHADOW))
-                .when(resizable, |frame| {
-                    frame
-                        .on_mouse_move(move |event, window, cx| {
-                            let edge = resize_edge(event.position, window.window_bounds().get_bounds().size, tiling);
-                            let previous = cx
-                                .try_global::<HoveredEdges>()
-                                .and_then(|edges| edges.0.get(&window_id).copied());
-                            if edge != previous {
-                                window.refresh();
-                            }
-                        })
-                        .on_mouse_down(MouseButton::Left, move |event, window, _| {
-                            if let Some(edge) = resize_edge(event.position, window.window_bounds().get_bounds().size, tiling) {
-                                window.start_window_resize(edge);
-                            }
-                        })
-                })
-        })
-        .child(
-            div()
-                .size_full()
-                .cursor(CursorStyle::Arrow)
-                .when(client, |content| {
-                    content
-                        .overflow_hidden()
-                        .border_color(cx.theme().colors().border)
-                        .when(!(tiling.top || tiling.left), |el| el.rounded_tl(ROUNDING))
-                        .when(!(tiling.top || tiling.right), |el| el.rounded_tr(ROUNDING))
-                        .when(!(tiling.bottom || tiling.left), |el| el.rounded_bl(ROUNDING))
-                        .when(!(tiling.bottom || tiling.right), |el| el.rounded_br(ROUNDING))
-                        .when(!tiling.top, |el| el.border_t_1())
-                        .when(!tiling.bottom, |el| el.border_b_1())
-                        .when(!tiling.left, |el| el.border_l_1())
-                        .when(!tiling.right, |el| el.border_r_1())
-                        .when(!tiling.is_tiled(), |el| {
-                            el.shadow(vec![gpui::BoxShadow::new(px(0.), px(0.), gpui::black().opacity(0.4)).blur_radius(SHADOW / 2.)])
-                        })
-                })
-                .on_mouse_move(|_, _, cx| cx.stop_propagation())
-                .child(content),
-        )
-        .when(client && resizable, |frame| {
-            frame.child(
-                canvas(
-                    |_, window, _| {
-                        window.insert_hitbox(Bounds::new(point(px(0.), px(0.)), window.window_bounds().get_bounds().size), HitboxBehavior::Normal)
-                    },
-                    move |_, hitbox, window, cx| {
-                        let edge = resize_edge(window.mouse_position(), window.window_bounds().get_bounds().size, tiling);
-                        if !cx.has_global::<HoveredEdges>() {
-                            cx.set_global(HoveredEdges::default());
-                        }
-                        let Some(edge) = edge else {
-                            cx.global_mut::<HoveredEdges>().0.remove(&window_id);
-                            return;
-                        };
-                        cx.global_mut::<HoveredEdges>().0.insert(window_id, edge);
-                        let cursor = match edge {
-                            ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
-                            ResizeEdge::Left | ResizeEdge::Right => CursorStyle::ResizeLeftRight,
-                            ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorStyle::ResizeUpLeftDownRight,
-                            ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorStyle::ResizeUpRightDownLeft,
-                        };
-                        window.set_cursor_style(cursor, &hitbox);
-                    },
-                )
-                .size_full()
-                .absolute(),
-            )
-        })
-}
-
-/// The window edge or corner at `pos`, if it is in the shadow around the window.
-fn resize_edge(pos: Point<Pixels>, window: Size<Pixels>, tiling: Tiling) -> Option<ResizeEdge> {
-    if Bounds::new(Point::default(), window).inset(SHADOW * 1.5).contains(&pos) {
-        return None;
-    }
-    let corner = SHADOW * 1.5;
-    let left = pos.x < corner;
-    let right = pos.x > window.width - corner;
-    let top = pos.y < corner;
-    let bottom = pos.y > window.height - corner;
-    match () {
-        _ if !tiling.top && top && left => Some(ResizeEdge::TopLeft),
-        _ if !tiling.top && top && right => Some(ResizeEdge::TopRight),
-        _ if !tiling.bottom && bottom && left => Some(ResizeEdge::BottomLeft),
-        _ if !tiling.bottom && bottom && right => Some(ResizeEdge::BottomRight),
-        _ if !tiling.top && pos.y < SHADOW => Some(ResizeEdge::Top),
-        _ if !tiling.bottom && pos.y > window.height - SHADOW => Some(ResizeEdge::Bottom),
-        _ if !tiling.left && pos.x < SHADOW => Some(ResizeEdge::Left),
-        _ if !tiling.right && pos.x > window.width - SHADOW => Some(ResizeEdge::Right),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use gpui::size;
-
-    #[test]
-    fn resize_edges() {
-        let window = size(px(800.), px(600.));
-        let free = Tiling::default();
-        assert_eq!(resize_edge(point(px(400.), px(300.)), window, free), None);
-        assert_eq!(resize_edge(point(px(2.), px(2.)), window, free), Some(ResizeEdge::TopLeft));
-        assert_eq!(resize_edge(point(px(400.), px(598.)), window, free), Some(ResizeEdge::Bottom));
-        assert_eq!(resize_edge(point(px(795.), px(300.)), window, free), Some(ResizeEdge::Right));
-        // A tiled edge can't be dragged.
-        let tiled = Tiling { right: true, ..Tiling::default() };
-        assert_eq!(resize_edge(point(px(795.), px(300.)), window, tiled), None);
-    }
+    desktop_common::layout::linux_window_frame(content, ROUNDING, window, cx)
 }

@@ -85,7 +85,7 @@ impl Hotkey {
         Self::ALL.get(id.checked_sub(1)?).copied()
     }
 
-    const fn setting_key(self) -> &'static str {
+    pub const fn setting_key(self) -> &'static str {
         match self {
             Self::QuickAdd => "hotkey_quick_add",
             Self::ShowHide => "hotkey_show_hide",
@@ -308,6 +308,8 @@ pub(super) struct Shared {
     pub thread: Option<u32>,
     #[cfg(target_os = "linux")]
     pub wake_window: Option<u32>,
+    #[cfg(target_os = "linux")]
+    pub quit_requested: bool,
     #[cfg_attr(not(any(windows, target_os = "macos", target_os = "linux")), allow(dead_code))]
     pub stopped: bool,
 }
@@ -340,7 +342,7 @@ pub fn set(hotkey: Hotkey, binding: Option<Binding>, cx: &mut App) {
     let Some(global) = cx.try_global::<GlobalHotkeys>() else { return };
     let value = binding.as_ref().map_or_else(|| "off".to_owned(), Binding::to_setting);
     if let Err(err) = global.store.set_setting(hotkey.setting_key(), &value) {
-        eprintln!("failed to save the shortcut: {err:#}");
+        desktop_common::logging::log_error("hotkeys", format!("failed to save the shortcut: {err:#}"));
     }
     {
         let mut shared = global.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -359,7 +361,7 @@ pub fn reset_defaults(cx: &mut App) {
         let hotkey = Hotkey::ALL[i];
         let default = hotkey.default_setting();
         if let Err(err) = global.store.set_setting(hotkey.setting_key(), default) {
-            eprintln!("failed to save the shortcut: {err:#}");
+            desktop_common::logging::log_error("hotkeys", format!("failed to save the shortcut: {err:#}"));
         }
         (default != "off").then(|| Binding::parse(default)).flatten()
     });
@@ -397,8 +399,7 @@ pub fn init(window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut App) {
         stopped_cv: stopped_cv.clone(),
     });
     // Debug builds: `FERN_DEV_STATE=quick-add-window` opens Quick Add, as its shortcut would.
-    #[cfg(debug_assertions)]
-    if std::env::var("FERN_DEV_STATE").is_ok_and(|state| state.contains("quick-add-window")) {
+    if desktop_common::dev_state_value().is_some_and(|state| state.contains("quick-add-window")) {
         cx.defer(move |cx| crate::quick_add_window::open(window, cx));
     }
 
@@ -431,7 +432,7 @@ pub fn init(window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut App) {
                         if let Some(store) = cx.try_global::<GlobalHotkeys>().map(|g| g.store.clone()) {
                             let next = !crate::tray::TrayPrefs::current(&store, cx).always_on_top;
                             if let Err(err) = crate::tray::set_always_on_top(&store, next, cx) {
-                                eprintln!("failed to toggle always_on_top: {err:#}");
+                                desktop_common::logging::log_error("hotkeys", format!("failed to toggle always_on_top: {err:#}"));
                             }
                         }
                     });

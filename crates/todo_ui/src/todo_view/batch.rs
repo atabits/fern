@@ -58,7 +58,7 @@ impl TodoView {
         let can_multi_select = self.view == View::Trash || !self.is_task_id_read_only(id);
         if modifiers.shift && can_multi_select {
             let ids: Vec<Id> = self
-                .visible_task_ids(strings)
+                .visible_task_ids(strings, cx)
                 .into_iter()
                 .filter(|tid| self.view == View::Trash || !self.is_task_id_read_only(*tid))
                 .collect();
@@ -135,7 +135,7 @@ impl TodoView {
         }
         window.focus(&self.list_focus, cx);
         let ids: Vec<Id> = self
-            .visible_task_ids(i18n::t(cx))
+            .visible_task_ids(i18n::t(cx), cx)
             .into_iter()
             .filter(|id| self.view == View::Trash || !self.is_task_id_read_only(*id))
             .collect();
@@ -162,7 +162,7 @@ impl TodoView {
             return;
         }
         let ids: Vec<Id> = self
-            .visible_task_ids(i18n::t(cx))
+            .visible_task_ids(i18n::t(cx), cx)
             .into_iter()
             .filter(|id| self.view == View::Trash || !self.is_task_id_read_only(*id))
             .collect();
@@ -240,7 +240,12 @@ impl TodoView {
         self.reload(cx);
     }
 
-    pub(super) fn render_batch_panel(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_batch_panel(
+        &self,
+        strings: &'static Strings,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().clone();
         let ids = self.selected_task_ids();
         let task_by_id: std::collections::HashMap<Id, &Task> =
@@ -299,7 +304,7 @@ impl TodoView {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let count = this.selected_task_ids().len();
                                 if count > 0 {
-                                    this.confirm_delete = Some(super::ConfirmDeleteTarget::BatchPurge(count));
+                                    this.overlays.confirm_delete = Some(super::ConfirmDeleteTarget::BatchPurge(count));
                                     cx.notify();
                                 }
                             })),
@@ -322,7 +327,7 @@ impl TodoView {
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !all_completed {
-                                    desktop_common::sound::play_complete(&this.store);
+                                    desktop_common::sound::play_complete(cx);
                                 }
                                 this.run_batch(false, cx, move |store, ids| store.batch_complete(ids, !all_completed));
                             })),
@@ -606,7 +611,7 @@ impl TodoView {
             .border_color(theme.colors().border)
             .child(
                 h_flex()
-                    .mt(crate::title_bar::header_inset())
+                    .mt(crate::title_bar::header_inset(window, cx))
                     .h(px(48.))
                     .px_5()
                     .border_b_1()
@@ -701,7 +706,7 @@ impl TodoView {
                         .on_click(cx.listener(|this, _, _, cx| {
                             let count = this.selected_task_ids().len();
                             if count > 0 {
-                                this.confirm_delete = Some(super::ConfirmDeleteTarget::BatchPurge(count));
+                                this.overlays.confirm_delete = Some(super::ConfirmDeleteTarget::BatchPurge(count));
                                 cx.notify();
                             }
                         })),
@@ -717,7 +722,7 @@ impl TodoView {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if !all_completed {
-                            desktop_common::sound::play_complete(&this.store);
+                            desktop_common::sound::play_complete(cx);
                         }
                         this.run_batch(false, cx, move |store, ids| store.batch_complete(ids, !all_completed));
                     })),

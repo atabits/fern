@@ -124,15 +124,29 @@ pub struct HorizonsView {
     // Slide-over TaskDetail drawer.
     pub(crate) detail_task: Option<Id>,
     pub(crate) detail: Entity<TaskDetail>,
-    pub(crate) text_edit_sync_task: Option<gpui::Task<()>>,
 
     // Scroll handle & undo history.
     pub(crate) h_scroll: ScrollHandle,
     pub(crate) undo_stack: Vec<UndoEntry>,
     pub(crate) redo_stack: Vec<UndoEntry>,
+    pub(crate) pending_complete: HashSet<Id>,
+    pub(crate) slot_open_counts: [usize; 8],
+    pub(crate) column_cache: std::cell::RefCell<CachedColumns>,
     active: bool,
     dirty: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+type ColumnCacheKey = (NaiveDate, Option<Id>, Option<String>, Option<Priority>, bool, bool);
+type HorizonBuckets = (Vec<usize>, Vec<usize>, Vec<usize>);
+
+#[derive(Default)]
+pub(crate) struct CachedColumns {
+    data_rev: u64,
+    key: Option<ColumnCacheKey>,
+    inbox: Option<Vec<usize>>,
+    days: HashMap<NaiveDate, (Vec<usize>, Vec<usize>)>,
+    horizons: HashMap<(Horizon, bool), HorizonBuckets>,
 }
 
 impl Focusable for HorizonsView {
@@ -151,7 +165,6 @@ impl HorizonsView {
 
         let subscriptions = vec![
             cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| {
-                this.text_edit_sync_task = None;
                 data_changed(cx.entity_id(), cx);
                 this.reload(cx);
             }),
@@ -215,10 +228,12 @@ impl HorizonsView {
             filter_priority: None,
             detail_task: None,
             detail,
-            text_edit_sync_task: None,
             h_scroll: ScrollHandle::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            pending_complete: HashSet::new(),
+            slot_open_counts: [0; 8],
+            column_cache: std::cell::RefCell::new(CachedColumns::default()),
             active: true,
             dirty: false,
             _subscriptions: subscriptions,
@@ -246,7 +261,6 @@ impl HorizonsView {
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.dirty = false;
-        self.text_edit_sync_task = None;
         self.tasks = self.store.tasks().unwrap_or_default();
         self.lists = self.store.lists().unwrap_or_default();
         self.list_meta = self
@@ -256,6 +270,26 @@ impl HorizonsView {
             .collect();
         self.tags = self.store.tags().unwrap_or_default();
         self.load_settings();
+        self.invalidate_column_cache();
+        let today = Self::today();
+        for (i, slot) in HorizonSlot::ALL.into_iter().enumerate() {
+            self.slot_open_counts[i] = match slot {
+                HorizonSlot::Inbox => self.open_inbox_count(),
+                HorizonSlot::Today => {
+                    let (items, rollover) =
+                        horizons_day_partition(&self.tasks, &self.lists, today, today, false);
+                    items.len() + rollover.len()
+                }
+                _ => match slot.target(today) {
+                    ColumnTarget::Horizon(h) => {
+                        let (items, rollover) =
+                            horizons_bucket_partition(&self.tasks, &self.lists, h, today, false);
+                        items.len() + rollover.len()
+                    }
+                    _ => 0,
+                },
+            };
+        }
 
         let lists_for_detail = self.lists.clone();
         self.detail.update(cx, |d, _| d.set_lists(lists_for_detail));
@@ -397,15 +431,60 @@ impl HorizonsView {
         let _ = self.store.set_setting(key, if value { "1" } else { "0" });
     }
 
-    fn inbox_tasks(&self) -> Vec<&Task> {
+    fn invalidate_column_cache(&self) {
+        let mut cache = self.column_cache.borrow_mut();
+        cache.data_rev = cache.data_rev.wrapping_add(1);
+        cache.key = None;
+        cache.inbox = None;
+        cache.days.clear();
+        cache.horizons.clear();
+    }
+
+    fn ensure_cache_key(&self, today: NaiveDate) {
+        let key = (
+            today,
+            self.filter_board,
+            self.filter_tag.clone(),
+            self.filter_priority,
+            self.show_completed,
+            self.show_dated_in_week,
+        );
+        let mut cache = self.column_cache.borrow_mut();
+        if cache.key.as_ref() != Some(&key) {
+            cache.key = Some(key);
+            cache.inbox = None;
+            cache.days.clear();
+            cache.horizons.clear();
+        }
+    }
+
+    fn task_indices_by_ptr(&self) -> HashMap<*const Task, usize> {
         self.tasks
             .iter()
-            .filter(|t| {
-                is_horizons_inbox(t)
-                    && (self.show_completed || !t.is_completed())
-                    && self.matches_filter(t)
-            })
+            .enumerate()
+            .map(|(i, t)| (t as *const Task, i))
             .collect()
+    }
+
+    fn inbox_tasks(&self) -> Vec<&Task> {
+        let today = Self::today();
+        self.ensure_cache_key(today);
+        if let Some(indices) = &self.column_cache.borrow().inbox {
+            return indices.iter().filter_map(|&i| self.tasks.get(i)).collect();
+        }
+        let mut indices = Vec::new();
+        let mut out = Vec::new();
+        for (idx, t) in self.tasks.iter().enumerate() {
+            if is_horizons_inbox(t)
+                && (self.show_completed || !t.is_completed())
+                && self.matches_filter(t)
+            {
+                indices.push(idx);
+                out.push(t);
+            }
+        }
+        self.column_cache.borrow_mut().inbox = Some(indices);
+        out
     }
 
     fn open_inbox_count(&self) -> usize {
@@ -422,8 +501,29 @@ impl HorizonsView {
         slot: Option<HorizonSlot>,
         strings: &Strings,
     ) -> ColumnSpec<'_> {
-        let (items, rollover) =
-            horizons_day_partition(&self.tasks, &self.lists, day, today, self.show_completed);
+        self.ensure_cache_key(today);
+        let (task_idx, rollover_idx) = if let Some(cached) = self.column_cache.borrow().days.get(&day) {
+            cached.clone()
+        } else {
+            let (items, rollover) =
+                horizons_day_partition(&self.tasks, &self.lists, day, today, self.show_completed);
+            let filtered_items = self.filter_vec(items);
+            let filtered_rollover = self.filter_vec(rollover);
+            let ptr_map = self.task_indices_by_ptr();
+            let ti: Vec<usize> = filtered_items
+                .iter()
+                .filter_map(|t| ptr_map.get(&(*t as *const Task)).copied())
+                .collect();
+            let ri: Vec<usize> = filtered_rollover
+                .iter()
+                .filter_map(|t| ptr_map.get(&(*t as *const Task)).copied())
+                .collect();
+            self.column_cache
+                .borrow_mut()
+                .days
+                .insert(day, (ti.clone(), ri.clone()));
+            (ti, ri)
+        };
         let diff = (day - today).num_days();
         let title = match diff {
             0 => strings.today.to_owned(),
@@ -438,8 +538,8 @@ impl HorizonsView {
             title,
             subtitle,
             is_current: day == today,
-            tasks: self.filter_vec(items),
-            rollover: self.filter_vec(rollover),
+            tasks: task_idx.into_iter().filter_map(|i| self.tasks.get(i)).collect(),
+            rollover: rollover_idx.into_iter().filter_map(|i| self.tasks.get(i)).collect(),
             dated_in_week: Vec::new(),
             empty_hint: None,
             show_triage_chips: false,
@@ -455,57 +555,77 @@ impl HorizonsView {
         exclude_today_in_week: bool,
         strings: &Strings,
     ) -> ColumnSpec<'_> {
-        let (items, rollover) =
-            horizons_bucket_partition(&self.tasks, &self.lists, horizon, today, self.show_completed);
+        self.ensure_cache_key(today);
+        let cache_key = (horizon, exclude_today_in_week);
+        let (task_idx, rollover_idx, dated_idx) =
+            if let Some(cached) = self.column_cache.borrow().horizons.get(&cache_key) {
+                cached.clone()
+            } else {
+                let (items, rollover) = horizons_bucket_partition(
+                    &self.tasks,
+                    &self.lists,
+                    horizon,
+                    today,
+                    self.show_completed,
+                );
+                let dated_in_week = match horizon {
+                    Horizon::Week { year, week } if self.show_dated_in_week => {
+                        let exclude = exclude_today_in_week.then_some(today);
+                        self.filter_vec(horizons_week_dated_tasks(
+                            &self.tasks,
+                            &self.lists,
+                            year,
+                            week,
+                            exclude,
+                            self.show_completed,
+                        ))
+                    }
+                    _ => Vec::new(),
+                };
+                let filtered_items = self.filter_vec(items);
+                let filtered_rollover = self.filter_vec(rollover);
+                let ptr_map = self.task_indices_by_ptr();
+                let ti: Vec<usize> = filtered_items
+                    .iter()
+                    .filter_map(|t| ptr_map.get(&(*t as *const Task)).copied())
+                    .collect();
+                let ri: Vec<usize> = filtered_rollover
+                    .iter()
+                    .filter_map(|t| ptr_map.get(&(*t as *const Task)).copied())
+                    .collect();
+                let di: Vec<usize> = dated_in_week
+                    .iter()
+                    .filter_map(|t| ptr_map.get(&(*t as *const Task)).copied())
+                    .collect();
+                self.column_cache
+                    .borrow_mut()
+                    .horizons
+                    .insert(cache_key, (ti.clone(), ri.clone(), di.clone()));
+                (ti, ri, di)
+            };
         let (title, subtitle) = calendar::format_horizon_heading(horizon, today, strings);
         let is_current = horizon != Horizon::Life
             && horizon == Horizon::current_for(horizon.granularity(), today);
-        let dated_in_week = match horizon {
-            Horizon::Week { year, week } if self.show_dated_in_week => {
-                let exclude = exclude_today_in_week.then_some(today);
-                self.filter_vec(horizons_week_dated_tasks(
-                    &self.tasks,
-                    &self.lists,
-                    year,
-                    week,
-                    exclude,
-                    self.show_completed,
-                ))
-            }
-            _ => Vec::new(),
-        };
         ColumnSpec {
             target: ColumnTarget::Horizon(horizon),
             slot,
             title,
             subtitle,
             is_current,
-            tasks: self.filter_vec(items),
-            rollover: self.filter_vec(rollover),
-            dated_in_week,
+            tasks: task_idx.into_iter().filter_map(|i| self.tasks.get(i)).collect(),
+            rollover: rollover_idx.into_iter().filter_map(|i| self.tasks.get(i)).collect(),
+            dated_in_week: dated_idx.into_iter().filter_map(|i| self.tasks.get(i)).collect(),
             empty_hint: None,
             show_triage_chips: false,
             show_board_badge: true,
         }
     }
 
-    fn slot_open_count(&self, slot: HorizonSlot, today: NaiveDate) -> usize {
-        match slot {
-            HorizonSlot::Inbox => self.open_inbox_count(),
-            HorizonSlot::Today => {
-                let (items, rollover) =
-                    horizons_day_partition(&self.tasks, &self.lists, today, today, false);
-                items.len() + rollover.len()
-            }
-            _ => match slot.target(today) {
-                ColumnTarget::Horizon(h) => {
-                    let (items, rollover) =
-                        horizons_bucket_partition(&self.tasks, &self.lists, h, today, false);
-                    items.len() + rollover.len()
-                }
-                _ => 0,
-            },
-        }
+    fn slot_open_count(&self, slot: HorizonSlot, _today: NaiveDate) -> usize {
+        HorizonSlot::ALL
+            .iter()
+            .position(|&s| s == slot)
+            .map_or(0, |idx| self.slot_open_counts[idx])
     }
 
     fn scale_range_hint(&self, today: NaiveDate, strings: &Strings) -> Option<String> {
@@ -626,7 +746,7 @@ impl HorizonsView {
 
     /// Razor-clean top strip bar: scale tabs on the left, optional period stepper in the middle,
     /// and Filter + View Options buttons on the right (below `title_bar_height()`).
-    fn render_top_strip(&self, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
+    fn render_top_strip(&self, today: NaiveDate, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let colors = theme.colors();
         let strings = i18n::t(cx);
@@ -754,7 +874,7 @@ impl HorizonsView {
             .debug_selector(|| "horizons-top-strip".to_owned())
             .w_full()
             .flex_none()
-            .pt(layout::title_bar_height() + px(8.))
+            .pt(layout::title_bar_height(window, cx) + px(8.))
             .pb(px(8.))
             .px(px(16.))
             .border_b_1()
@@ -1003,7 +1123,7 @@ impl HorizonsView {
 }
 
 impl Render for HorizonsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let today = Self::today();
 
@@ -1062,13 +1182,13 @@ impl Render for HorizonsView {
                     cx.notify();
                 }
             }))
-            .child(self.render_top_strip(today, cx))
+            .child(self.render_top_strip(today, window, cx))
             .child(self.render_main_canvas(today, cx))
             .when(self.show_prompt, |el| {
                 el.child(self.render_reflection_prompt(cx))
             })
             .when_some(self.detail_task, |el, task_id| {
-                el.child(self.render_drawer(task_id, today, cx))
+                el.child(self.render_drawer(task_id, today, window, cx))
             })
     }
 }

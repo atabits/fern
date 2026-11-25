@@ -96,7 +96,10 @@ impl CalendarOptionsDialog {
     fn change(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut CalendarOptions)) {
         change(&mut self.options);
         if let Err(err) = self.store.save_calendar_options(&self.options) {
-            eprintln!("failed to save the calendar options: {err:#}");
+            desktop_common::logging::log_error(
+                "calendar_ui",
+                format!("failed to save the calendar options: {err:#}"),
+            );
         }
         cx.emit(OptionsEvent::Changed(self.options.clone()));
         cx.notify();

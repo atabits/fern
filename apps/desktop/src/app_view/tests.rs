@@ -29,7 +29,7 @@ fn update_notification_opens_the_installed_notes_without_an_updater(cx: &mut gpu
     let button = cx.debug_bounds("updated-whats-new").unwrap();
     assert!(notice.left() >= bell.right());
     assert_eq!(notice.bottom(), bell.bottom());
-    assert!(notice.top() >= title_bar::height() && notice.bottom() <= px(400.));
+    assert!(notice.top() >= cx.update(|window, cx| title_bar::height(window, cx)) && notice.bottom() <= px(400.));
     assert!(cx.update(|_, cx| app.read(cx).settings.is_none()));
     cx.simulate_click(button.center(), gpui::Modifiers::default());
     let settings_window = cx.update(|_, cx| {
@@ -346,7 +346,7 @@ fn title_bar_overlays_full_height_columns_above_header_controls(cx: &mut gpui::T
     let sort = cx.debug_bounds("task-sort-menu-trigger").unwrap();
     let priority = cx.debug_bounds("task-detail-priority").unwrap();
     assert_eq!(bar.top(), px(0.));
-    assert_eq!(bar.bottom(), title_bar::height());
+    assert_eq!(bar.bottom(), cx.update(|window, cx| title_bar::height(window, cx)));
     assert_eq!(sidebar.top(), px(0.));
     assert_eq!(sidebar.bottom(), px(700.));
     assert_eq!(lists.top(), px(0.));
@@ -999,7 +999,6 @@ fn disabling_life_clock_feature_falls_back_to_task_section(cx: &mut gpui::TestAp
 fn horizons_view_embeds_in_tasks_and_disabling_feature_falls_back_cleanly(
     cx: &mut gpui::TestAppContext,
 ) {
-    let _horizons_guard = lock_horizons_flag();
     cx.update(|cx| {
         theme::init(cx);
         assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
@@ -1011,7 +1010,7 @@ fn horizons_view_embeds_in_tasks_and_disabling_feature_falls_back_cleanly(
 
     // Horizons has no duplicate left-rail icon; it lives inside Tasks as View::Horizons.
     assert!(cx.debug_bounds("section-horizons").is_none());
-    assert!(crate::calendar::horizons_enabled());
+    cx.update(|_, cx| assert!(desktop_common::ActivePreferences::get(cx).horizons_enabled));
 
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
@@ -1053,7 +1052,7 @@ fn horizons_view_embeds_in_tasks_and_disabling_feature_falls_back_cleanly(
 
     cx.update(|_, cx| {
         assert!(!app.read(cx).features.horizons);
-        assert!(!crate::calendar::horizons_enabled());
+        assert!(!desktop_common::ActivePreferences::get(cx).horizons_enabled);
         assert_eq!(app.read(cx).section, Section::Tasks);
     });
     assert!(cx.debug_bounds("horizons-view").is_none());
@@ -1065,13 +1064,12 @@ fn horizons_view_embeds_in_tasks_and_disabling_feature_falls_back_cleanly(
     cx.run_until_parked();
     cx.update(|_, cx| {
         assert!(app.read(cx).features.horizons);
-        assert!(crate::calendar::horizons_enabled());
+        assert!(desktop_common::ActivePreferences::get(cx).horizons_enabled);
     });
 }
 
 #[gpui::test]
 fn go_to_horizons_and_summary_actions_respect_horizons_flag(cx: &mut gpui::TestAppContext) {
-    let _horizons_guard = lock_horizons_flag();
     cx.update(|cx| {
         theme::init(cx);
         assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
@@ -1097,7 +1095,9 @@ fn go_to_horizons_and_summary_actions_respect_horizons_flag(cx: &mut gpui::TestA
     assert!(cx.debug_bounds("quick-add-input").is_none());
 
     // When Horizons is disabled, GoToHorizons is a no-op and stays on Calendar.
-    set_horizons_enabled(false);
+    cx.update(|_, cx| {
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = false);
+    });
     cx.update(|window, cx| app.update(cx, |app, cx| assert!(app.select(Section::Calendar, window, cx))));
     cx.update(|window, cx| window.dispatch_action(Box::new(GoToHorizons), cx));
     cx.run_until_parked();
@@ -1139,7 +1139,7 @@ mod ux_perf_tests {
 
         let alerts_bounds = cx.debug_bounds("active-reminder-alerts").unwrap();
         assert!(
-            alerts_bounds.top() >= title_bar::height(),
+            alerts_bounds.top() >= cx.update(|window, cx| title_bar::height(window, cx)),
             "alerts banner must anchor below the title bar, got top={:?}",
             alerts_bounds.top()
         );

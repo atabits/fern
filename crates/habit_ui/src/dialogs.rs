@@ -106,12 +106,12 @@ impl HabitView {
         self.pending_focus = Some(PendingFocus::View);
         let note = modal.note_input.read(cx).text().to_owned();
         if let Err(err) = self.store.set_checkin_log(modal.habit_id, modal.date, Some(&note), modal.mood) {
-            eprintln!("failed to save habit log: {err:#}");
+            desktop_common::logging::log_error("habit_ui", format!("failed to save habit log: {err:#}"));
         }
         if modal.disable_auto_pop
             && let Err(err) = self.store.set_habit_record_enable(modal.habit_id, false)
         {
-            eprintln!("failed to disable auto-pop habit log: {err:#}");
+            desktop_common::logging::log_error("habit_ui", format!("failed to disable auto-pop habit log: {err:#}"));
         }
         self.notify_data_changed(cx);
         self.reload(cx);
@@ -188,7 +188,7 @@ impl HabitView {
             self.store.set_checkin_amount(habit_id, date, amount)
         };
         if let Err(err) = res {
-            eprintln!("failed to save check-in amount: {err:#}");
+            desktop_common::logging::log_error("habit_ui", format!("failed to save check-in amount: {err:#}"));
             cx.notify();
             return;
         }
@@ -226,7 +226,7 @@ impl HabitView {
                                 Label::new(format!(
                                     "{}{}",
                                     strings.habit_log_on,
-                                    desktop_common::calendar::format_date(modal.date, strings)
+                                    desktop_common::calendar::format_date(modal.date, strings, cx)
                                 ))
                                 .size(LabelSize::Large)
                                 .weight(FontWeight::SEMIBOLD),
@@ -447,11 +447,9 @@ impl HabitView {
             ConfirmAction::SaveHabitCycleChange { .. } => (strings.edit_habit, strings.habit_cycle_reset_confirm, strings.save, false),
         };
 
-        ConfirmDialog::new("habit-confirm-modal", title)
+        ConfirmDialog::new("habit-confirm-modal", title, strings.cancel, confirm_label)
             .width(px(360.))
             .description(message)
-            .cancel_label(strings.cancel)
-            .confirm_label(confirm_label)
             .destructive(destructive)
             .on_cancel(cx.listener(|this, _, window, cx| {
                 this.confirm = None;
@@ -472,14 +470,14 @@ impl HabitView {
         match action {
             ConfirmAction::ResetCheckin { habit_id, date } => {
                 if let Err(err) = self.store.reset_checkin(habit_id, date, true) {
-                    eprintln!("failed to reset check-in: {err:#}");
+                    desktop_common::logging::log_error("habit_ui", format!("failed to reset check-in: {err:#}"));
                 }
                 self.notify_data_changed(cx);
                 self.reload(cx);
             }
             ConfirmAction::DeleteHabit { habit_id } => {
                 if let Err(err) = self.store.delete_habit(habit_id) {
-                    eprintln!("failed to delete habit: {err:#}");
+                    desktop_common::logging::log_error("habit_ui", format!("failed to delete habit: {err:#}"));
                 }
                 if self.selected == Some(habit_id) {
                     self.selected = None;
@@ -490,14 +488,14 @@ impl HabitView {
             }
             ConfirmAction::DeleteLog { habit_id, date } => {
                 if let Err(err) = self.store.delete_checkin_log(habit_id, date) {
-                    eprintln!("failed to delete habit log: {err:#}");
+                    desktop_common::logging::log_error("habit_ui", format!("failed to delete habit log: {err:#}"));
                 }
                 self.notify_data_changed(cx);
                 self.reload(cx);
             }
             ConfirmAction::DeleteSection { section_id } => {
                 if let Err(err) = self.store.delete_habit_section(section_id) {
-                    eprintln!("failed to delete section: {err:#}");
+                    desktop_common::logging::log_error("habit_ui", format!("failed to delete section: {err:#}"));
                 }
                 self.section_menu = None;
                 self.notify_data_changed(cx);
@@ -607,8 +605,8 @@ impl HabitView {
                                     .child(
                                         Label::new(format!(
                                             "{} — {}",
-                                            desktop_common::calendar::format_date(c.start, strings),
-                                            desktop_common::calendar::format_date(c.end, strings),
+                                            desktop_common::calendar::format_date(c.start, strings, cx),
+                                            desktop_common::calendar::format_date(c.end, strings, cx),
                                         ))
                                         .size(LabelSize::Small),
                                     ),

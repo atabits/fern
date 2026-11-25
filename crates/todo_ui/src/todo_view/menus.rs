@@ -58,13 +58,19 @@ impl TodoView {
             _ => None,
         };
         self.list_activity = Some(self.store.list_activity(list, 300).unwrap_or_default());
-        self.header_menu_open = false;
+        self.overlays.header_menu_open = false;
         cx.notify();
     }
 
     /// The original's List Activities: the list's task events by day, newest first, each with
     /// its task, which a click opens.
-    pub(super) fn render_list_activity(&self, entries: &[(fern_core::Activity, Id, String)], top_inset: bool, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_list_activity(
+        &self,
+        entries: &[(fern_core::Activity, Id, String)],
+        top_inset: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Self::today();
@@ -127,7 +133,7 @@ impl TodoView {
                                             })),
                                     ),
                             )
-                            .child(Label::new(format!("{} {}", crate::calendar::format_day_month(when.date_naive(), strings), crate::calendar::format_time(when, strings))).size(LabelSize::XSmall).color(Color::Muted)),
+                            .child(Label::new(format!("{} {}", crate::calendar::format_day_month(when.date_naive(), strings, cx), crate::calendar::format_time(when, strings, cx))).size(LabelSize::XSmall).color(Color::Muted)),
                     )
                     .into_any_element(),
             );
@@ -139,7 +145,7 @@ impl TodoView {
             .border_color(theme.colors().border)
             .child(
                 h_flex()
-                    .when(top_inset, |el| el.mt(crate::title_bar::header_inset()))
+                    .when(top_inset, |el| el.mt(crate::title_bar::header_inset(window, cx)))
                     .h(px(48.))
                     .px_5()
                     .border_b_1()
@@ -218,7 +224,7 @@ impl TodoView {
             .map(|task| {
                 let when = fern_core::suggest::created_day(task)
                     .zip(chrono::DateTime::from_timestamp_millis(task.created_at))
-                    .map(|(day, at)| task_rows::due_label(day, Some(at.with_timezone(&Local).time()), today, strings).0)
+                    .map(|(day, at)| task_rows::due_label(day, Some(at.with_timezone(&Local).time()), today, strings, cx).0)
                     .unwrap_or_default();
                 row(task, strings.added_on.replace("{when}", &when), cx)
             })
@@ -312,15 +318,15 @@ impl TodoView {
                 popover(cx)
                     .min_w(px(196.))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        this.view_options = Some(false);
+                        this.overlays.view_options = Some(false);
                         cx.notify();
                     }))
                     .child(choice("show-date-time", strings.task_time, !countdown).on_click(cx.listener(|this, _, _, cx| {
-                        this.view_options = Some(false);
+                        this.overlays.view_options = Some(false);
                         this.save_preferences(|p| p.countdown_dates = false, cx);
                     })))
                     .child(choice("show-date-countdown", strings.date_countdown, countdown).on_click(cx.listener(|this, _, _, cx| {
-                        this.view_options = Some(false);
+                        this.overlays.view_options = Some(false);
                         this.save_preferences(|p| p.countdown_dates = true, cx);
                     }))),
             )
@@ -392,7 +398,7 @@ impl TodoView {
             .padding(px(20.))
             .gap(px(12.))
             .on_dismiss(cx.listener(|this, _, _, cx| {
-                this.view_options = None;
+                this.overlays.view_options = None;
                 cx.notify();
             }))
             .child(
@@ -403,7 +409,7 @@ impl TodoView {
                             .icon_color(Color::Muted)
                             .tooltip(Tooltip::text(strings.close))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.view_options = None;
+                                this.overlays.view_options = None;
                                 cx.notify();
                             })),
                     ),
@@ -426,17 +432,17 @@ impl TodoView {
                                             .child(Label::new(if countdown { strings.date_countdown } else { strings.task_time }).color(Color::Muted))
                                             .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.view_options = Some(!this.view_options.unwrap_or(false));
+                                                this.overlays.view_options = Some(!this.overlays.view_options.unwrap_or(false));
                                                 cx.notify();
                                             })),
                                     )
                                     .children(menu),
                             ),
                     )
-                    .when(self.kanban, |el| {
-                        let size = self.kanban_column_size;
-                        let col_color = self.kanban_column_color;
-                        let quick_add = self.kanban_quick_add;
+                    .when(self.kanban.enabled, |el| {
+                        let size = self.kanban.column_size;
+                        let col_color = self.kanban.column_color;
+                        let quick_add = self.kanban.quick_add;
                         let size_btn = |id: &'static str, label: &'static str, value: u8, cx: &mut Context<Self>| {
                             let active = size == value;
                             div()
@@ -508,14 +514,14 @@ impl TodoView {
                                                 .child(Label::new(strings.kanban_workflow))
                                                 .child(Label::new(strings.kanban_workflow_hint).size(LabelSize::XSmall).color(Color::Muted)),
                                         )
-                                        .child(ui::Switch::new().toggle_state(self.kanban_workflow))
+                                        .child(ui::Switch::new().toggle_state(self.kanban.workflow))
                                         .on_click(cx.listener(|this, _, _, cx| this.toggle_kanban_workflow(cx))),
                                 ),
                         )
                     })
-                    .when(self.timeline && !self.kanban, |el| {
-                        let show_weekends = self.timeline_show_weekends;
-                        let color_by = self.timeline_color_by;
+                    .when(self.timeline.enabled && !self.kanban.enabled, |el| {
+                        let show_weekends = self.timeline.show_weekends;
+                        let color_by = self.timeline.color_by;
                         let color_btn = |id: &'static str, label: &'static str, choice: ColorBy, cx: &mut Context<Self>| {
                             let active = color_by == choice;
                             div()
@@ -601,7 +607,7 @@ impl TodoView {
                         ),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.sort_menu = Some(if expanded == Some(which) { None } else { Some(which) });
+                    this.overlays.sort_menu = Some(if expanded == Some(which) { None } else { Some(which) });
                     cx.notify();
                 }))
         };
@@ -612,11 +618,11 @@ impl TodoView {
         };
         popover(cx)
             .min_w(px(250.))
-            .track_focus(&self.sort_menu_focus)
+            .track_focus(&self.overlays.sort_menu_focus)
             .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_sort_menu(window, cx)))
             .child(row("group-by", IconName::Rows3, strings.group_by, group.label(strings), SortMenu::Group))
             .when(expanded == Some(SortMenu::Group), |el| {
-                let kanban_board = self.kanban && !self.timeline;
+                let kanban_board = self.kanban.enabled && !self.timeline.enabled;
                 el.children(
                     GroupBy::ALL
                         .into_iter()
@@ -652,7 +658,7 @@ impl TodoView {
 
 
     pub(super) fn list_action(&mut self, action: ListAction, window: &mut Window, cx: &mut Context<Self>) {
-        let target = self.list_menu.take().map(|(t, _)| t);
+        let target = self.overlays.list_menu.take().map(|(t, _)| t);
         let current = match self.view {
             View::List(id) => Some(id),
             _ => None,
@@ -671,8 +677,8 @@ impl TodoView {
                 self.check(result);
             }
             (ListAction::Delete, Some(ListMenuTarget::Tag(tag))) => {
-                self.confirm_delete = Some(ConfirmDeleteTarget::Tag(tag));
-                self.header_menu_open = false;
+                self.overlays.confirm_delete = Some(ConfirmDeleteTarget::Tag(tag));
+                self.overlays.header_menu_open = false;
                 cx.notify();
                 return;
             }
@@ -690,7 +696,7 @@ impl TodoView {
                 if let Some(id) = list {
                     let result = self.store.duplicate_list(id, i18n::t(cx).list_copy_suffix);
                     if let Some(copy) = self.check(result) {
-                        self.header_menu_open = false;
+                        self.overlays.header_menu_open = false;
                         crate::data_version::data_changed(cx.entity_id(), cx);
                         self.set_view(View::List(copy.id), cx);
                         return;
@@ -713,15 +719,15 @@ impl TodoView {
                         .find(|l| l.id == id)
                         .map(|l| l.name.clone())
                         .unwrap_or_default();
-                    self.confirm_delete = Some(ConfirmDeleteTarget::List(id, name));
-                    self.header_menu_open = false;
+                    self.overlays.confirm_delete = Some(ConfirmDeleteTarget::List(id, name));
+                    self.overlays.header_menu_open = false;
                     cx.notify();
                     return;
                 }
             }
             _ => {}
         }
-        self.header_menu_open = false;
+        self.overlays.header_menu_open = false;
         self.reload(cx);
     }
 
@@ -809,7 +815,7 @@ impl TodoView {
                     .height(px(34.))
                     .child(Label::new(strings.visibility_names[2]))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.list_menu = None;
+                        this.overlays.list_menu = None;
                         this.save_preferences(|p| p.set_visibility(list, fern_core::Visibility::Hide), cx);
                     }))
                     .into_any_element(),
@@ -823,7 +829,7 @@ impl TodoView {
     }
 
     pub(super) fn render_list_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (target, at) = self.list_menu.clone()?;
+        let (target, at) = self.overlays.list_menu.clone()?;
         // The tag menu is the original's 163 px; the others as the task menu.
         let width = match target {
             ListMenuTarget::Tag(_) | ListMenuTarget::TagsHeading => 163.,
@@ -835,7 +841,7 @@ impl TodoView {
         let menu = popover(cx)
             .min_w(px(width))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.list_menu = None;
+                this.overlays.list_menu = None;
                 cx.notify();
             }))
             .children(items)
@@ -847,14 +853,14 @@ impl TodoView {
     /// A right-click menu choice (see `task_menu`).
     pub(super) fn context_action(&mut self, action: task_menu::MenuAction, window: &mut Window, cx: &mut Context<Self>) {
         use task_menu::MenuAction;
-        let Some((id, _, _, _)) = self.context_menu.as_ref().map(|(t, p, n)| (t.id, *p, *n, t.title.clone())) else { return };
+        let Some((id, _, _, _)) = self.overlays.context_menu.as_ref().map(|(t, p, n)| (t.id, *p, *n, t.title.clone())) else { return };
         if let MenuAction::Side(side) = action {
-            self.context_side = side;
+            self.overlays.context_side = side;
             cx.notify();
             return;
         }
-        let Some((cached_task, _, _)) = self.context_menu.take() else { return };
-        self.context_side = None;
+        let Some((cached_task, _, _)) = self.overlays.context_menu.take() else { return };
+        self.overlays.context_side = None;
         let task = self
             .tasks
             .iter()
@@ -896,14 +902,14 @@ impl TodoView {
 
     /// The task's right-click menu, as the original's, at the pointer.
     pub(super) fn render_context_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (cached_task, position, nesting) = self.context_menu.as_ref()?;
+        let (cached_task, position, nesting) = self.overlays.context_menu.as_ref()?;
         let task = self.tasks.iter().find(|t| t.id == cached_task.id).unwrap_or(cached_task);
         let menu = task_menu::render(
             task,
             &self.active_lists(),
             task_menu::MenuKind::List,
             *nesting,
-            self.context_side,
+            self.overlays.context_side,
             strings,
             cx,
             std::rc::Rc::new(|this: &mut Self, action, window, cx| this.context_action(action, window, cx)),
@@ -912,7 +918,7 @@ impl TodoView {
     }
 
     pub(super) fn set_closed_menu(&mut self, menu: Option<ClosedMenu>, cx: &mut Context<Self>) {
-        self.closed_menu = menu;
+        self.overlays.closed_menu = menu;
         cx.notify();
     }
 
@@ -930,7 +936,7 @@ impl TodoView {
         cx: &mut Context<Self>,
         change: impl FnOnce(&mut Option<NaiveDate>, &mut Option<NaiveDate>, &mut Option<RangeEnd>, &mut NaiveDate),
     ) {
-        if let Some(ClosedMenu::OtherDate { start, end, picking, month }) = self.closed_menu.as_mut() {
+        if let Some(ClosedMenu::OtherDate { start, end, picking, month }) = self.overlays.closed_menu.as_mut() {
             change(start, end, picking, month);
         }
         cx.notify();
@@ -966,66 +972,47 @@ impl TodoView {
         };
         let calendar = picking.map(|which| {
             let selected = if which == RangeEnd::Start { start } else { end };
+            let entity_shift = cx.entity();
+            let entity_pick = cx.entity();
+            let header = desktop_common::month_calendar::MonthHeaderConfig::surface(
+                month,
+                strings,
+                "range-prev",
+                "range-next",
+            );
+            let mut grid_cfg = desktop_common::month_calendar::MonthGridConfig::single("range", month, today);
+            grid_cfg.selected = selected;
+            grid_cfg.cell_height = Some(px(26.));
+            grid_cfg.rounded_full = true;
+            grid_cfg.highlight_today_bg = false;
             v_flex()
                 .gap_1()
-                .child(
-                    h_flex()
-                        .child(div().flex_1().child(Label::new(crate::calendar::month_title(month, strings)).weight(FontWeight::SEMIBOLD)))
-                        .child(
-                            IconButton::new("range-prev", IconName::ChevronLeft)
-                                .size(px(22.))
-                                .tooltip(Tooltip::text("←"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.update_other_date(cx, |_, _, _, month| *month = crate::calendar::add_months(*month, -1))
-                                })),
-                        )
-                        .child(
-                            IconButton::new("range-next", IconName::ChevronRight)
-                                .size(px(22.))
-                                .tooltip(Tooltip::text("→"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.update_other_date(cx, |_, _, _, month| *month = crate::calendar::add_months(*month, 1))
-                                })),
-                        ),
-                )
-                .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
-                    div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(Color::Muted))
-                })))
-                .children(crate::calendar::month_grid(month).chunks(7).map(|week| {
-                    h_flex().children(week.iter().map(|&date| {
-                        let is_selected = selected == Some(date);
-                        div()
-                            .id(SharedString::from(format!("range-day-{date}")))
-                            .flex_1()
-                            .h(px(26.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .cursor_pointer()
-                            .when(is_selected, |el| el.bg(theme.colors().accent))
-                            .when(!is_selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
-                            .child(
-                                Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(if is_selected {
-                                    Color::OnAccent
-                                } else if date == today {
-                                    Color::Accent
-                                } else if date.month() != month.month() {
-                                    Color::Muted
-                                } else {
-                                    Color::Default
-                                }),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.update_other_date(cx, |start, end, picking, _| {
-                                    match which {
-                                        RangeEnd::Start => *start = Some(date),
-                                        RangeEnd::End => *end = Some(date),
-                                    }
-                                    *picking = None;
-                                })
-                            }))
-                    }))
+                .child(desktop_common::month_calendar::render_month_header(
+                    header,
+                    cx,
+                    move |delta, _, cx| {
+                        entity_shift.update(cx, |this, cx| {
+                            this.update_other_date(cx, |_, _, _, month| *month = crate::calendar::add_months(*month, delta))
+                        });
+                    },
+                    None,
+                ))
+                .child(desktop_common::month_calendar::render_weekday_row(
+                    strings,
+                    desktop_common::month_calendar::WeekdayStyle::Narrow,
+                    false,
+                    cx,
+                ))
+                .children(desktop_common::month_calendar::render_month_grid(&grid_cfg, cx, move |date, _, cx| {
+                    entity_pick.update(cx, |this, cx| {
+                        this.update_other_date(cx, |start, end, picking, _| {
+                            match which {
+                                RangeEnd::Start => *start = Some(date),
+                                RangeEnd::End => *end = Some(date),
+                            }
+                            *picking = None;
+                        })
+                    });
                 }))
         });
         let (start_calendar, end_calendar) =
@@ -1085,7 +1072,7 @@ impl TodoView {
 
     pub(super) fn sync_closed_filter(&mut self, cx: &mut Context<Self>) {
         let visible = self.selected.is_some_and(|selected| {
-            self.rows(i18n::t(cx)).into_iter().any(|row| matches!(row, Row::Task { task, .. } if task.id == selected))
+            self.rows(i18n::t(cx), cx).into_iter().any(|row| matches!(row, Row::Task { task, .. } if task.id == selected))
         });
         self.list_state = Self::new_list_state();
         self.list_entries.clear();
@@ -1097,7 +1084,7 @@ impl TodoView {
 
     /// Toggles a list in the lists-filter draft; "All Lists" is `None`.
     pub(super) fn toggle_closed_list(&mut self, list: Option<Option<Id>>, cx: &mut Context<Self>) {
-        if let Some(ClosedMenu::Lists(draft)) = self.closed_menu.as_mut() {
+        if let Some(ClosedMenu::Lists(draft)) = self.overlays.closed_menu.as_mut() {
             *draft = match (list, draft.take()) {
                 (None, _) => None,
                 (Some(list), None) => Some(vec![list]),
@@ -1126,7 +1113,7 @@ impl TodoView {
             Some(lists) if lists.len() == 1 => list_name(lists[0]),
             Some(lists) => format!("{} ({})", strings.all_lists, lists.len()).into(),
         };
-        let open = self.closed_menu.clone();
+        let open = self.overlays.closed_menu.clone();
         let filter_button = |id: &'static str, label: SharedString, active: bool| {
             h_flex()
                 .id(id)
@@ -1231,7 +1218,7 @@ impl TodoView {
                             .cursor_pointer()
                             .child(Label::new(strings.ok).size(LabelSize::Small).color(Color::OnAccent))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(ClosedMenu::Lists(draft)) = this.closed_menu.take() {
+                                if let Some(ClosedMenu::Lists(draft)) = this.overlays.closed_menu.take() {
                                     this.closed_lists = draft;
                                 }
                                 this.sync_closed_filter(cx);
@@ -1283,7 +1270,7 @@ impl TodoView {
         popover(cx)
             .min_w(px(236.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.header_menu_open = false;
+                this.overlays.header_menu_open = false;
                 cx.notify();
             }))
             .when_some(match self.view {
@@ -1319,8 +1306,8 @@ impl TodoView {
             .when(!in_trash && !matches!(self.view, View::Completed | View::WontDo | View::Search(_)), |el| {
                 let completed = self.view_flag("show_completed", true);
                 let details = self.view_flag("show_details", false);
-                let kanban = self.kanban;
-                let timeline = self.timeline && !kanban;
+                let kanban = self.kanban.enabled;
+                let timeline = self.timeline.enabled && !kanban;
                 let theme = cx.theme().clone();
                 let layout = |id: &'static str, icon: IconName, on: bool| {
                     div()
@@ -1354,8 +1341,8 @@ impl TodoView {
                                 .start_slot(Icon::new(IconName::CalendarPlus).color(Color::Icon))
                                 .child(Label::new(strings.arrange_tasks))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.arrange_open = true;
-                                    this.header_menu_open = false;
+                                    this.timeline.arrange_open = true;
+                                    this.overlays.header_menu_open = false;
                                     cx.notify();
                                 })),
                         )
@@ -1373,7 +1360,7 @@ impl TodoView {
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_view_flag("show_details", false, cx))),
                     )
                     .when(!timeline, |el| {
-                        let parents = self.parent_task_ids(strings);
+                        let parents = self.parent_task_ids(strings, cx);
                         if parents.is_empty() {
                             return el;
                         }
@@ -1387,7 +1374,7 @@ impl TodoView {
                                     strings.expand_all_subtasks
                                 }))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.header_menu_open = false;
+                                    this.overlays.header_menu_open = false;
                                     this.toggle_all_subtasks_now(cx);
                                 })),
                         )
@@ -1397,8 +1384,8 @@ impl TodoView {
                             .start_slot(Icon::new(IconName::Settings2).color(Color::Icon))
                             .child(Label::new(strings.view_options))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.header_menu_open = false;
-                                this.view_options = Some(false);
+                                this.overlays.header_menu_open = false;
+                                this.overlays.view_options = Some(false);
                                 cx.notify();
                             })),
                     )

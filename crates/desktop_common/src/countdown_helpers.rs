@@ -19,10 +19,10 @@ pub fn kind_icon(kind: CountdownKind) -> IconName {
     }
 }
 
-pub fn format_date(date: NaiveDate, strings: &Strings) -> String {
-    match (calendar::explicit_date_format(), strings.countdown_date) {
+pub fn format_date(date: NaiveDate, strings: &Strings, cx: &App) -> String {
+    match (calendar::explicit_date_format(cx), strings.countdown_date) {
         (None, Some(template)) => calendar::format_day(template, date, strings),
-        _ => calendar::format_date(date, strings),
+        _ => calendar::format_date(date, strings, cx),
     }
 }
 
@@ -103,7 +103,7 @@ pub fn face(countdown: &Countdown, today: NaiveDate, days_only: bool, cx: &App) 
     let mut subtitle = format!(
         "{} {}",
         if span.past { strings.countdown_days_since } else { strings.countdown_days_until },
-        format_date(date, strings)
+        format_date(date, strings, cx)
     );
     // A birthday with "Show Age" says the age turned on that day.
     if let Some(age) = countdown.age(today).filter(|_| countdown.show_age) {

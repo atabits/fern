@@ -20,7 +20,6 @@ mod imp {
     use std::cell::RefCell;
 
     use gpui::{FocusHandle, WeakFocusHandle, Window};
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::UI::ViewManagement::InputPane;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::WinRT::IInputPaneInterop;
@@ -42,14 +41,9 @@ mod imp {
         if !crate::touch::tapping() && extra & SIGNATURE_MASK != MI_WP_SIGNATURE {
             return false;
         }
-        // The trait's method: `Window` has an inherent `window_handle` too.
-        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        let Some(hwnd) = crate::win32::hwnd_isize(window) else {
             return false;
         };
-        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-            return false;
-        };
-        let hwnd = handle.hwnd.get();
         if input_pane(hwnd).and_then(|pane| pane.TryShow()).is_err() {
             return false;
         }

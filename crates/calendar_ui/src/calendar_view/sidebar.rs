@@ -134,7 +134,10 @@ impl CalendarView {
             .store
             .set_setting("calendar_sidebar", if self.sidebar_open { "1" } else { "0" })
         {
-            eprintln!("failed to save the calendar sidebar setting: {error:#}");
+            desktop_common::logging::log_error(
+                "calendar_ui",
+                format!("failed to save the calendar sidebar setting: {error:#}"),
+            );
         }
         cx.notify();
     }
@@ -145,7 +148,10 @@ impl CalendarView {
         }
         let encoded = filter.encode();
         if let Err(error) = self.store.set_setting("calendar_list_filter", &encoded) {
-            eprintln!("failed to save the calendar filter: {error:#}");
+            desktop_common::logging::log_error(
+                "calendar_ui",
+                format!("failed to save the calendar filter: {error:#}"),
+            );
             return;
         }
         self.close_card(cx);
@@ -254,7 +260,11 @@ impl CalendarView {
         self.save_filter(next, cx);
     }
 
-    pub(super) fn render_calendar_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_calendar_sidebar(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let colors = theme.colors();
@@ -303,7 +313,7 @@ impl CalendarView {
             v_flex()
                 .id("calendar-sidebar")
                 .debug_selector(|| "calendar-sidebar".to_owned())
-                .pt(crate::title_bar::header_inset() + px(13.))
+                .pt(crate::title_bar::header_inset(window, cx) + px(13.))
                 .px_3()
                 .pb_3()
                 .gap_3()

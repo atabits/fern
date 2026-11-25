@@ -31,13 +31,13 @@ pub fn toggle_task_completion(
         None
     } else if done {
         let action = undo::complete(store, task)?;
-        sound::play_complete(store);
+        sound::play_complete(cx);
         Some(action)
     } else {
         store.set_completed(task.id, false)?;
         None
     };
-    data_version::data_changed(source, cx);
+    data_version::data_changed_scoped(source, data_version::DataScope::TASKS, cx);
     Ok(undo)
 }
 

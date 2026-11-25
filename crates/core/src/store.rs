@@ -26,15 +26,19 @@ macro_rules! task_columns {
 mod backups;
 mod batch;
 mod calendar_sync;
+mod checklists;
+mod countdowns;
+mod filters;
 mod focus;
 mod habits;
 mod lists_tags;
 mod migrations;
+mod settings;
 mod task_mutations;
-mod templates_filters;
+mod templates;
 mod tree_sections;
 
-pub use backups::{BackupEntry, TableCounts, list_backups};
+pub use backups::{BackupEntry, TableCounts, is_safe_attachment_name, list_backups};
 pub use migrations::{SCHEMA_VERSION, apply_migrations_up_to};
 #[cfg(test)]
 pub(crate) use migrations::init_legacy_db_before_filter_rules;
@@ -444,10 +448,8 @@ impl Store {
     }
 
     pub(super) fn update(&self, id: Id, column: &'static str, value: impl rusqlite::ToSql) -> Result<()> {
-        self.conn.execute(
-            &format!("UPDATE tasks SET {column} = ?2 WHERE id = ?1"),
-            params![id.to_string(), value],
-        )?;
+        let sql = format!("UPDATE tasks SET {column} = ?2 WHERE id = ?1");
+        self.conn.prepare_cached(&sql)?.execute(params![id.to_string(), value])?;
         Ok(())
     }
 }

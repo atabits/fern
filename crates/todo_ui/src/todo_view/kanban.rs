@@ -54,8 +54,8 @@ pub(super) struct KanbanCacheKey {
 
 impl TodoView {
     pub(super) fn ensure_kanban_sections(&mut self, strings: &Strings, cx: &mut Context<Self>) {
-        if !self.kanban
-            || self.timeline
+        if !self.kanban.enabled
+            || self.timeline.enabled
             || matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_))
         {
             return;
@@ -118,7 +118,7 @@ impl TodoView {
         }
     }
 
-    pub(super) fn board_columns(&self, strings: &Strings) -> Rc<Vec<BoardCol>> {
+    pub(super) fn board_columns(&self, strings: &Strings, cx: &App) -> Rc<Vec<BoardCol>> {
         let (sort, group) = self.sort_settings();
         let show_completed = self.view_flag("show_completed", true);
         let descending = self.view_flag("descending", false);
@@ -129,14 +129,14 @@ impl TodoView {
             group,
             show_completed,
             descending,
-            kanban_workflow: self.kanban_workflow,
+            kanban_workflow: self.kanban.workflow,
             completing_len: self.completing.len(),
             overdue_last: self.preferences.task_defaults.overdue_last,
-            week_start: crate::calendar::week_start(),
+            week_start: crate::calendar::week_start(cx),
             today,
             strings_ptr: strings as *const Strings as usize,
         };
-        if let Some((cached_key, cols)) = self.kanban_cache.borrow().as_ref()
+        if let Some((cached_key, cols)) = self.kanban.cache.borrow().as_ref()
             && *cached_key == key
         {
             return Rc::clone(cols);
@@ -177,7 +177,7 @@ impl TodoView {
             BoardCol { key, title, drop, pinned_cards, open_cards, completed_cards }
         };
 
-        let built = if self.kanban_workflow {
+        let built = if self.kanban.workflow {
             let mut todo_cards = Vec::new();
             let mut in_progress_cards = Vec::new();
             let mut completed_cards = Vec::new();
@@ -198,7 +198,7 @@ impl TodoView {
         } else {
             match group {
                 GroupBy::Custom if self.view == View::Next7Days => {
-                    let week_start = crate::calendar::week_start();
+                    let week_start = crate::calendar::week_start(cx);
                     let mut cols = Vec::new();
                     let mut overdue = Vec::new();
                     let mut by_day: Vec<Vec<(Task, Vec<Task>)>> = (0..7).map(|_| Vec::new()).collect();
@@ -389,13 +389,13 @@ impl TodoView {
             }
         };
         let built = Rc::new(built);
-        *self.kanban_cache.borrow_mut() = Some((key, Rc::clone(&built)));
+        *self.kanban.cache.borrow_mut() = Some((key, Rc::clone(&built)));
         built
     }
 
     /// The original's column widths: Small 242 px, Medium 282 px, Large 342 px.
     pub(super) fn kanban_column_width(&self) -> f32 {
-        [242., 282., 342.][self.kanban_column_size.min(2) as usize]
+        [242., 282., 342.][self.kanban.column_size.min(2) as usize]
     }
 
     pub(super) fn set_kanban_column_size(&mut self, size: u8, cx: &mut Context<Self>) {
@@ -403,25 +403,25 @@ impl TodoView {
         let key = ["s", "m", "l"][size as usize];
         let result = self.store.set_setting("kanban:column_size", key);
         self.check(result);
-        self.kanban_column_size = size;
+        self.kanban.column_size = size;
         cx.notify();
     }
 
     pub(super) fn toggle_kanban_column_color(&mut self, cx: &mut Context<Self>) {
-        let next = !self.kanban_column_color;
+        let next = !self.kanban.column_color;
         let result = self.store.set_setting("kanban:column_color", if next { "1" } else { "0" });
         self.check(result);
-        self.kanban_column_color = next;
+        self.kanban.column_color = next;
         cx.notify();
     }
 
     pub(super) fn toggle_kanban_quick_add(&mut self, cx: &mut Context<Self>) {
-        let next = !self.kanban_quick_add;
+        let next = !self.kanban.quick_add;
         let result = self.store.set_setting("kanban:quick_add", if next { "1" } else { "0" });
         self.check(result);
-        self.kanban_quick_add = next;
+        self.kanban.quick_add = next;
         if next {
-            self.column_add = None;
+            self.kanban.column_add = None;
         } else {
             self.clear_kanban_quick_adds();
         }
@@ -430,11 +430,11 @@ impl TodoView {
     }
 
     pub(super) fn toggle_kanban_workflow(&mut self, cx: &mut Context<Self>) {
-        let next = !self.kanban_workflow;
+        let next = !self.kanban.workflow;
         let key = format!("kanban_workflow:{}", self.view_key());
         let result = self.store.set_setting(&key, if next { "1" } else { "0" });
         self.check(result);
-        self.kanban_workflow = next;
+        self.kanban.workflow = next;
         self.sync_kanban_column_state(cx);
         cx.notify();
     }
@@ -444,11 +444,11 @@ impl TodoView {
         let result = self.store.set_setting(&format!("kanban:section_color:{section}"), value);
         self.check(result);
         if value.is_empty() {
-            self.kanban_section_colors.remove(&section);
+            self.kanban.section_colors.remove(&section);
         } else {
-            self.kanban_section_colors.insert(section, value.to_owned());
+            self.kanban.section_colors.insert(section, value.to_owned());
         }
-        self.column_menu = None;
+        self.kanban.column_menu = None;
         cx.notify();
     }
 
@@ -466,7 +466,7 @@ impl TodoView {
         tag_colors: &HashMap<String, Hsla>,
         accent: Hsla,
     ) -> Option<Hsla> {
-        if !self.kanban_column_color {
+        if !self.kanban.column_color {
             return None;
         }
         let hex = |s: &str| lists_panel::parse_color(Some(s));
@@ -475,7 +475,7 @@ impl TodoView {
             Some(DropTarget::InProgress) => hex("#FAAD14"),
             Some(DropTarget::Complete) => hex("#A5A5A5"),
             Some(DropTarget::Section(Some(id))) => self
-                .kanban_section_colors
+                .kanban.section_colors
                 .get(id)
                 .and_then(|c| hex(c))
                 .or_else(|| hex(Self::KANBAN_COLUMN_COLORS[index % Self::KANBAN_COLUMN_COLORS.len()])),
@@ -520,8 +520,8 @@ impl TodoView {
     }
 
     pub(super) fn clear_kanban_quick_adds(&mut self) {
-        self.kanban_quick_adds.clear();
-        self.kanban_quick_add_subs.clear();
+        self.kanban.quick_adds.clear();
+        self.kanban.quick_add_subs.clear();
     }
 
     fn cancel_kanban_quick_add(
@@ -538,7 +538,7 @@ impl TodoView {
             cx.notify();
             return;
         }
-        self.column_add = None;
+        self.kanban.column_add = None;
         window.focus(&self.list_focus, cx);
         cx.notify();
     }
@@ -547,28 +547,28 @@ impl TodoView {
     /// active board columns outside of `render()` (called from `reload_inner`, layout/sort/option
     /// toggles, and section mutations).
     pub(super) fn sync_kanban_column_state(&mut self, cx: &mut Context<Self>) {
-        if !self.kanban
-            || self.timeline
+        if !self.kanban.enabled
+            || self.timeline.enabled
             || matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_))
         {
             self.clear_kanban_quick_adds();
-            self.kanban_col_scrolls.clear();
+            self.kanban.col_scrolls.clear();
             return;
         }
         let strings = i18n::t(cx);
-        let columns = self.board_columns(strings);
+        let columns = self.board_columns(strings, cx);
         let mut active_col_keys = HashSet::with_capacity(columns.len());
         for col in columns.iter() {
             active_col_keys.insert(col.key.clone());
-            self.kanban_col_scrolls.entry(col.key.clone()).or_default();
+            self.kanban.col_scrolls.entry(col.key.clone()).or_default();
         }
-        self.kanban_col_scrolls.retain(|k, _| active_col_keys.contains(k));
+        self.kanban.col_scrolls.retain(|k, _| active_col_keys.contains(k));
         self.sync_kanban_quick_adds(&columns, strings, cx);
     }
 
     pub(super) fn sync_kanban_quick_adds(&mut self, columns: &[BoardCol], strings: &'static Strings, cx: &mut Context<Self>) {
-        if !self.kanban_quick_add {
-            if !self.kanban_quick_adds.is_empty() {
+        if !self.kanban.quick_add {
+            if !self.kanban.quick_adds.is_empty() {
                 self.clear_kanban_quick_adds();
             }
             return;
@@ -580,7 +580,7 @@ impl TodoView {
             let Some(target) = col.drop.as_ref().filter(|t| !matches!(t, DropTarget::Complete)) else { continue };
             let key = col.key.clone();
             active_keys.insert(key.clone());
-            if let Some(entry) = self.kanban_quick_adds.get_mut(&key) {
+            if let Some(entry) = self.kanban.quick_adds.get_mut(&key) {
                 entry.0 = target.clone();
                 continue;
             }
@@ -597,7 +597,7 @@ impl TodoView {
                 if !text.trim().is_empty() {
                     input.update(cx, |input, cx| input.set_text("", cx));
                     if let Some(task) = this.add_task(text, cx) {
-                        if let Some((target, _)) = this.kanban_quick_adds.get(&key_for_sub).cloned() {
+                        if let Some((target, _)) = this.kanban.quick_adds.get(&key_for_sub).cloned() {
                             this.drop_on_column(task.id, target, cx);
                             return;
                         }
@@ -614,11 +614,11 @@ impl TodoView {
                     });
                 });
             });
-            self.kanban_quick_adds.insert(key.clone(), (target.clone(), input));
-            self.kanban_quick_add_subs.insert(key, cancel_sub);
+            self.kanban.quick_adds.insert(key.clone(), (target.clone(), input));
+            self.kanban.quick_add_subs.insert(key, cancel_sub);
         }
-        self.kanban_quick_adds.retain(|k, _| active_keys.contains(k));
-        self.kanban_quick_add_subs.retain(|k, _| active_keys.contains(k));
+        self.kanban.quick_adds.retain(|k, _| active_keys.contains(k));
+        self.kanban.quick_add_subs.retain(|k, _| active_keys.contains(k));
     }
 
     /// A kanban column's "+": a field at the column's top; the task it adds takes the column's
@@ -640,7 +640,7 @@ impl TodoView {
             if !text.trim().is_empty() {
                 input.update(cx, |input, cx| input.clear(window, cx));
                 if let Some(task) = this.add_task(text, cx) {
-                    if let Some((_, target, _)) = this.column_add.clone() {
+                    if let Some((_, target, _)) = this.kanban.column_add.clone() {
                         this.drop_on_column(task.id, target, cx);
                         return;
                     }
@@ -650,13 +650,13 @@ impl TodoView {
         })
         .detach();
         cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
-            this.column_add = None;
+            this.kanban.column_add = None;
             window.focus(&this.list_focus, cx);
             cx.notify();
         })
         .detach();
         window.focus(&input.focus_handle(cx), cx);
-        self.column_add = Some((column, target, input));
+        self.kanban.column_add = Some((column, target, input));
         cx.notify();
     }
 
@@ -673,7 +673,7 @@ impl TodoView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
-        let columns = self.board_columns(strings);
+        let columns = self.board_columns(strings, cx);
         let habit_col = self.render_habit_column(strings, cx);
         if columns.is_empty() && habit_col.is_none() && self.section_owner().is_none() {
             return v_flex()
@@ -685,7 +685,7 @@ impl TodoView {
         }
         let dark = theme.is_dark();
         let col_width = self.kanban_column_width();
-        let colored = self.kanban_column_color;
+        let colored = self.kanban.column_color;
         let card_px = if colored { px(10.) } else { px(12.) };
         let owner = self.section_owner();
         let show_list_name = self.view.shows_list_names() && self.sort_settings().1 != GroupBy::List;
@@ -754,15 +754,15 @@ impl TodoView {
                 })
                 .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
                     cx.stop_propagation();
-                    this.task_drop = None;
-                    this.task_drag_origin = None;
-                    this.kanban_hover_col = None;
+                    this.panel_dnd.task_drop = None;
+                    this.panel_dnd.task_drag_origin = None;
+                    this.kanban.hover_col = None;
                     this.drop_on_kanban_subsection(dragged.id, col_drop.clone(), sub_kind, cx);
                 }))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    if !this.kanban_folded_sub.remove(&fold_key) {
-                        this.kanban_folded_sub.insert(fold_key.clone());
+                    if !this.kanban.folded_sub.remove(&fold_key) {
+                        this.kanban.folded_sub.insert(fold_key.clone());
                     }
                     cx.notify();
                 }))
@@ -805,17 +805,17 @@ impl TodoView {
             let pinned_cards = &col.pinned_cards;
             let open_cards = &col.open_cards;
             let completed_cards = &col.completed_cards;
-            let persistent_add = if self.kanban_quick_add {
-                self.kanban_quick_adds.get(col_key).map(|(_, input)| input.clone())
+            let persistent_add = if self.kanban.quick_add {
+                self.kanban.quick_adds.get(col_key).map(|(_, input)| input.clone())
             } else {
                 None
             };
-            let is_temp_add = persistent_add.is_none() && self.column_add.as_ref().is_some_and(|(at, _, _)| *at == i);
+            let is_temp_add = persistent_add.is_none() && self.kanban.column_add.as_ref().is_some_and(|(at, _, _)| *at == i);
             let add_input = if self.is_current_view_archived_list() {
                 None
             } else {
                 persistent_add.or_else(|| {
-                    self.column_add.as_ref().filter(|(at, _, _)| *at == i).map(|(_, _, input)| input.clone())
+                    self.kanban.column_add.as_ref().filter(|(at, _, _)| *at == i).map(|(_, _, input)| input.clone())
                 })
             };
             let mut col_items: Vec<AnyElement> = Vec::new();
@@ -860,7 +860,7 @@ impl TodoView {
             if has_cards {
                 if !pinned_cards.is_empty() {
                     let pinned_key = format!("{col_key}:pinned");
-                    let pinned_folded = self.kanban_folded_sub.contains(&pinned_key);
+                    let pinned_folded = self.kanban.folded_sub.contains(&pinned_key);
                     col_items.push(render_sub_header(
                         format!("kanban-sub-pinned-{i}"),
                         pinned_key,
@@ -888,7 +888,7 @@ impl TodoView {
                     }
                     if !open_cards.is_empty() {
                         let unpinned_key = format!("{col_key}:unpinned");
-                        let unpinned_folded = self.kanban_folded_sub.contains(&unpinned_key);
+                        let unpinned_folded = self.kanban.folded_sub.contains(&unpinned_key);
                         col_items.push(render_sub_header(
                             format!("kanban-sub-unpinned-{i}"),
                             unpinned_key,
@@ -930,7 +930,7 @@ impl TodoView {
                 }
                 if !completed_cards.is_empty() {
                     let completed_key = format!("{col_key}:completed");
-                    let completed_folded = self.kanban_folded_sub.contains(&completed_key);
+                    let completed_folded = self.kanban.folded_sub.contains(&completed_key);
                     col_items.push(render_sub_header(
                         format!("kanban-sub-completed-{i}"),
                         completed_key,
@@ -959,11 +959,11 @@ impl TodoView {
                 }
             }
             let is_hover_target =
-                cx.has_active_drag() && self.kanban_hover_col.as_deref() == Some(col_key.as_str());
-            let col_bounds = self.kanban_col_bounds.clone();
+                cx.has_active_drag() && self.kanban.hover_col.as_deref() == Some(col_key.as_str());
+            let col_bounds = self.kanban.col_bounds.clone();
             let col_key_for_bounds = col_key.clone();
             let col_key_for_ids = col_key.clone();
-            let col_scroll_handle = self.kanban_col_scrolls.get(col_key).cloned();
+            let col_scroll_handle = self.kanban.col_scrolls.get(col_key).cloned();
             drag_cols.push(KanbanColRows {
                 key: col_key.clone(),
                 drop: drop_for_cards,
@@ -1093,14 +1093,14 @@ impl TodoView {
                     .into_any_element(),
             );
         }
-        self.kanban_drag_rows = drag_cols;
+        self.kanban.drag_rows = drag_cols;
         if inline_new_col_pos.is_some_and(|pos| pos >= rendered_cols.len())
             && let Some(input) = self.new_section.clone()
         {
             rendered_cols.push(render_new_sec_input(input, cx));
         }
-        let row_bounds_clear = self.kanban_row_bounds.clone();
-        let col_bounds_clear = self.kanban_col_bounds.clone();
+        let row_bounds_clear = self.kanban.row_bounds.clone();
+        let col_bounds_clear = self.kanban.col_bounds.clone();
         div()
             .relative()
             .flex_1()
@@ -1123,7 +1123,7 @@ impl TodoView {
                     h_flex()
                         .id("kanban")
                         .track_focus(&self.list_focus)
-                        .track_scroll(&self.kanban_scroll)
+                        .track_scroll(&self.kanban.scroll)
                         .on_drag_move(cx.listener(Self::move_kanban_task_drag))
                         .on_drop(cx.listener(Self::drop_task_in_kanban)),
                     cx,
@@ -1135,27 +1135,27 @@ impl TodoView {
                         this.detail.update(cx, |detail, cx| detail.show(None, cx));
                         cx.notify();
                     }
-                    let offset = this.kanban_scroll.offset();
-                    this.kanban_pan = Some((event.position.x, offset.x));
+                    let offset = this.kanban.scroll.offset();
+                    this.kanban.pan = Some((event.position.x, offset.x));
                 }))
                 .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
-                    let Some((start_x, start_offset_x)) = this.kanban_pan else { return };
+                    let Some((start_x, start_offset_x)) = this.kanban.pan else { return };
                     if cx.has_active_drag() || event.pressed_button != Some(MouseButton::Left) {
-                        this.kanban_pan = None;
+                        this.kanban.pan = None;
                         return;
                     }
                     let delta = event.position.x - start_x;
-                    let offset = this.kanban_scroll.offset();
-                    let max_x = this.kanban_scroll.max_offset().x.max(px(0.));
-                    this.kanban_scroll
+                    let offset = this.kanban.scroll.offset();
+                    let max_x = this.kanban.scroll.max_offset().x.max(px(0.));
+                    this.kanban.scroll
                         .set_offset(gpui::point((start_offset_x + delta).clamp(-max_x, px(0.)), offset.y));
                     cx.notify();
                 }))
                 .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| {
-                    this.kanban_pan = None;
+                    this.kanban.pan = None;
                 }))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| {
-                    this.kanban_pan = None;
+                    this.kanban.pan = None;
                 }))
                 .size_full()
                     .items_start()
@@ -1208,7 +1208,7 @@ impl TodoView {
                         })
                     }),
             )
-            .child(HorizontalScrollbar::for_handle("kanban-h-scroll", self.kanban_scroll.clone()))
+            .child(HorizontalScrollbar::for_handle("kanban-h-scroll", self.kanban.scroll.clone()))
             .into_any_element()
     }
 }

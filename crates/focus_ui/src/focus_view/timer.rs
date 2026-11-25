@@ -11,7 +11,7 @@ impl FocusView {
         if self.finish_prompt {
             return false;
         }
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         self.finish(cx);
@@ -107,9 +107,13 @@ impl FocusView {
             && let Some(delta) = fern_core::habit::focus_checkin_delta(habit, focused_minutes)
         {
             if let Err(err) = self.store.add_checkin_amount(habit_id, Local::now().date_naive(), delta) {
-                eprintln!("failed to auto check in habit from focus: {err:#}");
+                desktop_common::logging::log_error("focus_ui", format!("failed to auto check in habit from focus: {err:#}"));
             } else {
-                desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                desktop_common::data_version::data_changed_scoped(
+                    cx.entity_id(),
+                    desktop_common::data_version::DataScope::HABITS,
+                    cx,
+                );
             }
         }
     }
@@ -121,7 +125,7 @@ impl FocusView {
     pub(super) fn set_stopwatch_mode(&mut self, stopwatch: bool, cx: &mut Context<Self>) {
         self.settings.stopwatch_mode = stopwatch;
         if let Err(err) = self.store.set_setting(MODE_SETTING, if stopwatch { "stopwatch" } else { "pomo" }) {
-            eprintln!("failed to save the focus mode: {err:#}");
+            desktop_common::logging::log_error("focus_ui", format!("failed to save the focus mode: {err:#}"));
         }
         cx.notify();
     }
@@ -157,7 +161,7 @@ impl FocusView {
                 .map(|r| (r.task.clone(), r.timer.length_ms));
             self.finish_at(now, true, cx);
             if self.running.is_some() { return; }
-            desktop_common::sound::play_focus_done(&self.store);
+            desktop_common::sound::play_focus_done(cx);
             if let Some(continuation) = continuation {
                 self.continuation = Some(continuation);
                 self.completed_in_chain += 1;
@@ -197,7 +201,7 @@ impl FocusView {
     fn set_white_noise(&mut self, preset: desktop_common::sound::WhiteNoise, cx: &mut Context<Self>) {
         self.settings.white_noise = preset;
         if let Err(err) = desktop_common::sound::set_white_noise(&self.store, preset) {
-            eprintln!("failed to save white noise setting: {err:#}");
+            desktop_common::logging::log_error("focus_ui", format!("failed to save white noise setting: {err:#}"));
         }
         self.sync_ambient_sound();
         cx.notify();
@@ -300,7 +304,7 @@ impl FocusView {
                 .store
                 .add_focus_session_for(target.task_id, target.habit_id, &target.title, start, start + elapsed, stopwatch)
             {
-                eprintln!("failed to save the focus session: {err:#}");
+                desktop_common::logging::log_error("focus_ui", format!("failed to save the focus session: {err:#}"));
                 self.message = Some(strings.focus_save_failed.to_owned());
                 running.timer.pause(now);
                 self.running = Some(running);
@@ -382,11 +386,15 @@ impl FocusView {
                                         .child(Label::new(if archived { strings.habit_unarchive } else { strings.habit_archive }))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Err(err) = this.store.set_focus_timer_archived(id, !archived) {
-                                                eprintln!("failed to archive the timer: {err:#}");
+                                                desktop_common::logging::log_error("focus_ui", format!("failed to archive the timer: {err:#}"));
                                             }
                                             this.timer_menu = None;
                                             this.reload(cx);
-                                            desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                            desktop_common::data_version::data_changed_scoped(
+                                                cx.entity_id(),
+                                                desktop_common::data_version::DataScope::FOCUS,
+                                                cx,
+                                            );
                                         })),
                                 )
                                 .child(

@@ -24,6 +24,24 @@ pub const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
 pub const HTTP_POOL_THREADS: usize = 4;
+pub const MAX_HTTP_QUEUE_DEPTH: usize = 64;
+
+pub(crate) fn build_ssrf_agent(
+    allow_local: bool,
+    loopback_only: bool,
+    connect_timeout: Duration,
+    total_timeout: Duration,
+) -> ureq::Agent {
+    let config = Config::builder()
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .proxy(None)
+        .timeout_connect(Some(connect_timeout))
+        .timeout_global(Some(total_timeout))
+        .build();
+    let resolver = SsrfSafeResolver::new(allow_local, loopback_only);
+    ureq::Agent::with_parts(config, DefaultConnector::default(), resolver)
+}
 
 #[derive(Clone, Debug)]
 pub struct HttpRequest {
@@ -374,16 +392,12 @@ pub(crate) fn execute_http_request_with_redirects(
 
         validate_target_uri_syntax(&current_uri, permissions)?;
         let loopback_only = target_requires_loopback_only(&current_uri, permissions);
-
-        let config = Config::builder()
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .proxy(None)
-            .timeout_connect(Some(CONNECT_TIMEOUT.min(remaining)))
-            .timeout_global(Some(remaining))
-            .build();
-        let resolver = SsrfSafeResolver::new(allow_local, loopback_only);
-        let agent = ureq::Agent::with_parts(config, DefaultConnector::default(), resolver);
+        let agent = build_ssrf_agent(
+            allow_local,
+            loopback_only,
+            CONNECT_TIMEOUT.min(remaining),
+            remaining,
+        );
 
         let mut builder = ureq::http::Request::builder()
             .method(current_method.as_str())
@@ -533,7 +547,7 @@ fn is_body_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("transfer-encoding")
 }
 
-fn origin_key(uri: &Uri) -> (String, String, u16) {
+pub(crate) fn origin_key(uri: &Uri) -> (String, String, u16) {
     let scheme = uri
         .scheme_str()
         .map(str::to_ascii_lowercase)
@@ -648,6 +662,12 @@ impl HttpPool {
                 let _ = tx.send(Err(anyhow!("HTTP pool is shutting down")));
                 return rx;
             }
+            if guard.queue.len() >= MAX_HTTP_QUEUE_DEPTH {
+                let _ = tx.send(Err(anyhow!(
+                    "HTTP request queue full (max {MAX_HTTP_QUEUE_DEPTH} pending requests)"
+                )));
+                return rx;
+            }
             guard.queue.push_back(Box::new(move || {
                 let res = execute_http_request(&plugin_id, &permissions, Some(&vault), &req);
                 let _ = tx.send(res);
@@ -673,8 +693,12 @@ impl HttpPool {
 impl Drop for HttpPool {
     fn drop(&mut self) {
         self.close_nonblocking();
-        // Workers exit immediately once idle; do not block shutdown if a socket is mid-timeout.
-        let _ = &self.workers;
+        // Join workers that have already exited without blocking shutdown on slow in-flight sockets.
+        for handle in self.workers.drain(..) {
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -1070,5 +1094,60 @@ mod tests {
         let _ = srv_b.join();
         let _ = srv_a.join();
         Ok(())
+    }
+
+    #[test]
+    fn http_pool_enforces_max_queue_depth() {
+        // Hold the single worker thread blocked on an unreachable/slow listener or barrier
+        // so subsequent queued requests saturate `MAX_HTTP_QUEUE_DEPTH`.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let gate = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_srv = Arc::clone(&gate);
+        let srv = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let (lock, cv) = &*gate_srv;
+            let mut done = lock.lock().unwrap();
+            while !*done {
+                done = cv.wait(done).unwrap();
+            }
+        });
+
+        let pool = HttpPool::new(1);
+        let perms = PermissionSet::new(&[
+            Permission::Network(vec!["127.0.0.1".to_owned()]),
+            Permission::NetworkLocal,
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let vault = SecretsVault::open(dir.path().join("v"), dir.path().join("k")).unwrap();
+        let req = HttpRequest {
+            method: "GET".into(),
+            url: format!("http://{addr}/hold"),
+            headers: vec![],
+            body: None,
+            timeout_ms: Some(1500),
+        };
+
+        // 1 active job occupies the single worker + MAX_HTTP_QUEUE_DEPTH queued jobs fill the queue.
+        let mut rxs = Vec::new();
+        for _ in 0..=MAX_HTTP_QUEUE_DEPTH {
+            rxs.push(pool.fetch("p1".into(), perms.clone(), vault.clone(), req.clone()));
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        // Next submission must be rejected immediately once the queue reaches capacity.
+        let overflow_rx = pool.fetch("p1".into(), perms, vault, req);
+        let err = futures::executor::block_on(overflow_rx).unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("queue full"),
+            "expected queue capacity error, got: {err:#}"
+        );
+
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        drop(rxs);
+        drop(pool);
+        let _ = srv.join();
     }
 }

@@ -24,6 +24,7 @@ tempfile.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
 web-time.workspace = true
+zeroize.workspace = true
 zip.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

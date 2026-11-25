@@ -1,13 +1,15 @@
-use super::*;
+use desktop_common::i18n;
 use desktop_common::keymap::{self, ResolvedShortcut, SHORTCUT_SPECS, ShortcutSection};
-use gpui::KeyDownEvent;
-use ui::{Button, ButtonVariant, ConfirmDialog};
+use gpui::{FontWeight, KeyDownEvent, MouseButton};
+use ui::prelude::*;
+use ui::VerticalScrollbar;
 
-/// Which shortcut slot in Settings → Shortcuts is currently capturing a key press.
+use super::{ActiveConfirm, ROW_HEIGHT, SettingsWindow};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RecordingTarget {
     Action(usize),
-    Global(crate::hotkeys::Hotkey),
+    Global(usize),
 }
 
 const PILL_WIDTH: f32 = 168.;
@@ -41,7 +43,7 @@ impl SettingsWindow {
                 Ok(path) => cx.open_with_system(&path),
                 Err(err) => {
                     let message = format!("{err:#}");
-                    eprintln!("keymap: {message}");
+                    desktop_common::logging::log_error("keymap", &message);
                     keymap::set_errors(vec![message], cx);
                     cx.notify();
                 }
@@ -70,11 +72,16 @@ impl SettingsWindow {
                 match keymap::load_with_user(&assets::Assets, user_keymap.as_deref(), cx) {
                     Ok(mut errors) => {
                         read_errors.append(&mut errors);
-                        read_errors.iter().for_each(|err| eprintln!("keymap: {err}"));
+                        read_errors
+                            .iter()
+                            .for_each(|err| desktop_common::logging::log_warn("keymap", err));
                         keymap::set_errors(read_errors, cx);
                     }
                     Err(err) => {
-                        eprintln!("failed to reload the keymap: {err:#}");
+                        desktop_common::logging::log_error(
+                            "keymap",
+                            format!("failed to reload the keymap: {err:#}"),
+                        );
                         read_errors.push(err.to_string());
                         keymap::set_errors(read_errors, cx);
                     }
@@ -95,26 +102,27 @@ impl SettingsWindow {
         let Some(spec) = SHORTCUT_SPECS.get(spec_index).copied() else {
             return;
         };
-        let default_source = match gpui::AssetSource::load(&assets::Assets, keymap::DEFAULT_KEYMAP_PATH) {
-            Ok(Some(bytes)) => match String::from_utf8(bytes.into_owned()) {
-                Ok(text) => text,
-                Err(err) => {
-                    keymap::set_errors(vec![format!("{err}")], cx);
+        let default_source =
+            match gpui::AssetSource::load(&assets::Assets, keymap::DEFAULT_KEYMAP_PATH) {
+                Ok(Some(bytes)) => match String::from_utf8(bytes.into_owned()) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        keymap::set_errors(vec![format!("{err}")], cx);
+                        cx.notify();
+                        return;
+                    }
+                },
+                Ok(None) => {
+                    keymap::set_errors(vec![format!("{} is missing", keymap::DEFAULT_KEYMAP_PATH)], cx);
                     cx.notify();
                     return;
                 }
-            },
-            Ok(None) => {
-                keymap::set_errors(vec![format!("{} is missing", keymap::DEFAULT_KEYMAP_PATH)], cx);
-                cx.notify();
-                return;
-            }
-            Err(err) => {
-                keymap::set_errors(vec![format!("{err:#}")], cx);
-                cx.notify();
-                return;
-            }
-        };
+                Err(err) => {
+                    keymap::set_errors(vec![format!("{err:#}")], cx);
+                    cx.notify();
+                    return;
+                }
+            };
 
         let action = spec.action;
         let task = cx.background_spawn(async move {
@@ -127,11 +135,16 @@ impl SettingsWindow {
                     cx.clear_key_bindings();
                     match keymap::load_with_user(&assets::Assets, Some(&updated_source), cx) {
                         Ok(errors) => {
-                            errors.iter().for_each(|err| eprintln!("keymap: {err}"));
+                            errors
+                                .iter()
+                                .for_each(|err| desktop_common::logging::log_warn("keymap", err));
                             keymap::set_errors(errors, cx);
                         }
                         Err(err) => {
-                            eprintln!("failed to apply shortcut: {err:#}");
+                            desktop_common::logging::log_error(
+                                "keymap",
+                                format!("failed to apply shortcut: {err:#}"),
+                            );
                             keymap::set_errors(vec![err.to_string()], cx);
                         }
                     }
@@ -139,7 +152,7 @@ impl SettingsWindow {
                 }
                 Err(err) => {
                     let message = format!("{err:#}");
-                    eprintln!("keymap: {message}");
+                    desktop_common::logging::log_error("keymap", &message);
                     keymap::set_errors(vec![message], cx);
                     cx.notify();
                 }
@@ -150,10 +163,10 @@ impl SettingsWindow {
     }
 
     pub(super) fn reset_all_shortcuts(&mut self, cx: &mut Context<Self>) {
-        self.recording_shortcut = None;
-        self.recording_rejected = false;
-        self.confirm_reset_shortcuts = false;
-        crate::hotkeys::reset_defaults(cx);
+        self.shortcuts.recording = None;
+        self.shortcuts.rejected = false;
+        self.confirm = None;
+        (self.host.reset_global_hotkeys)(cx);
         let task = cx.background_spawn(async move { keymap::reset_user_keymap_file() });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -180,27 +193,30 @@ impl SettingsWindow {
         event: &KeyDownEvent,
         cx: &mut Context<Self>,
     ) {
-        let Some(target) = self.recording_shortcut else {
+        let Some(target) = self.shortcuts.recording else {
             return;
         };
         cx.stop_propagation();
 
         let ks = &event.keystroke;
-        let unmodified = !ks.modifiers.control && !ks.modifiers.alt && !ks.modifiers.shift && !ks.modifiers.platform;
+        let unmodified =
+            !ks.modifiers.control && !ks.modifiers.alt && !ks.modifiers.shift && !ks.modifiers.platform;
         if unmodified {
             match ks.key.as_str() {
                 "escape" => {
-                    self.recording_shortcut = None;
-                    self.recording_rejected = false;
+                    self.shortcuts.recording = None;
+                    self.shortcuts.rejected = false;
                     cx.notify();
                     return;
                 }
                 "backspace" | "delete" => {
-                    self.recording_shortcut = None;
-                    self.recording_rejected = false;
+                    self.shortcuts.recording = None;
+                    self.shortcuts.rejected = false;
                     match target {
                         RecordingTarget::Action(idx) => self.apply_action_shortcut(idx, None, cx),
-                        RecordingTarget::Global(hotkey) => crate::hotkeys::set(hotkey, None, cx),
+                        RecordingTarget::Global(idx) => {
+                            let _ = (self.host.set_global_hotkey)(idx, None, cx);
+                        }
                     }
                     cx.notify();
                     return;
@@ -212,47 +228,45 @@ impl SettingsWindow {
         match target {
             RecordingTarget::Action(idx) => {
                 let Some(spec) = SHORTCUT_SPECS.get(idx) else {
-                    self.recording_shortcut = None;
-                    self.recording_rejected = false;
+                    self.shortcuts.recording = None;
+                    self.shortcuts.rejected = false;
                     cx.notify();
                     return;
                 };
                 match keymap::classify_keystroke(ks, spec.allow_unmodified) {
                     keymap::RecordOutcome::IgnoreModifier => {}
                     keymap::RecordOutcome::Accepted(config_key) => {
-                        self.recording_shortcut = None;
-                        self.recording_rejected = false;
+                        self.shortcuts.recording = None;
+                        self.shortcuts.rejected = false;
                         self.apply_action_shortcut(idx, Some(config_key), cx);
                         cx.notify();
                     }
                     keymap::RecordOutcome::Rejected => {
-                        self.recording_rejected = true;
+                        self.shortcuts.rejected = true;
                         cx.notify();
                     }
                 }
             }
-            RecordingTarget::Global(hotkey) => {
+            RecordingTarget::Global(idx) => {
                 if keymap::is_bare_modifier(ks) {
                     return;
                 }
-                if let Some(binding) = crate::hotkeys::Binding::from_keystroke(ks) {
-                    self.recording_shortcut = None;
-                    self.recording_rejected = false;
-                    crate::hotkeys::set(hotkey, Some(binding), cx);
+                if (self.host.set_global_hotkey)(idx, Some(ks), cx) {
+                    self.shortcuts.recording = None;
+                    self.shortcuts.rejected = false;
                     cx.notify();
                 } else {
-                    self.recording_rejected = true;
+                    self.shortcuts.rejected = true;
                     cx.notify();
                 }
             }
         }
     }
 
-    /// Scrollable content + sticky bottom bar for `Page::Shortcuts`.
     pub(super) fn render_shortcuts_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let colors = theme.colors().clone();
+        let colors = theme.colors();
         let error_color = theme.status().error;
         let resolved: Vec<ResolvedShortcut> = keymap::cached_resolved_shortcuts(cx).to_vec();
         let keymap_errors = keymap::errors(cx).to_vec();
@@ -314,30 +328,42 @@ impl SettingsWindow {
                             .weight(FontWeight::SEMIBOLD)
                             .color(Color::Error),
                     )
-                    .children(keymap_errors.into_iter().map(|err| {
-                        div().text_size(px(12.)).text_color(error_color).child(err)
-                    })),
+                    .children(
+                        keymap_errors
+                            .into_iter()
+                            .map(|err| div().text_size(px(12.)).text_color(error_color).child(err)),
+                    ),
             );
         }
 
-        // 0: General
         scroll_body = scroll_body.child(render_section(ShortcutSection::General, 0, cx));
 
-        // 1: Global Actions
         scroll_body = scroll_body.child(
             v_flex()
                 .child(section_header(1))
+                .when(desktop_common::is_wayland_session(), |el| {
+                    el.child(
+                        div()
+                            .mb_2()
+                            .px_3()
+                            .py_2()
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(colors.border.opacity(0.6))
+                            .bg(colors.surface_background)
+                            .text_size(px(12.))
+                            .text_color(colors.text_muted)
+                            .child(strings.wayland_hotkeys_hint),
+                    )
+                })
                 .child(group_card().children(self.render_global_shortcut_rows(cx))),
         );
 
-        // 2: New Task
         scroll_body = scroll_body.child(render_section(ShortcutSection::NewTask, 2, cx));
 
-        // 3: Quick Add Task syntax (read-only reference)
         scroll_body = scroll_body.child(
-            v_flex()
-                .child(section_header(3))
-                .child(group_card().children(strings.quick_add_help.into_iter().map(|(what, example)| {
+            v_flex().child(section_header(3)).child(
+                group_card().children(strings.quick_add_help.into_iter().map(|(what, example)| {
                     h_flex()
                         .h(px(ROW_HEIGHT))
                         .px_4()
@@ -356,29 +382,30 @@ impl SettingsWindow {
                                 .border_color(colors.border.opacity(0.65))
                                 .child(Label::new(example).size(LabelSize::Small).color(Color::Muted)),
                         )
-                }))),
+                })),
+            ),
         );
 
-        // 4: Edit Task
         scroll_body = scroll_body.child(render_section(ShortcutSection::EditTask, 4, cx));
-        // 5: Navigation
         scroll_body = scroll_body.child(render_section(ShortcutSection::Navigation, 5, cx));
-        // 6: Switch Views
         scroll_body = scroll_body.child(render_section(ShortcutSection::SwitchView, 6, cx));
-        // 7: Focus
         scroll_body = scroll_body.child(render_section(ShortcutSection::Focus, 7, cx));
-        // 8: Sticky Note
         scroll_body = scroll_body.child(render_section(ShortcutSection::StickyNote, 8, cx));
 
-        let recording_banner = self.recording_shortcut.map(|target| {
+        let global_list = (self.host.global_shortcuts)(strings, cx);
+        let recording_banner = self.shortcuts.recording.map(|target| {
             let (name, rule_idx) = match target {
                 RecordingTarget::Action(idx) => {
-                    let allow_unmodified = SHORTCUT_SPECS.get(idx).is_some_and(|s| s.allow_unmodified);
+                    let allow_unmodified =
+                        SHORTCUT_SPECS.get(idx).is_some_and(|s| s.allow_unmodified);
                     (strings.shortcut_labels[idx], usize::from(allow_unmodified))
                 }
-                RecordingTarget::Global(hotkey) => (hotkey.label(strings), 2),
+                RecordingTarget::Global(idx) => {
+                    let label = global_list.get(idx).map_or("", |g| g.label);
+                    (label, 2)
+                }
             };
-            let rejected = self.recording_rejected;
+            let rejected = self.shortcuts.rejected;
             let message = platform_shortcut_text(if rejected {
                 strings.shortcut_record_rejected[rule_idx]
             } else {
@@ -439,9 +466,9 @@ impl SettingsWindow {
                         Button::new("reset-shortcuts", strings.shortcut_reset_all)
                             .variant(ButtonVariant::Secondary)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.recording_shortcut = None;
-                                this.recording_rejected = false;
-                                this.confirm_reset_shortcuts = true;
+                                this.shortcuts.recording = None;
+                                this.shortcuts.rejected = false;
+                                this.confirm = Some(ActiveConfirm::ResetShortcuts);
                                 cx.notify();
                             })),
                     ),
@@ -457,7 +484,10 @@ impl SettingsWindow {
                     .flex_1()
                     .min_h_0()
                     .child(scroll_body)
-                    .child(VerticalScrollbar::for_handle("settings-page-scroll", self.page_scroll.clone())),
+                    .child(VerticalScrollbar::for_handle(
+                        "settings-page-scroll",
+                        self.page_scroll.clone(),
+                    )),
             )
             .children(recording_banner)
             .child(footer)
@@ -471,10 +501,10 @@ impl SettingsWindow {
     ) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let colors = theme.colors().clone();
+        let colors = theme.colors();
         let idx = item.index;
         let label = strings.shortcut_labels[idx];
-        let recording = self.recording_shortcut == Some(RecordingTarget::Action(idx));
+        let recording = self.shortcuts.recording == Some(RecordingTarget::Action(idx));
         let direct = item.display_direct();
         let has_binding = direct.is_some();
         let conflict_tip = (!item.conflicts.is_empty()).then(|| {
@@ -505,19 +535,20 @@ impl SettingsWindow {
             has_conflict,
             pill_tooltip,
             cx.listener(move |this, _, window, cx| {
-                this.recording_rejected = false;
-                this.recording_shortcut = if this.recording_shortcut == Some(RecordingTarget::Action(idx)) {
-                    None
-                } else {
-                    Some(RecordingTarget::Action(idx))
-                };
+                this.shortcuts.rejected = false;
+                this.shortcuts.recording =
+                    if this.shortcuts.recording == Some(RecordingTarget::Action(idx)) {
+                        None
+                    } else {
+                        Some(RecordingTarget::Action(idx))
+                    };
                 window.focus(&this.focus_handle, cx);
                 cx.notify();
             }),
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.recording_shortcut = None;
-                this.recording_rejected = false;
+                this.shortcuts.recording = None;
+                this.shortcuts.rejected = false;
                 this.apply_action_shortcut(idx, None, cx);
                 cx.notify();
             }),
@@ -541,17 +572,15 @@ impl SettingsWindow {
                                 .px_2p5()
                                 .flex()
                                 .items_center()
-                                .justify_center()
                                 .rounded(px(6.))
                                 .border_1()
                                 .border_color(colors.border.opacity(0.6))
                                 .child(
-                                    Label::new(format!("{first} {} {second}", strings.shortcut_then))
+                                    Label::new(format!("{first} {second}"))
                                         .size(LabelSize::Small)
                                         .color(Color::Muted),
                                 ),
                         )
-                        .child(Label::new(strings.shortcut_or).size(LabelSize::Small).color(Color::Muted))
                     })
                     .child(pill),
             )
@@ -560,39 +589,48 @@ impl SettingsWindow {
 
     fn render_global_shortcut_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let strings = i18n::t(cx);
-        let all = crate::hotkeys::bindings(cx);
+        let all = (self.host.global_shortcuts)(strings, cx);
         all.iter()
-            .map(|(hotkey, binding, taken)| {
-                let hotkey = *hotkey;
-                let idx = hotkey.index();
-                let recording = self.recording_shortcut == Some(RecordingTarget::Global(hotkey));
-                let has_binding = binding.is_some();
-                let duplicates: Vec<&str> = binding
-                    .as_ref()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let recording = self.shortcuts.recording == Some(RecordingTarget::Global(idx));
+                let has_binding = entry.binding.is_some();
+                let duplicates: Vec<&str> = entry
+                    .binding
+                    .as_deref()
                     .map(|b| {
                         all.iter()
-                            .filter(|(other, other_b, _)| *other != hotkey && other_b.as_ref() == Some(b))
-                            .map(|(other, _, _)| other.label(strings))
+                            .enumerate()
+                            .filter(|(other_i, other)| {
+                                *other_i != idx && other.binding.as_deref() == Some(b)
+                            })
+                            .map(|(_, other)| other.label)
                             .collect()
                     })
                     .unwrap_or_default();
                 let conflict_tip = if !duplicates.is_empty() {
-                    Some(strings.shortcut_conflict.replace("{other}", &duplicates.join(", ")))
-                } else if *taken {
+                    Some(
+                        strings
+                            .shortcut_conflict
+                            .replace("{other}", &duplicates.join(", ")),
+                    )
+                } else if entry.taken {
                     Some(strings.shortcut_taken.to_owned())
                 } else {
                     None
                 };
                 let has_conflict = conflict_tip.is_some() && !recording;
                 let pill_tooltip = conflict_tip.or_else(|| {
-                    (!recording).then(|| platform_shortcut_text(strings.shortcut_rule_tips[2]).to_string())
+                    (!recording)
+                        .then(|| platform_shortcut_text(strings.shortcut_rule_tips[2]).to_string())
                 });
                 let pill_text = if recording {
                     strings.press_shortcut.to_owned()
                 } else {
-                    binding
-                        .as_ref()
-                        .map_or_else(|| strings.shortcut_set.to_owned(), |b| b.label())
+                    entry
+                        .binding
+                        .clone()
+                        .unwrap_or_else(|| strings.shortcut_set.to_owned())
                 };
                 let group_name = SharedString::from(format!("shortcut-pill-global-{idx}"));
 
@@ -605,20 +643,21 @@ impl SettingsWindow {
                     has_conflict,
                     pill_tooltip,
                     cx.listener(move |this, _, window, cx| {
-                        this.recording_rejected = false;
-                        this.recording_shortcut = if this.recording_shortcut == Some(RecordingTarget::Global(hotkey)) {
-                            None
-                        } else {
-                            Some(RecordingTarget::Global(hotkey))
-                        };
+                        this.shortcuts.rejected = false;
+                        this.shortcuts.recording =
+                            if this.shortcuts.recording == Some(RecordingTarget::Global(idx)) {
+                                None
+                            } else {
+                                Some(RecordingTarget::Global(idx))
+                            };
                         window.focus(&this.focus_handle, cx);
                         cx.notify();
                     }),
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.recording_shortcut = None;
-                        this.recording_rejected = false;
-                        crate::hotkeys::set(hotkey, None, cx);
+                        this.shortcuts.recording = None;
+                        this.shortcuts.rejected = false;
+                        let _ = (this.host.set_global_hotkey)(idx, None, cx);
                         cx.notify();
                     }),
                     cx,
@@ -628,7 +667,7 @@ impl SettingsWindow {
                     .h(px(ROW_HEIGHT))
                     .px_4()
                     .gap_3()
-                    .child(div().flex_1().min_w_0().child(Label::new(hotkey.label(strings)).truncate()))
+                    .child(div().flex_1().min_w_0().child(Label::new(entry.label).truncate()))
                     .child(pill)
                     .into_any_element()
             })
@@ -654,7 +693,7 @@ impl SettingsWindow {
         let colors = theme.colors();
         let error_color = theme.status().error;
 
-        let border_color = if recording && self.recording_rejected {
+        let border_color = if recording && self.shortcuts.rejected {
             error_color
         } else if recording {
             colors.accent
@@ -665,7 +704,7 @@ impl SettingsWindow {
         } else {
             colors.border.opacity(0.75)
         };
-        let text_color = if recording && self.recording_rejected {
+        let text_color = if recording && self.shortcuts.rejected {
             Color::Error
         } else if recording {
             Color::Accent
@@ -701,12 +740,17 @@ impl SettingsWindow {
             .border_1()
             .border_color(border_color)
             .when(recording, |el| {
-                let fill = if self.recording_rejected { error_color } else { colors.accent };
-                el.bg(fill.opacity(0.10)).on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.recording_shortcut = None;
-                    this.recording_rejected = false;
-                    cx.notify();
-                }))
+                let fill = if self.shortcuts.rejected {
+                    error_color
+                } else {
+                    colors.accent
+                };
+                el.bg(fill.opacity(0.10))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.shortcuts.recording = None;
+                        this.shortcuts.rejected = false;
+                        cx.notify();
+                    }))
             })
             .when(!recording, |el| el.hover(move |s| s.border_color(hover_border)))
             .cursor_pointer()
@@ -741,28 +785,6 @@ impl SettingsWindow {
             })
             .into_any_element()
     }
-
-    pub(super) fn render_reset_shortcuts_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.confirm_reset_shortcuts {
-            return None;
-        }
-        let strings = i18n::t(cx);
-        Some(
-            ConfirmDialog::new("confirm-reset-shortcuts", strings.shortcut_reset_confirm_title)
-                .description(strings.shortcut_reset_confirm_body)
-                .cancel_label(strings.cancel)
-                .confirm_label(strings.shortcut_reset_all)
-                .destructive(true)
-                .on_cancel(cx.listener(|this, _, _, cx| {
-                    this.confirm_reset_shortcuts = false;
-                    cx.notify();
-                }))
-                .on_confirm(cx.listener(|this, _, _, cx| {
-                    this.reset_all_shortcuts(cx);
-                }))
-                .into_any_element(),
-        )
-    }
 }
 
 #[cfg(test)]
@@ -785,7 +807,10 @@ mod tests {
                     let mac = replace_platform_modifier(text, "Cmd");
                     assert!(mac.contains("Cmd") && !mac.contains("Win"), "{locale:?}: {mac}");
                     let linux = replace_platform_modifier(text, "Super");
-                    assert!(linux.contains("Super") && !linux.contains("Win"), "{locale:?}: {linux}");
+                    assert!(
+                        linux.contains("Super") && !linux.contains("Win"),
+                        "{locale:?}: {linux}"
+                    );
                     let win = replace_platform_modifier(text, "Win");
                     assert_eq!(win.as_ref(), text);
                 }

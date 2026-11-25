@@ -156,8 +156,8 @@ fn new_inactive_preserves_settings_and_reloads_lazily(cx: &mut gpui::TestAppCont
         let view = cx.new(|cx| FocusView::new_inactive(store.clone(), cx));
         {
             let v = view.read(cx);
-            assert!(!v.active);
-            assert!(v.dirty);
+            assert!(!v.refresh.is_active());
+            assert!(v.refresh.is_dirty());
             assert!(v.tasks.is_empty());
             assert!(v.sessions.is_empty());
             assert!(v.stats_data.tasks.is_empty());
@@ -169,8 +169,8 @@ fn new_inactive_preserves_settings_and_reloads_lazily(cx: &mut gpui::TestAppCont
         view.update(cx, |v, cx| v.set_active(true, cx));
         {
             let v = view.read(cx);
-            assert!(v.active);
-            assert!(!v.dirty);
+            assert!(v.refresh.is_active());
+            assert!(!v.refresh.is_dirty());
             assert_eq!(v.tasks.len(), 1);
             assert_eq!(v.sessions.len(), 1);
             assert!(v.stats_data.tasks.is_empty());
@@ -178,25 +178,25 @@ fn new_inactive_preserves_settings_and_reloads_lazily(cx: &mut gpui::TestAppCont
         }
 
         let view_task = cx.new(|cx| FocusView::new_inactive(store.clone(), cx));
-        assert!(view_task.read(cx).dirty);
+        assert!(view_task.read(cx).refresh.is_dirty());
         view_task.update(cx, |v, cx| {
             v.start_for(Some(task.id), task.title.clone(), false, cx);
         });
-        assert!(!view_task.read(cx).dirty);
+        assert!(!view_task.read(cx).refresh.is_dirty());
         assert!(view_task.read(cx).running.is_some());
 
         let view_habit = cx.new(|cx| FocusView::new_inactive(store.clone(), cx));
-        assert!(view_habit.read(cx).dirty);
+        assert!(view_habit.read(cx).refresh.is_dirty());
         view_habit.update(cx, |v, cx| {
             v.start_for_habit(Some(habit.id), habit.name.clone(), true, cx);
         });
-        assert!(!view_habit.read(cx).dirty);
+        assert!(!view_habit.read(cx).refresh.is_dirty());
         assert!(view_habit.read(cx).running.is_some());
 
         let view_stats = cx.new(|cx| FocusView::new_inactive(store.clone(), cx));
-        assert!(view_stats.read(cx).dirty);
+        assert!(view_stats.read(cx).refresh.is_dirty());
         view_stats.update(cx, |v, cx| v.open_stats_overview(cx));
-        assert!(!view_stats.read(cx).dirty);
+        assert!(!view_stats.read(cx).refresh.is_dirty());
         assert!(!view_stats.read(cx).stats_data_dirty);
         assert!(view_stats.read(cx).stats.is_some());
         assert_eq!(view_stats.read(cx).stats_data.tasks.len(), 1);

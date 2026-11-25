@@ -94,7 +94,11 @@ impl ThingsView {
         }
 
         if mutated {
-            data_version::data_changed(cx.entity_id(), cx);
+            data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
             self.reload(cx);
             (true, true)
         } else {
@@ -170,7 +174,11 @@ impl ThingsView {
                 row.title_text = text.clone();
             }
             if this.store.set_checklist_item_title(item_id, &text).is_ok() {
-                data_version::data_changed(cx.entity_id(), cx);
+                data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
             }
         });
         let sub_submit = cx.subscribe(&input, move |this, _, _: &Submitted, cx| {
@@ -180,7 +188,11 @@ impl ThingsView {
             if let Ok(created) = this.store.add_checklist_item(task_id, "", Some(item_id)) {
                 this.mark_expanded_touched(task_id);
                 this.pending_checklist_focus = Some(created.id);
-                data_version::data_changed(cx.entity_id(), cx);
+                data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                 this.reload(cx);
             }
         });
@@ -254,7 +266,11 @@ impl ThingsView {
                         t.title = text;
                     }
                     this.invalidate_groups();
-                    data_version::data_changed(cx.entity_id(), cx);
+                    data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                     cx.notify();
                 }
             }),
@@ -273,7 +289,11 @@ impl ThingsView {
                         t.notes = text;
                     }
                     this.invalidate_groups();
-                    data_version::data_changed(cx.entity_id(), cx);
+                    data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                     cx.notify();
                 }
             }),
@@ -285,7 +305,11 @@ impl ThingsView {
                 if this.store.add_checklist_item(id, trimmed, None).is_ok() {
                     this.mark_expanded_touched(id);
                     input.update(cx, |i, cx| i.set_text("", cx));
-                    data_version::data_changed(cx.entity_id(), cx);
+                    data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                     this.reload(cx);
                     window.focus(&input.focus_handle(cx), cx);
                 }
@@ -332,7 +356,11 @@ impl ThingsView {
         }
         if self.store.set_tags(task_id, &next).is_ok() {
             self.mark_expanded_touched(task_id);
-            data_version::data_changed(cx.entity_id(), cx);
+            data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
             self.reload(cx);
             true
         } else {
@@ -428,7 +456,11 @@ impl ThingsView {
                 self.expanded = None;
                 window.focus(&self.focus_handle, cx);
             }
-            data_version::data_changed(cx.entity_id(), cx);
+            data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
             self.reload(cx);
         }
     }
@@ -526,7 +558,11 @@ impl ThingsView {
         if let Some((anchor_id, after)) = target.after_task {
             let _ = self.store.move_task(created.id, anchor_id, after);
         }
-        data_version::data_changed(cx.entity_id(), cx);
+        data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
         self.reload(cx);
         self.selected_id = Some(created.id);
         self.expand_task_inner(created.id, true, window, cx);
@@ -552,7 +588,7 @@ impl ThingsView {
         let strings = i18n::t(cx);
         let initial_text = task
             .start_date
-            .map(|d| calendar::format_date(d, strings))
+            .map(|d| calendar::format_date(d, strings, cx))
             .unwrap_or_default();
         let date_placeholder = strings.things_date_placeholder;
 
@@ -573,7 +609,7 @@ impl ThingsView {
         .detach();
         cx.subscribe_in(&date_input, window, move |this, input, Submitted(text), window, cx| {
             let strings = i18n::t(cx);
-            if let Some(date) = calendar::parse_date(text, Self::today(), strings) {
+            if let Some(date) = calendar::parse_date(text, Self::today(), strings, cx) {
                 this.when_date_error = false;
                 input.update(cx, |ti, cx| ti.set_ink_override(None, None, None, cx));
                 this.apply_when(task_id, Some(date), ScheduleBucket::None, window, cx);
@@ -630,7 +666,11 @@ impl ThingsView {
                 .is_ok()
         {
             self.mark_expanded_touched(task_id);
-            data_version::data_changed(cx.entity_id(), cx);
+            data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
             self.close_all_popovers();
             self.reload(cx);
             self.restore_focus(window, cx);
@@ -688,7 +728,11 @@ impl ThingsView {
                     let task_id = state.task_id;
                     if self.store.set_horizon(task_id, Some(horizon)).is_ok() {
                         self.mark_expanded_touched(task_id);
-                        data_version::data_changed(cx.entity_id(), cx);
+                        data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                         self.close_all_popovers();
                         self.reload(cx);
                         self.restore_focus(window, cx);
@@ -750,7 +794,11 @@ impl ThingsView {
                     };
                     self.close_all_popovers();
                     if res.is_ok() {
-                        data_version::data_changed(cx.entity_id(), cx);
+                        data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                         self.reload(cx);
                     }
                     self.restore_focus(window, cx);
@@ -779,7 +827,11 @@ impl ThingsView {
                 this.view = ThingsViewKind::Project(*id);
                 this.selected_id = None;
                 this.show_logged_in_project = false;
-                data_version::data_changed(cx.entity_id(), cx);
+                data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                 this.reload(cx);
             }
             this.list_dialog = None;
@@ -842,7 +894,11 @@ impl ThingsView {
                 };
                 if res.is_ok() {
                     self.mark_expanded_touched(task_id);
-                    data_version::data_changed(cx.entity_id(), cx);
+                    data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                     self.reload(cx);
                     if was_expanded && self.expanded.is_none() {
                         window.focus(&self.focus_handle, cx);
@@ -869,7 +925,11 @@ impl ThingsView {
                 let dialog = cx.new(|cx| FolderDialog::new(self.store.clone(), None, window, cx));
                 cx.subscribe_in(&dialog, window, |this, _, event: &DialogEvent, window, cx| {
                     if let DialogEvent::FolderSaved(_) = event {
-                        data_version::data_changed(cx.entity_id(), cx);
+                        data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                         this.reload(cx);
                     }
                     this.folder_dialog = None;
@@ -926,13 +986,21 @@ impl ThingsView {
             }
             CardAction::ToggleChecklistItem(item_id, completed) => {
                 if self.store.set_checklist_item_completed(item_id, completed).is_ok() {
-                    data_version::data_changed(cx.entity_id(), cx);
+                    data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                     self.reload(cx);
                 }
             }
             CardAction::DeleteChecklistItem(item_id) => {
                 if self.store.delete_checklist_item(item_id).is_ok() {
-                    data_version::data_changed(cx.entity_id(), cx);
+                    data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                     self.reload(cx);
                 }
             }
@@ -955,7 +1023,11 @@ impl ThingsView {
                         let toggled = target_task
                             .is_some_and(|task_id| this.toggle_task_tag(task_id, name, cx));
                         if !toggled {
-                            data_version::data_changed(cx.entity_id(), cx);
+                            data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                             this.reload(cx);
                         }
                     }
@@ -1010,7 +1082,11 @@ impl ThingsView {
                     && self.store.set_list(task_id, list_id).is_ok()
                 {
                     self.mark_expanded_touched(task_id);
-                    data_version::data_changed(cx.entity_id(), cx);
+                    data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                     self.close_all_popovers();
                     self.reload(cx);
                     self.restore_focus(window, cx);
@@ -1194,7 +1270,11 @@ impl ThingsView {
                         mutated = true;
                     }
                     if mutated {
-                        data_version::data_changed(cx.entity_id(), cx);
+                        data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                         self.reload(cx);
                         if was_expanded && self.expanded.is_none() {
                             window.focus(&self.focus_handle, cx);
@@ -1249,7 +1329,11 @@ impl ThingsView {
                     && self.store.set_list(task_id, list_id).is_ok()
                 {
                     self.mark_expanded_touched(task_id);
-                    data_version::data_changed(cx.entity_id(), cx);
+                    data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
                     self.close_all_popovers();
                     self.reload(cx);
                     self.restore_focus(window, cx);
@@ -1305,7 +1389,11 @@ impl ThingsView {
         }
         if mutated {
             self.mark_expanded_touched(task_id);
-            data_version::data_changed(cx.entity_id(), cx);
+            data_version::data_changed_scoped(
+                cx.entity_id(),
+                data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                cx,
+            );
             self.reload(cx);
             if was_expanded && self.expanded.is_none() {
                 window.focus(&self.focus_handle, cx);

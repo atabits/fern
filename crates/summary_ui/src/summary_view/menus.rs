@@ -85,7 +85,11 @@ impl SummaryView {
     /// current ones under a name.
     fn render_templates(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
+        let accent = cx.theme().colors().accent;
+        let border = cx.theme().colors().border;
+        let ghost_hover = cx.theme().colors().ghost_element_hover;
+        let element_hover = cx.theme().colors().element_hover;
+        let surface = cx.theme().colors().surface_background;
         let templates = self
             .cache
             .as_ref()
@@ -111,9 +115,9 @@ impl SummaryView {
                             .gap_1()
                             .rounded(px(13.))
                             .border_1()
-                            .border_color(if selected { colors.accent } else { colors.border })
+                            .border_color(if selected { accent } else { border })
                             .cursor_pointer()
-                            .hover(|s| s.bg(colors.ghost_element_hover))
+                            .hover(move |s| s.bg(ghost_hover))
                             .child(Label::new(template.name.clone()).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
                             .child(
                                 div()
@@ -150,10 +154,10 @@ impl SummaryView {
                             .justify_center()
                             .rounded(px(6.))
                             .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.surface_background)
+                            .border_color(border)
+                            .bg(surface)
                             .cursor_pointer()
-                            .hover(|s| s.bg(colors.element_hover))
+                            .hover(move |s| s.bg(element_hover))
                             .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
                             .when(templates.is_empty(), |el| {
                                 el.px_2()
@@ -172,7 +176,7 @@ impl SummaryView {
                 v_flex()
                     .gap_1p5()
                     .child(Label::new(strings.summary_template_hint).size(LabelSize::XSmall).color(Color::Muted))
-                    .child(h_flex().h(px(28.)).px_2().rounded(px(6.)).bg(colors.surface_background).child(input.clone()))
+                    .child(h_flex().h(px(28.)).px_2().rounded(px(6.)).bg(surface).child(input.clone()))
                     .child(
                         h_flex()
                             .gap_2()
@@ -186,8 +190,8 @@ impl SummaryView {
                                     .items_center()
                                     .rounded(px(6.))
                                     .border_1()
-                                    .border_color(colors.border)
-                                    .hover(|s| s.bg(colors.element_hover))
+                                    .border_color(border)
+                                    .hover(move |s| s.bg(element_hover))
                                     .cursor_pointer()
                                     .child(Label::new(strings.close).size(LabelSize::Small))
                                     .on_click(cx.listener(|this, _, window, cx| this.cancel_template(window, cx))),
@@ -200,7 +204,7 @@ impl SummaryView {
                                     .flex()
                                     .items_center()
                                     .rounded(px(6.))
-                                    .bg(colors.accent.opacity(if can_save { 1. } else { 0.5 }))
+                                    .bg(accent.opacity(if can_save { 1. } else { 0.5 }))
                                     .when(can_save, |el| el.cursor_pointer().hover(|s| s.opacity(0.9)))
                                     .child(Label::new(strings.save).size(LabelSize::Small).color(Color::OnAccent))
                                     .when(can_save, |el| {
@@ -367,19 +371,21 @@ impl SummaryView {
             )
     }
 
-    pub(super) fn render_options(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_options(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
+        let surface_bg = cx.theme().colors().surface_background;
+        let input_bg = cx.theme().colors().background;
         let today = Local::now().date_naive();
+        let week_start = crate::calendar::week_start(cx);
         let options = &self.options;
-        let group = || v_flex().py_1().rounded(px(8.)).bg(colors.surface_background);
+        let group = move || v_flex().py_1().rounded(px(8.)).bg(surface_bg);
         let heading = |text: &'static str| div().pt_3().pb_1p5().child(Label::new(text).weight(FontWeight::SEMIBOLD));
 
         let mut periods: Vec<(String, bool, Pick)> = Period::ALL
             .into_iter()
             .map(|period| {
                 let pick: Pick = Box::new(move |this, _, cx| this.update(cx, |o| o.period = period));
-                (period_label(period, today, strings), period == options.period, pick)
+                (period_label(period, today, week_start, strings), period == options.period, pick)
             })
             .collect();
         let custom = matches!(options.period, Period::Custom(..));
@@ -480,10 +486,10 @@ impl SummaryView {
             .child(heading(strings.summary_filter))
             .child(
                 group()
-                    .child(self.row(strings.summary_date, period_label(options.period, today, strings), Menu::Period, periods, false, cx))
+                    .child(self.row(strings.summary_date, period_label(options.period, today, week_start, strings), Menu::Period, periods, false, cx))
                     .children(self.custom.clone().map(|(start, end)| {
                         let field = |input: Entity<TextInput>| {
-                            h_flex().h(px(28.)).px_2().rounded(px(6.)).bg(colors.background).child(input)
+                            h_flex().h(px(28.)).px_2().rounded(px(6.)).bg(input_bg).child(input)
                         };
                         v_flex()
                             .mx_3()
@@ -545,9 +551,9 @@ impl SummaryView {
             .flex_none()
             .w(px(320.))
             .h_full()
-            .pt(crate::title_bar::height())
+            .pt(crate::title_bar::height(window, cx))
             .border_l_1()
-            .border_color(colors.border_variant)
+            .border_color(cx.theme().colors().border_variant)
             .child(v_scroll("summary-options-sidebar-scroll", content).flex_1().min_h_0())
     }
 }

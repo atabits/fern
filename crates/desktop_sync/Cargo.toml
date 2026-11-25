@@ -24,7 +24,7 @@ ureq.workspace = true
 
 [dev-dependencies]
 assets.workspace = true
-fern_server = { path = "../../apps/server" }
+fern_server.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 tiny_http.workspace = true
 uuid.workspace = true

@@ -240,7 +240,7 @@ impl CalendarView {
             self.year_scroll.transition = None;
             return;
         };
-        let layout = YearLayout::new(size, calendar::week_numbers());
+        let layout = YearLayout::new(size, calendar::week_numbers(cx));
         let now = cx.background_executor().now();
         let from = precise_position.unwrap_or_else(|| {
             self.year_scroll.transition.as_ref().map_or_else(
@@ -302,7 +302,7 @@ impl CalendarView {
         else {
             return;
         };
-        let layout = YearLayout::new(size, calendar::week_numbers());
+        let layout = YearLayout::new(size, calendar::week_numbers(cx));
         if event.delta.precise() {
             if !self.finish_task_before_navigation(cx) {
                 return;
@@ -445,7 +445,7 @@ impl CalendarView {
             }
         }
         if self.options.show_habits {
-            let week_start = crate::calendar::week_start();
+            let week_start = crate::calendar::week_start(cx);
             for habit in &self.habits {
                 let recs = self.habit_records.get(&habit.id).map(Vec::as_slice).unwrap_or(&[]);
                 for rec in recs {
@@ -569,10 +569,19 @@ impl CalendarView {
         self.ensure_year_heatmap(year, today, cx);
         let empty = BTreeMap::new();
         let counts = self.year_heatmap.get(&year).unwrap_or(&empty);
-        let html =
-            crate::print::year_html(year, today, counts, calendar::week_numbers(), i18n::t(cx));
+        let html = crate::print::year_html(
+            year,
+            today,
+            counts,
+            calendar::week_numbers(cx),
+            calendar::week_start(cx),
+            i18n::t(cx),
+        );
         if let Err(error) = crate::print::open(&format!("year-{year}"), &html) {
-            eprintln!("failed to print the calendar year: {error:#}");
+            desktop_common::logging::log_error(
+                "calendar_ui",
+                format!("failed to print the calendar year: {error:#}"),
+            );
         }
         cx.notify();
     }
@@ -584,7 +593,7 @@ impl CalendarView {
         cx: &mut Context<Self>,
     ) -> Div {
         let size = self.year_size.unwrap_or_else(|| window.viewport_size());
-        let layout = YearLayout::new(size, calendar::week_numbers());
+        let layout = YearLayout::new(size, calendar::week_numbers(cx));
         let now = cx.background_executor().now();
         if self
             .year_scroll
@@ -625,7 +634,7 @@ impl CalendarView {
                                 this.year_scroll = YearScroll::default();
                                 // An orientation change changes how many months a row holds.
                                 let columns =
-                                    YearLayout::new(bounds.size, calendar::week_numbers()).columns;
+                                    YearLayout::new(bounds.size, calendar::week_numbers(cx)).columns;
                                 this.month = align_month_to_columns(this.month, columns);
                                 cx.notify();
                             }
@@ -647,7 +656,7 @@ impl CalendarView {
             self.ensure_year_heatmap(year, today, cx);
         }
         let displayed_year = self.month.year();
-        let year_goals = self.horizon_goals_for(fern_core::Horizon::Year(displayed_year), today, false);
+        let year_goals = self.horizon_goals_for(fern_core::Horizon::Year(displayed_year), today, false, cx);
         let year_banner = self.render_horizon_goals_banner(
             "calendar-year-goals-banner",
             i18n::t(cx).calendar_year_goals,
@@ -739,7 +748,7 @@ impl CalendarView {
     ) -> Div {
         let strings = i18n::t(cx);
         let colors = cx.theme().colors();
-        let week_numbers = calendar::week_numbers();
+        let week_numbers = calendar::week_numbers(cx);
         let cell = |label: String, color| {
             h_flex()
                 .flex_1()
@@ -786,11 +795,11 @@ impl CalendarView {
                     .min_h_0()
                     .when(week_numbers, |el| el.child(div().flex_1().min_w_0()))
                     .children(
-                        calendar::weekday_labels(&strings.weekdays_year)
+                        calendar::weekday_labels(&strings.weekdays_year, cx)
                             .map(|label| cell(label.to_owned(), secondary)),
                     ),
             )
-            .children(calendar::month_grid(month).as_chunks::<7>().0.iter().map(|week| {
+            .children(calendar::month_grid(month, cx).as_chunks::<7>().0.iter().map(|week| {
                 h_flex()
                     .flex_1()
                     .min_h_0()
@@ -858,9 +867,9 @@ impl CalendarView {
             .m(px(0.5))
             .cursor_pointer()
             .tooltip(ui::Tooltip::text(if count > 0 {
-                format!("{} · {count}", calendar::format_date(date, strings))
+                format!("{} · {count}", calendar::format_date(date, strings, cx))
             } else {
-                calendar::format_date(date, strings)
+                calendar::format_date(date, strings, cx)
             }))
             .when(heatmap, |el| {
                 el.when(is_open || is_today || level > 0, |el| el.bg(background))
@@ -877,7 +886,10 @@ impl CalendarView {
                     Ok(dragged.id)
                 };
                 if let Err(error) = id.and_then(|id| this.store.move_dates(id, date)) {
-                    eprintln!("failed to schedule the dropped task: {error:#}");
+                    desktop_common::logging::log_error(
+                        "calendar_ui",
+                        format!("failed to schedule the dropped task: {error:#}"),
+                    );
                 }
                 desktop_common::data_version::data_changed(cx.entity_id(), cx);
                 this.reload(cx);
@@ -956,7 +968,7 @@ impl CalendarView {
             )
             .on_click(|_, _, cx| cx.stop_propagation())
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(Label::new(calendar::format_date(date, strings)).weight(FontWeight::SEMIBOLD))
+            .child(Label::new(calendar::format_date(date, strings, cx)).weight(FontWeight::SEMIBOLD))
             .when(empty, |el| {
                 el.child(
                     div()

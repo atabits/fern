@@ -32,7 +32,10 @@ pub fn restore(store: Rc<Store>, cx: &mut App) {
         if store.task(note.task).ok().flatten().is_some_and(|task| !task.is_deleted()) {
             open_note(store.clone(), note.task, false, cx);
         } else if let Err(err) = sticky_windows::close(&store, note.task) {
-            eprintln!("failed to forget deleted note: {err:#}");
+            desktop_common::logging::log_error(
+                "sticky_ui",
+                format!("failed to forget deleted note: {err:#}"),
+            );
         }
     }
 }
@@ -116,7 +119,7 @@ fn open_note(store: Rc<Store>, id: Id, activate: bool, cx: &mut App) {
         window_decorations: Some(WindowDecorations::Client),
         app_owns_titlebar_drag: true,
         window_min_size: Some(size(px(MIN_WIDTH), px(COMPACT_HEIGHT))),
-        app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),
+        app_id: Some(desktop_common::app_id()),
         ..Default::default()
     };
     match cx.open_window(options, |window, cx| {
@@ -141,7 +144,10 @@ fn open_note(store: Rc<Store>, id: Id, activate: bool, cx: &mut App) {
             cx.default_global::<OpenNotes>().0 = live;
             cx.default_global::<OpenNotes>().0.push(handle);
         }
-        Err(err) => eprintln!("failed to open the sticky note: {err:#}"),
+        Err(err) => desktop_common::logging::log_error(
+            "sticky_ui",
+            format!("failed to open the sticky note: {err:#}"),
+        ),
     }
 }
 
@@ -167,7 +173,6 @@ pub struct StickyNote {
     last_bounds: Bounds<Pixels>,
     pending_bounds: Option<Bounds<Pixels>>,
     save_bounds_task: Option<gpui::Task<()>>,
-    text_edit_sync_task: Option<gpui::Task<()>>,
 }
 
 impl StickyNote {
@@ -185,7 +190,6 @@ impl StickyNote {
             detail
         });
         cx.subscribe_in(&detail, window, |this, _, _: &TaskUpdated, window, cx| {
-            this.text_edit_sync_task = None;
             data_changed(cx.entity_id(), cx);
             this.refresh_task(window, cx);
         })
@@ -199,15 +203,6 @@ impl StickyNote {
                     cx.notify();
                 }
             }
-            this.text_edit_sync_task = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(300))
-                    .await;
-                let _ = this.update(cx, |this, cx| {
-                    this.text_edit_sync_task = None;
-                    data_changed(cx.entity_id(), cx);
-                });
-            }));
         })
         .detach();
         // A subtask or parent clicked in the note opens in the note.
@@ -252,7 +247,6 @@ impl StickyNote {
             last_bounds: initial_bounds,
             pending_bounds: None,
             save_bounds_task: None,
-            text_edit_sync_task: None,
         };
         this.show(note.task, window, cx);
         this.remember_bounds(initial_bounds, cx);
@@ -350,7 +344,10 @@ impl StickyNote {
             cx.new(|cx| StickyPalette::new(note, self.style().color, self.pinned, window, cx))
         }, cx) {
             Ok(palette) => self.palette = Some(palette),
-            Err(err) => eprintln!("failed to open sticky note colors: {err:#}"),
+            Err(err) => desktop_common::logging::log_error(
+                "sticky_ui",
+                format!("failed to open sticky note colors: {err:#}"),
+            ),
         }
     }
 
@@ -397,7 +394,10 @@ impl StickyNote {
         }, cx) {
             Ok(popup) => self.detail_popup = Some(popup),
             Err(err) => {
-                eprintln!("failed to open sticky task menu: {err:#}");
+                desktop_common::logging::log_error(
+                    "sticky_ui",
+                    format!("failed to open sticky task menu: {err:#}"),
+                );
                 self.detail.update(cx, |detail, cx| detail.dismiss_popup(window, cx));
             }
         }
@@ -417,15 +417,15 @@ impl StickyNote {
             note.height = self.expanded_height.into();
             match sticky_windows::save(&self.store, note, self.saved_task) {
                 Ok(()) => self.saved_task = Some(id),
-                Err(err) => eprintln!("failed to save sticky window: {err:#}"),
+                Err(err) => desktop_common::logging::log_error(
+                    "sticky_ui",
+                    format!("failed to save sticky window: {err:#}"),
+                ),
             }
         }
     }
 
     fn forget(&mut self, cx: &mut Context<Self>) {
-        if self.text_edit_sync_task.take().is_some() {
-            data_changed(cx.entity_id(), cx);
-        }
         self.save_bounds_task.take();
         if let Some(bounds) = self.pending_bounds.take() {
             self.remember_bounds(bounds, cx);
@@ -437,7 +437,10 @@ impl StickyNote {
         }
         if let Some(id) = self.detail.read(cx).task_id().or(self.saved_task)
             && let Err(err) = sticky_windows::close(&self.store, id) {
-            eprintln!("failed to close saved note: {err:#}");
+            desktop_common::logging::log_error(
+                "sticky_ui",
+                format!("failed to close saved note: {err:#}"),
+            );
         }
     }
 
@@ -513,15 +516,15 @@ impl StickyNote {
 }
 
 impl Render for StickyNote {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.detail.read(cx).has_popup()
             && !self.opening_detail_popup
             && !self.detail_popup.is_some_and(|popup| popup.read(cx).is_ok())
         {
             self.opening_detail_popup = true;
-            let anchor = self.popup_anchor(_window, cx);
-            let measured = popup::measure_detail(&self.detail, anchor, _window, cx);
-            cx.defer_in(_window, move |this, window, cx| this.open_detail_popup(anchor, measured, window, cx));
+            let anchor = self.popup_anchor(window, cx);
+            let measured = popup::measure_detail(&self.detail, anchor, window, cx);
+            cx.defer_in(window, move |this, window, cx| this.open_detail_popup(anchor, measured, window, cx));
         }
         let strings = i18n::t(cx);
         let style = self.style();
@@ -532,7 +535,7 @@ impl Render for StickyNote {
                 el.opacity(0.).group_hover("sticky-window", |style| style.opacity(1.))
             })
         };
-        v_flex()
+        let root = v_flex()
             .id("sticky-window")
             .group("sticky-window")
             .track_focus(&self.focus_handle)
@@ -635,24 +638,26 @@ impl Render for StickyNote {
                                     .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx))),
                             ),
                         )
-                        .child(
-                            div()
-                                .when(self.pinned, |el| {
-                                    el.opacity(0.85).group_hover("sticky-window", |style| style.opacity(1.))
-                                })
-                                .when(!self.pinned && !crate::touch::active(), |el| {
-                                    el.opacity(0.).group_hover("sticky-window", |style| style.opacity(1.))
-                                })
-                                .child(
-                                    IconButton::new("sticky-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
-                                        .size(px(20.))
-                                        .icon_size(IconSize::Small)
-                                        .icon_color(Color::Custom(foreground))
-                                        .hover_color(foreground.opacity(0.12))
-                                        .tooltip(popup::tooltip(if self.pinned { strings.unpin } else { strings.pin }))
-                                        .on_click(cx.listener(|this, _, window, cx| this.toggle_pin(window, cx))),
-                                ),
-                        )
+                        .when(!desktop_common::is_wayland_session(), |controls| {
+                            controls.child(
+                                div()
+                                    .when(self.pinned, |el| {
+                                        el.opacity(0.85).group_hover("sticky-window", |style| style.opacity(1.))
+                                    })
+                                    .when(!self.pinned && !crate::touch::active(), |el| {
+                                        el.opacity(0.).group_hover("sticky-window", |style| style.opacity(1.))
+                                    })
+                                    .child(
+                                        IconButton::new("sticky-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
+                                            .size(px(20.))
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Custom(foreground))
+                                            .hover_color(foreground.opacity(0.12))
+                                            .tooltip(popup::tooltip(if self.pinned { strings.unpin } else { strings.pin }))
+                                            .on_click(cx.listener(|this, _, window, cx| this.toggle_pin(window, cx))),
+                                    ),
+                            )
+                        })
                         .child(
                             hover_control(div()).child(
                                 IconButton::new("sticky-compact", if self.compact { IconName::ChevronDown } else { IconName::ChevronUp })
@@ -684,7 +689,8 @@ impl Render for StickyNote {
                         .capture_any_mouse_down(cx.listener(|this, _, _, cx| { this.close_palette(cx); }))
                         .child(self.detail.clone()),
                 )
-            })
+            });
+        desktop_common::layout::linux_window_frame(root, px(8.), window, cx)
     }
 }
 
@@ -772,9 +778,9 @@ impl Render for StickyPalette {
 
 #[cfg(target_os = "linux")]
 use desktop_common::sticky_windows::set_skip_taskbar;
-#[cfg(windows)]
-pub(crate) use desktop_common::sticky_windows::win32_window_handle;
 use desktop_common::sticky_windows::{ScreenEdge, align_to_edge, set_opacity, set_topmost};
+#[cfg(windows)]
+pub(crate) use desktop_common::win32::hwnd_from_window as win32_window_handle;
 
 #[cfg(test)]
 mod tests;

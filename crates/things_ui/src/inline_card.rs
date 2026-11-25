@@ -95,8 +95,12 @@ pub fn render_collapsed_row<V: 'static>(
     on_action: impl Fn(&mut V, CardAction, &mut Window, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
     let theme = cx.theme().clone();
-    let colors = theme.colors().clone();
-    let status = theme.status().clone();
+    let accent_soft = theme.colors().accent.opacity(0.10);
+    let element_hover = theme.colors().element_hover;
+    let element_selected = theme.colors().element_selected;
+    let ghost_element_hover = theme.colors().ghost_element_hover;
+    let text_muted = theme.colors().text_muted;
+    let error_soft = theme.status().error.opacity(0.12);
     let task = props.task;
     let id = task.id;
     let strings = props.strings;
@@ -120,7 +124,7 @@ pub fn render_collapsed_row<V: 'static>(
             .px_1p5()
             .h(px(18.))
             .rounded(px(5.))
-            .bg(colors.accent.opacity(0.10))
+            .bg(accent_soft)
             .child(Icon::new(IconName::Moon).size(IconSize::XSmall).color(Color::Accent))
             .child(Label::new(strings.things_today_evening).size(LabelSize::XSmall).color(Color::Accent))
     });
@@ -134,26 +138,26 @@ pub fn render_collapsed_row<V: 'static>(
     {
         None
     } else {
-        when_picker::format_when_label(task, props.today, strings).map(|label| {
+        when_picker::format_when_label(task, props.today, strings, cx).map(|label| {
             h_flex()
                 .gap_1()
                 .px_1p5()
                 .h(px(18.))
                 .rounded(px(5.))
-                .bg(colors.element_hover)
+                .bg(element_hover)
                 .child(Icon::new(IconName::CalendarDays).size(IconSize::XSmall).color(Color::Muted))
                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
         })
     };
 
-    let horizon_chip = (calendar::horizons_enabled() && task.due_date.is_none())
+    let horizon_chip = (calendar::horizons_enabled(cx) && task.due_date.is_none())
         .then(|| {
             task.horizon.map(|h| {
                 let label = calendar::format_horizon_badge(h, strings);
                 let past = h.is_past_relative_to(props.today);
                 let (fg_hsla, bg_hsla, _) = task_rows::horizon_badge_style(past, closed, &theme);
                 let fg = if past && !closed { Color::Custom(fg_hsla) } else { Color::Muted };
-                let bg = if past && !closed { bg_hsla } else { colors.element_hover };
+                let bg = if past && !closed { bg_hsla } else { element_hover };
                 h_flex()
                     .when(cfg!(test), |el| {
                         el.debug_selector(move || format!("things-horizon-chip-{id}"))
@@ -174,14 +178,10 @@ pub fn render_collapsed_row<V: 'static>(
         .flatten();
 
     let due_chip = task.due_date.map(|due| {
-        let (label, overdue) = task_rows::due_label(due, task.due_time, props.today, strings);
+        let (label, overdue) = task_rows::due_label(due, task.due_time, props.today, strings, cx);
         let overdue = overdue && !closed;
         let fg = if overdue { Color::Error } else { Color::Muted };
-        let bg = if overdue {
-            status.error.opacity(0.12)
-        } else {
-            colors.element_hover
-        };
+        let bg = if overdue { error_soft } else { element_hover };
         h_flex()
             .gap_1()
             .px_1p5()
@@ -209,7 +209,7 @@ pub fn render_collapsed_row<V: 'static>(
                     .flex()
                     .items_center()
                     .rounded(px(5.))
-                    .bg(colors.element_hover)
+                    .bg(element_hover)
                     .child(
                         Label::new(name.clone())
                             .size(LabelSize::XSmall)
@@ -238,8 +238,8 @@ pub fn render_collapsed_row<V: 'static>(
         .items_center()
         .gap_2p5()
         .cursor_pointer()
-        .when(props.selected, |el| el.bg(colors.element_selected))
-        .when(!props.selected, |el| el.hover(|s| s.bg(colors.ghost_element_hover)))
+        .when(props.selected, |el| el.bg(element_selected))
+        .when(!props.selected, |el| el.hover(|s| s.bg(ghost_element_hover)))
         .when(allow_row_drop, |el| {
             el.drag_over::<DraggedMagicPlus>(move |style, _, _, cx| {
                 style.border_b_2().border_color(cx.theme().colors().accent)
@@ -330,7 +330,7 @@ pub fn render_collapsed_row<V: 'static>(
                         .tag_colors
                         .get(&tag.to_lowercase())
                         .copied()
-                        .unwrap_or(colors.text_muted);
+                        .unwrap_or(text_muted);
                     Chip::new(tag.clone(), color)
                 })),
         )
@@ -383,8 +383,14 @@ pub fn render_expanded_card<V: 'static>(
     on_action: impl Fn(&mut V, CardAction, &mut Window, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
     let theme = cx.theme().clone();
-    let colors = theme.colors().clone();
-    let status = theme.status().clone();
+    let accent = theme.colors().accent;
+    let surface_background = theme.colors().surface_background;
+    let border_variant = theme.colors().border_variant;
+    let element_hover = theme.colors().element_hover;
+    let elevated_surface_background = theme.colors().elevated_surface_background;
+    let border = theme.colors().border;
+    let error_bg = theme.status().error.opacity(0.10);
+    let warning_bg = theme.status().warning.opacity(0.12);
     let task = props.task;
     let id = task.id;
     let state = props.state;
@@ -405,10 +411,10 @@ pub fn render_expanded_card<V: 'static>(
     let act_close_pop = on_action.clone();
     let act_move_pick = on_action.clone();
 
-    let horizon_when = (calendar::horizons_enabled() && task.due_date.is_none())
+    let horizon_when = (calendar::horizons_enabled(cx) && task.due_date.is_none())
         .then_some(task.horizon)
         .flatten();
-    let when_label = when_picker::format_when_label(task, props.today, strings)
+    let when_label = when_picker::format_when_label(task, props.today, strings, cx)
         .or_else(|| horizon_when.map(|h| calendar::format_horizon_badge(h, strings)))
         .unwrap_or_else(|| strings.things_when.to_owned());
     let has_when = task.start_date.is_some()
@@ -430,7 +436,7 @@ pub fn render_expanded_card<V: 'static>(
 
     let (deadline_label, deadline_overdue) = match task.due_date {
         Some(d) => {
-            let (lbl, over) = task_rows::due_label(d, task.due_time, props.today, strings);
+            let (lbl, over) = task_rows::due_label(d, task.due_time, props.today, strings, cx);
             (lbl, over && !closed)
         }
         None => (strings.things_deadline.to_owned(), false),
@@ -541,9 +547,9 @@ pub fn render_expanded_card<V: 'static>(
                     .px_2()
                     .gap_1p5()
                     .rounded(px(6.))
-                    .bg(colors.surface_background)
+                    .bg(surface_background)
                     .border_1()
-                    .border_color(colors.border_variant)
+                    .border_color(border_variant)
                     .child(Icon::new(IconName::Tag).size(IconSize::XSmall).color(Color::Muted))
                     .child(div().flex_1().min_w_0().child(state.tag_input.clone())),
             )
@@ -618,10 +624,10 @@ pub fn render_expanded_card<V: 'static>(
             .gap_1()
             .rounded(px(6.))
             .cursor_pointer()
-            .when(matches!(tone, PillTone::Error), |el| el.bg(status.error.opacity(0.10)))
-            .when(matches!(tone, PillTone::Warning), |el| el.bg(status.warning.opacity(0.12)))
-            .when(matches!(tone, PillTone::Accent), |el| el.bg(colors.accent.opacity(0.10)))
-            .when(matches!(tone, PillTone::Muted), |el| el.hover(|s| s.bg(colors.element_hover)))
+            .when(matches!(tone, PillTone::Error), |el| el.bg(error_bg))
+            .when(matches!(tone, PillTone::Warning), |el| el.bg(warning_bg))
+            .when(matches!(tone, PillTone::Accent), |el| el.bg(accent.opacity(0.10)))
+            .when(matches!(tone, PillTone::Muted), |el| el.hover(|s| s.bg(element_hover)))
             .child(
                 div()
                     .flex_none()
@@ -673,9 +679,9 @@ pub fn render_expanded_card<V: 'static>(
         .py_3()
         .gap_2p5()
         .rounded(px(10.))
-        .bg(colors.elevated_surface_background)
+        .bg(elevated_surface_background)
         .border_1()
-        .border_color(colors.border)
+        .border_color(border)
         .shadow_lg()
         .on_click(|_, _, cx| cx.stop_propagation())
         .child(
@@ -752,7 +758,7 @@ pub fn render_expanded_card<V: 'static>(
                             .tag_colors
                             .get(&tag.to_lowercase())
                             .copied()
-                            .unwrap_or(colors.accent);
+                            .unwrap_or(accent);
                         let rem = on_action.clone();
                         Chip::new(name.clone(), color).end_slot(
                             div()

@@ -62,8 +62,8 @@ impl TaskDetail {
                         .map(|t| {
                             format!(
                                 "{} {}",
-                                calendar::format_day_month(t.date_naive(), strings),
-                                calendar::format_time(t, strings)
+                                calendar::format_day_month(t.date_naive(), strings, cx),
+                                calendar::format_time(t, strings, cx)
                             )
                         })
                         .unwrap_or_default();
@@ -279,13 +279,11 @@ impl TaskDetail {
                 el.debug_selector(move || modal_selector.to_owned())
             })
             .child(
-                ui::ConfirmDialog::new(dialog_id, title)
+                ui::ConfirmDialog::new(dialog_id, title, strings.cancel, strings.delete)
                     .width(px(340.))
                     .when(!description.is_empty(), |dialog| {
                         dialog.description(description)
                     })
-                    .cancel_label(strings.cancel)
-                    .confirm_label(strings.delete)
                     .destructive(true)
                     .on_cancel(cx.listener(|this, _, window, cx| {
                         this.dismiss_pending_delete(window, cx);
@@ -364,7 +362,7 @@ impl Render for TaskDetail {
         let notes_focus_click = notes_focus.clone();
         let today = Local::now().date_naive();
         let kind = self.kind_preview(task);
-        let due = self.due_badge(task, kind, done, today, muted, strings);
+        let due = self.due_badge(task, kind, done, today, muted, cx);
         let in_progress = task.is_in_progress();
         let read_only = self.is_read_only();
         let show_location = self.location_open || task.location.is_some();

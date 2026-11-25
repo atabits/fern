@@ -169,29 +169,42 @@ impl Drop for ClearPersistentGuard {
     }
 }
 
-pub(super) struct DeactivateGateFuture<Fut> {
+struct DisarmGuard<'a>(&'a ExecGate);
+
+impl Drop for DisarmGuard<'_> {
+    fn drop(&mut self) {
+        self.0.disarm();
+    }
+}
+
+pub(super) struct SimpleGateFuture<Fut> {
     pub(super) fut: Fut,
     pub(super) gate: Arc<ExecGate>,
     pub(super) budget: Duration,
+    pub(super) deactivate: bool,
 }
 
-impl<Fut: std::future::Future> std::future::Future for DeactivateGateFuture<Fut> {
+impl<Fut: std::future::Future> std::future::Future for SimpleGateFuture<Fut> {
     type Output = Fut::Output;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
-        // SAFETY: projecting pinned field `fut`; `gate` and `budget` are not pinned.
-        let (fut, gate, budget) = unsafe {
+        // SAFETY: projecting pinned field `fut`; `gate`, `budget`, and `deactivate` are not pinned.
+        let (fut, gate, budget, deactivate) = unsafe {
             let this = self.get_unchecked_mut();
             (
                 std::pin::Pin::new_unchecked(&mut this.fut),
                 &this.gate,
                 this.budget,
+                this.deactivate,
             )
         };
-        gate.arm_deactivate(budget);
-        let res = fut.poll(cx);
-        gate.disarm();
-        res
+        if deactivate {
+            gate.arm_deactivate(budget);
+        } else {
+            gate.arm(budget);
+        }
+        let _disarm = DisarmGuard(gate);
+        fut.poll(cx)
     }
 }
 
@@ -231,33 +244,6 @@ pub(super) async fn runtime_driver_task(
 ) {
     const MAX_JOBS_PER_BURST: usize = 10_000;
 
-    struct DriverJobFuture<Fut> {
-        fut: Fut,
-        gate: Arc<ExecGate>,
-        budget: Duration,
-    }
-    impl<Fut: std::future::Future> std::future::Future for DriverJobFuture<Fut> {
-        type Output = Fut::Output;
-        fn poll(
-            self: std::pin::Pin<&mut Self>,
-            cx: &mut TaskContext<'_>,
-        ) -> Poll<Self::Output> {
-            // SAFETY: projecting pinned field `fut`; `gate` and `budget` are not pinned.
-            let (fut, gate, budget) = unsafe {
-                let this = self.get_unchecked_mut();
-                (
-                    std::pin::Pin::new_unchecked(&mut this.fut),
-                    &this.gate,
-                    this.budget,
-                )
-            };
-            gate.arm(budget);
-            let res = fut.poll(cx);
-            gate.disarm();
-            res
-        }
-    }
-
     loop {
         if env.shutdown_flag.load(Ordering::Acquire) {
             break;
@@ -290,10 +276,11 @@ pub(super) async fn runtime_driver_task(
                 break;
             }
 
-            let job_res = DriverJobFuture {
+            let job_res = SimpleGateFuture {
                 fut: rt.execute_pending_job(),
                 gate: Arc::clone(&gate),
                 budget: remaining,
+                deactivate: false,
             }
             .await;
 
@@ -464,10 +451,10 @@ where
             } else {
                 gate.arm(remaining);
             }
+            let _disarm = DisarmGuard(gate);
             let poll_start = Instant::now();
             let res = fut.poll(cx);
             *cpu_used = cpu_used.saturating_add(poll_start.elapsed());
-            gate.disarm();
             res
         }
     }

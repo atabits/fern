@@ -23,7 +23,7 @@ use gpui::{Entity, Focusable as _, FontWeight, Point, ScrollHandle};
 use ui::prelude::*;
 use ui::{EmptyState, Placement, PopoverAttachment, popover};
 
-use desktop_common::data_version::{DataVersion, changed_elsewhere, data_changed};
+use desktop_common::data_version::{DataScope, DataVersion, ViewRefreshState, data_changed_scoped};
 use desktop_common::habit_helpers::progress_ring;
 use desktop_common::text_input::{Cancelled, Mode, Submitted, TextInput};
 use desktop_common::{actions, calendar, export, layout, resize};
@@ -120,8 +120,7 @@ pub struct HabitView {
     export_message: Option<String>,
     detail_notice: Option<String>,
     pending_focus: Option<PendingFocus>,
-    active: bool,
-    dirty: bool,
+    refresh: ViewRefreshState,
 }
 
 impl gpui::Focusable for HabitView {
@@ -156,8 +155,8 @@ impl HabitView {
             .unwrap_or_default();
 
         cx.observe_global::<DataVersion>(|this, cx| {
-            if changed_elsewhere(cx.entity_id(), cx) {
-                this.sync_external(cx);
+            if this.refresh.on_data_version(cx.entity_id(), cx) {
+                this.reload(cx);
             }
         })
         .detach();
@@ -200,8 +199,7 @@ impl HabitView {
             export_message: None,
             detail_notice: None,
             pending_focus: None,
-            active: initial_active,
-            dirty: !initial_active,
+            refresh: ViewRefreshState::new(initial_active, DataScope::HABITS | DataScope::PREFS, cx),
         };
         if initial_active {
             this.reload(cx);
@@ -210,27 +208,23 @@ impl HabitView {
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
-        self.active = active;
-        if active && self.dirty {
-            self.dirty = false;
+        if self.refresh.set_active(active, cx) {
             self.reload(cx);
         }
     }
 
     pub fn sync_external(&mut self, cx: &mut Context<Self>) {
-        if self.active {
+        if self.refresh.mark_dirty_or_reload() {
             self.reload(cx);
-        } else {
-            self.dirty = true;
         }
     }
 
     pub(crate) fn notify_data_changed(&self, cx: &mut Context<Self>) {
-        data_changed(cx.entity_id(), cx);
+        data_changed_scoped(cx.entity_id(), DataScope::HABITS, cx);
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.dirty = false;
+        self.refresh.mark_clean(cx);
         self.habits = Rc::new(self.store.habits().unwrap_or_default());
         self.sections = self.store.habit_sections().unwrap_or_default();
         self.records = self.store.all_habit_checkins().unwrap_or_default();
@@ -282,7 +276,7 @@ impl HabitView {
     }
 
     pub fn select(&mut self, habit: Id, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         if let Some(found) = self.habits.iter().find(|h| h.id == habit)
@@ -396,7 +390,7 @@ impl HabitView {
             _ => {}
         }
         if let Err(err) = self.store.set_setting(key, if on { "1" } else { "0" }) {
-            eprintln!("failed to save setting {key}: {err:#}");
+            desktop_common::logging::log_error("habit_ui", format!("failed to save setting {key}: {err:#}"));
         }
         self.notify_data_changed(cx);
         cx.notify();
@@ -405,7 +399,7 @@ impl HabitView {
     pub(crate) fn set_list_layout(&mut self, list: bool, cx: &mut Context<Self>) {
         self.list_layout = list;
         if let Err(err) = self.store.set_setting(LAYOUT_SETTING, if list { "list" } else { "cards" }) {
-            eprintln!("failed to save habit layout: {err:#}");
+            desktop_common::logging::log_error("habit_ui", format!("failed to save habit layout: {err:#}"));
         }
         cx.notify();
     }
@@ -422,7 +416,7 @@ impl HabitView {
 
     pub(crate) fn set_archived(&mut self, id: Id, archived: bool, cx: &mut Context<Self>) {
         if let Err(err) = self.store.set_habit_archived(id, archived) {
-            eprintln!("failed to update archive status: {err:#}");
+            desktop_common::logging::log_error("habit_ui", format!("failed to update archive status: {err:#}"));
         }
         self.detail_menu_open = false;
         self.detail_submenu = None;
@@ -450,8 +444,8 @@ impl HabitView {
         }
     }
 
-    pub(crate) fn day_progress(&self, date: NaiveDate) -> DayProgress {
-        habit::day_progress(&self.habits, &self.records, date, calendar::week_start())
+    pub(crate) fn day_progress(&self, date: NaiveDate, cx: &App) -> DayProgress {
+        habit::day_progress(&self.habits, &self.records, date, calendar::week_start(cx))
     }
 
     pub(crate) fn open_day_menu(&mut self, habit_id: Id, date: NaiveDate, position: Point<Pixels>, cx: &mut Context<Self>) {
@@ -504,7 +498,7 @@ impl HabitView {
                             self.after_checkin_completed(habit_id, date, Some(window), cx);
                         }
                     }
-                    Err(err) => eprintln!("failed to toggle check-in: {err:#}"),
+                    Err(err) => desktop_common::logging::log_error("habit_ui", format!("failed to toggle check-in: {err:#}")),
                 }
             }
             Some(CheckinMode::Auto { .. }) => {
@@ -513,7 +507,7 @@ impl HabitView {
                     cx.notify();
                 } else {
                     if let Err(err) = self.store.step_checkin(habit_id, date) {
-                        eprintln!("failed to step check-in: {err:#}");
+                        desktop_common::logging::log_error("habit_ui", format!("failed to step check-in: {err:#}"));
                         return;
                     }
                     self.notify_data_changed(cx);
@@ -545,7 +539,7 @@ impl HabitView {
         let Some(habit) = self.habits.iter().find(|h| h.id == habit_id).cloned() else {
             return;
         };
-        desktop_common::sound::play_complete(&self.store);
+        desktop_common::sound::play_complete(cx);
         // Check if this check-in just completed a Goal Days cycle.
         if let Some(target) = habit.goal_days
             && target > 0
@@ -575,7 +569,7 @@ impl HabitView {
             return;
         }
         if let Err(err) = self.store.mark_checkin_undone(habit_id, date) {
-            eprintln!("failed to mark unachieved: {err:#}");
+            desktop_common::logging::log_error("habit_ui", format!("failed to mark unachieved: {err:#}"));
             return;
         }
         self.day_menu = None;
@@ -598,7 +592,7 @@ impl HabitView {
             self.store.skip_habit_date(habit_id, date)
         };
         if let Err(err) = res {
-            eprintln!("failed to toggle skip: {err:#}");
+            desktop_common::logging::log_error("habit_ui", format!("failed to toggle skip: {err:#}"));
         }
         self.day_menu = None;
         self.notify_data_changed(cx);
@@ -630,7 +624,7 @@ impl HabitView {
         });
         cx.subscribe_in(&input, window, move |this, _, Submitted(text), window, cx| {
             if let Err(err) = this.store.rename_habit_section(id, text) {
-                eprintln!("failed to rename section: {err:#}");
+                desktop_common::logging::log_error("habit_ui", format!("failed to rename section: {err:#}"));
             }
             this.renaming_section = None;
             this.focus_or_defer(PendingFocus::View, Some(window), cx);
@@ -677,7 +671,7 @@ impl HabitView {
             .map(|(idx, h)| (h.id, h.section, idx as i64))
             .collect();
         if let Err(err) = self.store.reorder_habits(&updates) {
-            eprintln!("failed to reorder habits: {err:#}");
+            desktop_common::logging::log_error("habit_ui", format!("failed to reorder habits: {err:#}"));
         }
         self.notify_data_changed(cx);
         self.reload(cx);
@@ -695,7 +689,7 @@ impl HabitView {
         let to = ids.iter().position(|id| *id == target_id).unwrap_or(ids.len());
         ids.insert(to, item);
         if let Err(err) = self.store.reorder_habit_sections(&ids) {
-            eprintln!("failed to reorder habit sections: {err:#}");
+            desktop_common::logging::log_error("habit_ui", format!("failed to reorder habit sections: {err:#}"));
         }
         self.notify_data_changed(cx);
         self.reload(cx);
@@ -727,8 +721,8 @@ impl HabitView {
             .is_some_and(|r| r.is_handled())
     }
 
-    fn visible_sections<'a>(&self, habits: &'a [Habit], today: NaiveDate) -> Vec<HabitGroup<'a>> {
-        let week_start = calendar::week_start();
+    fn visible_sections<'a>(&self, habits: &'a [Habit], today: NaiveDate, cx: &App) -> Vec<HabitGroup<'a>> {
+        let week_start = calendar::week_start(cx);
         let visible: Vec<&Habit> = habits
             .iter()
             .filter(|h| h.archived == self.show_archived)
@@ -784,8 +778,8 @@ impl HabitView {
         groups
     }
 
-    fn visible_habit_ids(&self, today: NaiveDate) -> Vec<Id> {
-        self.visible_sections(&self.habits, today)
+    fn visible_habit_ids(&self, today: NaiveDate, cx: &App) -> Vec<Id> {
+        self.visible_sections(&self.habits, today, cx)
             .into_iter()
             .filter(|g| !g.collapsed)
             .flat_map(|g| g.habits.into_iter().map(|h| h.id))
@@ -822,7 +816,7 @@ impl HabitView {
 
     fn select_relative(&mut self, delta: isize, cx: &mut Context<Self>) {
         let today = Local::now().date_naive();
-        let ids = self.visible_habit_ids(today);
+        let ids = self.visible_habit_ids(today, cx);
         if ids.is_empty() {
             return;
         }
@@ -841,7 +835,7 @@ impl HabitView {
     #[cfg(debug_assertions)]
     pub fn dev_apply(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
         use fern_core::{Goal, HabitFrequency};
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         let custom = |name: &str| self.sections.iter().find(|s| s.name == name).map(|s| s.id);
@@ -954,7 +948,7 @@ impl HabitView {
 
     #[cfg(debug_assertions)]
     pub fn dev_select(&mut self, name: &str, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         if let Some(id) = self.habits.iter().find(|h| h.name == name).map(|h| h.id) {
@@ -973,7 +967,7 @@ impl Render for HabitView {
 
         self.card_bounds.borrow_mut().clear();
         let habits = Rc::clone(&self.habits);
-        let groups = self.visible_sections(&habits, today);
+        let groups = self.visible_sections(&habits, today, cx);
         let mut sections_ui: Vec<AnyElement> = Vec::new();
         for group in groups {
             let allow_dnd = matches!(group.kind, HabitGroupKind::Section { .. });
@@ -1057,7 +1051,7 @@ impl Render for HabitView {
                 .pt(px(14.))
                 .pb(px(20.))
                 .children(week.map(|date| {
-                    let progress = self.day_progress(date);
+                    let progress = self.day_progress(date, cx);
                     let is_today = date == today;
                     let is_selected = self.selected_date == Some(date);
                     let ring_el: AnyElement = match progress {
@@ -1097,9 +1091,9 @@ impl Render for HabitView {
                     };
 
                     let day_tip = match progress {
-                        DayProgress::Needless => calendar::format_date(date, strings),
-                        DayProgress::AllUndone => format!("{} · {}", calendar::format_date(date, strings), strings.habit_unachieved),
-                        DayProgress::Fraction(frac) => format!("{} · {}%", calendar::format_date(date, strings), (frac * 100.0).round() as u32),
+                        DayProgress::Needless => calendar::format_date(date, strings, cx),
+                        DayProgress::AllUndone => format!("{} · {}", calendar::format_date(date, strings, cx), strings.habit_unachieved),
+                        DayProgress::Fraction(frac) => format!("{} · {}%", calendar::format_date(date, strings, cx), (frac * 100.0).round() as u32),
                     };
 
                     v_flex()
@@ -1135,7 +1129,7 @@ impl Render for HabitView {
         let detail = self
             .selected
             .and_then(|id| habits.iter().find(|h| h.id == id))
-            .map(|habit| self.render_detail(habit, today, cx));
+            .map(|habit| self.render_detail(habit, today, window, cx));
 
         let viewport_width = window.viewport_size().width;
         let clamped_detail = self.detail_width.clamp(MIN_DETAIL_WIDTH, MAX_DETAIL_WIDTH);
@@ -1148,7 +1142,7 @@ impl Render for HabitView {
             .border_color(theme.colors().border)
             .child(
                 h_flex()
-                    .mt(layout::header_inset())
+                    .mt(layout::header_inset(window, cx))
                     .h(px(52.))
                     .flex_none()
                     .px(px(22.))

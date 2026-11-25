@@ -17,7 +17,7 @@ impl TodoView {
     }
 
     /// Today and Next 7 Days list the habits due today, unless turned off in the habit settings.
-    pub(super) fn reload_today_habits(&mut self) {
+    pub(super) fn reload_today_habits(&mut self, cx: &App) {
         self.today_habits = Rc::new(Vec::new());
         if !matches!(self.view, View::Today | View::Next7Days)
             || self.store.setting(crate::habit_view::IN_TODAY_SETTING).ok().flatten().as_deref() == Some("0")
@@ -25,7 +25,7 @@ impl TodoView {
             return;
         }
         let today = Self::today();
-        let week_start = crate::calendar::week_start();
+        let week_start = crate::calendar::week_start(cx);
         let sections = self.store.habit_sections().unwrap_or_default();
         let section_order = fern_core::HabitSection::ordered(&sections);
         let all_records = self.store.all_habit_checkins().unwrap_or_default();
@@ -106,7 +106,7 @@ impl TodoView {
                                     };
                                     this.check(result);
                                     desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                    this.reload_today_habits();
+                                    this.reload_today_habits(cx);
                                     cx.notify();
                                 }))
                                 .child(crate::habit_view::avatar(habit, px(20.), cx)),
@@ -128,14 +128,14 @@ impl TodoView {
                             };
                             this.check(result);
                             desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                            this.reload_today_habits();
+                            this.reload_today_habits(cx);
                             cx.notify();
                         }))
                         .on_mouse_down(
                             gpui::MouseButton::Right,
                             cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
-                                this.habit_menu = Some((id, ev.position));
+                                this.overlays.habit_menu = Some((id, ev.position));
                                 cx.notify();
                             }),
                         )
@@ -147,7 +147,7 @@ impl TodoView {
     }
 
     pub(super) fn render_habit_context_menu(&self, strings: &Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (id, pos) = self.habit_menu?;
+        let (id, pos) = self.overlays.habit_menu?;
         let habit = self.today_habits.iter().find(|(h, _, _)| h.id == id)?.0.clone();
         let today = Self::today();
         let name = habit.name;
@@ -163,7 +163,7 @@ impl TodoView {
                     popover(cx)
                         .min_w(px(176.))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.habit_menu = None;
+                            this.overlays.habit_menu = None;
                             cx.notify();
                         }))
                         .child(
@@ -172,7 +172,7 @@ impl TodoView {
                                 .start_slot(Icon::new(IconName::FernHabit).color(Color::Muted))
                                 .child(Label::new(strings.section_habits))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.habit_menu = None;
+                                    this.overlays.habit_menu = None;
                                     cx.emit(OpenHabit(id));
                                     cx.notify();
                                 })),
@@ -183,7 +183,7 @@ impl TodoView {
                                 .start_slot(Icon::new(IconName::Timer).color(Color::Muted))
                                 .child(Label::new(strings.habit_start_pomo))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.habit_menu = None;
+                                    this.overlays.habit_menu = None;
                                     cx.emit(StartHabitFocus { habit_id: id, title: name.clone(), stopwatch: false });
                                     cx.notify();
                                 })),
@@ -194,7 +194,7 @@ impl TodoView {
                                 .start_slot(Icon::new(IconName::Clock).color(Color::Muted))
                                 .child(Label::new(strings.habit_start_stopwatch))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.habit_menu = None;
+                                    this.overlays.habit_menu = None;
                                     cx.emit(StartHabitFocus { habit_id: id, title: name_sw.clone(), stopwatch: true });
                                     cx.notify();
                                 })),
@@ -205,11 +205,11 @@ impl TodoView {
                                 .start_slot(Icon::new(IconName::Minus).color(Color::Muted))
                                 .child(Label::new(strings.habit_skip))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.habit_menu = None;
+                                    this.overlays.habit_menu = None;
                                     let res = this.store.skip_habit_date(id, today);
                                     this.check(res);
                                     desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                    this.reload_today_habits();
+                                    this.reload_today_habits(cx);
                                     cx.notify();
                                 })),
                         )
@@ -219,11 +219,11 @@ impl TodoView {
                                 .start_slot(Icon::new(IconName::Ban).color(Color::Muted))
                                 .child(Label::new(strings.habit_unachieved))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.habit_menu = None;
+                                    this.overlays.habit_menu = None;
                                     let res = this.store.mark_checkin_undone(id, today);
                                     this.check(res);
                                     desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                    this.reload_today_habits();
+                                    this.reload_today_habits(cx);
                                     cx.notify();
                                 })),
                         )
@@ -233,11 +233,11 @@ impl TodoView {
                                 .start_slot(Icon::new(IconName::RotateCcw).color(Color::Muted))
                                 .child(Label::new(strings.habit_reset))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.habit_menu = None;
+                                    this.overlays.habit_menu = None;
                                     let res = this.store.reset_checkin(id, today, true);
                                     this.check(res);
                                     desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                    this.reload_today_habits();
+                                    this.reload_today_habits(cx);
                                     cx.notify();
                                 })),
                         ),

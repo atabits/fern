@@ -27,7 +27,7 @@ pub(super) struct PanelDragState {
 
 impl TodoView {
     pub(super) fn schedule_drag_expand(&mut self, target: DragExpandTarget, cx: &mut Context<Self>) {
-        if self.drag_expand.as_ref().is_some_and(|(cur, _)| *cur == target) {
+        if self.panel_dnd.drag_expand.as_ref().is_some_and(|(cur, _)| *cur == target) {
             return;
         }
         let scheduled = target.clone();
@@ -35,17 +35,17 @@ impl TodoView {
             cx.background_executor().timer(std::time::Duration::from_millis(900)).await;
             let _ = this.update(cx, |this, cx| {
                 if !cx.has_active_drag() {
-                    this.drag_expand = None;
+                    this.panel_dnd.drag_expand = None;
                     return;
                 }
-                if !this.drag_expand.as_ref().is_some_and(|(cur, _)| *cur == scheduled) {
+                if !this.panel_dnd.drag_expand.as_ref().is_some_and(|(cur, _)| *cur == scheduled) {
                     return;
                 }
-                this.drag_expand = None;
+                this.panel_dnd.drag_expand = None;
                 match scheduled {
                     DragExpandTarget::Folder(id) => {
                         if this.collapsed_folders.remove(&id) {
-                            if let Some(drag) = this.panel_drag.as_mut()
+                            if let Some(drag) = this.panel_dnd.panel_drag.as_mut()
                                 && let lists_panel::ActiveDragItem::List(dragged_id) = drag.item
                             {
                                 drag.highlight = None;
@@ -56,7 +56,7 @@ impl TodoView {
                     }
                     DragExpandTarget::Tag(tag) => {
                         if this.collapsed_tags.remove(&tag) {
-                            if let Some(drag) = this.panel_drag.as_mut()
+                            if let Some(drag) = this.panel_dnd.panel_drag.as_mut()
                                 && let lists_panel::ActiveDragItem::Tag(dragged_name) = drag.item.clone()
                             {
                                 drag.highlight = None;
@@ -68,7 +68,7 @@ impl TodoView {
                 }
             });
         });
-        self.drag_expand = Some((target, task));
+        self.panel_dnd.drag_expand = Some((target, task));
     }
 
     pub(super) fn persist_collapsed_sidebar_sets(&mut self) {
@@ -93,8 +93,8 @@ impl TodoView {
             }
             PanelEvent::ToggleArchived => self.archived_open = !self.archived_open,
             PanelEvent::AddTag => return self.open_tag_dialog(None, None, window, cx),
-            PanelEvent::TagsMenu(at) => self.list_menu = Some((ListMenuTarget::TagsHeading, at)),
-            PanelEvent::SmartMenu(list, at) => self.list_menu = Some((ListMenuTarget::Smart(list), at)),
+            PanelEvent::TagsMenu(at) => self.overlays.list_menu = Some((ListMenuTarget::TagsHeading, at)),
+            PanelEvent::SmartMenu(list, at) => self.overlays.list_menu = Some((ListMenuTarget::Smart(list), at)),
             PanelEvent::ToggleTags => {
                 self.tags_collapsed = !self.tags_collapsed;
                 let result = self.store.set_setting("tags_collapsed", if self.tags_collapsed { "1" } else { "0" });
@@ -108,9 +108,9 @@ impl TodoView {
                 let result = self.store.set_setting("collapsed_tags", &value.join("\n"));
                 self.check(result);
             }
-            PanelEvent::TagMenu(tag, at) => self.list_menu = Some((ListMenuTarget::Tag(tag), at)),
-            PanelEvent::ListMenu(id, at) => self.list_menu = Some((ListMenuTarget::List(id), at)),
-            PanelEvent::FolderMenu(id, at) => self.list_menu = Some((ListMenuTarget::Folder(id), at)),
+            PanelEvent::TagMenu(tag, at) => self.overlays.list_menu = Some((ListMenuTarget::Tag(tag), at)),
+            PanelEvent::ListMenu(id, at) => self.overlays.list_menu = Some((ListMenuTarget::List(id), at)),
+            PanelEvent::FolderMenu(id, at) => self.overlays.list_menu = Some((ListMenuTarget::Folder(id), at)),
             PanelEvent::StartDrag { item, grab_offset_y } => {
                 self.start_panel_drag(item, grab_offset_y, cx);
                 return;
@@ -121,9 +121,9 @@ impl TodoView {
 
     pub(super) fn measure_non_dragged_block_spans(&self, item: &lists_panel::ActiveDragItem) -> Vec<f32> {
         use lists_panel::{ActiveDragItem, PanelChild};
-        let rows = self.lists_rows.borrow();
-        let item_top = |ix: usize| self.lists_scroll.bounds_for_item(ix).map_or(0., |b| f32::from(b.top()));
-        let item_bot = |ix: usize| self.lists_scroll.bounds_for_item(ix).map_or(0., |b| f32::from(b.bottom()));
+        let rows = self.panel_dnd.lists_rows.borrow();
+        let item_top = |ix: usize| self.panel_dnd.lists_scroll.bounds_for_item(ix).map_or(0., |b| f32::from(b.top()));
+        let item_bot = |ix: usize| self.panel_dnd.lists_scroll.bounds_for_item(ix).map_or(0., |b| f32::from(b.bottom()));
 
         match item {
             ActiveDragItem::SidebarSection(dragged_sec) => {
@@ -229,8 +229,8 @@ impl TodoView {
     }
 
     pub(super) fn start_panel_drag(&mut self, item: lists_panel::ActiveDragItem, grab_offset_y: f32, cx: &mut Context<Self>) {
-        self.drag_expand = None;
-        self.list_menu = None;
+        self.panel_dnd.drag_expand = None;
+        self.overlays.list_menu = None;
         let block_spans = self.measure_non_dragged_block_spans(&item);
         let orig_tag_pinned = match &item {
             lists_panel::ActiveDragItem::Tag(name) => {
@@ -249,7 +249,7 @@ impl TodoView {
         normalize_lists_in_memory(&mut self.lists, &self.folders);
         normalize_tags_in_memory(&mut self.tags);
 
-        self.panel_drag = Some(PanelDragState {
+        self.panel_dnd.panel_drag = Some(PanelDragState {
             item,
             grab_offset_y,
             highlight: None,
@@ -267,8 +267,8 @@ impl TodoView {
     }
 
     pub(super) fn restore_panel_drag_snapshot(&mut self) -> bool {
-        self.drag_expand = None;
-        let Some(drag) = self.panel_drag.take() else { return false };
+        self.panel_dnd.drag_expand = None;
+        let Some(drag) = self.panel_dnd.panel_drag.take() else { return false };
         self.preferences = drag.orig_preferences;
         self.lists = drag.orig_lists;
         self.folders = drag.orig_folders;
@@ -276,6 +276,7 @@ impl TodoView {
         self.filters = drag.orig_filters;
         self.collapsed_folders = drag.orig_collapsed_folders;
         self.collapsed_tags = drag.orig_collapsed_tags;
+        self.panel_dnd.lists_index_dirty = true;
         true
     }
 
@@ -302,8 +303,8 @@ impl TodoView {
 
     pub(super) fn finish_panel_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use lists_panel::{ActiveDragItem, HighlightTarget};
-        self.drag_expand = None;
-        let Some(drag) = self.panel_drag.take() else { return };
+        self.panel_dnd.drag_expand = None;
+        let Some(drag) = self.panel_dnd.panel_drag.take() else { return };
         cx.stop_active_drag(window);
 
         let collapsed_changed = self.collapsed_folders != drag.orig_collapsed_folders
@@ -396,14 +397,14 @@ impl TodoView {
     }
 
     pub(super) fn lists_panel_content_y(&self, mouse_pos: Point<Pixels>, cx: &mut Context<Self>) -> f32 {
-        let viewport = self.lists_scroll.bounds();
-        let max_y = self.lists_scroll.max_offset().y;
+        let viewport = self.panel_dnd.lists_scroll.bounds();
+        let max_y = self.panel_dnd.lists_scroll.max_offset().y;
         if max_y > px(0.)
             && viewport.size.height > px(64.)
             && mouse_pos.x >= viewport.left() - px(24.)
             && mouse_pos.x <= viewport.right() + px(80.)
         {
-            let cur = self.lists_scroll.offset();
+            let cur = self.panel_dnd.lists_scroll.offset();
             let edge = px(28.);
             let next_y = if mouse_pos.y < viewport.top() + edge && cur.y < px(0.) {
                 (cur.y + px(8.)).min(px(0.))
@@ -413,11 +414,11 @@ impl TodoView {
                 cur.y
             };
             if next_y != cur.y {
-                self.lists_scroll.set_offset(gpui::point(cur.x, next_y));
+                self.panel_dnd.lists_scroll.set_offset(gpui::point(cur.x, next_y));
                 cx.notify();
             }
         }
-        f32::from(mouse_pos.y - self.lists_scroll.offset().y)
+        f32::from(mouse_pos.y - self.panel_dnd.lists_scroll.offset().y)
     }
 }
 

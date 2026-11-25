@@ -14,8 +14,8 @@ fn report_lines_and_markdown() {
         fields: vec![Field::Status, Field::CompletionTime, Field::Tag, Field::Title],
         ..Default::default()
     };
-    let groups = summarize(&tasks, &options, today, calendar::week_start());
-    let report = report(&groups, &options, &[], today, &EN);
+    let groups = summarize(&tasks, &options, today, chrono::Weekday::Mon);
+    let report = report(&groups, &options, &[], today, chrono::Weekday::Mon, false, &EN);
     let day = short_date(today, &EN);
     assert_eq!(report.groups, [("Completed".to_owned(), vec![format!("[x] [{day}] Ship it #work")])]);
     assert_eq!(report.markdown(), format!("# {day}\n\n## Completed\n- [x] [{day}] Ship it #work\n"));

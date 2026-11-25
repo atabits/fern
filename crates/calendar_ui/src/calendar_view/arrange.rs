@@ -9,7 +9,12 @@ use super::CalendarView;
 impl CalendarView {
     /// The original's "Arrange tasks" panel at the calendar's right: the open tasks without a
     /// date under Lists, Tags or Priority tabs, dragged onto a day to plan them.
-    pub(super) fn render_arrange(&self, tab: usize, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_arrange(
+        &self,
+        tab: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let mut groups: Vec<(String, Vec<&Task>)> = Vec::new();
@@ -131,7 +136,7 @@ impl CalendarView {
             .flex_none()
             .h_full()
             .px_3()
-            .pt(crate::title_bar::height() + px(4.))
+            .pt(crate::title_bar::height(window, cx) + px(4.))
             .gap_2()
             .border_l_1()
             .border_color(theme.colors().border_variant)

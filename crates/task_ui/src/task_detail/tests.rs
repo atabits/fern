@@ -512,3 +512,54 @@ fn list_menu_search() {
     assert!(list_matches("Входящие", "вх"));
     assert!(!list_matches("Work", "home"));
 }
+
+#[gpui::test]
+fn text_edits_debounce_coalesce_and_flush_on_task_switch(cx: &mut gpui::TestAppContext) {
+    cx.update(theme::init);
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let first = store.add_task("Original").unwrap();
+    let second = store.add_task("Second").unwrap();
+    let edited_count = Rc::new(std::cell::Cell::new(0usize));
+    let flushed_ids = Rc::new(std::cell::RefCell::new(Vec::new()));
+
+    let (view, cx) = cx.add_window_view(|window, cx| TaskDetail::new(store.clone(), window, cx));
+    cx.simulate_resize(gpui::size(px(800.), px(600.)));
+    cx.update(|_, cx| {
+        let edited_count = edited_count.clone();
+        let flushed_ids = flushed_ids.clone();
+        cx.subscribe(&view, move |_, _: &TaskTextEdited, _| {
+            edited_count.set(edited_count.get() + 1);
+        })
+        .detach();
+        cx.subscribe(&view, move |_, event: &TaskTextFlushed, _| {
+            flushed_ids.borrow_mut().push(event.0);
+        })
+        .detach();
+        view.update(cx, |detail, cx| detail.show(Some(first.clone()), cx));
+    });
+    cx.run_until_parked();
+
+    let title_bounds = cx.debug_bounds("task-detail-title").expect("detail title bounds");
+    cx.simulate_click(title_bounds.center(), gpui::Modifiers::default());
+    cx.simulate_input("!");
+    cx.simulate_input("?");
+    cx.run_until_parked();
+
+    assert_eq!(edited_count.get(), 2, "keystrokes emit immediate in-memory updates");
+    assert!(flushed_ids.borrow().is_empty(), "SQLite write is debounced within 250ms");
+    assert_eq!(store.task(first.id).unwrap().unwrap().title, "Original");
+
+    // Switching tasks flushes the coalesced edit synchronously without waiting 250ms.
+    cx.update(|_, cx| view.update(cx, |detail, cx| detail.show(Some(second.clone()), cx)));
+    cx.run_until_parked();
+    assert_eq!(store.task(first.id).unwrap().unwrap().title, "Original!?");
+    assert_eq!(flushed_ids.borrow().as_slice(), &[first.id]);
+
+    // Waiting past the 250ms window flushes notes edits normally.
+    cx.update(|window, cx| window.focus(&view.read(cx).notes.focus_handle(cx), cx));
+    cx.simulate_input("hello");
+    cx.executor().advance_clock(std::time::Duration::from_millis(260));
+    cx.run_until_parked();
+    assert_eq!(store.task(second.id).unwrap().unwrap().notes, "hello");
+    assert_eq!(flushed_ids.borrow().as_slice(), &[first.id, second.id]);
+}

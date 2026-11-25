@@ -1,11 +1,24 @@
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{OptionalExtension as _, params};
 use uuid::Uuid;
 
 use crate::focus::FocusSession;
 use crate::model::Id;
 
 use super::{Store, now_ms, parse_uuid};
+
+fn focus_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FocusSession> {
+    Ok(FocusSession {
+        id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+        task_id: row.get::<_, Option<String>>(1)?.map(|t| parse_uuid(&t, 1)).transpose()?,
+        habit_id: row.get::<_, Option<String>>(2)?.map(|h| parse_uuid(&h, 2)).transpose()?,
+        title: row.get(3)?,
+        started_at: row.get(4)?,
+        ended_at: row.get(5)?,
+        stopwatch: row.get(6)?,
+        note: row.get(7)?,
+    })
+}
 
 impl Store {
     /// Records a finished focus session.
@@ -143,19 +156,19 @@ impl Store {
             "SELECT id, task_id, habit_id, title, started_at, ended_at, stopwatch, note FROM focus_sessions ORDER BY started_at DESC",
         )?;
         let sessions = stmt
-            .query_map([], |row| {
-                Ok(FocusSession {
-                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
-                    task_id: row.get::<_, Option<String>>(1)?.map(|t| parse_uuid(&t, 1)).transpose()?,
-                    habit_id: row.get::<_, Option<String>>(2)?.map(|h| parse_uuid(&h, 2)).transpose()?,
-                    title: row.get(3)?,
-                    started_at: row.get(4)?,
-                    ended_at: row.get(5)?,
-                    stopwatch: row.get(6)?,
-                    note: row.get(7)?,
-                })
-            })?
+            .query_map([], focus_session_from_row)?
             .collect::<Result<_, _>>()?;
         Ok(sessions)
+    }
+
+    /// Loads a single focus session by ID without scanning the whole table.
+    pub fn focus_session(&self, id: Id) -> Result<Option<FocusSession>> {
+        self.conn
+            .prepare_cached(
+                "SELECT id, task_id, habit_id, title, started_at, ended_at, stopwatch, note FROM focus_sessions WHERE id = ?1",
+            )?
+            .query_row([id.to_string()], focus_session_from_row)
+            .optional()
+            .map_err(Into::into)
     }
 }

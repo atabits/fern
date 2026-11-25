@@ -273,7 +273,9 @@ fn cached_search_updates_on_data_version_filters_and_scrolls(cx: &mut gpui::Test
         assert_eq!(m.habits.len(), 9);
         assert_eq!(m.tags.len(), 2);
         assert_eq!(m.lists.len(), 2);
-        assert_eq!(m.results_scroll.offset().y, px(0.));
+        let top = m.results_list_state.logical_scroll_top();
+        assert_eq!(top.item_ix, 0);
+        assert_eq!(top.offset_in_item, px(0.));
     });
 
     cx.update(|_, cx| {
@@ -285,9 +287,10 @@ fn cached_search_updates_on_data_version_filters_and_scrolls(cx: &mut gpui::Test
     });
     cx.run_until_parked();
     cx.update(|_, cx| {
+        let top = modal.read(cx).results_list_state.logical_scroll_top();
         assert!(
-            modal.read(cx).results_scroll.offset().y < px(0.),
-            "moving selection past visible fold must scroll results_scroll"
+            top.item_ix > 0 || top.offset_in_item > px(0.),
+            "moving selection past visible fold must scroll results list: {top:?}"
         );
     });
 
@@ -307,7 +310,9 @@ fn cached_search_updates_on_data_version_filters_and_scrolls(cx: &mut gpui::Test
     });
     cx.run_until_parked();
     cx.update(|_, cx| {
-        assert_eq!(modal.read(cx).results_scroll.offset().y, px(0.));
+        let top = modal.read(cx).results_list_state.logical_scroll_top();
+        assert_eq!(top.item_ix, 0);
+        assert_eq!(top.offset_in_item, px(0.));
     });
 }
 

@@ -2,6 +2,7 @@
 //! its Filter and Display Options on the right, and "Copy" to take it as Markdown.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use chrono::{Local, NaiveDate};
 use fern_core::markdown::{self, Format};
@@ -37,7 +38,7 @@ enum Menu {
 
 /// Cached summary report & filter metadata so `SummaryView::render()` performs zero SQLite reads.
 struct CachedSummary {
-    report: Report,
+    report: Arc<Report>,
     lists: Vec<List>,
     tags: Vec<fern_core::Tag>,
     templates: Vec<fern_core::summary::SummaryTemplate>,
@@ -58,9 +59,7 @@ pub struct SummaryView {
     cache: Option<CachedSummary>,
     /// Set whenever options, templates, locale, or `DataVersion` change.
     cache_dirty: bool,
-    /// Lazily registers global `DataVersion` and `CurrentLocale` observers on first context access.
-    observers_registered: bool,
-    /// Whether this view is currently visible; hidden views defer `cx.notify()` until shown.
+    /// Whether this view is currently visible; hidden views defer rebuilds until shown.
     active: bool,
     #[cfg(test)]
     rebuild_count: usize,
@@ -129,15 +128,15 @@ fn percent_encode(text: &str) -> String {
         .collect()
 }
 
-pub fn period_label(period: Period, today: NaiveDate, strings: &Strings) -> String {
+pub fn period_label(period: Period, today: NaiveDate, week_start: chrono::Weekday, strings: &Strings) -> String {
     let Some(index) = Period::ALL.iter().position(|p| *p == period) else {
-        let (first, last) = period.range(today, calendar::week_start());
+        let (first, last) = period.range(today, week_start);
         return format!("{} - {}", short_date(first, strings), short_date(last, strings));
     };
     let name = strings.summary_periods[index];
     match period {
         Period::ThisWeek | Period::NextWeek | Period::LastWeek => {
-            let (first, last) = period.range(today, calendar::week_start());
+            let (first, last) = period.range(today, week_start);
             format!("{name} ({} - {})", short_date(first, strings), short_date(last, strings))
         }
         _ => name.to_owned(),
@@ -167,7 +166,7 @@ fn group_title(key: &GroupKey, lists: &[List], strings: &Strings) -> String {
 }
 
 /// One task's line with the chosen fields: "[x] [Oct 17] Title · Oct 20 · Work #home".
-fn line(task: &Task, fields: &[Field], lists: &[List], strings: &Strings) -> String {
+fn line(task: &Task, fields: &[Field], lists: &[List], hour12: bool, strings: &Strings) -> String {
     let mut out = String::new();
     if fields.contains(&Field::Status) {
         out.push_str(if task.is_completed() { "[x] " } else if task.is_wont_do() { "[-] " } else { "[ ] " });
@@ -183,7 +182,7 @@ fn line(task: &Task, fields: &[Field], lists: &[List], strings: &Strings) -> Str
     {
         out.push_str(&format!(" · {}", short_date(due, strings)));
         if let Some(time) = task.due_time {
-            out.push_str(&format!(" {}", calendar::format_time(time, strings)));
+            out.push_str(&format!(" {}", calendar::format_time_with(time, hour12, strings)));
         }
     }
     if fields.contains(&Field::List) {
@@ -198,8 +197,16 @@ fn line(task: &Task, fields: &[Field], lists: &[List], strings: &Strings) -> Str
     out
 }
 
-pub fn report(groups: &[SummaryGroup], options: &SummaryOptions, lists: &[List], today: NaiveDate, strings: &Strings) -> Report {
-    let (first, last) = options.period.range(today, calendar::week_start());
+pub fn report(
+    groups: &[SummaryGroup],
+    options: &SummaryOptions,
+    lists: &[List],
+    today: NaiveDate,
+    week_start: chrono::Weekday,
+    hour12: bool,
+    strings: &Strings,
+) -> Report {
+    let (first, last) = options.period.range(today, week_start);
     let heading = if first == last {
         short_date(first, strings)
     } else {
@@ -207,7 +214,7 @@ pub fn report(groups: &[SummaryGroup], options: &SummaryOptions, lists: &[List],
     };
     let groups = groups
         .iter()
-        .map(|g| (group_title(&g.key, lists, strings), g.tasks.iter().map(|t| line(t, &options.fields, lists, strings)).collect()))
+        .map(|g| (group_title(&g.key, lists, strings), g.tasks.iter().map(|t| line(t, &options.fields, lists, hour12, strings)).collect()))
         .collect();
     Report { heading, groups }
 }
@@ -222,7 +229,7 @@ impl SummaryView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
         // The original keeps the Summary's choices; so does Fern, in the settings table.
         let options = store.summary_options().unwrap_or_default();
-        Self {
+        let mut this = Self {
             store,
             focus_handle: cx.focus_handle(),
             options,
@@ -231,7 +238,6 @@ impl SummaryView {
             copied_reset: None,
             cache: None,
             cache_dirty: true,
-            observers_registered: false,
             active: true,
             #[cfg(test)]
             rebuild_count: 0,
@@ -248,7 +254,19 @@ impl SummaryView {
             editing: false,
             heading_menu: false,
             pending_focus: false,
-        }
+        };
+        cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
+            if desktop_common::data_version::changed_elsewhere(cx.entity_id(), cx) {
+                this.invalidate_cache(cx);
+            }
+        })
+        .detach();
+        cx.observe_global::<i18n::CurrentLocale>(|this, cx| {
+            this.invalidate_cache(cx);
+        })
+        .detach();
+        this.rebuild_cache(cx);
+        this
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
@@ -260,32 +278,14 @@ impl SummaryView {
             return;
         }
         self.active = active;
+        let today = Local::now().date_naive();
         if active
             && (self.cache_dirty
-                || self
-                    .cache
-                    .as_ref()
-                    .is_none_or(|c| c.today != Local::now().date_naive()))
+                || self.cache.as_ref().is_none_or(|c| c.today != today))
         {
+            self.rebuild_cache(cx);
             cx.notify();
         }
-    }
-
-    fn ensure_observers(&mut self, cx: &mut Context<Self>) {
-        if self.observers_registered {
-            return;
-        }
-        self.observers_registered = true;
-        cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
-            if desktop_common::data_version::changed_elsewhere(cx.entity_id(), cx) {
-                this.invalidate_cache(cx);
-            }
-        })
-        .detach();
-        cx.observe_global::<i18n::CurrentLocale>(|this, cx| {
-            this.invalidate_cache(cx);
-        })
-        .detach();
     }
 
     fn invalidate_cache(&mut self, cx: &mut Context<Self>) {
@@ -295,6 +295,7 @@ impl SummaryView {
             self.editor_initial.clear();
         }
         if self.active {
+            self.rebuild_cache(cx);
             cx.notify();
         }
     }
@@ -312,11 +313,11 @@ impl SummaryView {
     fn open_custom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let strings = i18n::t(cx);
         let today = Local::now().date_naive();
-        let (first, last) = self.options.period.range(today, calendar::week_start());
+        let (first, last) = self.options.period.range(today, calendar::week_start(cx));
         let field = |placeholder: &'static str, date: NaiveDate, cx: &mut Context<Self>| {
             let input = cx.new(|cx| {
                 let mut input = TextInput::new(Mode::SingleLine, placeholder, cx);
-                input.set_text(calendar::format_date(date, strings), cx);
+                input.set_text(calendar::format_date(date, strings, cx), cx);
                 input
             });
             cx.subscribe_in(&input, window, |this, _, _: &Submitted, window, cx| {
@@ -375,7 +376,7 @@ impl SummaryView {
                 self.refresh_templates(cx);
             }
             Err(err) => {
-                eprintln!("failed to save the summary template: {err:#}");
+                desktop_common::logging::log_error("summary_ui", format!("failed to save the summary template: {err:#}"));
                 cx.notify();
             }
         }
@@ -385,7 +386,7 @@ impl SummaryView {
         let Some((start, end)) = &self.custom else { return };
         let strings = i18n::t(cx);
         let today = Local::now().date_naive();
-        let parse = |input: &Entity<TextInput>| calendar::parse_date(input.read(cx).text(), today, strings);
+        let parse = |input: &Entity<TextInput>| calendar::parse_date(input.read(cx).text(), today, strings, cx);
         if let (Some(first), Some(last)) = (parse(start), parse(end)) {
             self.custom = None;
             self.update(cx, |o| o.period = Period::Custom(first, last));
@@ -457,7 +458,7 @@ impl SummaryView {
     fn apply_options(&mut self, options: SummaryOptions, cx: &mut Context<Self>) {
         self.options = options;
         if let Err(err) = self.store.save_summary_options(&self.options) {
-            eprintln!("failed to save the summary options: {err:#}");
+            desktop_common::logging::log_error("summary_ui", format!("failed to save the summary options: {err:#}"));
         }
         self.copied = false;
         self.copied_reset = None;
@@ -497,7 +498,7 @@ impl SummaryView {
             }
         } else {
             if self.editor.is_none() {
-                let markdown = self.ensure_cache(cx).report.markdown();
+                let markdown = self.rebuild_cache(cx).report.markdown();
                 self.editor_initial = markdown.clone();
                 self.editor = Some(cx.new(|cx| {
                     let mut input = TextInput::new(Mode::MultiLine, "", cx);
@@ -528,7 +529,7 @@ impl SummaryView {
             let selection = input.selection();
             let (text, selection) = match format {
                 Some(format) => markdown::apply(input.text(), selection, format),
-                None => markdown::insert(input.text(), selection, &calendar::format_time(Local::now().time(), i18n::t(cx))),
+                None => markdown::insert(input.text(), selection, &calendar::format_time(Local::now().time(), i18n::t(cx), cx)),
             };
             input.edit(text, selection, window, cx);
         });
@@ -540,7 +541,8 @@ impl SummaryView {
 
     /// The original's toolbar over the edited report (see `markdown_toolbar`).
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let colors = cx.theme().colors().clone();
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
         let on_action: crate::markdown_toolbar::OnAction<Self> = std::rc::Rc::new(|this, action, window, cx| match action {
             crate::markdown_toolbar::ToolbarAction::Format(format) => this.format(format, window, cx),
             crate::markdown_toolbar::ToolbarAction::ToggleHeadings => {
@@ -606,7 +608,7 @@ impl SummaryView {
             });
             cx.spawn(async move |this, cx| {
                 if let Err(err) = task.await {
-                    eprintln!("failed to export summary image: {err}");
+                    desktop_common::logging::log_error("summary_ui", format!("failed to export summary image: {err}"));
                     this.update(cx, |this, cx| {
                         this.saved = Some(err);
                         cx.notify();
@@ -626,8 +628,7 @@ impl SummaryView {
         cx.notify();
     }
 
-    fn ensure_cache(&mut self, cx: &mut Context<Self>) -> &CachedSummary {
-        self.ensure_observers(cx);
+    fn rebuild_cache(&mut self, cx: &mut Context<Self>) -> &CachedSummary {
         let today = Local::now().date_naive();
         let locale = cx.try_global::<i18n::CurrentLocale>().map_or(i18n::Locale::En, |l| l.0);
         let needs_rebuild = self.cache_dirty
@@ -641,8 +642,9 @@ impl SummaryView {
             let lists = self.store.lists().unwrap_or_default();
             let tags = self.store.tags().unwrap_or_default();
             let templates = self.store.summary_templates().unwrap_or_default();
-            let groups = summarize(&tasks, &self.options, today, calendar::week_start());
-            let mut report = report(&groups, &self.options, &lists, today, strings);
+            let prefs = desktop_common::ActivePreferences::get(cx);
+            let groups = summarize(&tasks, &self.options, today, prefs.week_start);
+            let mut report = report(&groups, &self.options, &lists, today, prefs.week_start, prefs.hour12, strings);
             let sessions = if self.options.fields.contains(&Field::Focus) {
                 self.store.focus_sessions().unwrap_or_default()
             } else {
@@ -653,7 +655,7 @@ impl SummaryView {
             if self.options.habits {
                 let habits = self.store.habits().unwrap_or_default();
                 let checkins = self.store.all_habit_done_dates().unwrap_or_default();
-                let rows = fern_core::summary::habit_checkins(&habits, &checkins, &self.options, today, calendar::week_start());
+                let rows = fern_core::summary::habit_checkins(&habits, &checkins, &self.options, today, prefs.week_start);
                 if !rows.is_empty() {
                     let lines = rows
                         .into_iter()
@@ -675,7 +677,14 @@ impl SummaryView {
                     self.editor_initial.clear();
                 }
             }
-            self.cache = Some(CachedSummary { report, lists, tags, templates, today, locale });
+            self.cache = Some(CachedSummary {
+                report: Arc::new(report),
+                lists,
+                tags,
+                templates,
+                today,
+                locale,
+            });
             self.cache_dirty = false;
             #[cfg(test)]
             {
@@ -690,7 +699,7 @@ impl SummaryView {
     fn export_snapshot(&mut self, cx: &mut Context<Self>) -> (Report, String, String) {
         let strings = i18n::t(cx);
         let edited = self.edited_markdown(cx);
-        let report = &self.ensure_cache(cx).report;
+        let report = Arc::clone(&self.rebuild_cache(cx).report);
         let subject = format!("{} {}", strings.summary, report.heading);
         let markdown = edited.clone().unwrap_or_else(|| report.markdown());
         let mailto = match &edited {
@@ -708,9 +717,26 @@ impl Render for SummaryView {
             window.focus(&self.focus_handle, cx);
         }
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
-        self.ensure_cache(cx);
-        let report = self.cache.as_ref().expect("summary cache populated").report.clone();
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
+        let today = Local::now().date_naive();
+        let locale = cx.try_global::<i18n::CurrentLocale>().map_or(i18n::Locale::En, |l| l.0);
+        if self.cache_dirty
+            || self
+                .cache
+                .as_ref()
+                .is_none_or(|c| c.today != today || c.locale != locale)
+        {
+            cx.defer_in(window, |this, _, cx| {
+                this.rebuild_cache(cx);
+                cx.notify();
+            });
+        }
+        let report = self
+            .cache
+            .as_ref()
+            .map(|c| Arc::clone(&c.report))
+            .unwrap_or_else(|| Arc::new(Report { heading: String::new(), groups: Vec::new() }));
         let empty = report.groups.is_empty();
         let edited = self.edited_markdown(cx);
         let has_manual_edits = edited.is_some();
@@ -754,16 +780,16 @@ impl Render for SummaryView {
             .when(editor.is_none() && !has_manual_edits && empty, |el| {
                 el.child(Label::new(strings.summary_empty).color(Color::Muted))
             })
-            .children(report.groups.into_iter().filter(|_| editor.is_none() && !has_manual_edits).map(|(title, lines)| {
+            .children(report.groups.iter().filter(|_| editor.is_none() && !has_manual_edits).map(|(title, lines)| {
                 v_flex()
                     .pt_1()
-                    .child(div().pb_1().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(title))
-                    .children(lines.into_iter().map(|line| {
+                    .child(div().pb_1().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(title.clone()))
+                    .children(lines.iter().map(|line| {
                         h_flex()
                             .gap_2()
                             .pl_1()
                             .child(div().size(px(5.)).rounded_full().bg(colors.accent))
-                            .child(Label::new(line))
+                            .child(Label::new(line.clone()))
                     }))
             }));
 
@@ -786,7 +812,7 @@ impl Render for SummaryView {
                     .h_full()
                     .child(
                         h_flex()
-                            .mt(crate::title_bar::header_inset())
+                            .mt(crate::title_bar::header_inset(window, cx))
                             .h(px(52.))
                             .px_4()
                             .gap_2()
@@ -845,7 +871,7 @@ impl Render for SummaryView {
                                                     let (export, _, _) = this.export_snapshot(cx);
                                                     let html = crate::print::report_html(&export.heading, &export.groups);
                                                     if let Err(err) = crate::print::open("summary", &html) {
-                                                        eprintln!("failed to open the summary for printing: {err:#}");
+                                                        desktop_common::logging::log_error("summary_ui", format!("failed to open the summary for printing: {err:#}"));
                                                     }
                                                     cx.notify();
                                                 })),
@@ -948,14 +974,17 @@ impl Render for SummaryView {
                         }),
                     ),
             )
-            .child(self.render_options(cx))
+            .child(self.render_options(window, cx))
             .when_some(self.pending_options.clone(), |el, next| {
                 el.child(
-                    ConfirmDialog::new("summary-overwrite", strings.summary_overwrite_title)
+                    ConfirmDialog::new(
+                        "summary-overwrite",
+                        strings.summary_overwrite_title,
+                        strings.cancel,
+                        strings.confirm,
+                    )
                         .width(px(360.))
                         .description(strings.summary_overwrite_message)
-                        .cancel_label(strings.cancel)
-                        .confirm_label(strings.confirm)
                         .on_cancel(cx.listener(|this, _, _, cx| {
                             this.pending_options = None;
                             cx.notify();
@@ -972,11 +1001,14 @@ impl Render for SummaryView {
                         .inset_0()
                         .when(cfg!(test), |el| el.debug_selector(|| "summary-template-delete-modal".to_owned()))
                         .child(
-                            ConfirmDialog::new("summary-template-delete", strings.confirm_delete_summary_template)
+                            ConfirmDialog::new(
+                                "summary-template-delete",
+                                strings.confirm_delete_summary_template,
+                                strings.cancel,
+                                strings.delete,
+                            )
                                 .width(px(340.))
                                 .description(name)
-                                .cancel_label(strings.cancel)
-                                .confirm_label(strings.delete)
                                 .destructive(true)
                                 .on_cancel(cx.listener(|this, _, _, cx| {
                                     this.confirm_delete_template = None;
@@ -985,7 +1017,7 @@ impl Render for SummaryView {
                                 .on_confirm(cx.listener(move |this, _, _, cx| {
                                     this.confirm_delete_template = None;
                                     if let Err(err) = this.store.delete_summary_template(id) {
-                                        eprintln!("failed to delete the summary template: {err:#}");
+                                        desktop_common::logging::log_error("summary_ui", format!("failed to delete the summary template: {err:#}"));
                                     }
                                     this.refresh_templates(cx);
                                     desktop_common::data_version::data_changed(cx.entity_id(), cx);

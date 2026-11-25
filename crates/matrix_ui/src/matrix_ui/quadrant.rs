@@ -96,16 +96,37 @@ pub fn arrange(
     today: NaiveDate,
     strings: &Strings,
 ) -> Vec<(String, Vec<Task>)> {
-    arrange_with_manual(tasks, view, lists, today, strings, &[])
+    arrange_with_horizons(tasks, view, lists, today, strings, &[], false)
 }
 
 pub(super) fn arrange_with_manual(
+    tasks: Vec<Task>,
+    view: QuadrantView,
+    lists: &[List],
+    today: NaiveDate,
+    strings: &Strings,
+    manual_order: &[Id],
+    cx: &App,
+) -> Vec<(String, Vec<Task>)> {
+    arrange_with_horizons(
+        tasks,
+        view,
+        lists,
+        today,
+        strings,
+        manual_order,
+        desktop_common::calendar::horizons_enabled(cx),
+    )
+}
+
+fn arrange_with_horizons(
     mut tasks: Vec<Task>,
     view: QuadrantView,
     lists: &[List],
     today: NaiveDate,
     strings: &Strings,
     manual_order: &[Id],
+    horizons_enabled: bool,
 ) -> Vec<(String, Vec<Task>)> {
     if !manual_order.is_empty() {
         let pos: HashMap<Id, usize> = manual_order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
@@ -148,7 +169,9 @@ pub(super) fn arrange_with_manual(
         }
         other => {
             let mut groups: Vec<(String, Vec<Task>)> = Vec::new();
-            for row in task_rows::grouped_rows(&tasks, other, today, false, strings) {
+            for row in
+                task_rows::grouped_rows_with(&tasks, other, today, false, horizons_enabled, strings)
+            {
                 match row {
                     task_rows::Row::Day { label, .. } => groups.push((label, Vec::new())),
                     task_rows::Row::Task { task, .. } => match groups.last_mut() {
@@ -298,7 +321,7 @@ impl MatrixView {
                                 this.views[quadrant] = next;
                                 let key = this.profile_setting_key(&format!("matrix_view_{quadrant}"));
                                 if let Err(err) = this.store.set_setting(&key, &next.to_storage()) {
-                                    eprintln!("failed to save the quadrant's view: {err:#}");
+                                    desktop_common::logging::log_error("matrix_ui", format!("failed to save the quadrant's view: {err:#}"));
                                 }
                                 this.menu_row = None;
                                 this.rebuild_cache(cx);
@@ -379,13 +402,15 @@ impl MatrixView {
         let countdown_dates = self.preferences.countdown_dates;
         let due = task
             .due_date
-            .map(|date| task_rows::row_due_label(date, task.due_time, today, strings, countdown_dates));
+            .map(|date| {
+                task_rows::row_due_label(date, task.due_time, today, strings, countdown_dates, cx)
+            });
         let badge_group = if completed {
             GroupBy::None
         } else {
             self.views[quadrant].group
         };
-        let horizon_badge = task_rows::horizon_badge_for_group(task, badge_group, today, strings);
+        let horizon_badge = task_rows::horizon_badge_for_group(task, badge_group, today, strings, cx);
         let has_notes = !is_note && !task.notes.trim().is_empty();
         let has_location = task.location.as_deref().is_some_and(|l| !l.trim().is_empty());
         let mut has_visible_children = false;
@@ -548,7 +573,7 @@ impl MatrixView {
                     })
                     .when_some(due, |el, (label, overdue)| {
                         let due_tip = match (countdown_dates, task.due_date) {
-                            (true, Some(d)) => format!("{} · {}", desktop_common::calendar::format_date(d, strings), strings.show_countdown_mode),
+                            (true, Some(d)) => format!("{} · {}", desktop_common::calendar::format_date(d, strings, cx), strings.show_countdown_mode),
                             _ => strings.show_countdown_mode.to_owned(),
                         };
                         el.child(
@@ -574,10 +599,14 @@ impl MatrixView {
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     cx.stop_propagation();
                                     if let Err(err) = this.store.update_preferences(|p| p.countdown_dates = !p.countdown_dates) {
-                                        eprintln!("failed to toggle countdown dates: {err:#}");
+                                        desktop_common::logging::log_error("matrix_ui", format!("failed to toggle countdown dates: {err:#}"));
                                     } else {
                                         this.preferences.countdown_dates = !this.preferences.countdown_dates;
-                                        desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                        desktop_common::data_version::data_changed_scoped(
+                                            cx.entity_id(),
+                                            desktop_common::data_version::DataScope::TASKS,
+                                            cx,
+                                        );
                                     }
                                     cx.notify();
                                 })),

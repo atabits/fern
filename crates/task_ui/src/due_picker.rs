@@ -315,7 +315,12 @@ pub fn all_day_parts(offset: i64) -> (u32, NaiveTime) {
 }
 
 /// The label of one reminder, with the time for all-day tasks: "1 day early (09:00)".
-pub fn describe_reminder(offset: i64, has_time: bool, strings: &Strings) -> String {
+pub fn describe_reminder(offset: i64, has_time: bool, strings: &Strings, cx: &gpui::App) -> String {
+    describe_reminder_with(offset, has_time, strings, crate::calendar::hour12(cx))
+}
+
+/// Pure variant of [`describe_reminder`] for headless/unit-test callers.
+pub fn describe_reminder_with(offset: i64, has_time: bool, strings: &Strings, hour12: bool) -> String {
     let fill = |template: &str, n: i64| template.replace("{n}", &n.to_string());
     let fill_days = |n: i64| if n == 1 { strings.reminders_all_day[1].to_owned() } else { fill(strings.reminder_days_early, n) };
     if has_time {
@@ -340,30 +345,41 @@ pub fn describe_reminder(offset: i64, has_time: bool, strings: &Strings) -> Stri
     } else {
         fill_days(days as i64)
     };
-    format!("{base} ({})", crate::calendar::format_time(at, strings))
+    format!("{base} ({})", crate::calendar::format_time_with(at, hour12, strings))
 }
 
 /// The reminder options for the draft, with a hint ("09:00" for all-day tasks).
-pub fn reminder_options(has_time: bool, strings: &Strings) -> Vec<(i64, &'static str, String)> {
+pub fn reminder_options(has_time: bool, strings: &Strings, cx: &gpui::App) -> Vec<(i64, &'static str, String)> {
+    reminder_options_with(has_time, strings, crate::calendar::hour12(cx))
+}
+
+/// Pure variant of [`reminder_options`] for headless/unit-test callers.
+pub fn reminder_options_with(has_time: bool, strings: &Strings, hour12: bool) -> Vec<(i64, &'static str, String)> {
     if has_time {
         TIMED_OFFSETS.into_iter().zip(strings.reminders_timed).map(|(m, label)| (m, label, String::new())).collect()
     } else {
-        let hint = crate::calendar::format_hour(ALL_DAY_REMINDER_HOUR, strings);
+        let hint = crate::calendar::format_hour_with(ALL_DAY_REMINDER_HOUR, hour12, strings);
         ALL_DAY_OFFSETS.into_iter().zip(strings.reminders_all_day).map(|(m, label)| (m, label, hint.clone())).collect()
     }
 }
 
 /// The Reminder row's label: the chosen reminders, or `None` for the plain "Reminder".
-pub fn reminder_label(reminders: &[i64], has_time: bool, strings: &Strings) -> Option<String> {
+pub fn reminder_label(reminders: &[i64], has_time: bool, strings: &Strings, cx: &gpui::App) -> Option<String> {
+    reminder_label_with(reminders, has_time, strings, crate::calendar::hour12(cx))
+}
+
+/// Pure variant of [`reminder_label`] for headless/unit-test callers.
+pub fn reminder_label_with(reminders: &[i64], has_time: bool, strings: &Strings, hour12: bool) -> Option<String> {
     if reminders.is_empty() {
         return None;
     }
+    let hint_suffix = format!(" ({})", crate::calendar::format_hour_with(ALL_DAY_REMINDER_HOUR, hour12, strings));
     let labels: Vec<String> = reminders
         .iter()
         .map(|offset| {
-            let label = describe_reminder(*offset, has_time, strings);
+            let label = describe_reminder_with(*offset, has_time, strings, hour12);
             // The row stays short: preset all-day reminders drop their usual "(09:00)".
-            label.strip_suffix(&format!(" ({})", crate::calendar::format_hour(ALL_DAY_REMINDER_HOUR, strings))).map(str::to_owned).unwrap_or(label)
+            label.strip_suffix(&hint_suffix).map(str::to_owned).unwrap_or(label)
         })
         .collect();
     Some(labels.join(", "))
@@ -376,9 +392,22 @@ pub fn range_label(
     end: NaiveDate,
     end_time: Option<NaiveTime>,
     strings: &Strings,
+    cx: &gpui::App,
+) -> String {
+    range_label_with(start, start_time, end, end_time, strings, crate::calendar::hour12(cx))
+}
+
+/// Pure variant of [`range_label`] for headless/unit-test callers.
+pub fn range_label_with(
+    start: NaiveDate,
+    start_time: Option<NaiveTime>,
+    end: NaiveDate,
+    end_time: Option<NaiveTime>,
+    strings: &Strings,
+    hour12: bool,
 ) -> String {
     let day = |date| crate::task_rows::short_date(date, strings);
-    let time = |t: Option<NaiveTime>| t.map(|t| crate::calendar::format_time(t, strings));
+    let time = |t: Option<NaiveTime>| t.map(|t| crate::calendar::format_time_with(t, hour12, strings));
     match (time(start_time), time(end_time)) {
         (Some(a), Some(b)) if start == end => format!("{}, {a} - {b}", day(start)),
         (Some(a), Some(b)) => format!("{}, {a} - {}, {b}", day(start), day(end)),
@@ -388,11 +417,16 @@ pub fn range_label(
 }
 
 /// The quick picks above the calendar: today, tomorrow, next week, next month.
-pub fn quick_dates(today: NaiveDate) -> [NaiveDate; 4] {
+pub fn quick_dates(today: NaiveDate, cx: &gpui::App) -> [NaiveDate; 4] {
+    quick_dates_with(today, calendar::week_start(cx))
+}
+
+/// Pure variant of [`quick_dates`] for headless/unit-test callers.
+pub fn quick_dates_with(today: NaiveDate, week_start: chrono::Weekday) -> [NaiveDate; 4] {
     [
         today,
         today + Duration::days(1),
-        fern_core::next_week_date(today, calendar::week_start()),
+        fern_core::next_week_date(today, week_start),
         today.checked_add_months(Months::new(1)).unwrap_or(today),
     ]
 }
@@ -583,11 +617,11 @@ mod tests {
         draft.toggle_reminder(24 * 60, today);
         draft.toggle_reminder(0, today);
         assert_eq!((draft.date, draft.reminders.as_slice()), (Some(today), [0, 24 * 60].as_slice()));
-        assert_eq!(reminder_label(&draft.reminders, false, &EN).as_deref(), Some("On the day, 1 day early"));
-        assert_eq!(reminder_label(&[30], true, &EN).as_deref(), Some("30 minutes early"));
+        assert_eq!(reminder_label_with(&draft.reminders, false, &EN, false).as_deref(), Some("On the day, 1 day early"));
+        assert_eq!(reminder_label_with(&[30], true, &EN, false).as_deref(), Some("30 minutes early"));
         draft.toggle_reminder(0, today);
         assert_eq!(draft.reminders, [24 * 60]);
-        assert_eq!(reminder_options(false, &EN)[0].2, "09:00");
+        assert_eq!(reminder_options_with(false, &EN, false)[0].2, "09:00");
     }
 
     #[test]
@@ -602,11 +636,11 @@ mod tests {
         assert_eq!(all_day_parts(7 * 24 * 60 + 30), (7, t(8, 30)));
         assert_eq!(CustomReminder { unit: ReminderUnit::Hour, amount: 2, at: t(9, 0) }.offset(true), 120);
 
-        assert_eq!(describe_reminder(120, true, &EN), "2 hours early");
-        assert_eq!(describe_reminder(45, true, &EN), "45 minutes early");
-        assert_eq!(describe_reminder(-9 * 60, false, &EN), "On the day (18:00)");
-        assert_eq!(describe_reminder(7 * 24 * 60 + 30, false, &EN), "1 week early (08:30)");
-        assert_eq!(reminder_label(&[24 * 60, 2 * 24 * 60 - 60], false, &EN).as_deref(), Some("1 day early, 2 days early (10:00)"));
+        assert_eq!(describe_reminder_with(120, true, &EN, false), "2 hours early");
+        assert_eq!(describe_reminder_with(45, true, &EN, false), "45 minutes early");
+        assert_eq!(describe_reminder_with(-9 * 60, false, &EN, false), "On the day (18:00)");
+        assert_eq!(describe_reminder_with(7 * 24 * 60 + 30, false, &EN, false), "1 week early (08:30)");
+        assert_eq!(reminder_label_with(&[24 * 60, 2 * 24 * 60 - 60], false, &EN, false).as_deref(), Some("1 day early, 2 days early (10:00)"));
     }
 
     #[test]
@@ -643,8 +677,8 @@ mod tests {
         draft.tab = DueTab::Date;
         assert_eq!(draft.end(), None, "the Date tab saves no duration");
 
-        assert_eq!(range_label(today, t(6), today, t(7), &EN), "Oct 18, 06:00 - 07:00");
-        assert_eq!(range_label(today, None, d(2026, 10, 20), None, &EN), "Oct 18 - Oct 20");
+        assert_eq!(range_label_with(today, t(6), today, t(7), &EN, false), "Oct 18, 06:00 - 07:00");
+        assert_eq!(range_label_with(today, None, d(2026, 10, 20), None, &EN, false), "Oct 18 - Oct 20");
     }
 
     #[test]
@@ -723,7 +757,7 @@ mod tests {
         draft.pick_repeat(Some(Recurrence::weekdays()), today);
         assert_eq!(draft.date, Some(today));
         assert_eq!(time_options().len(), 48);
-        assert_eq!(quick_dates(d(2026, 1, 31))[3], d(2026, 2, 28));
+        assert_eq!(quick_dates_with(d(2026, 1, 31), chrono::Weekday::Mon)[3], d(2026, 2, 28));
     }
 
     #[test]
@@ -792,14 +826,16 @@ mod tests {
     fn quick_dates_next_week_aligns_with_core_next_week_date() {
         let sunday = d(2026, 10, 18);
         let monday = d(2026, 10, 19);
-        assert_eq!(
-            quick_dates(sunday)[2],
-            fern_core::next_week_date(sunday, calendar::week_start())
-        );
-        assert_eq!(
-            quick_dates(monday)[2],
-            fern_core::next_week_date(monday, calendar::week_start())
-        );
+        for week_start in [chrono::Weekday::Mon, chrono::Weekday::Sun] {
+            assert_eq!(
+                quick_dates_with(sunday, week_start)[2],
+                fern_core::next_week_date(sunday, week_start)
+            );
+            assert_eq!(
+                quick_dates_with(monday, week_start)[2],
+                fern_core::next_week_date(monday, week_start)
+            );
+        }
     }
 
     #[test]

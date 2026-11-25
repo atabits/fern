@@ -72,7 +72,7 @@ pub(super) fn summary_parts(template: &str, counts: &[(&str, String)]) -> Vec<(S
 
 impl FocusView {
     pub(super) fn open_stats(&mut self, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         self.ensure_stats_data();
@@ -82,7 +82,7 @@ impl FocusView {
         self.stats = Some(StatsPage {
             tab: 2,
             day: today,
-            week: crate::calendar::week_of(today)[0],
+            week: crate::calendar::week_of(today, cx)[0],
             month: crate::calendar::month_start(today),
             year: today.year(),
             curves: [Bucket::Day; 4],
@@ -95,7 +95,7 @@ impl FocusView {
             details_period: Bucket::Day,
             details_day: today,
             details_menu: None,
-            timeline_week: crate::calendar::week_of(today)[0],
+            timeline_week: crate::calendar::week_of(today, cx)[0],
         });
         cx.notify();
     }
@@ -112,7 +112,7 @@ impl FocusView {
     }
 
     /// The original's Statistics page for focus: overview, Trends, Most Focused Time and the year grid.
-    pub(super) fn render_stats(&self, page: StatsPage, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_stats(&self, page: StatsPage, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Local::now().date_naive();
@@ -245,7 +245,7 @@ impl FocusView {
             )
             // As the original's, the week as a curve.
             .child({
-                let trend_labels: Vec<String> = crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|d| (*d).to_owned()).collect();
+                let trend_labels: Vec<String> = crate::calendar::weekday_labels(&strings.weekdays_short, cx).iter().map(|d| (*d).to_owned()).collect();
                 let trend_tips: Vec<String> = trend_labels.iter().zip(&week).map(|(l, v)| format!("{l} · {}", format_minutes(*v, strings))).collect();
                 line_chart("focus-trends", &week, trend_labels, trend_tips, CHART, true, cx)
             });
@@ -253,7 +253,7 @@ impl FocusView {
         // Timeline: the week's sessions as blocks on a day's hours, as in the original.
         const TIMELINE: f32 = 200.;
         let blocks = fern_core::focus::timeline(&self.sessions, page.timeline_week);
-        let timeline_label = if page.timeline_week == crate::calendar::week_of(today)[0] {
+        let timeline_label = if page.timeline_week == crate::calendar::week_of(today, cx)[0] {
             strings.stats_this_week.to_owned()
         } else {
             format!(
@@ -284,7 +284,7 @@ impl FocusView {
                     .items_start()
                     .gap_2()
                     .child(v_flex().w(px(40.)).h(px(TIMELINE)).justify_between().children((0..=6).map(|i| {
-                        Label::new(crate::calendar::format_hour((i * 4) % 24, strings)).size(LabelSize::XSmall).color(Color::Muted)
+                        Label::new(crate::calendar::format_hour((i * 4) % 24, strings, cx)).size(LabelSize::XSmall).color(Color::Muted)
                     })))
                     .child(
                         div()
@@ -295,7 +295,7 @@ impl FocusView {
                                 div().absolute().left_0().right_0().top(px(TIMELINE * i as f32 / 6.)).h(px(1.)).bg(grid_line)
                             }))
                             .child(h_flex().size_full().children((0..7).map(|day| {
-                                let weekday = crate::calendar::weekday_labels(&strings.weekdays_short)[day];
+                                let weekday = crate::calendar::weekday_labels(&strings.weekdays_short, cx)[day];
                                 div().flex_1().h_full().relative().children(
                                     blocks.iter().filter(|(d, _, _)| *d == day).enumerate().map(|(idx, (_, from, to))| {
                                         let top = TIMELINE * *from as f32 / 1440.;
@@ -303,7 +303,7 @@ impl FocusView {
                                         let fmt_min = |m: i64| {
                                             let clamped = m.clamp(0, 1439) as u32;
                                             chrono::NaiveTime::from_hms_opt(clamped / 60, clamped % 60, 0)
-                                                .map(|t| crate::calendar::format_time(t, strings))
+                                                .map(|t| crate::calendar::format_time(t, strings, cx))
                                                 .unwrap_or_default()
                                         };
                                         let tip = format!(
@@ -327,7 +327,7 @@ impl FocusView {
                             }))),
                     ),
             )
-            .child(h_flex().pl(px(48.)).children(crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|d| {
+            .child(h_flex().pl(px(48.)).children(crate::calendar::weekday_labels(&strings.weekdays_short, cx).iter().map(|d| {
                 div().flex_1().flex().justify_center().child(Label::new(*d).size(LabelSize::XSmall).color(Color::Muted))
             })));
 
@@ -357,7 +357,7 @@ impl FocusView {
                 hours
                     .iter()
                     .enumerate()
-                    .map(|(h, m)| format!("{} · {}", crate::calendar::format_hour(h as u32, strings), format_minutes(*m, strings)))
+                    .map(|(h, m)| format!("{} · {}", crate::calendar::format_hour(h as u32, strings, cx), format_minutes(*m, strings)))
                     .collect(),
                 most,
             ));
@@ -421,7 +421,7 @@ impl FocusView {
                                 .when(index < in_year, |el| {
                                     let day = first + chrono::Duration::days(index as i64);
                                     let mins = year_days[index];
-                                    let tip = format!("{} · {}", crate::calendar::format_date(day, strings), format_minutes(mins, strings));
+                                    let tip = format!("{} · {}", crate::calendar::format_date(day, strings, cx), format_minutes(mins, strings));
                                     el.bg(shade(mins)).tooltip(Tooltip::text(tip))
                                 })
                         }))
@@ -439,7 +439,7 @@ impl FocusView {
             .w_full()
             .max_w(px(1024.))
             .px_8()
-            .pt(crate::title_bar::height() + px(6.))
+            .pt(crate::title_bar::height(window, cx) + px(6.))
             .pb_4()
             .flex_none()
             .child(div().flex_1().child(div().text_size(px(28.)).font_weight(FontWeight::MEDIUM).child(strings.statistics)))
@@ -605,7 +605,8 @@ impl FocusView {
             Label::new(text).when(count, |l| l.weight(FontWeight::SEMIBOLD))
         }));
         // Each curve has its own Day / Week / Month switch, as in the original.
-        let periods = |curve: usize| stats::buckets(page.curves[curve], today, crate::calendar::week_start(), 7);
+        let week_start = crate::calendar::week_start(cx);
+        let periods = |curve: usize| stats::buckets(page.curves[curve], today, week_start, 7);
         let labels = |curve: usize| -> Vec<String> {
             let bucket = page.curves[curve];
             let periods = periods(curve);
@@ -709,8 +710,8 @@ impl FocusView {
         };
 
         // The week's habits: proportional daily progress respecting is_due and Undone.
-        let week_start = crate::calendar::week_start();
-        let week = crate::calendar::week_of(today);
+        let week_start = crate::calendar::week_start(cx);
+        let week = crate::calendar::week_of(today, cx);
         let habit_week = h_flex().justify_between().children(week.iter().map(|date| {
             let progress = fern_core::habit::day_progress(&self.stats_data.all_habits, &self.stats_data.habit_records, *date, week_start);
             let ring: AnyElement = match progress {
@@ -749,9 +750,9 @@ impl FocusView {
                 .into_any_element(),
             };
             let tip = match progress {
-                fern_core::DayProgress::Needless => crate::calendar::format_date(*date, strings),
-                fern_core::DayProgress::AllUndone => format!("{} · {}", crate::calendar::format_date(*date, strings), strings.habit_unachieved),
-                fern_core::DayProgress::Fraction(frac) => format!("{} · {}%", crate::calendar::format_date(*date, strings), (frac * 100.0).round() as u32),
+                fern_core::DayProgress::Needless => crate::calendar::format_date(*date, strings, cx),
+                fern_core::DayProgress::AllUndone => format!("{} · {}", crate::calendar::format_date(*date, strings, cx), strings.habit_unachieved),
+                fern_core::DayProgress::Fraction(frac) => format!("{} · {}%", crate::calendar::format_date(*date, strings, cx), (frac * 100.0).round() as u32),
             };
             v_flex()
                 .id(SharedString::from(format!("stats-habit-week-{date}")))
@@ -874,7 +875,7 @@ impl FocusView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let tasks = &self.stats_data.tasks;
-        let week_start = crate::calendar::week_start();
+        let week_start = crate::calendar::week_start(cx);
         let period = page.task_period;
         // The period containing a day, and the one before it.
         let range = |day: NaiveDate| stats::buckets(period, day, week_start, 1)[0];

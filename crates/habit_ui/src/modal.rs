@@ -452,7 +452,7 @@ impl HabitView {
         match id {
             Some(existing_id) => {
                 if let Err(err) = self.store.save_habit(existing_id, &draft) {
-                    eprintln!("failed to save habit: {err:#}");
+                    desktop_common::logging::log_error("habit_ui", format!("failed to save habit: {err:#}"));
                 }
             }
             None => match self.store.create_habit(&draft) {
@@ -460,7 +460,7 @@ impl HabitView {
                     self.show_archived = false;
                     self.selected = Some(created.id);
                 }
-                Err(err) => eprintln!("failed to create habit: {err:#}"),
+                Err(err) => desktop_common::logging::log_error("habit_ui", format!("failed to create habit: {err:#}")),
             },
         }
         self.notify_data_changed(cx);
@@ -565,7 +565,7 @@ impl HabitView {
         };
         let start_label = edit
             .start_date
-            .map(|d| desktop_common::calendar::format_date(d, strings))
+            .map(|d| desktop_common::calendar::format_date(d, strings, cx))
             .unwrap_or_else(|| strings.habit_start_anytime.to_owned());
         let goal_days_label = edit
             .goal_days
@@ -732,7 +732,7 @@ impl HabitView {
                     .flex_wrap()
                     .gap_1p5()
                     .children(edit.reminders.iter().enumerate().map(|(idx, &time)| {
-                        let label = calendar::format_time(time, strings);
+                        let label = calendar::format_time(time, strings, cx);
                         let picker_open = edit.reminder_picker == Some(Some(idx));
                         div()
                             .relative()

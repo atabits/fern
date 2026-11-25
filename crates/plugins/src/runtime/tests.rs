@@ -1923,3 +1923,117 @@ fn medium_batch_savepoint_filters_scripts_startup_and_http_secret_scrubbing() ->
     mgr.shutdown();
     Ok(())
 }
+
+#[test]
+fn plugin_sandbox_blocks_undeclared_views_reserved_ids_service_hijack_and_deep_json() -> Result<()> {
+    let env = TestEnv::new()?;
+
+    // Plugin declares NO views, yet tries to register `"__modal__"` and `"secret_view"`.
+    env.write_plugin(
+        "com.test.sneaky",
+        r#"{
+            "api_version": 1,
+            "id": "com.test.sneaky",
+            "name": "Sneaky",
+            "version": "1.0.0",
+            "entry": "index.js",
+            "permissions": ["services"],
+            "activation_events": ["onCommand:regModal", "onCommand:regUndeclared", "onCommand:regSvc", "onCommand:deepJson"],
+            "contributions": {
+                "commands": [
+                    { "id": "regModal", "title": "RegModal" },
+                    { "id": "regUndeclared", "title": "RegUndeclared" },
+                    { "id": "regSvc", "title": "RegSvc" },
+                    { "id": "deepJson", "title": "DeepJson" }
+                ]
+            }
+        }"#,
+        &[(
+            "index.js",
+            r#"
+            import fern from "fern";
+            import * as ui from "fern:ui";
+            export function activate() {
+                fern.commands.register("regModal", () => {
+                    fern.views.register("__modal__", { render: () => ui.text("hijack") });
+                });
+                fern.commands.register("regUndeclared", () => {
+                    fern.views.register("undeclared_view", { render: () => ui.text("nope") });
+                });
+                fern.commands.register("regSvc", () => {
+                    fern.services.provide("shared.svc", () => "hijacked");
+                });
+                fern.commands.register("deepJson", () => {
+                    let deep = { a: 1 };
+                    for (let i = 0; i < 80; i++) deep = { next: deep };
+                    return deep;
+                });
+            }
+            "#,
+        )],
+    )?;
+
+    env.write_plugin(
+        "com.test.owner",
+        r#"{
+            "api_version": 1,
+            "id": "com.test.owner",
+            "name": "Owner",
+            "version": "1.0.0",
+            "entry": "index.js",
+            "permissions": ["services"],
+            "activation_events": ["*"],
+            "contributions": {}
+        }"#,
+        &[(
+            "index.js",
+            r#"
+            import fern from "fern";
+            export function activate() {
+                fern.services.provide("shared.svc", () => "legit");
+            }
+            "#,
+        )],
+    )?;
+
+    let (mgr, _rx) = PluginManager::spawn(env.engine_config())?;
+    mgr.approve_permissions("com.test.owner")?;
+    mgr.approve_permissions("com.test.sneaky")?;
+
+    // Wait for Owner startup activation by calling deepJson (or triggering activation) via sneaky commands.
+    let err_modal = mgr.run_command("com.test.sneaky", "regModal", None).unwrap_err();
+    assert!(format!("{err_modal:#}").contains("reserved"), "expected reserved view rejection: {err_modal:#}");
+
+    let err_undecl = mgr.run_command("com.test.sneaky", "regUndeclared", None).unwrap_err();
+    assert!(format!("{err_undecl:#}").contains("not declared"), "expected undeclared view rejection: {err_undecl:#}");
+
+    // Service owned by com.test.owner cannot be hijacked by com.test.sneaky.
+    // Force owner activation first via outbox/app_ready.
+    mgr.emit_app_ready()?;
+    let err_svc = mgr.run_command("com.test.sneaky", "regSvc", None).unwrap_err();
+    assert!(format!("{err_svc:#}").contains("already registered"), "expected service hijack rejection: {err_svc:#}");
+
+    let deep_res = mgr.run_command("com.test.sneaky", "deepJson", None);
+    assert!(deep_res.is_err(), "expected JSON depth limit error");
+
+    mgr.shutdown();
+    Ok(())
+}
+
+#[test]
+fn json_to_js_enforces_max_depth() -> Result<()> {
+    let rt = rquickjs::AsyncRuntime::new()?;
+    let ctx = rquickjs::AsyncContext::full(&rt);
+    let mut deep = serde_json::json!(1);
+    for _ in 0..80 {
+        deep = serde_json::json!({ "nested": deep });
+    }
+    futures::executor::block_on(async {
+        let c = ctx.await?;
+        let res = c
+            .with(|c| crate::api::json_to_js(&c, &deep).map(|_| ()))
+            .await;
+        assert!(res.is_err(), "expected json_to_js depth limit error");
+        Ok::<_, anyhow::Error>(())
+    })
+}

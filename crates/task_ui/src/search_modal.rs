@@ -8,9 +8,12 @@ use chrono::Local;
 use desktop_common::plugin_bus::{PluginBus, PluginCommandSpec, PluginSearchHit};
 use fern_core::search::{DateRange, TagRule, TaskFilter};
 use fern_core::{Habit, Id, Kind, List, Priority, Store, Tag, Task, View};
-use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, ScrollHandle, StyledText};
+use gpui::{
+    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, ListAlignment,
+    ListState, StyledText, list,
+};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Placement, PopoverAttachment, VerticalScrollbar, popover};
 
 use crate::i18n;
 use crate::lists_panel;
@@ -54,6 +57,42 @@ pub enum SearchEvent {
     Dismissed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchGroup {
+    Tasks,
+    Habits,
+    Tags,
+    Lists,
+    PluginCommands,
+    Plugins,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchRow {
+    Heading(SearchGroup),
+    Task { idx: usize, selectable_idx: usize },
+    ViewMore,
+    Habit { idx: usize, selectable_idx: usize },
+    Tag { idx: usize, selectable_idx: usize },
+    List { idx: usize, selectable_idx: usize },
+    PluginCommand { idx: usize, selectable_idx: usize },
+    PluginHit { idx: usize, selectable_idx: Option<usize> },
+}
+
+impl SearchRow {
+    fn selectable_idx(self) -> Option<usize> {
+        match self {
+            Self::Task { selectable_idx, .. }
+            | Self::Habit { selectable_idx, .. }
+            | Self::Tag { selectable_idx, .. }
+            | Self::List { selectable_idx, .. }
+            | Self::PluginCommand { selectable_idx, .. } => Some(selectable_idx),
+            Self::PluginHit { selectable_idx, .. } => selectable_idx,
+            Self::Heading(_) | Self::ViewMore => None,
+        }
+    }
+}
+
 pub struct SearchModal {
     store: Rc<Store>,
     input: Entity<TextInput>,
@@ -70,7 +109,8 @@ pub struct SearchModal {
     all_habits: Vec<Habit>,
     all_lists: Vec<List>,
     all_tags: Vec<Tag>,
-    results_scroll: ScrollHandle,
+    results_rows: Vec<SearchRow>,
+    results_list_state: ListState,
     search_task: Option<gpui::Task<()>>,
     pending_search: bool,
     /// The Task filter's choices, the open dropdown, and the choices being made in it (applied
@@ -150,7 +190,8 @@ impl SearchModal {
             all_habits,
             all_lists,
             all_tags,
-            results_scroll: ScrollHandle::new(),
+            results_rows: Vec::new(),
+            results_list_state: ListState::new(0, ListAlignment::Top, px(200.)),
             search_task: None,
             pending_search: false,
             task_filter: TaskFilter::default(),
@@ -218,7 +259,7 @@ impl SearchModal {
                 .tasks_in_from(self.all_tasks.clone(), &View::Search(query.clone()), today)
                 .unwrap_or_default();
             if self.filter == Filter::Tasks {
-                let week_start = crate::calendar::week_start();
+                let week_start = crate::calendar::week_start(cx);
                 self.tasks
                     .retain(|task| self.task_filter.matches(task, today, week_start));
             }
@@ -243,7 +284,7 @@ impl SearchModal {
                 .collect();
         }
         self.selected = 0;
-        self.results_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.results_list_state.scroll_to_reveal_item(0);
         if self.filter != Filter::All || query.is_empty() {
             self.last_plugin_query.clear();
             self.plugin_hits.clear();
@@ -286,7 +327,86 @@ impl SearchModal {
         } else {
             self.selected = self.selected.min(count - 1);
         }
+        self.rebuild_results_rows(!query.is_empty());
         cx.notify();
+    }
+
+    fn rebuild_results_rows(&mut self, has_query: bool) {
+        self.results_rows.clear();
+        if !has_query {
+            self.results_list_state.reset(0);
+            return;
+        }
+        let mut selectable = 0usize;
+        if self.shows(Filter::Tasks) && !self.tasks.is_empty() {
+            self.results_rows.push(SearchRow::Heading(SearchGroup::Tasks));
+            for idx in 0..self.tasks.len().min(TASK_LIMIT) {
+                self.results_rows.push(SearchRow::Task {
+                    idx,
+                    selectable_idx: selectable,
+                });
+                selectable += 1;
+            }
+            if self.tasks.len() > TASK_LIMIT {
+                self.results_rows.push(SearchRow::ViewMore);
+            }
+        }
+        if self.shows(Filter::Habits) && !self.habits.is_empty() {
+            self.results_rows.push(SearchRow::Heading(SearchGroup::Habits));
+            for idx in 0..self.habits.len() {
+                self.results_rows.push(SearchRow::Habit {
+                    idx,
+                    selectable_idx: selectable,
+                });
+                selectable += 1;
+            }
+        }
+        if self.shows(Filter::Tags) && !self.tags.is_empty() {
+            self.results_rows.push(SearchRow::Heading(SearchGroup::Tags));
+            for idx in 0..self.tags.len() {
+                self.results_rows.push(SearchRow::Tag {
+                    idx,
+                    selectable_idx: selectable,
+                });
+                selectable += 1;
+            }
+        }
+        if self.shows(Filter::Lists) && !self.lists.is_empty() {
+            self.results_rows.push(SearchRow::Heading(SearchGroup::Lists));
+            for idx in 0..self.lists.len() {
+                self.results_rows.push(SearchRow::List {
+                    idx,
+                    selectable_idx: selectable,
+                });
+                selectable += 1;
+            }
+        }
+        if self.filter == Filter::All && !self.plugin_commands.is_empty() {
+            self.results_rows
+                .push(SearchRow::Heading(SearchGroup::PluginCommands));
+            for idx in 0..self.plugin_commands.len() {
+                self.results_rows.push(SearchRow::PluginCommand {
+                    idx,
+                    selectable_idx: selectable,
+                });
+                selectable += 1;
+            }
+        }
+        if self.filter == Filter::All && !self.plugin_hits.is_empty() {
+            self.results_rows.push(SearchRow::Heading(SearchGroup::Plugins));
+            for (idx, hit) in self.plugin_hits.iter().enumerate() {
+                let selectable_idx = if Self::plugin_hit_event(hit).is_some() {
+                    let s = selectable;
+                    selectable += 1;
+                    Some(s)
+                } else {
+                    None
+                };
+                self.results_rows
+                    .push(SearchRow::PluginHit { idx, selectable_idx });
+            }
+        }
+        self.results_list_state.reset(self.results_rows.len());
     }
 
     fn plugin_hit_event(hit: &PluginSearchHit) -> Option<SearchEvent> {
@@ -340,7 +460,7 @@ impl SearchModal {
     }
 
     /// A Date choice's words: "This Week (Oct 12 - Oct 18)", as the original's.
-    fn range_label(range: DateRange, strings: &'static crate::i18n::Strings) -> String {
+    fn range_label(range: DateRange, strings: &'static crate::i18n::Strings, cx: &App) -> String {
         let today = Local::now().date_naive();
         let short = |date| task_rows::short_date(date, strings);
         let name = match range {
@@ -352,7 +472,7 @@ impl SearchModal {
             DateRange::LastMonth => strings.last_month,
             DateRange::Custom(..) => strings.custom_range,
         };
-        match (range, range.days(today, crate::calendar::week_start())) {
+        match (range, range.days(today, crate::calendar::week_start(cx))) {
             (DateRange::ThisWeek | DateRange::NextWeek | DateRange::LastWeek | DateRange::Custom(..), Some((from, until))) => {
                 format!("{name} ({} - {})", short(from), short(until))
             }
@@ -467,7 +587,7 @@ impl SearchModal {
                 let current = self.task_filter.date;
                 for range in [DateRange::All, DateRange::ThisWeek, DateRange::NextWeek, DateRange::LastWeek, DateRange::ThisMonth, DateRange::LastMonth] {
                     items.push(
-                        row(SharedString::from(format!("search-date-{range:?}")), None, Self::range_label(range, strings).into(), current == range)
+                        row(SharedString::from(format!("search-date-{range:?}")), None, Self::range_label(range, strings, cx).into(), current == range)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.draft.date = range;
                                 this.apply(cx);
@@ -477,7 +597,7 @@ impl SearchModal {
                 }
                 let custom = matches!(current, DateRange::Custom(..));
                 let custom_label = if custom {
-                    Self::range_label(current, strings)
+                    Self::range_label(current, strings, cx)
                 } else {
                     strings.custom_range.to_owned()
                 };
@@ -560,11 +680,13 @@ impl SearchModal {
                                                     this.custom_from.read(cx).text(),
                                                     today,
                                                     strings,
+                                                    cx,
                                                 );
                                                 let until = crate::calendar::parse_date(
                                                     this.custom_until.read(cx).text(),
                                                     today,
                                                     strings,
+                                                    cx,
                                                 );
                                                 if let (Some(from), Some(until)) = (from, until) {
                                                     this.draft.date = DateRange::Custom(from, until);
@@ -608,95 +730,18 @@ impl SearchModal {
         events
     }
 
-    fn selected_child_index(&self) -> Option<usize> {
-        let mut child_idx = 0usize;
-        let mut sel_idx = 0usize;
-
-        let task_count = if self.shows(Filter::Tasks) {
-            self.tasks.len().min(TASK_LIMIT)
-        } else {
-            0
-        };
-        if task_count > 0 {
-            child_idx += 1;
-            if self.selected < sel_idx + task_count {
-                return Some(child_idx + (self.selected - sel_idx));
-            }
-            child_idx += task_count;
-            sel_idx += task_count;
-            if self.tasks.len() > TASK_LIMIT {
-                child_idx += 1;
-            }
-        }
-
-        let groups = [
-            (self.shows(Filter::Habits), self.habits.len()),
-            (self.shows(Filter::Tags), self.tags.len()),
-            (self.shows(Filter::Lists), self.lists.len()),
-            (self.filter == Filter::All, self.plugin_commands.len()),
-        ];
-        for (shown, len) in groups {
-            if shown && len > 0 {
-                child_idx += 1;
-                if self.selected < sel_idx + len {
-                    return Some(child_idx + (self.selected - sel_idx));
-                }
-                child_idx += len;
-                sel_idx += len;
-            }
-        }
-
-        if self.filter == Filter::All && !self.plugin_hits.is_empty() {
-            child_idx += 1;
-            for hit in &self.plugin_hits {
-                if Self::plugin_hit_event(hit).is_some() {
-                    if sel_idx == self.selected {
-                        return Some(child_idx);
-                    }
-                    sel_idx += 1;
-                }
-                child_idx += 1;
-            }
-        }
-
-        None
+    fn selected_row_index(&self) -> Option<usize> {
+        self.results_rows
+            .iter()
+            .position(|row| row.selectable_idx() == Some(self.selected))
     }
 
     fn scroll_selected_into_view(&self) {
-        let Some(child_ix) = self.selected_child_index() else {
+        let Some(row_ix) = self.selected_row_index() else {
             return;
         };
-        let viewport = self.results_scroll.bounds();
-        if viewport.size.height <= px(0.) {
-            self.results_scroll
-                .scroll_to_item(if self.selected == 0 { 0 } else { child_ix });
-            return;
-        }
-        if self.selected == 0 {
-            let cur = self.results_scroll.offset();
-            if cur.y < px(0.) {
-                self.results_scroll.set_offset(gpui::point(cur.x, px(0.)));
-            }
-            return;
-        }
-        let Some(unscrolled) = self.results_scroll.bounds_for_item(child_ix) else {
-            self.results_scroll.scroll_to_item(child_ix);
-            return;
-        };
-        let cur = self.results_scroll.offset();
-        let top = unscrolled.top() + cur.y;
-        let bottom = unscrolled.bottom() + cur.y;
-        let mut next_y = cur.y;
-        if top < viewport.top() {
-            next_y += viewport.top() - top;
-        } else if bottom > viewport.bottom() {
-            next_y += viewport.bottom() - bottom;
-        } else {
-            return;
-        }
-        let max_y = self.results_scroll.max_offset().y.max(px(0.));
-        self.results_scroll
-            .set_offset(gpui::point(cur.x, next_y.clamp(-max_y, px(0.))));
+        self.results_list_state
+            .scroll_to_reveal_item(if self.selected == 0 { 0 } else { row_ix });
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -725,11 +770,11 @@ impl SearchModal {
         cx: &mut App,
     ) -> bool {
         if let Err(err) = desktop_common::undo::complete(store, task) {
-            eprintln!("failed to toggle task from search: {err:#}");
+            desktop_common::logging::log_error("search_modal", format!("failed to toggle task from search: {err:#}"));
             return false;
         }
         desktop_common::completion_mark::record(task.id, cx);
-        desktop_common::sound::play_complete(store);
+        desktop_common::sound::play_complete(cx);
         desktop_common::data_version::data_changed(entity_id, cx);
         true
     }
@@ -785,7 +830,7 @@ impl SearchModal {
             self.store.set_completed(task.id, false)
         };
         if let Err(err) = result {
-            eprintln!("failed to toggle task from search: {err:#}");
+            desktop_common::logging::log_error("search_modal", format!("failed to toggle task from search: {err:#}"));
             return;
         }
         desktop_common::data_version::data_changed(cx.entity_id(), cx);
@@ -804,6 +849,286 @@ impl SearchModal {
         }
         let index = self.selected.min(events.len() - 1);
         self.emit_close(events.swap_remove(index), cx);
+    }
+
+    fn render_result_row(
+        &self,
+        row: SearchRow,
+        query: &str,
+        today: chrono::NaiveDate,
+        list_names: &std::collections::HashMap<Id, &str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let selected_index = self.selected;
+
+        match row {
+            SearchRow::Heading(group) => {
+                let title = match group {
+                    SearchGroup::Tasks => strings.group_tasks,
+                    SearchGroup::Habits => strings.section_habits,
+                    SearchGroup::Tags => strings.tags,
+                    SearchGroup::Lists => strings.lists,
+                    SearchGroup::PluginCommands => strings.plugins_commands,
+                    SearchGroup::Plugins => strings.plugins,
+                };
+                Self::group_heading(title).into_any_element()
+            }
+            SearchRow::Task { idx, selectable_idx } => {
+                let Some(task) = self.tasks.get(idx) else {
+                    return div().into_any_element();
+                };
+                let is_selected = selectable_idx == selected_index;
+                let id = task.id;
+                let list_label = task
+                    .list_id
+                    .and_then(|id| list_names.get(&id).copied())
+                    .map_or(SharedString::new_static(strings.inbox), |name| SharedString::from(name.to_owned()));
+                let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings, cx));
+                let horizon = crate::calendar::horizons_enabled(cx)
+                    .then(|| task_rows::horizon_badge(task, today, strings))
+                    .flatten();
+                let title_matches = !task_rows::match_ranges(&task.title, query).is_empty();
+                let note = (!title_matches)
+                    .then(|| task_rows::snippet(&task.notes, query, 30))
+                    .flatten()
+                    .map(|snippet| Self::strip_markdown_inline(&snippet));
+                let location_match = task
+                    .location
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|loc| !loc.is_empty() && !task_rows::match_ranges(loc, query).is_empty())
+                    .map(str::to_owned);
+                v_flex()
+                    .id(SharedString::from(format!("search-task-{id}")))
+                    .px_2()
+                    .py_1()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when(is_selected, |el| el.bg(theme.colors().ghost_element_selected))
+                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                    .child(
+                        h_flex()
+                            .h(px(24.))
+                            .gap_2()
+                            .child(if task.kind == Kind::Note {
+                                Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted).into_any_element()
+                            } else {
+                                let done = task.is_completed();
+                                let wont_do = task.is_wont_do();
+                                let read_only = self.is_task_read_only(task);
+                                let task_snapshot = task.clone();
+                                Checkbox::new(SharedString::from(format!("search-checkbox-{id}")))
+                                    .size(px(14.))
+                                    .toggle_state(done)
+                                    .in_progress(task.is_in_progress())
+                                    .dismissed(wont_do)
+                                    .tint(task_rows::priority_color(task.priority, &theme))
+                                    .when(!read_only, |cb| {
+                                        cb.on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_task_completion(&task_snapshot, cx);
+                                        }))
+                                    })
+                                    .into_any_element()
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .line_height(px(17.))
+                                    .when(task.is_completed(), |el| el.text_color(theme.colors().text_muted).line_through())
+                                    .child(self.highlighted(&task.title, query, cx)),
+                            )
+                            .when_some(due, |el, (label, overdue)| {
+                                el.child(
+                                    Label::new(label)
+                                        .size(LabelSize::XSmall)
+                                        .color(if overdue && !task.is_completed() { Color::Error } else { Color::Accent }),
+                                )
+                            })
+                            .when_some(horizon, |el, (label, past)| {
+                                let (fg, bg, border) =
+                                    task_rows::horizon_badge_style(past, task.is_closed(), &theme);
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .px(px(6.))
+                                        .py(px(1.))
+                                        .rounded(px(4.))
+                                        .bg(bg)
+                                        .border_1()
+                                        .border_color(border)
+                                        .child(
+                                            Label::new(label)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Custom(fg)),
+                                        ),
+                                )
+                            })
+                            .child(Label::new(list_label).size(LabelSize::XSmall).color(Color::Muted)),
+                    )
+                    .when_some(note, |el, note| {
+                        el.child(
+                            div()
+                                .pl(px(22.))
+                                .truncate()
+                                .text_size(px(12.))
+                                .line_height(px(15.))
+                                .text_color(theme.colors().text_muted)
+                                .child(self.highlighted(&note, query, cx)),
+                        )
+                    })
+                    .when_some(location_match, |el, loc| {
+                        el.child(
+                            h_flex()
+                                .pl(px(22.))
+                                .gap_1()
+                                .child(Icon::new(IconName::MapPin).size(IconSize::XSmall).color(Color::Muted))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(12.))
+                                        .line_height(px(15.))
+                                        .text_color(theme.colors().text_muted)
+                                        .child(self.highlighted(&loc, query, cx)),
+                                ),
+                        )
+                    })
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenTask(id))))
+                    .into_any_element()
+            }
+            SearchRow::ViewMore => div()
+                .id("search-view-more")
+                .px_2()
+                .py_1()
+                .rounded(px(4.))
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .cursor_pointer()
+                .child(Label::new(strings.view_more).size(LabelSize::Small).color(Color::Accent))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let query = this.query(cx);
+                    cx.emit(SearchEvent::OpenView(View::Search(query)))
+                }))
+                .into_any_element(),
+            SearchRow::Habit { idx, selectable_idx } => {
+                let Some(habit) = self.habits.get(idx) else {
+                    return div().into_any_element();
+                };
+                let is_selected = selectable_idx == selected_index;
+                let id = habit.id;
+                ListItem::new(SharedString::from(format!("search-habit-{id}")))
+                    .height(px(30.))
+                    .toggle_state(is_selected)
+                    .start_slot(desktop_common::habit_helpers::avatar(habit, px(18.), cx))
+                    .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&habit.name, query, cx)))
+                    .when(habit.archived, |item| {
+                        item.end_slot(Label::new(strings.habit_archived).size(LabelSize::XSmall).color(Color::Muted))
+                    })
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenHabit(id))))
+                    .into_any_element()
+            }
+            SearchRow::Tag { idx, selectable_idx } => {
+                let Some(t) = self.tags.get(idx) else {
+                    return div().into_any_element();
+                };
+                let is_selected = selectable_idx == selected_index;
+                let view = View::Tag(t.name.clone());
+                ListItem::new(SharedString::from(format!("search-tag-{}", t.name)))
+                    .height(px(30.))
+                    .toggle_state(is_selected)
+                    .start_slot(Icon::new(IconName::Tag).color(lists_panel::color(t.color.as_deref(), cx)))
+                    .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&t.name, query, cx)))
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenView(view.clone()))))
+                    .into_any_element()
+            }
+            SearchRow::List { idx, selectable_idx } => {
+                let Some(l) = self.lists.get(idx) else {
+                    return div().into_any_element();
+                };
+                let is_selected = selectable_idx == selected_index;
+                let view = View::List(l.id);
+                let start: AnyElement = match l.icon.as_deref().filter(|s| !s.is_empty()) {
+                    Some(emoji) => div().w(px(16.)).flex().justify_center().text_size(px(13.)).child(emoji.to_owned()).into_any_element(),
+                    None => {
+                        let icon = if l.kind == Kind::Note { IconName::FileText } else { IconName::List };
+                        Icon::new(icon).color(lists_panel::color(l.color.as_deref(), cx)).into_any_element()
+                    }
+                };
+                ListItem::new(SharedString::from(format!("search-list-result-{}", l.id)))
+                    .height(px(30.))
+                    .toggle_state(is_selected)
+                    .start_slot(start)
+                    .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&l.name, query, cx)))
+                    .when(l.archived, |item| {
+                        item.end_slot(Label::new(strings.habit_archived).size(LabelSize::XSmall).color(Color::Muted))
+                    })
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenView(view.clone()))))
+                    .into_any_element()
+            }
+            SearchRow::PluginCommand { idx, selectable_idx } => {
+                let Some(cmd) = self.plugin_commands.get(idx) else {
+                    return div().into_any_element();
+                };
+                let is_selected = selectable_idx == selected_index;
+                let plugin_id = cmd.plugin_id.clone();
+                let command_id = cmd.command_id.clone();
+                ListItem::new(SharedString::from(format!(
+                    "search-plugin-cmd-{}-{}",
+                    cmd.plugin_id, cmd.command_id
+                )))
+                .height(px(30.))
+                .toggle_state(is_selected)
+                .start_slot(Icon::new(IconName::Code).color(Color::Accent))
+                .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&cmd.title, query, cx)))
+                .end_slot(Label::new(cmd.plugin_name.clone()).size(LabelSize::XSmall).color(Color::Muted))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(SearchEvent::RunPluginCommand {
+                        plugin_id: plugin_id.clone(),
+                        command_id: command_id.clone(),
+                        arg: None,
+                    });
+                }))
+                .into_any_element()
+            }
+            SearchRow::PluginHit { idx, selectable_idx } => {
+                let Some(hit) = self.plugin_hits.get(idx) else {
+                    return div().into_any_element();
+                };
+                let event = Self::plugin_hit_event(hit);
+                let is_selected = selectable_idx.is_some_and(|s| s == selected_index);
+                let mut item = ListItem::new(SharedString::from(format!(
+                    "search-plugin-hit-{}-{idx}",
+                    hit.plugin_id
+                )))
+                .height(px(30.))
+                .toggle_state(is_selected)
+                .start_slot(Icon::new(IconName::Zap).color(Color::Muted))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&hit.title, query, cx)))
+                        .when_some(hit.subtitle.clone(), |el, sub| {
+                            el.child(Label::new(sub).size(LabelSize::XSmall).color(Color::Muted).truncate())
+                        }),
+                );
+                if let Some(badge) = hit.badge.clone() {
+                    item = item.end_slot(Label::new(badge).size(LabelSize::XSmall).color(Color::Muted));
+                }
+                if let Some(ev) = event {
+                    item = item.on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(ev.clone());
+                    }));
+                }
+                item.into_any_element()
+            }
+        }
     }
 
     fn highlighted(&self, text: &str, query: &str, cx: &App) -> StyledText {
@@ -905,7 +1230,7 @@ impl Render for SearchModal {
         };
         let task_dropdowns: Vec<AnyElement> = if self.filter == Filter::Tasks {
             let f = &self.task_filter;
-            let date_label: SharedString = if f.date == DateRange::All { strings.filter_date.into() } else { Self::range_label(f.date, strings).into() };
+            let date_label: SharedString = if f.date == DateRange::All { strings.filter_date.into() } else { Self::range_label(f.date, strings, cx).into() };
             vec![
                 dropdown(Menu::Lists, strings.lists.into(), !f.lists.is_empty(), cx).into_any_element(),
                 dropdown(Menu::Tags, strings.search_filter_tag.into(), f.tags != TagRule::All, cx).into_any_element(),
@@ -916,299 +1241,100 @@ impl Render for SearchModal {
             Vec::new()
         };
 
-        let today = Local::now().date_naive();
-        let mut row_index = 0usize;
-        let selected_index = self.selected;
-
-        let task_rows: Vec<AnyElement> = if self.shows(Filter::Tasks) {
-            let list_names: std::collections::HashMap<_, _> = self
-                .all_lists
-                .iter()
-                .map(|l| (l.id, l.name.as_str()))
-                .collect();
-            self.tasks
-                .iter()
-                .take(TASK_LIMIT)
-                .map(|task| {
-                    let is_selected = has_query && row_index == selected_index;
-                    row_index += 1;
-                    let id = task.id;
-                    let list = task
-                        .list_id
-                        .and_then(|id| list_names.get(&id).copied())
-                        .map_or(SharedString::new_static(strings.inbox), |name| SharedString::from(name.to_owned()));
-                    let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
-                    let horizon = crate::calendar::horizons_enabled()
-                        .then(|| task_rows::horizon_badge(task, today, strings))
-                        .flatten();
-                    let title_matches = !task_rows::match_ranges(&task.title, &query).is_empty();
-                    let note = (!title_matches)
-                        .then(|| task_rows::snippet(&task.notes, &query, 30))
-                        .flatten()
-                        .map(|snippet| Self::strip_markdown_inline(&snippet));
-                    let location_match = task
-                        .location
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|loc| !loc.is_empty() && !task_rows::match_ranges(loc, &query).is_empty())
-                        .map(str::to_owned);
-                    v_flex()
-                        .id(SharedString::from(format!("search-task-{id}")))
-                        .px_2()
-                        .py_1()
+        let nothing = has_query && !self.pending_search && self.results_rows.is_empty();
+        let results_body: AnyElement = if !has_query {
+            let hint = match self.filter {
+                Filter::All => strings.search_hint,
+                Filter::Tasks => strings.search_hint_task,
+                Filter::Habits => strings.section_habits,
+                Filter::Tags => strings.search_hint_tag,
+                Filter::Lists => strings.search_hint_list,
+            };
+            let icon = match self.filter {
+                Filter::Tasks => IconName::SquareCheck,
+                Filter::Habits => IconName::FernHabit,
+                Filter::Tags => IconName::Tag,
+                Filter::Lists => IconName::List,
+                Filter::All => IconName::Search,
+            };
+            v_flex()
+                .id("search-results")
+                .flex_1()
+                .min_h(px(180.))
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(Icon::new(icon).size(IconSize::XLarge).color(Color::Muted))
+                .child(Label::new(hint).color(Color::Muted))
+                .into_any_element()
+        } else if nothing {
+            let create_query = query;
+            let (create_label, truncated) =
+                Self::create_task_button_label(strings.add_task, &create_query);
+            let full_tooltip = truncated
+                .then(|| format!("{}: \"{}\"", strings.add_task, create_query));
+            v_flex()
+                .id("search-results")
+                .flex_1()
+                .min_h(px(180.))
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(Label::new(strings.nothing_found).color(Color::Muted))
+                .child(
+                    div()
+                        .max_w_full()
                         .rounded(px(6.))
-                        .cursor_pointer()
-                        .when(is_selected, |el| el.bg(theme.colors().ghost_element_selected))
-                        .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                        .bg(theme.colors().accent.opacity(0.14))
+                        .when(cfg!(test), |el| {
+                            el.debug_selector(|| "search-create-task".to_owned())
+                        })
                         .child(
-                            h_flex()
-                                .h(px(24.))
-                                .gap_2()
-                                .child(if task.kind == Kind::Note {
-                                    Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted).into_any_element()
-                                } else {
-                                    let done = task.is_completed();
-                                    let wont_do = task.is_wont_do();
-                                    let read_only = self.is_task_read_only(task);
-                                    let task_snapshot = task.clone();
-                                    Checkbox::new(SharedString::from(format!("search-checkbox-{id}")))
-                                        .size(px(14.))
-                                        .toggle_state(done)
-                                        .in_progress(task.is_in_progress())
-                                        .dismissed(wont_do)
-                                        .tint(task_rows::priority_color(task.priority, &theme))
-                                        .when(!read_only, |cb| {
-                                            cb.on_click(cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.toggle_task_completion(&task_snapshot, cx);
-                                            }))
-                                        })
-                                        .into_any_element()
+                            Button::new("search-create-task", create_label)
+                                .variant(ButtonVariant::Ghost)
+                                .size(ButtonSize::Md)
+                                .icon(IconName::Plus)
+                                .when_some(full_tooltip, |btn, tip| {
+                                    btn.tooltip(Tooltip::text(tip))
                                 })
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_size(px(13.))
-                                        .line_height(px(17.))
-                                        .when(task.is_completed(), |el| el.text_color(theme.colors().text_muted).line_through())
-                                        .child(self.highlighted(&task.title, &query, cx)),
-                                )
-                                .when_some(due, |el, (label, overdue)| {
-                                    el.child(
-                                        Label::new(label)
-                                            .size(LabelSize::XSmall)
-                                            .color(if overdue && !task.is_completed() { Color::Error } else { Color::Accent }),
-                                    )
-                                })
-                                .when_some(horizon, |el, (label, past)| {
-                                    let (fg, bg, border) =
-                                        task_rows::horizon_badge_style(past, task.is_closed(), &theme);
-                                    el.child(
-                                        div()
-                                            .flex_none()
-                                            .px(px(6.))
-                                            .py(px(1.))
-                                            .rounded(px(4.))
-                                            .bg(bg)
-                                            .border_1()
-                                            .border_color(border)
-                                            .child(
-                                                Label::new(label)
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Custom(fg)),
-                                            ),
-                                    )
-                                })
-                                .child(Label::new(list).size(LabelSize::XSmall).color(Color::Muted)),
-                        )
-                        .when_some(note, |el, note| {
-                            el.child(
-                                div()
-                                    .pl(px(22.))
-                                    .truncate()
-                                    .text_size(px(12.))
-                                    .line_height(px(15.))
-                                    .text_color(theme.colors().text_muted)
-                                    .child(self.highlighted(&note, &query, cx)),
-                            )
-                        })
-                        .when_some(location_match, |el, loc| {
-                            el.child(
-                                h_flex()
-                                    .pl(px(22.))
-                                    .gap_1()
-                                    .child(Icon::new(IconName::MapPin).size(IconSize::XSmall).color(Color::Muted))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_size(px(12.))
-                                            .line_height(px(15.))
-                                            .text_color(theme.colors().text_muted)
-                                            .child(self.highlighted(&loc, &query, cx)),
-                                    ),
-                            )
-                        })
-                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenTask(id))))
-                        .into_any_element()
-                })
-                .collect()
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(SearchEvent::CreateTask(create_query.clone()));
+                                })),
+                        ),
+                )
+                .into_any_element()
         } else {
-            Vec::new()
+            let list_query = query;
+            let list_today = Local::now().date_naive();
+            let rows = self.results_rows.clone();
+            div()
+                .relative()
+                .flex_1()
+                .min_h(px(180.))
+                .w_full()
+                .child(
+                    list(
+                        self.results_list_state.clone(),
+                        cx.processor(move |this, ix, _, cx| {
+                            let Some(&row) = rows.get(ix) else {
+                                return div().into_any_element();
+                            };
+                            let list_names: std::collections::HashMap<_, _> = this
+                                .all_lists
+                                .iter()
+                                .map(|l| (l.id, l.name.as_str()))
+                                .collect();
+                            this.render_result_row(row, &list_query, list_today, &list_names, cx)
+                        }),
+                    )
+                    .size_full(),
+                )
+                .child(VerticalScrollbar::for_list(
+                    "search-results-scroll",
+                    self.results_list_state.clone(),
+                ))
+                .into_any_element()
         };
-        let more = self.shows(Filter::Tasks) && self.tasks.len() > TASK_LIMIT;
-
-        let habit_rows: Vec<AnyElement> = if self.shows(Filter::Habits) {
-            self.habits
-                .iter()
-                .map(|habit| {
-                    let is_selected = has_query && row_index == selected_index;
-                    row_index += 1;
-                    let id = habit.id;
-                    ListItem::new(SharedString::from(format!("search-habit-{id}")))
-                        .height(px(30.))
-                        .toggle_state(is_selected)
-                        .start_slot(desktop_common::habit_helpers::avatar(habit, px(18.), cx))
-                        .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&habit.name, &query, cx)))
-                        .when(habit.archived, |item| {
-                            item.end_slot(Label::new(strings.habit_archived).size(LabelSize::XSmall).color(Color::Muted))
-                        })
-                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenHabit(id))))
-                        .into_any_element()
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let tag_rows = if self.shows(Filter::Tags) {
-            self.tags
-                .iter()
-                .map(|t| {
-                    let is_selected = has_query && row_index == selected_index;
-                    row_index += 1;
-                    let view = View::Tag(t.name.clone());
-                    ListItem::new(SharedString::from(format!("search-tag-{}", t.name)))
-                        .height(px(30.))
-                        .toggle_state(is_selected)
-                        .start_slot(Icon::new(IconName::Tag).color(lists_panel::color(t.color.as_deref(), cx)))
-                        .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&t.name, &query, cx)))
-                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenView(view.clone()))))
-                        .into_any_element()
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let list_rows = if self.shows(Filter::Lists) {
-            self.lists
-                .iter()
-                .map(|l| {
-                    let is_selected = has_query && row_index == selected_index;
-                    row_index += 1;
-                    let view = View::List(l.id);
-                    let start: AnyElement = match l.icon.as_deref().filter(|s| !s.is_empty()) {
-                        Some(emoji) => div().w(px(16.)).flex().justify_center().text_size(px(13.)).child(emoji.to_owned()).into_any_element(),
-                        None => {
-                            let icon = if l.kind == Kind::Note { IconName::FileText } else { IconName::List };
-                            Icon::new(icon).color(lists_panel::color(l.color.as_deref(), cx)).into_any_element()
-                        }
-                    };
-                    ListItem::new(SharedString::from(format!("search-list-result-{}", l.id)))
-                        .height(px(30.))
-                        .toggle_state(is_selected)
-                        .start_slot(start)
-                        .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&l.name, &query, cx)))
-                        .when(l.archived, |item| {
-                            item.end_slot(Label::new(strings.habit_archived).size(LabelSize::XSmall).color(Color::Muted))
-                        })
-                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenView(view.clone()))))
-                        .into_any_element()
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let command_rows = if self.filter == Filter::All {
-            self.plugin_commands
-                .iter()
-                .map(|cmd| {
-                    let is_selected = has_query && row_index == selected_index;
-                    row_index += 1;
-                    let plugin_id = cmd.plugin_id.clone();
-                    let command_id = cmd.command_id.clone();
-                    ListItem::new(SharedString::from(format!(
-                        "search-plugin-cmd-{}-{}",
-                        cmd.plugin_id, cmd.command_id
-                    )))
-                    .height(px(30.))
-                    .toggle_state(is_selected)
-                    .start_slot(Icon::new(IconName::Code).color(Color::Accent))
-                    .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&cmd.title, &query, cx)))
-                    .end_slot(Label::new(cmd.plugin_name.clone()).size(LabelSize::XSmall).color(Color::Muted))
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(SearchEvent::RunPluginCommand {
-                            plugin_id: plugin_id.clone(),
-                            command_id: command_id.clone(),
-                            arg: None,
-                        });
-                    }))
-                    .into_any_element()
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let plugin_hit_rows = if self.filter == Filter::All {
-            self.plugin_hits
-                .iter()
-                .enumerate()
-                .map(|(idx, hit)| {
-                    let event = Self::plugin_hit_event(hit);
-                    let is_selected = has_query && event.is_some() && row_index == selected_index;
-                    if event.is_some() {
-                        row_index += 1;
-                    }
-                    let mut item = ListItem::new(SharedString::from(format!(
-                        "search-plugin-hit-{}-{idx}",
-                        hit.plugin_id
-                    )))
-                    .height(px(30.))
-                    .toggle_state(is_selected)
-                    .start_slot(Icon::new(IconName::Zap).color(Color::Muted))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(div().text_size(px(13.)).line_height(px(17.)).child(self.highlighted(&hit.title, &query, cx)))
-                            .when_some(hit.subtitle.clone(), |el, sub| {
-                                el.child(Label::new(sub).size(LabelSize::XSmall).color(Color::Muted).truncate())
-                            }),
-                    );
-                    if let Some(badge) = hit.badge.clone() {
-                        item = item.end_slot(Label::new(badge).size(LabelSize::XSmall).color(Color::Muted));
-                    }
-                    if let Some(ev) = event {
-                        item = item.on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(ev.clone());
-                        }));
-                    }
-                    item.into_any_element()
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let nothing = has_query
-            && !self.pending_search
-            && task_rows.is_empty()
-            && habit_rows.is_empty()
-            && tag_rows.is_empty()
-            && list_rows.is_empty()
-            && command_rows.is_empty()
-            && plugin_hit_rows.is_empty();
 
         v_flex()
             .w(px(560.))
@@ -1289,90 +1415,7 @@ impl Render for SearchModal {
                     .when(self.filter == Filter::All || self.filter == Filter::Tags, |el| el.child(chip(Filter::Tags, strings.search_filter_tag, cx)))
                     .when(self.filter == Filter::All || self.filter == Filter::Lists, |el| el.child(chip(Filter::Lists, strings.search_filter_list, cx))),
             )
-            .child(
-                v_scroll(
-                    "search-results-scroll",
-                    v_flex()
-                        .id("search-results")
-                        .when(!has_query, |el| {
-                            // As in the original, the hint names what the chosen chip searches.
-                            let hint = match self.filter {
-                                Filter::All => strings.search_hint,
-                                Filter::Tasks => strings.search_hint_task,
-                                Filter::Habits => strings.section_habits,
-                                Filter::Tags => strings.search_hint_tag,
-                                Filter::Lists => strings.search_hint_list,
-                            };
-                            let icon = match self.filter {
-                                Filter::Tasks => IconName::SquareCheck,
-                                Filter::Habits => IconName::FernHabit,
-                                Filter::Tags => IconName::Tag,
-                                Filter::Lists => IconName::List,
-                                Filter::All => IconName::Search,
-                            };
-                            el.items_center().justify_center().gap_2().child(Icon::new(icon).size(IconSize::XLarge).color(Color::Muted)).child(Label::new(hint).color(Color::Muted))
-                        })
-                        .when(nothing, |el| {
-                            let create_query = query.clone();
-                            let (create_label, truncated) =
-                                Self::create_task_button_label(strings.add_task, &create_query);
-                            let full_tooltip = truncated
-                                .then(|| format!("{}: \"{}\"", strings.add_task, create_query));
-                            el.items_center()
-                                .justify_center()
-                                .gap_3()
-                                .child(Label::new(strings.nothing_found).color(Color::Muted))
-                                .child(
-                                    div()
-                                        .max_w_full()
-                                        .rounded(px(6.))
-                                        .bg(theme.colors().accent.opacity(0.14))
-                                        .when(cfg!(test), |el| {
-                                            el.debug_selector(|| "search-create-task".to_owned())
-                                        })
-                                        .child(
-                                            Button::new("search-create-task", create_label)
-                                                .variant(ButtonVariant::Ghost)
-                                                .size(ButtonSize::Md)
-                                                .icon(IconName::Plus)
-                                                .when_some(full_tooltip, |btn, tip| {
-                                                    btn.tooltip(Tooltip::text(tip))
-                                                })
-                                                .on_click(cx.listener(move |_, _, _, cx| {
-                                                    cx.emit(SearchEvent::CreateTask(
-                                                        create_query.clone(),
-                                                    ));
-                                                })),
-                                        ),
-                                )
-                        })
-                        .when(!task_rows.is_empty(), |el| el.child(Self::group_heading(strings.group_tasks)).children(task_rows))
-                        .when(more, |el| {
-                            el.child(
-                                div()
-                                    .id("search-view-more")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.))
-                                    .hover(|s| s.bg(theme.colors().element_hover))
-                                    .cursor_pointer()
-                                    .child(Label::new(strings.view_more).size(LabelSize::Small).color(Color::Accent))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let query = this.query(cx);
-                                        cx.emit(SearchEvent::OpenView(View::Search(query)))
-                                    })),
-                            )
-                        })
-                        .when(!habit_rows.is_empty(), |el| el.child(Self::group_heading(strings.section_habits)).children(habit_rows))
-                        .when(!tag_rows.is_empty(), |el| el.child(Self::group_heading(strings.tags)).children(tag_rows))
-                        .when(!list_rows.is_empty(), |el| el.child(Self::group_heading(strings.lists)).children(list_rows))
-                        .when(!command_rows.is_empty(), |el| el.child(Self::group_heading(strings.plugins_commands)).children(command_rows))
-                        .when(!plugin_hit_rows.is_empty(), |el| el.child(Self::group_heading(strings.plugins)).children(plugin_hit_rows)),
-                )
-                .track_scroll(&self.results_scroll)
-                .flex_1()
-                .min_h(px(180.)),
-            )
+            .child(results_body)
             .child({
                 let kbd = |text: &'static str| {
                     div()

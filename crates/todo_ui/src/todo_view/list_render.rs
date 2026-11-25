@@ -70,10 +70,10 @@ impl TodoView {
         self.list_entries = entries;
     }
 
-    pub(super) fn sync_list_entries(&mut self, strings: &Strings) -> bool {
-        let rows = self.rows_rc(strings);
+    pub(super) fn sync_list_entries(&mut self, strings: &Strings, cx: &App) -> bool {
+        let rows = self.rows_rc(strings, cx);
         let rows_empty = rows.is_empty();
-        let list_key = (self.rows_cache_key(strings), self.new_section.is_some(), self.view == View::Next7Days);
+        let list_key = (self.rows_cache_key(strings, cx), self.new_section.is_some(), self.view == View::Next7Days);
         if self.synced_list_key.as_ref() == Some(&list_key) && !self.list_entries.is_empty() {
             for (ix, entry) in self.list_entries.iter().enumerate() {
                 if !matches!(entry, ListEntry::Row(_)) {
@@ -156,8 +156,8 @@ impl TodoView {
                         el.drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.10)))
                             .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
                                 cx.stop_propagation();
-                                this.task_drop = None;
-                                this.task_drag_origin = None;
+                                this.panel_dnd.task_drop = None;
+                                this.panel_dnd.task_drag_origin = None;
                                 this.drop_on_column(dragged.id, target.clone(), cx);
                             }))
                     })
@@ -181,11 +181,20 @@ impl TodoView {
     pub(super) fn invalidate_rows(&mut self) {
         self.rows_version = self.rows_version.wrapping_add(1);
         self.cached_rows.borrow_mut().take();
-        self.kanban_cache.borrow_mut().take();
+        self.kanban.cache.borrow_mut().take();
+        self.timeline.cache.borrow_mut().take();
         self.synced_list_key = None;
     }
 
-    pub(super) fn rows_cache_key(&self, strings: &Strings) -> RowsCacheKey {
+    pub(super) fn ensure_lists_index(&mut self) {
+        if self.show_lists && (self.panel_dnd.lists_index_dirty || self.panel_dnd.panel_drag.is_some()) {
+            self.panel_dnd.lists_index =
+                lists_panel::ListsPanelIndex::build(&self.lists, &self.folders, &self.tags);
+            self.panel_dnd.lists_index_dirty = false;
+        }
+    }
+
+    pub(super) fn rows_cache_key(&self, strings: &Strings, cx: &App) -> RowsCacheKey {
         RowsCacheKey {
             version: self.rows_version,
             today: Self::today(),
@@ -201,28 +210,28 @@ impl TodoView {
             collapsed_days_len: self.collapsed_days.len(),
             completing_len: self.completing.len(),
             overdue_last: self.preferences.task_defaults.overdue_last,
-            horizons_enabled: crate::calendar::horizons_enabled(),
-            week_start: crate::calendar::week_start(),
+            horizons_enabled: crate::calendar::horizons_enabled(cx),
+            week_start: crate::calendar::week_start(cx),
         }
     }
 
-    pub(super) fn rows_rc(&self, strings: &Strings) -> Rc<Vec<Row>> {
-        let key = self.rows_cache_key(strings);
+    pub(super) fn rows_rc(&self, strings: &Strings, cx: &App) -> Rc<Vec<Row>> {
+        let key = self.rows_cache_key(strings, cx);
         if let Some((cached_key, rows)) = self.cached_rows.borrow().as_ref()
             && *cached_key == key
         {
             return Rc::clone(rows);
         }
         let built = Rc::new(task_rows::fold_days(
-            self.rows_with(strings, &self.collapsed_tasks, &self.collapsed_sections),
+            self.rows_with(strings, &self.collapsed_tasks, &self.collapsed_sections, cx),
             &self.collapsed_days,
         ));
         *self.cached_rows.borrow_mut() = Some((key, Rc::clone(&built)));
         built
     }
 
-    pub(super) fn rows(&self, strings: &Strings) -> Vec<Row> {
-        (*self.rows_rc(strings)).clone()
+    pub(super) fn rows(&self, strings: &Strings, cx: &App) -> Vec<Row> {
+        (*self.rows_rc(strings, cx)).clone()
     }
 
     pub(super) fn tasks_for_rows(&self) -> Vec<Task> {
@@ -243,7 +252,13 @@ impl TodoView {
     }
 
     /// Rows with the given collapsed tasks and groups; the kanban board shows everything.
-    pub(super) fn rows_with(&self, strings: &Strings, collapsed_tasks: &HashSet<Id>, collapsed_sections: &HashSet<Section>) -> Vec<Row> {
+    pub(super) fn rows_with(
+        &self,
+        strings: &Strings,
+        collapsed_tasks: &HashSet<Id>,
+        collapsed_sections: &HashSet<Section>,
+        cx: &App,
+    ) -> Vec<Row> {
         let tasks = self.tasks_for_rows();
         let closed = |closed_at: fn(&Task) -> Option<i64>| {
             let today = Self::today();
@@ -251,7 +266,7 @@ impl TodoView {
                 .iter()
                 .filter(|t| {
                     let day = closed_at(t).and_then(task_rows::local_day).unwrap_or(today);
-                    self.closed_range.contains(day, today)
+                    self.closed_range.contains(day, today, crate::calendar::week_start(cx))
                         && self.closed_lists.as_ref().is_none_or(|lists| lists.contains(&t.list_id))
                 })
                 .cloned()
@@ -278,7 +293,7 @@ impl TodoView {
                 match group {
                     // As the original's Next 7 Days: a group for each day.
                     GroupBy::Custom if self.view == View::Next7Days => {
-                        task_rows::next_days_rows(&tasks, Self::today(), crate::calendar::week_start(), strings)
+                        task_rows::next_days_rows(&tasks, Self::today(), strings, cx)
                     }
                     GroupBy::Custom if !self.sections.is_empty() => {
                         task_rows::section_rows(&tasks, &self.sections, collapsed_tasks, strings)
@@ -288,7 +303,7 @@ impl TodoView {
                     }
                     group => {
                         let lists: Vec<(Id, String)> = self.lists.iter().map(|l| (l.id, l.name.clone())).collect();
-                        task_rows::grouped_rows_in(&tasks, group, Self::today(), self.preferences.task_defaults.overdue_last, &lists, strings)
+                        task_rows::grouped_rows_in(&tasks, group, Self::today(), self.preferences.task_defaults.overdue_last, &lists, strings, cx)
                     }
                 }
             }
@@ -296,9 +311,9 @@ impl TodoView {
     }
 
     pub(super) fn clear_task_drag_state(&mut self) -> bool {
-        self.task_drop.take().is_some()
-            | self.task_drag_origin.take().is_some()
-            | self.kanban_hover_col.take().is_some()
+        self.panel_dnd.task_drop.take().is_some()
+            | self.panel_dnd.task_drag_origin.take().is_some()
+            | self.kanban.hover_col.take().is_some()
     }
 
     pub(super) fn cancel_task_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -347,21 +362,21 @@ impl TodoView {
     }
 
     pub(super) fn move_task_drag(&mut self, event: &gpui::DragMoveEvent<DraggedTask>, _: &mut Window, cx: &mut Context<Self>) {
-        if self.view == View::Trash || self.is_current_view_archived_list() || self.kanban || self.timeline {
+        if self.view == View::Trash || self.is_current_view_archived_list() || self.kanban.enabled || self.timeline.enabled {
             return;
         }
         let pos = event.event.position;
         if !event.bounds.contains(&pos) {
-            if self.task_drop.take().is_some() {
+            if self.panel_dnd.task_drop.take().is_some() {
                 cx.notify();
             }
             return;
         }
         let dragged_id = event.drag(cx).id;
-        let start_x = match self.task_drag_origin {
+        let start_x = match self.panel_dnd.task_drag_origin {
             Some((id, x)) if id == dragged_id => x,
             _ => {
-                self.task_drag_origin = Some((dragged_id, pos.x));
+                self.panel_dnd.task_drag_origin = Some((dragged_id, pos.x));
                 pos.x
             }
         };
@@ -409,15 +424,15 @@ impl TodoView {
             None
         };
 
-        if self.task_drop != plan {
-            self.task_drop = plan;
+        if self.panel_dnd.task_drop != plan {
+            self.panel_dnd.task_drop = plan;
             cx.notify();
         }
     }
 
     pub(super) fn drop_task_in_list(&mut self, dragged: &DraggedTask, _: &mut Window, cx: &mut Context<Self>) {
-        let plan = self.task_drop.take();
-        self.task_drag_origin = None;
+        let plan = self.panel_dnd.task_drop.take();
+        self.panel_dnd.task_drag_origin = None;
         if let Some(plan) = plan {
             cx.stop_propagation();
             self.apply_task_drop(dragged.id, plan, cx);
@@ -607,7 +622,7 @@ impl TodoView {
             if matches!(self.view, View::Completed | View::WontDo) {
                 (task_rows::closed_due_label(date, today, strings), false)
             } else {
-                task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates)
+                task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates, cx)
             }
         });
         let badge_group = if closed_view
@@ -621,15 +636,15 @@ impl TodoView {
         } else {
             self.group_by
         };
-        let horizon_badge = task_rows::horizon_badge_for_group(task, badge_group, today, strings);
+        let horizon_badge = task_rows::horizon_badge_for_group(task, badge_group, today, strings, cx);
 
         let draggable = self.view != View::Trash && !read_only && title_input.is_none();
         let dragged = DraggedTask { id, title: task.title.clone().into() };
         let accent = theme.colors().accent;
         let dragging_active = cx.has_active_drag();
-        let is_being_dragged = dragging_active && self.task_drag_origin.is_some_and(|(d, _)| d == id);
+        let is_being_dragged = dragging_active && self.panel_dnd.task_drag_origin.is_some_and(|(d, _)| d == id);
         let drop_indicator = dragging_active
-            .then(|| self.task_drop.as_ref().filter(|plan| plan.target_id == id).cloned())
+            .then(|| self.panel_dnd.task_drop.as_ref().filter(|plan| plan.target_id == id).cloned())
             .flatten();
 
         // The separator starts at the checkbox; the gutter to its left holds the chevron.
@@ -650,8 +665,8 @@ impl TodoView {
                             .position(|e| matches!(e, ListEntry::Row(Row::Task { task, .. }) if task.id == dragged_id))
                             .and_then(|ix| this.list_entry_bounds.borrow().get(&ix).copied())
                             .map_or(fallback_x, |area| area.left() + px(14.) + cursor_offset.x);
-                        this.task_drag_origin = Some((dragged_id, start_x));
-                        this.task_drop = None;
+                        this.panel_dnd.task_drag_origin = Some((dragged_id, start_x));
+                        this.panel_dnd.task_drop = None;
                         cx.notify();
                     })
                     .ok();
@@ -824,7 +839,7 @@ impl TodoView {
                                 due_label.into_any_element()
                             } else {
                                 let due_tip = match (self.preferences.countdown_dates, task.due_date) {
-                                    (true, Some(d)) => format!("{} · {}", crate::calendar::format_date(d, strings), strings.show_countdown_mode),
+                                    (true, Some(d)) => format!("{} · {}", crate::calendar::format_date(d, strings, cx), strings.show_countdown_mode),
                                     _ => strings.show_countdown_mode.to_owned(),
                                 };
                                 div()
@@ -984,6 +999,7 @@ impl TodoView {
         rows_empty: bool,
         strings: &'static Strings,
         theme: &theme::Theme,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         v_flex()
@@ -992,7 +1008,7 @@ impl TodoView {
             .h_full()
             .child(
                 h_flex()
-                    .mt(crate::title_bar::header_inset())
+                    .mt(crate::title_bar::header_inset(window, cx))
                     .h(px(60.))
                     // The title sits 4 px above the row's middle, as the original's.
                     .pb(px(8.))
@@ -1022,7 +1038,7 @@ impl TodoView {
                                             .child(self.search_input.clone()),
                                     )
                                 } else {
-                                    el.truncate().child(self.view_title(strings))
+                                    el.truncate().child(self.view_title(strings, cx))
                                 }
                             }),
                     )
@@ -1055,7 +1071,7 @@ impl TodoView {
                     // The Completed and Won't Do views have only Print, as the original's.
                     .when(closed_header, |el| el.child(IconButton::new("print-closed", IconName::Printer).tooltip(Tooltip::text(strings.print)).on_click(cx.listener(|this, _, _, cx| this.print_list(cx)))))
                     .when(kanban_only, |el| {
-                        let workflow_on = self.kanban_workflow;
+                        let workflow_on = self.kanban.workflow;
                         el.child(
                             h_flex()
                                 .id("kanban-workflow-toggle")
@@ -1085,7 +1101,7 @@ impl TodoView {
                                 .relative()
                                 .debug_selector(|| "task-sort-menu-trigger".to_owned())
                                 .child(IconButton::new("sort", IconName::ArrowDownUp).tip(strings.group_and_sort, ui::TipSide::Below).on_click(cx.listener(|this, _, window, cx| this.open_sort_menu(window, cx))))
-                                .when_some(self.sort_menu, |el, expanded| {
+                                .when_some(self.overlays.sort_menu, |el, expanded| {
                                     el.child(PopoverAttachment::new(Placement::BelowRight, self.render_sort_menu(expanded, strings, cx)))
                                 }),
                         )
@@ -1095,11 +1111,11 @@ impl TodoView {
                             .relative()
                             .child(IconButton::new("more", IconName::Ellipsis).tip(strings.more, ui::TipSide::Below).on_click(cx.listener(
                                 |this, _, _, cx| {
-                                    this.header_menu_open = true;
+                                    this.overlays.header_menu_open = true;
                                     cx.notify();
                                 },
                             )))
-                            .when(self.header_menu_open, |el| {
+                            .when(self.overlays.header_menu_open, |el| {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
                                     self.render_header_menu(strings, cx),
@@ -1129,15 +1145,15 @@ impl TodoView {
                         window.focus(&input_focus, cx);
                     })
                     .child(Icon::new(IconName::Plus))
-                    .child(div().flex_1().min_w_0().debug_selector(|| "quick-add-input".to_owned()).child(self.input.clone()))
+                    .child(div().flex_1().min_w_0().debug_selector(|| "quick-add-input".to_owned()).child(self.quick_add.input.clone()))
                     .children(self.shown_add_due().map(|(date, time)| {
-                        let (label, _) = task_rows::due_label(date, time, Self::today(), strings);
+                        let (label, _) = task_rows::due_label(date, time, Self::today(), strings, cx);
                         // A picked duration shows its span, as the original's "Today, 22:00 - 23:00".
-                        let label = match self.add_draft.end.filter(|_| self.quick_add_due.is_none()) {
-                            Some((end, end_time)) => crate::due_picker::range_label(date, time, end, end_time, strings),
+                        let label = match self.quick_add.draft.end.filter(|_| self.quick_add.due.is_none()) {
+                            Some((end, end_time)) => crate::due_picker::range_label(date, time, end, end_time, strings, cx),
                             None => label,
                         };
-                        let has_repeat = self.quick_add_repeat || self.add_draft.repeat.is_some();
+                        let has_repeat = self.quick_add.repeat || self.quick_add.draft.repeat.is_some();
                         h_flex()
                             .flex_none()
                             .gap_1()
@@ -1148,7 +1164,7 @@ impl TodoView {
                             .child(Label::new(label).size(LabelSize::Small).color(Color::Accent))
                     }))
                     .when(self.shown_add_due().is_none(), |el| {
-                        el.when_some(self.shown_add_horizon(), |el, h| {
+                        el.when_some(self.shown_add_horizon(cx), |el, h| {
                             el.child(
                                 div()
                                     .flex_none()
@@ -1164,7 +1180,7 @@ impl TodoView {
                             )
                         })
                     })
-                    .when(self.shown_add_due().is_none() && (self.quick_add_repeat || self.add_draft.repeat.is_some()), |el| {
+                    .when(self.shown_add_due().is_none() && (self.quick_add.repeat || self.quick_add.draft.repeat.is_some()), |el| {
                         el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(Color::Accent))
                     })
                     .child(
@@ -1181,8 +1197,8 @@ impl TodoView {
                                     .icon_color(Color::Muted)
                                     .tooltip(Tooltip::text(strings.more))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_menu_open = !this.add_menu_open;
-                                        this.add_list_side = false;
+                                        this.quick_add.menu_open = !this.quick_add.menu_open;
+                                        this.quick_add.list_side = false;
                                         cx.notify();
                                     })),
                             ))
@@ -1230,7 +1246,7 @@ impl TodoView {
                             .child(VerticalScrollbar::for_list("task-list-scroll", self.list_state.clone())),
                     ),
             ))
-            .when_some(self.error.clone().or_else(|| self.add_attachment_error.clone()), |el, error| {
+            .when_some(self.error.clone().or_else(|| self.quick_add.attachment_error.clone()), |el, error| {
                 el.child(
                     div()
                         .px_6()

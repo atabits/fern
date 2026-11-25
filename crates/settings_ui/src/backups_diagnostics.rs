@@ -1,52 +1,16 @@
+use desktop_common::{calendar, i18n};
 use gpui::FontWeight;
 use ui::prelude::*;
 
-use crate::calendar;
-use crate::i18n;
-use crate::release_notes::action_button;
-
-use super::{ROW_HEIGHT, SettingsWindow};
+use super::{ActiveConfirm, ROW_HEIGHT, SettingsWindow};
 
 impl SettingsWindow {
-    pub(super) fn render_restore_backup_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let path = self.pending_restore.as_ref()?;
-        let strings = i18n::t(cx);
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("backup.db");
-        let description = strings.restore_backup_confirm_body.replace("{file}", filename);
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .debug_selector(|| "confirm-restore-backup".to_owned())
-                .child(
-                    ConfirmDialog::new(
-                        "confirm-restore-backup",
-                        strings.restore_backup_confirm_title,
-                    )
-                    .description(description)
-                    .cancel_label(strings.cancel)
-                    .confirm_label(strings.restore_action)
-                    .destructive(true)
-                    .on_cancel(cx.listener(|this, _, _, cx| {
-                        this.pending_restore = None;
-                        cx.notify();
-                    }))
-                    .on_confirm(cx.listener(|this, _, _, cx| {
-                        this.confirm_restore(cx);
-                    })),
-                )
-                .into_any_element(),
-        )
-    }
-
     pub(super) fn render_auto_backups(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
         let group = v_flex().py_1p5().rounded(px(8.)).bg(colors.surface_background);
-        let content = if self.auto_backups.is_empty() {
+        let content = if self.backups.auto_backups.is_empty() {
             group.child(
                 h_flex()
                     .debug_selector(|| "settings-auto-backups-empty".to_owned())
@@ -59,10 +23,10 @@ impl SettingsWindow {
                     ),
             )
         } else {
-            group.children(self.auto_backups.iter().enumerate().map(|(idx, entry)| {
+            group.children(self.backups.auto_backups.iter().enumerate().map(|(idx, entry)| {
                 let primary = entry
                     .date
-                    .map(|date| calendar::format_date(date, strings))
+                    .map(|date| calendar::format_date(date, strings, cx))
                     .unwrap_or_else(|| entry.filename.clone());
                 let size_label = format_bytes(entry.size_bytes);
                 let filename = entry.filename.clone();
@@ -99,7 +63,7 @@ impl SettingsWindow {
                                 .variant(ButtonVariant::Secondary)
                                 .size(ButtonSize::Sm)
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.pending_restore = Some(path.clone());
+                                    this.confirm = Some(ActiveConfirm::RestoreBackup(path.clone()));
                                     cx.notify();
                                 })),
                             ),
@@ -119,9 +83,9 @@ impl SettingsWindow {
         let db_health = cx.try_global::<desktop_common::diagnostics::DbHealth>();
         let healthy = db_health.is_none_or(|health| health.healthy);
         let status_text = if healthy {
-            format!("{} (v{})", strings.db_integrity_ok, self.schema_version)
+            format!("{} (v{})", strings.db_integrity_ok, self.backups.schema_version)
         } else {
-            format!("{} (v{})", strings.db_integrity_issue, self.schema_version)
+            format!("{} (v{})", strings.db_integrity_issue, self.backups.schema_version)
         };
         let detail = db_health.filter(|health| !health.healthy).and_then(|health| {
             if let Some(backup) = &health.recovered_corrupt_backup {
@@ -198,7 +162,7 @@ impl SettingsWindow {
     pub(super) fn render_diagnostics(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let colors = theme.colors().clone();
+        let colors = theme.colors();
         v_flex()
             .child(div().pb_3().child(Label::new(strings.diagnostics).weight(FontWeight::MEDIUM)))
             .child(
@@ -213,31 +177,30 @@ impl SettingsWindow {
                             .px_4()
                             .py_1p5()
                             .child(
-                                action_button("save-diagnostic-log", cx)
+                                div()
                                     .debug_selector(|| "save-diagnostic-log".to_owned())
-                                    .border_color(colors.border)
                                     .child(
-                                        Icon::new(IconName::FileText)
-                                            .size(IconSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        Label::new(strings.save_diagnostic_log)
-                                            .size(LabelSize::Small)
-                                            .weight(FontWeight::MEDIUM),
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.save_diagnostic_log(cx);
-                                    })),
+                                        ui::Button::new("save-diagnostic-log", strings.save_diagnostic_log)
+                                            .variant(ui::ButtonVariant::Secondary)
+                                            .size(ui::ButtonSize::Sm)
+                                            .icon(IconName::FileText)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.save_diagnostic_log(cx);
+                                            })),
+                                    ),
                             ),
                     ),
             )
-            .children(self.diagnostic_message.as_ref().map(|(message, is_error)| {
+            .children(self.backups.diagnostic_message.as_ref().map(|(message, is_error)| {
                 div()
                     .pt_1p5()
                     .px_1()
                     .text_size(px(11.))
-                    .text_color(if *is_error { theme.status().error } else { colors.text_muted })
+                    .text_color(if *is_error {
+                        theme.status().error
+                    } else {
+                        colors.text_muted
+                    })
                     .child(message.clone())
             }))
             .into_any_element()

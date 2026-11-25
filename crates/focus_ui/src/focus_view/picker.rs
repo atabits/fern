@@ -20,6 +20,24 @@ pub(super) struct Picker {
     /// The Task tab's "Today >" list of views, while open.
     pub(super) views_open: bool,
     cache: PickerCache,
+    scroll: gpui::UniformListScrollHandle,
+}
+
+#[derive(Clone)]
+enum PickerRow {
+    ViewsBar(SharedString),
+    ViewOption {
+        index: usize,
+        view: View,
+        name: SharedString,
+        active: bool,
+    },
+    SectionHeading(&'static str),
+    Target {
+        id: SharedString,
+        title: String,
+        next: NextFocus,
+    },
 }
 
 /// What the focus page's Start focuses on.
@@ -82,7 +100,7 @@ impl FocusView {
     }
 
     pub(super) fn open_picker(&mut self, at_eye: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         if self.picker.as_ref().is_some_and(|p| p.at_eye == at_eye) {
@@ -101,7 +119,13 @@ impl FocusView {
         window.focus(&search.focus_handle(cx), cx);
         self.ensure_stats_data();
         let cache = self.load_picker_cache(Local::now().date_naive());
-        self.picker = Some(Picker { search, at_eye, views_open: false, cache });
+        self.picker = Some(Picker {
+            search,
+            at_eye,
+            views_open: false,
+            cache,
+            scroll: gpui::UniformListScrollHandle::new(),
+        });
         cx.notify();
     }
 
@@ -141,21 +165,7 @@ impl FocusView {
             .collect();
         // As in the original, the picked one has a filled circle and stays lit.
         let picked = self.next.as_ref().map(|n| n.title().to_owned());
-        let item = |id: SharedString, title: String, next: NextFocus, cx: &mut Context<Self>| {
-            let on = picked.as_deref() == Some(next.title());
-            ListItem::new(id)
-                .toggle_state(on)
-                .start_slot(
-                    Icon::new(if on { IconName::CircleDot } else { IconName::Circle })
-                        .size(IconSize::Small)
-                        .color(if on { Color::Accent } else { Color::Muted }),
-                )
-                .child(Label::new(title).size(LabelSize::Small).truncate())
-                .on_click(cx.listener(move |this, _, _, cx| this.pick(next.clone(), cx)))
-                .into_any_element()
-        };
-        let mut items: Vec<AnyElement> = Vec::new();
-        // The views the Task tab can list: the smart lists, the Inbox and the lists.
+        let mut rows: Vec<PickerRow> = Vec::new();
         let views: Vec<(View, SharedString)> = [
             (View::Today, SharedString::new_static(strings.today)),
             (View::Tomorrow, SharedString::new_static(strings.tomorrow)),
@@ -168,76 +178,63 @@ impl FocusView {
         let view_name = views.iter().find(|(v, _)| *v == self.picker_view).map_or(SharedString::new_static(strings.today), |(_, n)| n.clone());
         match self.picker_tab {
             0 if picker.views_open => {
-                for (i, (view, name)) in views.into_iter().enumerate() {
-                    let on = view == self.picker_view;
-                    items.push(
-                        ListItem::new(("focus-picker-view", i))
-                            .toggle_state(on)
-                            .child(Label::new(name).size(LabelSize::Small).color(if on { Color::Accent } else { Color::Default }))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.picker_view = view.clone();
-                                let tasks = if this.picker_view == View::Today {
-                                    this.tasks.clone()
-                                } else {
-                                    this.store.tasks_in(&this.picker_view, Local::now().date_naive()).unwrap_or_default()
-                                };
-                                if let Some(picker) = this.picker.as_mut() {
-                                    picker.views_open = false;
-                                    picker.cache.tasks = tasks;
-                                }
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                    );
+                for (index, (view, name)) in views.into_iter().enumerate() {
+                    let active = view == self.picker_view;
+                    rows.push(PickerRow::ViewOption { index, view, name, active });
                 }
             }
             0 => {
-                items.push(
-                    h_flex()
-                        .id("focus-picker-views")
-                        .gap_1()
-                        .px_2()
-                        .py_1()
-                        .cursor_pointer()
-                        .child(Icon::new(IconName::CalendarDays).size(IconSize::Small).color(Color::Muted))
-                        .child(Label::new(view_name).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
-                        .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(picker) = this.picker.as_mut() {
-                                picker.views_open = true;
-                            }
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                );
+                rows.push(PickerRow::ViewsBar(view_name));
                 for task in picker.cache.tasks.iter().filter(|t| matches_search(&t.title, &query)) {
-                    items.push(item(format!("pick-task-{}", task.id).into(), task.title.clone(), NextFocus::Task(task.id, task.title.clone()), cx));
+                    rows.push(PickerRow::Target {
+                        id: format!("pick-task-{}", task.id).into(),
+                        title: task.title.clone(),
+                        next: NextFocus::Task(task.id, task.title.clone()),
+                    });
                 }
                 // As in the original, the habits due today follow Today's tasks.
-                let week_start = crate::calendar::week_start();
+                let week_start = crate::calendar::week_start(cx);
                 let due: Vec<&fern_core::Habit> = habits
                     .iter()
                     .filter(|(h, done)| self.picker_view == View::Today && h.is_due_on(today, done, week_start))
                     .map(|(h, _)| *h)
                     .collect();
                 if !due.is_empty() {
-                    items.push(div().px_2().pt_1().child(Label::new(strings.focus_picker_tabs[2]).size(LabelSize::XSmall).color(Color::Muted)).into_any_element());
+                    rows.push(PickerRow::SectionHeading(strings.focus_picker_tabs[2]));
                 }
                 for habit in due {
-                    items.push(item(format!("pick-habit-{}", habit.id).into(), habit.name.clone(), NextFocus::Habit(habit.id, habit.name.clone()), cx));
+                    rows.push(PickerRow::Target {
+                        id: format!("pick-habit-{}", habit.id).into(),
+                        title: habit.name.clone(),
+                        next: NextFocus::Habit(habit.id, habit.name.clone()),
+                    });
                 }
             }
             1 => {
                 for timer in picker.cache.timers.iter().filter(|t| matches_search(&t.name, &query)) {
-                    items.push(item(format!("pick-timer-{}", timer.id).into(), timer.name.clone(), NextFocus::Timer(timer.clone()), cx));
+                    rows.push(PickerRow::Target {
+                        id: format!("pick-timer-{}", timer.id).into(),
+                        title: timer.name.clone(),
+                        next: NextFocus::Timer(timer.clone()),
+                    });
                 }
             }
             _ => {
                 for (habit, _) in &habits {
-                    items.push(item(format!("pick-habit-{}", habit.id).into(), habit.name.clone(), NextFocus::Habit(habit.id, habit.name.clone()), cx));
+                    rows.push(PickerRow::Target {
+                        id: format!("pick-habit-{}", habit.id).into(),
+                        title: habit.name.clone(),
+                        next: NextFocus::Habit(habit.id, habit.name.clone()),
+                    });
                 }
             }
         }
+        let rows = Rc::new(rows);
+        let row_count = rows.len();
+        let list_id = (
+            "focus-picker-items",
+            self.picker_tab * 2 + usize::from(picker.views_open),
+        );
         let tabs = h_flex().justify_center().gap_1().children(strings.focus_picker_tabs.iter().enumerate().map(|(i, label)| {
             let on = self.picker_tab == i;
             div()
@@ -254,6 +251,7 @@ impl FocusView {
                     this.picker_tab = i;
                     if let Some(picker) = this.picker.as_mut() {
                         picker.views_open = false;
+                        picker.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
                     }
                     cx.notify();
                 }))
@@ -279,12 +277,85 @@ impl FocusView {
                     .child(div().flex_1().child(picker.search.clone())),
             )
             .child(
-                v_scroll(
-                    ("focus-picker-items-scroll", self.picker_tab * 2 + usize::from(picker.views_open)),
-                    v_flex()
-                        .id(("focus-picker-items", self.picker_tab * 2 + usize::from(picker.views_open)))
-                        .children(items),
+                gpui::uniform_list(
+                    list_id,
+                    row_count,
+                    cx.processor(move |_this, range: std::ops::Range<usize>, _window, cx| {
+                        range
+                            .map(|ix| match &rows[ix] {
+                                PickerRow::ViewsBar(view_name) => h_flex()
+                                    .id("focus-picker-views")
+                                    .h(px(30.))
+                                    .gap_1()
+                                    .px_2()
+                                    .cursor_pointer()
+                                    .child(Icon::new(IconName::CalendarDays).size(IconSize::Small).color(Color::Muted))
+                                    .child(Label::new(view_name.clone()).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                                    .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(picker) = this.picker.as_mut() {
+                                            picker.views_open = true;
+                                            picker.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .into_any_element(),
+                                PickerRow::ViewOption { index, view, name, active } => {
+                                    let view = view.clone();
+                                    let on = *active;
+                                    ListItem::new(("focus-picker-view", *index))
+                                        .height(px(30.))
+                                        .toggle_state(on)
+                                        .child(Label::new(name.clone()).size(LabelSize::Small).color(if on {
+                                            Color::Accent
+                                        } else {
+                                            Color::Default
+                                        }))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.picker_view = view.clone();
+                                            let tasks = if this.picker_view == View::Today {
+                                                this.tasks.clone()
+                                            } else {
+                                                this.store
+                                                    .tasks_in(&this.picker_view, Local::now().date_naive())
+                                                    .unwrap_or_default()
+                                            };
+                                            if let Some(picker) = this.picker.as_mut() {
+                                                picker.views_open = false;
+                                                picker.cache.tasks = tasks;
+                                                picker.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .into_any_element()
+                                }
+                                PickerRow::SectionHeading(label) => div()
+                                    .h(px(30.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .child(Label::new(*label).size(LabelSize::XSmall).color(Color::Muted))
+                                    .into_any_element(),
+                                PickerRow::Target { id, title, next } => {
+                                    let on = picked.as_deref() == Some(next.title());
+                                    let next = next.clone();
+                                    ListItem::new(id.clone())
+                                        .height(px(30.))
+                                        .toggle_state(on)
+                                        .start_slot(
+                                            Icon::new(if on { IconName::CircleDot } else { IconName::Circle })
+                                                .size(IconSize::Small)
+                                                .color(if on { Color::Accent } else { Color::Muted }),
+                                        )
+                                        .child(Label::new(title.clone()).size(LabelSize::Small).truncate())
+                                        .on_click(cx.listener(move |this, _, _, cx| this.pick(next.clone(), cx)))
+                                        .into_any_element()
+                                }
+                            })
+                            .collect()
+                    }),
                 )
+                .track_scroll(&picker.scroll)
                 .flex_1()
                 .min_h_0(),
             )
@@ -294,7 +365,7 @@ impl FocusView {
     /// The original's full focus page: the arrow back, Pomo / Stopwatch and "…" on top, "Focus >"
     /// over a big ring with the time and Start (or Pause / Continue and End), and on the right
     /// the day's hours with its sessions and a red line at the time now.
-    pub(super) fn render_page(&self, clock: String, label: SharedString, running: bool, paused: bool, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_page(&self, clock: String, label: SharedString, running: bool, paused: bool, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         // The original's measures: an hour is 213 px, the ring 350 px, the panel 490 px wide.
         const HOUR: f32 = 213.;
         let strings = i18n::t(cx);
@@ -342,7 +413,7 @@ impl FocusView {
             .border_color(theme.colors().border)
             .child(
                 h_flex()
-                    .mt(crate::title_bar::header_inset())
+                    .mt(crate::title_bar::header_inset(window, cx))
                     .h(px(52.))
                     .flex_none()
                     .px_4()
@@ -481,7 +552,7 @@ impl FocusView {
             .px_4()
             .child(
                 h_flex()
-                    .mt(crate::title_bar::header_inset())
+                    .mt(crate::title_bar::header_inset(window, cx))
                     .h(px(52.))
                     .gap_2()
                     .child(Icon::new(if stopwatch { IconName::Timer } else { IconName::FernFocus }).color(Color::Accent))

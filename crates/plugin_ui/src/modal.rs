@@ -1,6 +1,7 @@
 //! Plugin modal overlays (`View`, `Confirm`, `Prompt`) and auto-expiring toast stack.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use desktop_common::actions::{DismissSettings, DismissTransient};
 use desktop_common::plugin_bus::{
@@ -122,6 +123,7 @@ pub struct PluginOverlayView {
     modal_tree_key: Option<(String, String)>,
     modal_title: String,
     seen_modal_gen: u64,
+    modal_tree_payload: Option<Result<Arc<UiTreePayload>, String>>,
     modal_tree_state: UiTreeState,
     modal_scroll: gpui::ScrollHandle,
     _bus_sub: Subscription,
@@ -178,6 +180,7 @@ impl PluginOverlayView {
             modal_tree_key: None,
             modal_title: String::new(),
             seen_modal_gen: 0,
+            modal_tree_payload: None,
             modal_tree_state: UiTreeState::new(),
             modal_scroll: gpui::ScrollHandle::new(),
             _bus_sub: bus_sub,
@@ -247,17 +250,16 @@ impl PluginOverlayView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
-        let status_colors = cx.theme().status().clone();
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
+        let status_colors = theme.status();
         let title = spec.title.clone();
 
         match &spec.kind {
             PluginModalKind::Confirm { body, request_id } => {
                 let req_id = *request_id;
-                ConfirmDialog::new("plugin-confirm-modal", title)
+                ConfirmDialog::new("plugin-confirm-modal", title, strings.cancel, strings.confirm)
                     .description(body.clone())
-                    .cancel_label(strings.cancel)
-                    .confirm_label(strings.confirm)
                     .on_cancel(move |_, _, cx| {
                         resolve_and_close_prompt(req_id, PromptReplyValue::Confirm(false), cx);
                     })
@@ -339,28 +341,35 @@ impl PluginOverlayView {
                 let next_key = (spec.plugin_id.clone(), spec.view_id.clone());
                 let key_changed = self.modal_tree_key.as_ref() != Some(&next_key);
                 let gen_changed = self.seen_modal_gen != modal_gen;
-                if key_changed || gen_changed {
-                    self.modal_scroll = gpui::ScrollHandle::new();
-                    self.modal_tree_state.close_select();
-                    if key_changed || self.modal_title != spec.title {
-                        self.modal_tree_state.clear();
+                if key_changed || gen_changed || self.modal_tree_payload.is_none() {
+                    if key_changed || gen_changed {
+                        self.modal_scroll = gpui::ScrollHandle::new();
+                        self.modal_tree_state.close_select();
+                        if key_changed || self.modal_title != spec.title {
+                            self.modal_tree_state.clear();
+                        }
+                        self.modal_tree_key = Some(next_key);
+                        self.modal_title = spec.title.clone();
+                        self.seen_modal_gen = modal_gen;
                     }
-                    self.modal_tree_key = Some(next_key);
-                    self.modal_title = spec.title.clone();
-                    self.seen_modal_gen = modal_gen;
+                    self.modal_tree_payload = Some(
+                        serde_json::from_value::<UiNode>(tree.clone())
+                            .map(|root| {
+                                Arc::new(UiTreePayload {
+                                    plugin_id: spec.plugin_id.clone(),
+                                    view_id: spec.view_id.clone(),
+                                    root,
+                                })
+                            })
+                            .map_err(|err| format!("{err}")),
+                    );
                 }
 
                 let modal_error = PluginHost::global(cx)
                     .and_then(|h| h.view_error(&spec.plugin_id, &spec.view_id).map(str::to_owned));
 
-                let parsed: Result<UiNode, _> = serde_json::from_value(tree.clone());
-                let body = match parsed {
-                    Ok(root) => {
-                        let payload = UiTreePayload {
-                            plugin_id: spec.plugin_id.clone(),
-                            view_id: spec.view_id.clone(),
-                            root,
-                        };
+                let body = match self.modal_tree_payload.as_ref() {
+                    Some(Ok(payload)) => {
                         let pid = spec.plugin_id.clone();
                         let sink = Rc::new(move |ev, cx: &mut App| {
                             PluginHost::dispatch_ui_event_async(pid.clone(), ev, cx);
@@ -370,12 +379,13 @@ impl PluginOverlayView {
                             let _ = weak.update(cx, |_, cx| cx.notify());
                         });
                         self.modal_tree_state
-                            .render_tree(&payload, sink, notify_sink, cx)
+                            .render_tree(payload, sink, notify_sink, cx)
                     }
-                    Err(err) => Label::new(format!("{err}"))
+                    Some(Err(err)) => Label::new(err.clone())
                         .size(LabelSize::Small)
                         .color(Color::Error)
                         .into_any_element(),
+                    None => div().into_any_element(),
                 };
 
                 Modal::new("plugin-view-modal")
@@ -473,9 +483,10 @@ impl Render for PluginOverlayView {
         if !matches!(
             active_modal.as_ref().map(|m| &m.kind),
             Some(PluginModalKind::View { .. })
-        ) && self.modal_tree_key.is_some()
+        ) && (self.modal_tree_key.is_some() || self.modal_tree_payload.is_some())
         {
             self.modal_tree_key = None;
+            self.modal_tree_payload = None;
             self.modal_title.clear();
             self.modal_tree_state.clear();
             self.modal_scroll = gpui::ScrollHandle::new();

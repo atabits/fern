@@ -1,5 +1,20 @@
 use super::*;
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct TimelineCacheKey {
+    rows_key: RowsCacheKey,
+    from: NaiveDate,
+    scale: usize,
+    show_weekends: bool,
+}
+
+pub(super) type TimelineGroup = (String, Vec<(Task, usize, usize)>);
+
+pub(super) struct TimelineCacheData {
+    days: Vec<NaiveDate>,
+    groups: Vec<TimelineGroup>,
+}
+
 fn visible_timeline_bar(task: &Task, days: &[NaiveDate]) -> Option<(usize, usize)> {
     let start = task.due_date?;
     let end = task.end_date.unwrap_or(start).max(start);
@@ -15,17 +30,17 @@ fn visible_timeline_bar(task: &Task, days: &[NaiveDate]) -> Option<(usize, usize
 
 impl TodoView {
     pub(super) fn toggle_timeline_weekends(&mut self, cx: &mut Context<Self>) {
-        let next = !self.timeline_show_weekends;
+        let next = !self.timeline.show_weekends;
         let result = self.store.set_setting("timeline_show_weekends", if next { "1" } else { "0" });
         self.check(result);
-        self.timeline_show_weekends = next;
+        self.timeline.show_weekends = next;
         cx.notify();
     }
 
     pub(super) fn set_timeline_color_by(&mut self, choice: ColorBy, cx: &mut Context<Self>) {
         let result = self.store.set_setting("timeline_color_by", choice.code());
         self.check(result);
-        self.timeline_color_by = choice;
+        self.timeline.color_by = choice;
         cx.notify();
     }
 
@@ -37,8 +52,8 @@ impl TodoView {
             .map(str::to_owned);
         let result = self.store.set_setting("timeline_secondary_tz", cleaned.as_deref().unwrap_or(""));
         self.check(result);
-        self.timeline_secondary_tz = cleaned;
-        self.timeline_tz_menu = false;
+        self.timeline.secondary_tz = cleaned;
+        self.timeline.tz_menu = false;
         cx.notify();
     }
 
@@ -58,7 +73,7 @@ impl TodoView {
 
     fn timeline_bar_color(&self, task: &Task, theme: &theme::Theme) -> Hsla {
         let accent = theme.colors().accent;
-        match self.timeline_color_by {
+        match self.timeline.color_by {
             ColorBy::List => task
                 .list_id
                 .and_then(|id| self.list_colors.get(&id).copied())
@@ -75,11 +90,11 @@ impl TodoView {
     fn render_timeline_tz_button(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let label = self
-            .timeline_secondary_tz
+            .timeline.secondary_tz
             .as_deref()
             .map(|z| z.rsplit('/').next().unwrap_or(z).replace('_', " "))
             .unwrap_or_else(|| strings.secondary_timezone_none.to_owned());
-        let query = self.timeline_tz_input.read(cx).text().trim().to_lowercase();
+        let query = self.timeline.tz_input.read(cx).text().trim().to_lowercase();
         let tz_choices: Vec<&'static str> = if query.is_empty() {
             vec![
                 "UTC",
@@ -115,14 +130,14 @@ impl TodoView {
                     .child(Label::new(label).size(LabelSize::Small))
                     .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.timeline_tz_menu = !this.timeline_tz_menu;
-                        if this.timeline_tz_menu {
-                            window.focus(&this.timeline_tz_input.focus_handle(cx), cx);
+                        this.timeline.tz_menu = !this.timeline.tz_menu;
+                        if this.timeline.tz_menu {
+                            window.focus(&this.timeline.tz_input.focus_handle(cx), cx);
                         }
                         cx.notify();
                     })),
             )
-            .when(self.timeline_tz_menu, |el| {
+            .when(self.timeline.tz_menu, |el| {
                 el.child(PopoverAttachment::new(
                     Placement::BelowRight,
                     popover(cx)
@@ -130,7 +145,7 @@ impl TodoView {
                         .p_2()
                         .gap_1p5()
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.timeline_tz_menu = false;
+                            this.timeline.tz_menu = false;
                             cx.notify();
                         }))
                         .child(
@@ -140,9 +155,9 @@ impl TodoView {
                                 .rounded(px(6.))
                                 .border_1()
                                 .border_color(theme.colors().border)
-                                .child(self.timeline_tz_input.clone())
+                                .child(self.timeline.tz_input.clone())
                                 .child(
-                                    Label::new(if self.timeline_tz_input.read(cx).text().is_empty() {
+                                    Label::new(if self.timeline.tz_input.read(cx).text().is_empty() {
                                         strings.timezone_search
                                     } else {
                                         ""
@@ -159,12 +174,12 @@ impl TodoView {
                                     .child(
                                         ListItem::new("timeline-tz-none")
                                             .height(px(28.))
-                                            .toggle_state(self.timeline_secondary_tz.is_none())
+                                            .toggle_state(self.timeline.secondary_tz.is_none())
                                             .child(Label::new(strings.secondary_timezone_none).size(LabelSize::Small))
                                             .on_click(cx.listener(|this, _, _, cx| this.set_timeline_secondary_tz(None, cx))),
                                     )
                                     .children(tz_choices.into_iter().map(|zone| {
-                                        let active = self.timeline_secondary_tz.as_deref() == Some(zone);
+                                        let active = self.timeline.secondary_tz.as_deref() == Some(zone);
                                         ListItem::new(SharedString::from(format!("timeline-tz-{zone}")))
                                             .height(px(28.))
                                             .toggle_state(active)
@@ -200,30 +215,30 @@ impl TodoView {
                     .border_1()
                     .border_color(theme.colors().border)
                     .cursor_pointer()
-                    .child(Label::new(labels[self.timeline_scale]).size(LabelSize::Small))
+                    .child(Label::new(labels[self.timeline.scale]).size(LabelSize::Small))
                     .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.scale_menu_open = !this.scale_menu_open;
+                        this.timeline.scale_menu_open = !this.timeline.scale_menu_open;
                         cx.notify();
                     })),
             )
-            .when(self.scale_menu_open, |el| {
+            .when(self.timeline.scale_menu_open, |el| {
                 el.child(PopoverAttachment::new(
                     Placement::BelowRight,
                     popover(cx)
                         .min_w(px(150.))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.scale_menu_open = false;
+                            this.timeline.scale_menu_open = false;
                             cx.notify();
                         }))
                         .children(labels.into_iter().enumerate().map(|(i, label)| {
-                            let selected = i == self.timeline_scale;
+                            let selected = i == self.timeline.scale;
                             ListItem::new(SharedString::from(format!("timeline-scale-{i}")))
                                 .child(Label::new(label).color(if selected { Color::Accent } else { Color::Default }))
                                 .when(selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.timeline_scale = i;
-                                    this.scale_menu_open = false;
+                                    this.timeline.scale = i;
+                                    this.timeline.scale_menu_open = false;
                                     let result = this.store.set_setting(&format!("timeline_scale:{}", this.view_key()), &i.to_string());
                                     this.check(result);
                                     cx.notify();
@@ -237,41 +252,75 @@ impl TodoView {
 
     /// The original's Timeline: the groups as rows, the coming days as columns (weekends shaded),
     /// and each dated task as a bar from its date to the end of its duration; a click opens it.
+    fn timeline_cache_data(&self, strings: &'static Strings, cx: &App) -> Rc<TimelineCacheData> {
+        let scale = self.timeline.scale;
+        let from = self.timeline.from;
+        let show_weekends = self.timeline.show_weekends;
+        let key = TimelineCacheKey {
+            rows_key: self.rows_cache_key(strings, cx),
+            from,
+            scale,
+            show_weekends,
+        };
+        if let Some((cached_key, cached)) = self.timeline.cache.borrow().as_ref()
+            && *cached_key == key
+        {
+            return Rc::clone(cached);
+        }
+        let days_shown = [10usize, 22, 45][scale];
+        let days: Vec<NaiveDate> = (0..days_shown as i64)
+            .map(|i| from + chrono::Duration::days(i))
+            .filter(|d| show_weekends || !matches!(d.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun))
+            .collect();
+        let raw_groups =
+            task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new(), cx), strings);
+        let groups = raw_groups
+            .into_iter()
+            .map(|(label, _, cards)| {
+                let bars = cards
+                    .into_iter()
+                    .flat_map(|(task, subtasks)| std::iter::once(task).chain(subtasks))
+                    .filter_map(|task| visible_timeline_bar(&task, &days).map(|(first, span)| (task, first, span)))
+                    .collect();
+                (label, bars)
+            })
+            .collect();
+        let data = Rc::new(TimelineCacheData { days, groups });
+        *self.timeline.cache.borrow_mut() = Some((key, Rc::clone(&data)));
+        data
+    }
+
     pub(super) fn render_timeline(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         // The original's scales: Day shows ten days, Week three weeks, Month six; the arrows move
         // by a week, two weeks or a month.
-        let scale = self.timeline_scale;
-        let days_shown = [10usize, 22, 45][scale];
+        let scale = self.timeline.scale;
         let step = [7i64, 14, 30][scale];
         const LABEL_WIDTH: f32 = 108.;
         let theme = cx.theme().clone();
         let today = Self::today();
-        let from = self.timeline_from;
+        let from = self.timeline.from;
         let today_line = theme.status().error;
         let weekend = |date: &NaiveDate| matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
-        let days: Vec<NaiveDate> = (0..days_shown as i64)
-            .map(|i| from + chrono::Duration::days(i))
-            .filter(|d| self.timeline_show_weekends || !weekend(d))
-            .collect();
+        let cached = self.timeline_cache_data(strings, cx);
+        let days = &cached.days;
         let visible_cols = days.len().max(1);
-        let groups = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
         let scale_button = self.render_scale_button(strings, cx);
         let tz_button = self.render_timeline_tz_button(strings, cx);
-        let dual_clock = self.timeline_secondary_tz.as_deref().and_then(|tz_name| {
+        let dual_clock = self.timeline.secondary_tz.as_deref().and_then(|tz_name| {
             let now_local = Local::now();
             let sec_time = crate::calendar::time_in_timezone(now_local, tz_name)?;
             let city = tz_name.rsplit('/').next().unwrap_or(tz_name).replace('_', " ");
             Some(format!(
                 "{} {} · {} {}",
                 strings.timezone_local,
-                crate::calendar::format_time(now_local.time(), strings),
+                crate::calendar::format_time(now_local.time(), strings, cx),
                 city,
-                crate::calendar::format_time(sec_time, strings)
+                crate::calendar::format_time(sec_time, strings, cx)
             ))
         });
         let shift = |delta: i64| {
             cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                this.timeline_from += chrono::Duration::days(delta);
+                this.timeline.from += chrono::Duration::days(delta);
                 cx.notify();
             })
         };
@@ -337,7 +386,7 @@ impl TodoView {
                             .hover(|s| s.bg(theme.colors().element_hover))
                             .child(Label::new(strings.today).size(LabelSize::Small))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.timeline_from = Self::today();
+                                this.timeline.from = Self::today();
                                 cx.notify();
                             })),
                     )
@@ -383,7 +432,7 @@ impl TodoView {
                             .items_center()
                             .justify_center()
                             .when(weekend(date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
-                            .tooltip(Tooltip::text(crate::calendar::format_date(*date, strings)))
+                            .tooltip(Tooltip::text(crate::calendar::format_date(*date, strings, cx)))
                             .when(labelled || is_today, |el| el.child(Label::new(date.day().to_string()).centered().weight(FontWeight::SEMIBOLD).color(color)))
                     })))
                     .child(
@@ -394,15 +443,10 @@ impl TodoView {
                             .on_click(shift(step)),
                     ),
             );
-        let rows = groups.into_iter().enumerate().map(|(i, (label, _, cards))| {
-            let bars: Vec<(Task, usize, usize)> = cards
-                .into_iter()
-                .flat_map(|(task, subtasks)| std::iter::once(task).chain(subtasks))
-                .filter_map(|task| visible_timeline_bar(&task, &days).map(|(first, span)| (task, first, span)))
-                .collect();
+        let rows = cached.groups.iter().enumerate().map(|(i, (label, bars))| {
             // A group folds up with the arrow before its name, as in the original.
-            let folded = self.timeline_folded.contains(&label);
-            let bars = if folded { Vec::new() } else { bars };
+            let folded = self.timeline.folded.contains(label);
+            let bars: &[(Task, usize, usize)] = if folded { &[] } else { bars.as_slice() };
             let height = px(if folded { 40. } else { 20. + 40. * bars.len().max(1) as f32 });
             let fold_label = label.clone();
             h_flex()
@@ -422,10 +466,10 @@ impl TodoView {
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.colors().ghost_element_hover))
                         .child(Icon::new(if folded { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall).color(Color::Muted))
-                        .child(Label::new(label).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                        .child(Label::new(label.clone()).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.timeline_folded.remove(&fold_label) {
-                                this.timeline_folded.insert(fold_label.clone());
+                            if !this.timeline.folded.remove(&fold_label) {
+                                this.timeline.folded.insert(fold_label.clone());
                             }
                             cx.notify();
                         })),
@@ -437,11 +481,13 @@ impl TodoView {
                         .mr(px(20.))
                         .relative()
                         .child(backdrop(i, height, cx))
-                        .children(bars.into_iter().enumerate().map(|(n, (task, first, span))| {
+                        .children(bars.iter().enumerate().map(|(n, (task, first, span))| {
+                            let first = *first;
+                            let span = *span;
                             let id = task.id;
                             let completed = task.is_completed();
-                            let read_only = self.is_task_read_only(&task);
-                            let tint = self.timeline_bar_color(&task, &theme);
+                            let read_only = self.is_task_read_only(task);
+                            let tint = self.timeline_bar_color(task, &theme);
                             let fill_alpha = if completed { 0.3 } else { 0.75 };
                             let effective_bg = theme.colors().background.blend(tint.opacity(fill_alpha));
                             let bar_fg = theme::foreground_on(&[effective_bg], 3.8);
@@ -449,7 +495,7 @@ impl TodoView {
                             let dragged = DraggedTask { id, title: handle_title.clone() };
                             let span_start = task.due_date.unwrap_or(today);
                             let span_end = task.end_date.unwrap_or(span_start).max(span_start);
-                            let sec_time_label = self.timeline_secondary_tz.as_deref().and_then(|tz_name| {
+                            let sec_time_label = self.timeline.secondary_tz.as_deref().and_then(|tz_name| {
                                 let d = task.due_date?;
                                 let t = task.due_time?;
                                 let naive = d.and_time(t);
@@ -457,8 +503,8 @@ impl TodoView {
                                 let sec_time = crate::calendar::time_in_timezone(local_dt, tz_name)?;
                                 Some(format!(
                                     "{} ({})",
-                                    crate::calendar::format_time(t, strings),
-                                    crate::calendar::format_time(sec_time, strings)
+                                    crate::calendar::format_time(t, strings, cx),
+                                    crate::calendar::format_time(sec_time, strings, cx)
                                 ))
                             });
                             let resize_handle = |edge: ResizeEdge| {
@@ -540,7 +586,7 @@ impl TodoView {
                                         .flex_1()
                                         .min_w_0()
                                         .when(completed, |el| el.line_through())
-                                        .child(Label::new(task.title).color(Color::Custom(bar_fg)).truncate()),
+                                        .child(Label::new(task.title.clone()).color(Color::Custom(bar_fg)).truncate()),
                                 );
                             h_flex()
                                 .id(SharedString::from(format!("timeline-{i}-{id}")))
@@ -577,7 +623,7 @@ impl TodoView {
             .min_h_0()
             .items_start()
             .child(timeline)
-            .when(self.arrange_open && !archived_view, |el| el.child(self.render_arrange(strings, cx)))
+            .when(self.timeline.arrange_open && !archived_view, |el| el.child(self.render_arrange(strings, cx)))
             .into_any_element()
     }
 
@@ -585,7 +631,7 @@ impl TodoView {
     /// first tag's color, to drag onto a day of the Timeline.
     pub(super) fn render_arrange(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let groups = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
+        let groups = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new(), cx), strings);
         let tag_color = |task: &Task| {
             task.tags
                 .first()
@@ -675,7 +721,7 @@ impl TodoView {
                                 .icon_size(IconSize::Small)
                                 .tooltip(Tooltip::text(strings.close))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.arrange_open = false;
+                                    this.timeline.arrange_open = false;
                                     cx.notify();
                                 })),
                         ),

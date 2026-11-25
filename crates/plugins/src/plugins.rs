@@ -41,3 +41,16 @@ pub use ui_ast::{
     UiSelectOption, UiTextSize, UiTreePayload, UiWeight, sanitize_svg,
 };
 pub use vault::SecretsVault;
+
+static HOST_WARN_FN: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Registers a host callback for runtime warnings that occur outside a specific plugin slot.
+pub fn set_host_warn_fn(f: fn(&str)) {
+    let _ = HOST_WARN_FN.set(f);
+}
+
+pub(crate) fn log_host_warn(message: &str) {
+    if let Some(f) = HOST_WARN_FN.get() {
+        f(message);
+    }
+}

@@ -8,18 +8,14 @@ mod updates;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(not(test))]
 use std::future::Future;
 use std::path::PathBuf;
-#[cfg(not(test))]
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-#[cfg(not(test))]
-use std::task::{Context as TaskContext, Poll};
-use std::task::Waker;
+use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -38,8 +34,9 @@ use plugins::{
 use theme::Theme;
 
 pub use themes::collect_plugin_themes;
-#[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use updates::{apply_ui_effect, resolve_displaced_modal, schedule_toast_expiry};
+#[cfg(test)]
+pub(crate) use updates::apply_ui_effect;
+pub(crate) use updates::{resolve_displaced_modal, schedule_toast_expiry};
 
 use themes::ThemeSourceSignature;
 #[cfg(test)]
@@ -90,31 +87,60 @@ impl PluginHostConfig {
 /// Sentinel GPUI entity used as the `EntityId` source when plugins mutate SQLite data.
 struct HostDataMarker;
 
+pub(super) type ViewMap<T> = HashMap<String, HashMap<String, T>>;
+
+pub(super) fn view_map_get<'a, T>(
+    map: &'a ViewMap<T>,
+    plugin_id: &str,
+    view_id: &str,
+) -> Option<&'a T> {
+    map.get(plugin_id).and_then(|views| views.get(view_id))
+}
+
+pub(super) fn view_map_contains<T>(map: &ViewMap<T>, plugin_id: &str, view_id: &str) -> bool {
+    view_map_get(map, plugin_id, view_id).is_some()
+}
+
+pub(super) fn view_map_insert<T>(map: &mut ViewMap<T>, plugin_id: &str, view_id: String, val: T) {
+    if let Some(inner) = map.get_mut(plugin_id) {
+        inner.insert(view_id, val);
+    } else {
+        let mut inner = HashMap::new();
+        inner.insert(view_id, val);
+        map.insert(plugin_id.to_owned(), inner);
+    }
+}
+
+pub(super) fn view_map_remove<T>(map: &mut ViewMap<T>, plugin_id: &str, view_id: &str) {
+    if let Some(inner) = map.get_mut(plugin_id) {
+        inner.remove(view_id);
+        if inner.is_empty() {
+            map.remove(plugin_id);
+        }
+    }
+}
+
 pub(super) struct WakeSignal {
-    #[cfg(not(test))]
     woken: AtomicBool,
     pub(super) closed: AtomicBool,
     waker: Mutex<Option<Waker>>,
 }
 
-#[cfg(not(test))]
 impl WakeSignal {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            woken: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            waker: Mutex::new(None),
+        })
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
     fn wake(&self) {
         self.woken.store(true, Ordering::SeqCst);
         if let Some(waker) = self.waker.lock().ok().and_then(|mut guard| guard.take()) {
             waker.wake();
         }
-    }
-}
-
-impl WakeSignal {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            #[cfg(not(test))]
-            woken: AtomicBool::new(false),
-            closed: AtomicBool::new(false),
-            waker: Mutex::new(None),
-        })
     }
 
     fn close(&self) {
@@ -125,10 +151,8 @@ impl WakeSignal {
     }
 }
 
-#[cfg(not(test))]
 pub(super) struct WaitForWake(pub(super) Arc<WakeSignal>);
 
-#[cfg(not(test))]
 impl Future for WaitForWake {
     type Output = bool;
 
@@ -163,8 +187,8 @@ pub(super) enum PluginViewOp {
 
 #[derive(Default)]
 pub(super) struct PluginOpState {
-    pub(super) view_generations: HashMap<(String, String), u64>,
-    pub(super) mounting_views: HashSet<(String, String)>,
+    pub(super) view_generations: ViewMap<u64>,
+    pub(super) mounting_views: HashMap<String, HashSet<String>>,
     pub(super) in_flight_reload_or_reset: HashSet<String>,
     pub(super) queues: HashMap<String, VecDeque<PluginViewOp>>,
     pub(super) running: HashSet<String>,
@@ -172,19 +196,39 @@ pub(super) struct PluginOpState {
 
 impl PluginOpState {
     pub(super) fn next_view_gen(&mut self, plugin_id: &str, view_id: &str) -> u64 {
-        let key = (plugin_id.to_owned(), view_id.to_owned());
-        let entry = self.view_generations.entry(key).or_insert(0);
-        *entry = entry.wrapping_add(1);
-        *entry
+        let views = self.view_generations.entry(plugin_id.to_owned()).or_default();
+        if let Some(entry) = views.get_mut(view_id) {
+            *entry = entry.wrapping_add(1);
+            *entry
+        } else {
+            views.insert(view_id.to_owned(), 1);
+            1
+        }
+    }
+
+    pub(super) fn set_mounting(&mut self, plugin_id: &str, view_id: &str) {
+        self.mounting_views
+            .entry(plugin_id.to_owned())
+            .or_default()
+            .insert(view_id.to_owned());
+    }
+
+    pub(super) fn clear_mounting(&mut self, plugin_id: &str, view_id: &str) {
+        if let Some(set) = self.mounting_views.get_mut(plugin_id) {
+            set.remove(view_id);
+            if set.is_empty() {
+                self.mounting_views.remove(plugin_id);
+            }
+        }
     }
 
     pub(super) fn invalidate_plugin_views(&mut self, plugin_id: &str) {
-        for ((pid, _), generation) in &mut self.view_generations {
-            if pid == plugin_id {
+        if let Some(views) = self.view_generations.get_mut(plugin_id) {
+            for generation in views.values_mut() {
                 *generation = generation.wrapping_add(1);
             }
         }
-        self.mounting_views.retain(|(pid, _)| pid != plugin_id);
+        self.mounting_views.remove(plugin_id);
     }
 }
 
@@ -199,9 +243,9 @@ pub struct PluginHost {
     hot_reload_started: bool,
     plugins: Arc<Vec<PluginInfo>>,
     plugin_revisions: HashMap<String, u64>,
-    views: HashMap<(String, String), Arc<UiTreePayload>>,
-    view_errors: HashMap<(String, String), String>,
-    view_revisions: HashMap<(String, String), u64>,
+    views: ViewMap<Arc<UiTreePayload>>,
+    view_errors: ViewMap<String>,
+    view_revisions: ViewMap<u64>,
     op_state: RefCell<PluginOpState>,
     registry_change_seq: u64,
     pending_hot_reload: HashSet<String>,
@@ -383,6 +427,7 @@ impl PluginHost {
 
     /// Initializes [`PluginHost`] as a GPUI `Global`, spawning [`PluginManager`] unless in safe mode.
     pub fn init(config: PluginHostConfig, cx: &mut App) -> Result<()> {
+        plugins::set_host_warn_fn(|msg| desktop_common::logging::log_warn("plugin_runtime", msg));
         let mut prev_theme_ids = HashSet::new();
         let mut prev_theme_errors = Vec::new();
         if cx.try_global::<Self>().is_some() {
@@ -601,7 +646,7 @@ impl PluginHost {
         &self.plugins
     }
 
-    pub(crate) fn plugins_arc(&self) -> Arc<Vec<PluginInfo>> {
+    pub fn plugins_arc(&self) -> Arc<Vec<PluginInfo>> {
         Arc::clone(&self.plugins)
     }
 
@@ -614,16 +659,15 @@ impl PluginHost {
     }
 
     pub(crate) fn view_revision(&self, plugin_id: &str, view_id: &str) -> Option<u64> {
-        self.view_revisions
-            .get(&(plugin_id.to_owned(), view_id.to_owned()))
-            .copied()
+        view_map_get(&self.view_revisions, plugin_id, view_id).copied()
     }
 
     pub(crate) fn is_view_mounting(&self, plugin_id: &str, view_id: &str) -> bool {
         self.op_state
             .borrow()
             .mounting_views
-            .contains(&(plugin_id.to_owned(), view_id.to_owned()))
+            .get(plugin_id)
+            .is_some_and(|views| views.contains(view_id))
     }
 
     pub(crate) fn modal_generation(&self) -> u64 {
@@ -656,21 +700,15 @@ impl PluginHost {
     }
 
     pub fn view_tree(&self, plugin_id: &str, view_id: &str) -> Option<&UiTreePayload> {
-        self.views
-            .get(&(plugin_id.to_owned(), view_id.to_owned()))
-            .map(Arc::as_ref)
+        view_map_get(&self.views, plugin_id, view_id).map(Arc::as_ref)
     }
 
     pub fn view_tree_arc(&self, plugin_id: &str, view_id: &str) -> Option<Arc<UiTreePayload>> {
-        self.views
-            .get(&(plugin_id.to_owned(), view_id.to_owned()))
-            .cloned()
+        view_map_get(&self.views, plugin_id, view_id).cloned()
     }
 
     pub fn view_error(&self, plugin_id: &str, view_id: &str) -> Option<&str> {
-        self.view_errors
-            .get(&(plugin_id.to_owned(), view_id.to_owned()))
-            .map(String::as_str)
+        view_map_get(&self.view_errors, plugin_id, view_id).map(String::as_str)
     }
 
     pub fn plugin_theme_errors(&self) -> &[String] {
@@ -686,12 +724,13 @@ impl PluginHost {
         if !cx.has_global::<Self>() {
             return;
         }
-        let key = (plugin_id.into(), view_id.into());
+        let pid = plugin_id.into();
+        let vid = view_id.into();
         cx.update_global::<Self, _>(|host, _| {
-            let rev = host.plugin_revision(&key.0);
-            host.view_errors.remove(&key);
-            host.views.insert(key.clone(), Arc::new(payload));
-            host.view_revisions.insert(key, rev);
+            let rev = host.plugin_revision(&pid);
+            view_map_remove(&mut host.view_errors, &pid, &vid);
+            view_map_insert(&mut host.views, &pid, vid.clone(), Arc::new(payload));
+            view_map_insert(&mut host.view_revisions, &pid, vid, rev);
         });
     }
 
@@ -704,24 +743,22 @@ impl PluginHost {
         if !cx.has_global::<Self>() {
             return;
         }
-        let key = (plugin_id.into(), view_id.into());
+        let pid = plugin_id.into();
+        let vid = view_id.into();
         cx.update_global::<Self, _>(|host, _| {
-            host.view_errors.insert(key, error);
+            view_map_insert(&mut host.view_errors, &pid, vid, error);
         });
     }
 
     pub fn clear_view_error(plugin_id: &str, view_id: &str, cx: &mut App) {
-        let should_clear = cx.try_global::<Self>().is_some_and(|host| {
-            host.view_errors
-                .iter()
-                .any(|((p, v), _)| p == plugin_id && v == view_id)
-        });
+        let should_clear = cx
+            .try_global::<Self>()
+            .is_some_and(|host| view_map_contains(&host.view_errors, plugin_id, view_id));
         if !should_clear {
             return;
         }
-        let key = (plugin_id.to_owned(), view_id.to_owned());
         cx.update_global::<Self, _>(|host, _| {
-            host.view_errors.remove(&key);
+            view_map_remove(&mut host.view_errors, plugin_id, view_id);
         });
     }
 
@@ -947,9 +984,9 @@ fn handle_hot_reload_changed(
         host.loaded_theme_signature = None;
         let reload_already_delivered = host.registry_change_seq > seq_before;
         for id in &changed_ids {
-            host.views.retain(|(p, _), _| p != id);
-            host.view_errors.retain(|(p, _), _| p != id);
-            host.view_revisions.retain(|(p, _), _| p != id);
+            host.views.remove(id);
+            host.view_errors.remove(id);
+            host.view_revisions.remove(id);
             host.op_state.borrow_mut().invalidate_plugin_views(id);
             if reload_already_delivered {
                 let entry = host.plugin_revisions.entry(id.clone()).or_insert(0);
@@ -1040,5 +1077,49 @@ mod tests {
             assert!(!host.hot_reload_started);
             PluginHost::shutdown(cx);
         });
+    }
+
+    #[test]
+    fn wake_signal_and_wait_for_wake_cover_before_poll_during_poll_and_close() {
+        use std::sync::Arc as StdArc;
+        use std::task::{Context as StdCtx, Poll as StdPoll, Wake, Waker as StdWaker};
+
+        struct CountWaker(std::sync::atomic::AtomicUsize);
+        impl Wake for CountWaker {
+            fn wake(self: StdArc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // 1. Wake before first poll resolves immediately.
+        let sig1 = WakeSignal::new();
+        sig1.wake();
+        let w1 = StdArc::new(CountWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker1 = StdWaker::from(w1);
+        let mut cx1 = StdCtx::from_waker(&waker1);
+        let mut fut1 = WaitForWake(StdArc::clone(&sig1));
+        assert_eq!(Pin::new(&mut fut1).poll(&mut cx1), StdPoll::Ready(true));
+
+        // 2. Poll while idle returns Pending, then wake fires waker and next poll returns Ready(true).
+        let sig2 = WakeSignal::new();
+        let w2 = StdArc::new(CountWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker2 = StdWaker::from(StdArc::clone(&w2));
+        let mut cx2 = StdCtx::from_waker(&waker2);
+        let mut fut2 = WaitForWake(StdArc::clone(&sig2));
+        assert_eq!(Pin::new(&mut fut2).poll(&mut cx2), StdPoll::Pending);
+        sig2.wake();
+        assert_eq!(w2.0.load(Ordering::SeqCst), 1);
+        assert_eq!(Pin::new(&mut fut2).poll(&mut cx2), StdPoll::Ready(true));
+
+        // 3. Close while pending wakes task and resolves to Ready(false).
+        let sig3 = WakeSignal::new();
+        let w3 = StdArc::new(CountWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker3 = StdWaker::from(StdArc::clone(&w3));
+        let mut cx3 = StdCtx::from_waker(&waker3);
+        let mut fut3 = WaitForWake(StdArc::clone(&sig3));
+        assert_eq!(Pin::new(&mut fut3).poll(&mut cx3), StdPoll::Pending);
+        sig3.close();
+        assert_eq!(w3.0.load(Ordering::SeqCst), 1);
+        assert_eq!(Pin::new(&mut fut3).poll(&mut cx3), StdPoll::Ready(false));
     }
 }

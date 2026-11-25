@@ -135,7 +135,7 @@ impl HabitView {
                     "habit-rem-time-scroll",
                     v_flex().id("habit-rem-time-list").children(slots.into_iter().map(|time| {
                         let selected = current_parsed == Some(time);
-                        let label = calendar::format_time(time, strings);
+                        let label = calendar::format_time(time, strings, cx);
                         ListItem::new(SharedString::from(format!("rem-slot-{:02}{:02}", time.hour(), time.minute())))
                             .height(px(28.))
                             .toggle_state(selected)
@@ -412,11 +412,38 @@ impl HabitView {
     }
 
     pub(crate) fn render_start_date_popover(&self, edit: &HabitEdit, today: NaiveDate, cx: &mut Context<Self>) -> Div {
+        use desktop_common::month_calendar::{
+            MonthGridConfig, MonthHeaderConfig, WeekdayStyle, render_month_grid, render_month_header,
+            render_weekday_row,
+        };
+
         let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
         let shown_month = edit.start_calendar.unwrap_or_else(|| calendar::month_start(edit.start_date.unwrap_or(today)));
         let month_label = format!("{} {}", strings.months[shown_month.month0() as usize], shown_month.year());
-        let grid = calendar::month_grid(shown_month);
+        let entity_shift = cx.entity();
+        let entity_pick = cx.entity();
+        let mut header = MonthHeaderConfig::surface(shown_month, strings, "start-cal-prev", "start-cal-next");
+        header.custom_title = Some(month_label);
+        header.small_title = true;
+        header.title_weight = FontWeight::MEDIUM;
+
+        let mut grid_cfg = MonthGridConfig::single("start", shown_month, today);
+        grid_cfg.selected = edit.start_date;
+        grid_cfg.cell_height = Some(px(28.));
+        grid_cfg.rounded_full = false;
+        grid_cfg.label_size = LabelSize::XSmall;
+        grid_cfg.fade_outside_with_opacity = true;
+        grid_cfg.highlight_today_bg = false;
+
+        let weeks = render_month_grid(&grid_cfg, cx, move |date, _, cx| {
+            entity_pick.update(cx, |this, cx| {
+                this.update_edit(cx, |e| {
+                    e.start_date = Some(date);
+                    e.open = None;
+                    e.start_calendar = None;
+                });
+            });
+        });
 
         popover(cx)
             .w(px(264.))
@@ -428,71 +455,23 @@ impl HabitView {
                     e.start_calendar = None;
                 });
             }))
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(IconButton::new("start-cal-prev", IconName::ChevronLeft).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.update_edit(cx, |e| {
-                                let base = e
-                                    .start_calendar
-                                    .unwrap_or_else(|| calendar::month_start(e.start_date.unwrap_or_else(|| Local::now().date_naive())));
-                                e.start_calendar = Some(calendar::add_months(base, -1));
-                            });
-                        },
-                    )))
-                    .child(Label::new(month_label).size(LabelSize::Small).weight(FontWeight::MEDIUM))
-                    .child(IconButton::new("start-cal-next", IconName::ChevronRight).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.update_edit(cx, |e| {
-                                let base = e
-                                    .start_calendar
-                                    .unwrap_or_else(|| calendar::month_start(e.start_date.unwrap_or_else(|| Local::now().date_naive())));
-                                e.start_calendar = Some(calendar::add_months(base, 1));
-                            });
-                        },
-                    ))),
-            )
-            .child(h_flex().children(calendar::weekday_labels(&strings.weekdays_short).iter().map(|d| {
-                div().flex_1().flex().justify_center().child(Label::new(*d).size(LabelSize::XSmall).color(Color::Muted))
-            })))
-            .children(grid.chunks(7).map(|week| {
-                h_flex().children(week.iter().map(|&date| {
-                    let selected = edit.start_date == Some(date);
-                    let in_month = date.month() == shown_month.month();
-                    div()
-                        .id(SharedString::from(format!("start-day-{date}")))
-                        .flex_1()
-                        .h(px(28.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .when(!in_month, |el| el.opacity(0.4))
-                        .when(selected, |el| el.bg(theme.colors().accent))
-                        .hover(|s| s.bg(theme.colors().element_hover))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.update_edit(cx, |e| {
-                                e.start_date = Some(date);
-                                e.open = None;
-                                e.start_calendar = None;
-                            });
-                        }))
-                        .child(
-                            Label::new(date.day().to_string())
-                                .size(LabelSize::XSmall)
-                                .color(if selected {
-                                    Color::OnAccent
-                                } else if date == today {
-                                    Color::Accent
-                                } else {
-                                    Color::Default
-                                }),
-                        )
-                }))
-            }))
+            .child(render_month_header(
+                header,
+                cx,
+                move |delta, _, cx| {
+                    entity_shift.update(cx, |this, cx| {
+                        this.update_edit(cx, |e| {
+                            let base = e
+                                .start_calendar
+                                .unwrap_or_else(|| calendar::month_start(e.start_date.unwrap_or_else(|| Local::now().date_naive())));
+                            e.start_calendar = Some(calendar::add_months(base, delta));
+                        });
+                    });
+                },
+                None,
+            ))
+            .child(render_weekday_row(strings, WeekdayStyle::Short, false, cx))
+            .children(weeks)
             .child(
                 h_flex()
                     .justify_between()

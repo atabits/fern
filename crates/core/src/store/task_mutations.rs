@@ -121,8 +121,8 @@ impl Store {
         for prepared in attachments {
             if result.is_ok() {
                 prepared.keep_publication();
-            } else if let Err(error) = prepared.rollback_publication() {
-                eprintln!("failed to roll back attachment publication: {error:#}");
+            } else {
+                let _ = prepared.rollback_publication();
             }
         }
         result
@@ -529,14 +529,16 @@ impl Store {
     /// Sets or clears the repeat rule. A repeating task needs a due date or matching horizon;
     /// `today` is used when the task has neither.
     pub fn set_repeat(&self, id: Id, repeat: Option<Recurrence>, today: NaiveDate) -> Result<()> {
-        if let Some(ref rule) = repeat
-            && let Some(task) = self.task(id)?
-            && task.due_date.is_none()
-            && !task.horizon.is_some_and(|h| h.advance_for_recurrence(rule).is_some())
-        {
-            self.set_due(id, Some(today), task.due_time)?;
-        }
-        self.update(id, "repeat", repeat.map(|r| r.to_string()))
+        self.in_tx(|| {
+            if let Some(ref rule) = repeat
+                && let Some(task) = self.task(id)?
+                && task.due_date.is_none()
+                && !task.horizon.is_some_and(|h| h.advance_for_recurrence(rule).is_some())
+            {
+                self.set_due(id, Some(today), task.due_time)?;
+            }
+            self.update(id, "repeat", repeat.map(|r| r.to_string()))
+        })
     }
 
     /// Marks a task "Won't Do" (cascading to open descendants), or reopens it (and closed ancestors).
@@ -625,68 +627,79 @@ impl Store {
 
     /// Moves both dates if the task has a duration, keeping their local times.
     pub fn move_dates(&self, id: Id, date: NaiveDate) -> Result<()> {
-        let task = self.task(id)?.context("task not found")?;
-        let end = match (task.due_date, task.end_date) {
-            (Some(start), Some(end)) => Some(
-                end.checked_add_signed(date - start).context("task duration is outside the calendar")?,
-            ),
-            _ => None,
-        };
-        self.conn.execute(
-            "UPDATE tasks SET due_date = ?2, end_date = ?3, end_time = ?4, horizon = NULL WHERE id = ?1",
-            params![
-                id.to_string(),
-                date.format(DATE_FORMAT).to_string(),
-                end.map(|date| date.format(DATE_FORMAT).to_string()),
-                end.and(task.end_time).map(|time| time.format(TIME_FORMAT).to_string()),
-            ],
-        )?;
-        Ok(())
+        self.in_tx(|| {
+            let task = self.task(id)?.context("task not found")?;
+            let end = match (task.due_date, task.end_date) {
+                (Some(start), Some(end)) => Some(
+                    end.checked_add_signed(date - start).context("task duration is outside the calendar")?,
+                ),
+                _ => None,
+            };
+            self.conn.execute(
+                "UPDATE tasks SET due_date = ?2, end_date = ?3, end_time = ?4, horizon = NULL WHERE id = ?1",
+                params![
+                    id.to_string(),
+                    date.format(DATE_FORMAT).to_string(),
+                    end.map(|date| date.format(DATE_FORMAT).to_string()),
+                    end.and(task.end_time).map(|time| time.format(TIME_FORMAT).to_string()),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Resizes an all-day / date-span task to `[start, end]` inclusive.
     pub fn resize_dates(&self, id: Id, start: NaiveDate, end: NaiveDate) -> Result<()> {
-        let task = self.task(id)?.context("task not found")?;
-        let end = end.max(start);
-        let stored_end_date = (end > start).then_some(end);
-        let stored_end_time = if stored_end_date.is_some() {
-            task.end_time
-        } else {
-            task.end_time.filter(|et| task.due_time.is_none_or(|st| *et > st))
-        };
-        self.conn.execute(
-            "UPDATE tasks SET due_date = ?2, end_date = ?3, end_time = ?4, horizon = NULL WHERE id = ?1",
-            params![
-                id.to_string(),
-                start.format(DATE_FORMAT).to_string(),
-                stored_end_date.map(|d| d.format(DATE_FORMAT).to_string()),
-                stored_end_time.map(|t| t.format(TIME_FORMAT).to_string()),
-            ],
-        )?;
-        Ok(())
+        self.in_tx(|| {
+            let task = self.task(id)?.context("task not found")?;
+            let end = end.max(start);
+            let stored_end_date = (end > start).then_some(end);
+            let stored_end_time = if stored_end_date.is_some() {
+                task.end_time
+            } else {
+                task.end_time.filter(|et| task.due_time.is_none_or(|st| *et > st))
+            };
+            self.conn.execute(
+                "UPDATE tasks SET due_date = ?2, end_date = ?3, end_time = ?4, horizon = NULL WHERE id = ?1",
+                params![
+                    id.to_string(),
+                    start.format(DATE_FORMAT).to_string(),
+                    stored_end_date.map(|d| d.format(DATE_FORMAT).to_string()),
+                    stored_end_time.map(|t| t.format(TIME_FORMAT).to_string()),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Resizes a timed task block to `[date start .. end_date end]`.
     pub fn resize_timed_range(&self, id: Id, date: NaiveDate, start: NaiveTime, end: NaiveTime, end_date: Option<NaiveDate>) -> Result<()> {
-        let _ = self.task(id)?.context("task not found")?;
-        let stored_end_date = end_date.filter(|d| *d > date);
-        let end = if stored_end_date.is_none() && end <= start {
-            let mins = (start.hour() * 60 + start.minute() + 15).min(23 * 60 + 59);
-            NaiveTime::from_hms_opt(mins / 60, mins % 60, 0).unwrap_or(start)
-        } else {
-            end
-        };
-        self.conn.execute(
-            "UPDATE tasks SET due_date = ?2, due_time = ?3, end_date = ?4, end_time = ?5, horizon = NULL WHERE id = ?1",
-            params![
-                id.to_string(),
-                date.format(DATE_FORMAT).to_string(),
-                start.format(TIME_FORMAT).to_string(),
-                stored_end_date.map(|d| d.format(DATE_FORMAT).to_string()),
-                end.format(TIME_FORMAT).to_string(),
-            ],
-        )?;
-        Ok(())
+        self.in_tx(|| {
+            let exists: Option<i64> = self
+                .conn
+                .prepare_cached("SELECT 1 FROM tasks WHERE id = ?1")?
+                .query_row([id.to_string()], |row| row.get(0))
+                .optional()?;
+            exists.context("task not found")?;
+            let stored_end_date = end_date.filter(|d| *d > date);
+            let end = if stored_end_date.is_none() && end <= start {
+                let mins = (start.hour() * 60 + start.minute() + 15).min(23 * 60 + 59);
+                NaiveTime::from_hms_opt(mins / 60, mins % 60, 0).unwrap_or(start)
+            } else {
+                end
+            };
+            self.conn.execute(
+                "UPDATE tasks SET due_date = ?2, due_time = ?3, end_date = ?4, end_time = ?5, horizon = NULL WHERE id = ?1",
+                params![
+                    id.to_string(),
+                    date.format(DATE_FORMAT).to_string(),
+                    start.format(TIME_FORMAT).to_string(),
+                    stored_end_date.map(|d| d.format(DATE_FORMAT).to_string()),
+                    end.format(TIME_FORMAT).to_string(),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// "Estimation": the expected pomos or minutes; `None` clears it.
@@ -771,26 +784,33 @@ impl Store {
         }
         let day_str = day.format(DATE_FORMAT).to_string();
         self.in_tx(|| {
-            let mut stmt = self.conn.prepare_cached(
+            let mut select = self.conn.prepare_cached(
+                "SELECT due_date, end_date FROM tasks
+                 WHERE id = ?1 AND deleted_at IS NULL AND completed_at IS NULL AND wont_do_at IS NULL",
+            )?;
+            let mut update = self.conn.prepare_cached(
                 "UPDATE tasks
                  SET due_date = ?2, end_date = ?3, horizon = NULL, snoozed_until = NULL
                  WHERE id = ?1 AND deleted_at IS NULL AND completed_at IS NULL AND wont_do_at IS NULL",
             )?;
             for &id in ids {
-                let Some(task) = self.task(id)? else {
+                let id_str = id.to_string();
+                let Some((old_due_str, old_end_str)): Option<(Option<String>, Option<String>)> = select
+                    .query_row([&id_str], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .optional()?
+                else {
                     continue;
                 };
-                if task.is_deleted() || task.is_closed() {
-                    continue;
-                }
-                let next_end = match (task.due_date, task.end_date) {
+                let old_due = old_due_str.and_then(|s| NaiveDate::parse_from_str(&s, DATE_FORMAT).ok());
+                let old_end = old_end_str.and_then(|s| NaiveDate::parse_from_str(&s, DATE_FORMAT).ok());
+                let next_end = match (old_due, old_end) {
                     (Some(old_due), Some(old_end)) => old_end
                         .checked_add_signed(day - old_due)
                         .map(|d| d.format(DATE_FORMAT).to_string()),
                     (_, Some(old_end)) => Some(old_end.format(DATE_FORMAT).to_string()),
                     _ => None,
                 };
-                stmt.execute(params![id.to_string(), &day_str, next_end])?;
+                update.execute(params![&id_str, &day_str, next_end])?;
             }
             Ok(())
         })
@@ -982,11 +1002,28 @@ impl Store {
             return;
         };
         for name in files {
-            if name.is_empty() || name.contains(['/', '\\', '\0']) {
+            if !super::is_safe_attachment_name(name) {
                 continue;
             }
             let _ = std::fs::remove_file(dir.join(name));
         }
+    }
+
+    pub(super) fn cleanup_task_subtree_artifacts(
+        &self,
+        sub_cte_sql: &str,
+        params: impl rusqlite::Params + Clone,
+    ) -> Result<Vec<String>> {
+        let files_sql = format!(
+            "{sub_cte_sql} SELECT a.id || '-' || a.name FROM task_attachments a JOIN sub ON a.task_id = sub.id"
+        );
+        let files = self.collect_attachment_files_for_query(&files_sql, params.clone())?;
+        let meta_sql = format!(
+            "{sub_cte_sql} DELETE FROM plugin_entity_meta WHERE entity_type = 'task' AND entity_id IN (SELECT id FROM sub)"
+        );
+        self.conn.execute(&meta_sql, params)?;
+        self.prune_sync_uploaded(&files)?;
+        Ok(files)
     }
 
     /// Removes unreferenced files in `dir` (keeping files referenced by `task_attachments` or
@@ -1075,27 +1112,15 @@ impl Store {
     /// orphaned attachment files in `dir` (or the store's default attachment directory).
     pub fn purge_task_with_dir(&self, id: Id, dir: Option<&Path>) -> Result<()> {
         let removed_files = self.in_tx(|| {
-            let files = self.collect_attachment_files_for_query(
+            let files = self.cleanup_task_subtree_artifacts(
                 "WITH RECURSIVE sub(id) AS (
                      SELECT ?1
                      UNION
                      SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
-                 )
-                 SELECT a.id || '-' || a.name FROM task_attachments a JOIN sub ON a.task_id = sub.id",
+                 )",
                 params![id.to_string()],
             )?;
-            self.conn.execute(
-                "WITH RECURSIVE sub(id) AS (
-                     SELECT ?1
-                     UNION
-                     SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
-                 )
-                 DELETE FROM plugin_entity_meta
-                 WHERE entity_type = 'task' AND entity_id IN (SELECT id FROM sub)",
-                [id.to_string()],
-            )?;
             self.conn.execute("DELETE FROM tasks WHERE id = ?1", [id.to_string()])?;
-            self.prune_sync_uploaded(&files)?;
             Ok(files)
         })?;
         self.unlink_attachment_files(&removed_files, dir);
@@ -1112,27 +1137,15 @@ impl Store {
     /// orphaned attachment files in `dir` (or the store's default attachment directory).
     pub fn empty_trash_with_dir(&self, dir: Option<&Path>) -> Result<()> {
         let removed_files = self.in_tx(|| {
-            let files = self.collect_attachment_files_for_query(
+            let files = self.cleanup_task_subtree_artifacts(
                 "WITH RECURSIVE sub(id) AS (
                      SELECT id FROM tasks WHERE deleted_at IS NOT NULL
                      UNION
                      SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
-                 )
-                 SELECT a.id || '-' || a.name FROM task_attachments a JOIN sub ON a.task_id = sub.id",
-                [],
-            )?;
-            self.conn.execute(
-                "WITH RECURSIVE sub(id) AS (
-                     SELECT id FROM tasks WHERE deleted_at IS NOT NULL
-                     UNION
-                     SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
-                 )
-                 DELETE FROM plugin_entity_meta
-                 WHERE entity_type = 'task' AND entity_id IN (SELECT id FROM sub)",
+                 )",
                 [],
             )?;
             self.conn.execute("DELETE FROM tasks WHERE deleted_at IS NOT NULL", [])?;
-            self.prune_sync_uploaded(&files)?;
             Ok(files)
         })?;
         self.unlink_attachment_files(&removed_files, dir);

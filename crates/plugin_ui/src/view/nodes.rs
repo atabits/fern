@@ -235,7 +235,8 @@ impl UiTreeState {
                 padding,
                 children,
             } => {
-                let colors = cx.theme().colors().clone();
+                let card_bg = cx.theme().colors().surface_background;
+                let card_border = cx.theme().colors().border_variant;
                 #[cfg(test)]
                 let card_idx = {
                     let idx = self.test_card_counter;
@@ -250,9 +251,9 @@ impl UiTreeState {
                     .map(|el| apply_block_width(el, layout_ctx))
                     .min_w_0()
                     .rounded(px(8.))
-                    .bg(colors.surface_background)
+                    .bg(card_bg)
                     .border_1()
-                    .border_color(colors.border_variant)
+                    .border_color(card_border)
                     .p(px(padding.unwrap_or(14.0).max(0.0)))
                     .gap_2()
                     .when_some(title.clone(), |el, title_text| {
@@ -622,7 +623,8 @@ impl UiTreeState {
                     sink,
                     cx,
                 );
-                let colors = cx.theme().colors();
+                let input_bg = cx.theme().colors().background;
+                let input_border = cx.theme().colors().border;
                 div()
                     .map(|el| apply_input_width(el, layout_ctx))
                     .h(px(30.))
@@ -631,9 +633,9 @@ impl UiTreeState {
                     .items_center()
                     .overflow_hidden()
                     .rounded(px(6.))
-                    .bg(colors.background)
+                    .bg(input_bg)
                     .border_1()
-                    .border_color(colors.border)
+                    .border_color(input_border)
                     .when(*disabled, |el| el.opacity(0.6))
                     .when(cfg!(test), |el| {
                         let sel = format!("plugin-input-{key}");
@@ -664,7 +666,8 @@ impl UiTreeState {
                     sink,
                     cx,
                 );
-                let colors = cx.theme().colors();
+                let area_bg = cx.theme().colors().background;
+                let area_border = cx.theme().colors().border;
                 let height_px = (f32::from((*rows).clamp(2, 24)) * 20.0 + 12.0).clamp(52.0, 480.0);
                 div()
                     .map(|el| apply_input_width(el, layout_ctx))
@@ -672,9 +675,9 @@ impl UiTreeState {
                     .p_2()
                     .overflow_hidden()
                     .rounded(px(6.))
-                    .bg(colors.background)
+                    .bg(area_bg)
                     .border_1()
-                    .border_color(colors.border)
+                    .border_color(area_border)
                     .when(*disabled, |el| el.opacity(0.6))
                     .child(entity)
                     .into_any_element()
@@ -686,7 +689,6 @@ impl UiTreeState {
                 disabled,
                 on_change,
             } => {
-                let colors = cx.theme().colors().clone();
                 let is_open = self.open_select.borrow().as_deref() == Some(key.as_str());
                 let active_label = options
                     .iter()
@@ -764,6 +766,7 @@ impl UiTreeState {
                     None
                 };
 
+                let element_hover = cx.theme().colors().element_hover;
                 div()
                     .relative()
                     .child(
@@ -774,13 +777,13 @@ impl UiTreeState {
                             .gap_2()
                             .justify_between()
                             .rounded(px(6.))
-                            .bg(colors.background)
+                            .bg(cx.theme().colors().background)
                             .border_1()
-                            .border_color(colors.border)
+                            .border_color(cx.theme().colors().border)
                             .when(*disabled, |el| el.opacity(0.5).cursor_default())
                             .when(!*disabled, |el| {
                                 el.cursor_pointer()
-                                    .hover(|s| s.bg(colors.element_hover))
+                                    .hover(move |s| s.bg(element_hover))
                                     .on_click(move |_, _, cx| {
                                         let mut guard = open_ref.borrow_mut();
                                         if guard.as_deref() == Some(key_own.as_str()) {

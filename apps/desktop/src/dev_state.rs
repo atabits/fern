@@ -9,7 +9,7 @@ use crate::settings_window;
 use crate::sidebar::Section;
 
 pub(crate) fn apply(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
-    let Ok(state) = std::env::var("FERN_DEV_STATE") else {
+    let Some(state) = desktop_common::dev_state_value() else {
         return;
     };
     if state.contains("section=calendar") {
@@ -342,7 +342,11 @@ pub(crate) fn apply(this: &mut AppView, window: &mut Window, cx: &mut Context<Ap
         }
         this.store.save_preferences(&preferences).ok();
         this.features = preferences.features;
-        crate::calendar::set_horizons_enabled(preferences.features.horizons);
+        desktop_common::ActivePreferences::sync_from_preferences(
+            &preferences,
+            desktop_common::sound::enabled(&this.store),
+            cx,
+        );
         this.todo.update(cx, |view, cx| view.reload(cx));
         this.things.update(cx, |view, cx| view.reload(cx));
         this.calendar.update(cx, |view, cx| view.reload(cx));

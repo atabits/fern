@@ -621,6 +621,8 @@ pub static RU: Strings = Strings {
     tray_stopwatch: "Секундомер",
     tray_always_on_top: "Поверх всех окон",
     tray_quit: "Выход",
+    wayland_hotkeys_hint: "В Wayland назначьте системные сочетания на команды: fern --quick-add, fern --toggle, fern --focus-mini.",
+    wayland_window_controls_hint: "В Wayland закрепление поверх окон и сворачивание в трей управляются правилами композитора.",
     daily_time: "Время",
     daily_title: "Сегодня: задач — {n}",
     daily_empty: "На сегодня ничего нет.",

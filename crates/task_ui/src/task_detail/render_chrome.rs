@@ -156,8 +156,9 @@ impl TaskDetail {
         done: bool,
         today: NaiveDate,
         muted: Color,
-        strings: &'static Strings,
+        cx: &gpui::App,
     ) -> DueBadge {
+        let strings = crate::i18n::t(cx);
         let preview = self.session.draft.as_ref().map(|_| self.due_preview(task, today));
         let (date, time, repeats, tz_name, is_floating, horizon) = preview.as_ref().map_or(
             (
@@ -186,14 +187,14 @@ impl TaskDetail {
         };
         let (text, color): (SharedString, Color) = match (date, horizon) {
             (Some(date), _) => {
-                let (label, overdue) = task_rows::due_label(date, time, today, strings);
+                let (label, overdue) = task_rows::due_label(date, time, today, strings, cx);
                 let label = match task.end_date {
-                    Some(end) => due_picker::range_label(date, time, end, task.end_time, strings),
+                    Some(end) => due_picker::range_label(date, time, end, task.end_time, strings, cx),
                     None => label,
                 };
                 // The calendar's card writes the date out, as the original's.
                 let mut label = if self.calendar_card && task.end_date.is_none() {
-                    task_rows::card_due_label(date, time, today, strings)
+                    task_rows::card_due_label(date, time, today, strings, cx)
                 } else {
                     task_rows::detail_due_label(label, date, today, strings)
                 };
@@ -262,7 +263,7 @@ impl TaskDetail {
         } = *meta;
         h_flex()
             .debug_selector(|| "task-detail-header".into())
-            .when(self.top_inset, |el| el.mt(desktop_common::layout::header_inset()))
+            .when(self.top_inset, |el| el.mt(desktop_common::layout::header_inset(window, cx)))
             .gap_2()
             .h(px(48.))
             .flex_none()
@@ -426,7 +427,8 @@ impl TaskDetail {
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.open_popup_from_ui(Popup::LinkParent, window, cx);
-                                    window.focus(&this.link_search.focus_handle(cx), cx);
+                                    let search = this.ensure_link_search(cx);
+                                    window.focus(&search.focus_handle(cx), cx);
                                 })),
                         )
                         .child(

@@ -444,7 +444,7 @@ fn notice_to_json(notice: &Notice) -> serde_json::Value {
 /// ones as desktop notifications. All periodic SQLite polling runs off the foreground UI thread.
 pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView>) {
     // UI screenshots run the app with demo data; they must not notify on the real desktop.
-    if std::env::var_os("FERN_DEV_STATE").is_some() {
+    if desktop_common::is_dev_state() {
         return;
     }
     #[cfg(target_os = "macos")]
@@ -542,7 +542,10 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
                 cx.background_spawn(async move {
                     for payload in payloads {
                         if let Err(err) = mgr.run_on_reminder(payload) {
-                            eprintln!("plugin onReminder hook failed: {err:#}");
+                            desktop_common::logging::log_error(
+                                "plugin",
+                                format!("plugin onReminder hook failed: {err:#}"),
+                            );
                         }
                     }
                 })
@@ -561,7 +564,7 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
                 notices
                     .into_iter()
                     .map(|n| {
-                        let due = task_rows::due_label(n.at.date(), Some(n.at.time()), now.date(), strings).0;
+                        let due = task_rows::due_label(n.at.date(), Some(n.at.time()), now.date(), strings, cx).0;
                         let buttons = n.actions().iter().map(|a| (a.key(), a.label(strings))).collect();
                         (n, due, buttons)
                     })

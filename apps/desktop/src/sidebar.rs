@@ -29,7 +29,8 @@ pub struct DraggedRailItem {
 
 impl Render for DraggedRailItem {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors().clone();
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
         let icon_color = if self.active {
             colors.sidebar_icon
         } else {
@@ -323,13 +324,15 @@ pub fn render(
     sync: Option<SyncButton>,
     focus_clock: Option<(String, bool)>,
     features: fern_core::Features,
+    window: &Window,
     cx: &mut App,
 ) -> AnyElement {
     let plugin_views = cx
         .try_global::<PluginBus>()
         .map(|bus| bus.sidebar_views.clone())
         .unwrap_or_default();
-    let colors = cx.theme().colors().clone();
+    let theme = cx.theme().clone();
+    let colors = theme.colors();
     let error_color = cx.theme().status().error;
     let on_error_color = cx.theme().status().on_error;
     let strings = i18n::t(cx);
@@ -475,7 +478,7 @@ pub fn render(
         .w(px(WIDTH))
         .h_full()
         .items_center()
-        .pt(crate::title_bar::height())
+        .pt(crate::title_bar::height(window, cx))
         .pb_3()
         .gap_1()
         .bg(colors.sidebar_background)

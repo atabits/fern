@@ -1,6 +1,52 @@
 //! Pleasant synthesized completion chimes, Pomodoro chimes, and focus ticking across Windows, macOS, and Linux.
 
 use fern_core::Store;
+use gpui::App;
+
+use crate::active_preferences::ActivePreferences;
+
+#[cfg(all(not(test), target_arch = "wasm32"))]
+#[path = "sound/wasm.rs"]
+mod wasm_audio;
+
+#[cfg(all(windows, not(test)))]
+#[path = "sound/windows.rs"]
+mod platform;
+
+#[cfg(all(target_os = "macos", not(test)))]
+#[path = "sound/macos.rs"]
+mod platform;
+
+#[cfg(any(all(target_os = "linux", not(test)), test))]
+#[path = "sound/linux.rs"]
+mod linux;
+
+#[cfg(all(target_os = "linux", not(test)))]
+use linux as platform;
+
+#[cfg(all(
+    not(any(windows, target_os = "macos", target_os = "linux", target_arch = "wasm32")),
+    not(test)
+))]
+mod platform {
+    pub(super) struct AudioBackend;
+
+    impl AudioBackend {
+        pub(super) fn new() -> Self {
+            Self
+        }
+        pub(super) fn play_once(&mut self, _tag: &str, _wav: &'static [u8]) {}
+        pub(super) fn play_loop(&mut self, _wav: &'static [u8]) {}
+        pub(super) fn stop(&mut self) {}
+        pub(super) fn reap_deadline(&self) -> Option<std::time::Instant> {
+            None
+        }
+        pub(super) fn poll_reap(&mut self, _now: std::time::Instant) {}
+    }
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+use platform::AudioBackend;
 
 const SETTING: &str = "completion_sound";
 const WHITE_NOISE_SETTING: &str = "focus_white_noise";
@@ -99,13 +145,16 @@ pub fn enabled(store: &Store) -> bool {
     store.setting(SETTING).ok().flatten().as_deref() != Some("0")
 }
 
-pub fn set_enabled(store: &Store, on: bool) -> anyhow::Result<()> {
-    store.set_setting(SETTING, if on { "1" } else { "0" })
+/// Persists completion sound preference and keeps the [`ActivePreferences`] global in sync.
+pub fn set_enabled(store: &Store, on: bool, cx: &mut App) -> anyhow::Result<()> {
+    store.set_setting(SETTING, if on { "1" } else { "0" })?;
+    ActivePreferences::update(cx, |prefs| prefs.completion_sound = on);
+    Ok(())
 }
 
-/// Plays a short, crisp chime when a task or habit is completed.
-pub fn play_complete(store: &Store) {
-    if enabled(store) {
+/// Plays a short, crisp chime when a task or habit is completed (reading the cached preference).
+pub fn play_complete(cx: &App) {
+    if ActivePreferences::get(cx).completion_sound {
         #[cfg(all(not(test), not(target_arch = "wasm32")))]
         send_audio(AudioCommand::PlayChime(Chime::Complete));
         #[cfg(all(not(test), target_arch = "wasm32"))]
@@ -113,42 +162,13 @@ pub fn play_complete(store: &Store) {
     }
 }
 
-/// Plays a warm three-note chime when a Pomodoro session finishes.
-pub fn play_focus_done(store: &Store) {
-    if enabled(store) {
+/// Plays a warm three-note chime when a Pomodoro session finishes (reading the cached preference).
+pub fn play_focus_done(cx: &App) {
+    if ActivePreferences::get(cx).completion_sound {
         #[cfg(all(not(test), not(target_arch = "wasm32")))]
         send_audio(AudioCommand::PlayChime(Chime::FocusDone));
         #[cfg(all(not(test), target_arch = "wasm32"))]
         wasm_audio::play_once(focus_done_wav());
-    }
-}
-
-#[cfg(all(not(test), target_arch = "wasm32"))]
-mod wasm_audio {
-    use wasm_bindgen::prelude::*;
-
-    #[wasm_bindgen]
-    extern "C" {
-        #[wasm_bindgen(js_namespace = ["window", "__fernAudio"], js_name = playOnce, catch)]
-        fn js_play_once(wav: &[u8]) -> Result<(), JsValue>;
-
-        #[wasm_bindgen(js_namespace = ["window", "__fernAudio"], js_name = playLoop, catch)]
-        fn js_play_loop(wav: &[u8]) -> Result<(), JsValue>;
-
-        #[wasm_bindgen(js_namespace = ["window", "__fernAudio"], js_name = stopLoop, catch)]
-        fn js_stop_loop() -> Result<(), JsValue>;
-    }
-
-    pub(super) fn play_once(wav: &[u8]) {
-        let _ = js_play_once(wav);
-    }
-
-    pub(super) fn play_loop(wav: &[u8]) {
-        let _ = js_play_loop(wav);
-    }
-
-    pub(super) fn stop_loop() {
-        let _ = js_stop_loop();
     }
 }
 
@@ -309,8 +329,8 @@ fn synthesize_wav(notes: &[(f32, f32, f32)], total_s: f32, volume: f32) -> Vec<u
     wav.extend_from_slice(b"WAVE");
     wav.extend_from_slice(b"fmt ");
     wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
     wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
     wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
     wav.extend_from_slice(&2u16.to_le_bytes());
@@ -343,7 +363,6 @@ fn synthesize_wav(notes: &[(f32, f32, f32)], total_s: f32, volume: f32) -> Vec<u
 fn complete_wav() -> &'static [u8] {
     use std::sync::OnceLock;
     static WAV: OnceLock<Vec<u8>> = OnceLock::new();
-    // Crisp two-note upward tick chime (G5 -> C6).
     WAV.get_or_init(|| synthesize_wav(&[(783.99, 0.0, 0.11), (1046.50, 0.055, 0.15)], 0.21, 0.22))
 }
 
@@ -351,7 +370,6 @@ fn complete_wav() -> &'static [u8] {
 fn focus_done_wav() -> &'static [u8] {
     use std::sync::OnceLock;
     static WAV: OnceLock<Vec<u8>> = OnceLock::new();
-    // Warm three-note major triad bell (C5 -> E5 -> G5).
     WAV.get_or_init(|| {
         synthesize_wav(&[(523.25, 0.0, 0.22), (659.25, 0.09, 0.24), (783.99, 0.18, 0.32)], 0.52, 0.24)
     })
@@ -384,7 +402,6 @@ fn synthesize_ambient(preset: WhiteNoise) -> Vec<u8> {
     match preset {
         WhiteNoise::Off => {}
         WhiteNoise::Ticking => {
-            // Warm wooden mechanical clock tick once per second.
             let sr = SAMPLE_RATE as f32;
             for (i, s) in samples.iter_mut().enumerate() {
                 let sec_pos = (i % SAMPLE_RATE as usize) as f32 / sr;
@@ -414,408 +431,22 @@ fn white_noise_wav(preset: WhiteNoise) -> &'static [u8] {
     }
 }
 
-#[cfg(all(windows, not(test)))]
-struct AudioBackend;
-
-#[cfg(all(windows, not(test)))]
-impl AudioBackend {
-    fn new() -> Self {
-        Self
-    }
-
-    fn play_once(&mut self, _tag: &str, wav: &'static [u8]) {
-        const SND_ASYNC: u32 = 0x0001;
-        const SND_NODEFAULT: u32 = 0x0002;
-        const SND_MEMORY: u32 = 0x0004;
-
-        #[link(name = "winmm")]
-        unsafe extern "system" {
-            fn PlaySoundW(psz_sound: *const u16, hmod: *mut core::ffi::c_void, fdw_sound: u32) -> i32;
-        }
-
-        unsafe {
-            PlaySoundW(wav.as_ptr().cast(), core::ptr::null_mut(), SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
-        }
-    }
-
-    fn play_loop(&mut self, wav: &'static [u8]) {
-        const SND_ASYNC: u32 = 0x0001;
-        const SND_NODEFAULT: u32 = 0x0002;
-        const SND_MEMORY: u32 = 0x0004;
-        const SND_LOOP: u32 = 0x0008;
-
-        #[link(name = "winmm")]
-        unsafe extern "system" {
-            fn PlaySoundW(psz_sound: *const u16, hmod: *mut core::ffi::c_void, fdw_sound: u32) -> i32;
-        }
-
-        unsafe {
-            PlaySoundW(
-                wav.as_ptr().cast(),
-                core::ptr::null_mut(),
-                SND_MEMORY | SND_ASYNC | SND_LOOP | SND_NODEFAULT,
-            );
-        }
-    }
-
-    fn stop(&mut self) {
-        #[link(name = "winmm")]
-        unsafe extern "system" {
-            fn PlaySoundW(psz_sound: *const u16, hmod: *mut core::ffi::c_void, fdw_sound: u32) -> i32;
-        }
-
-        unsafe {
-            PlaySoundW(core::ptr::null(), core::ptr::null_mut(), 0);
-        }
-    }
-
-    fn reap_deadline(&self) -> Option<std::time::Instant> {
-        None
-    }
-
-    fn poll_reap(&mut self, _now: std::time::Instant) {}
-}
-
-#[cfg(all(target_os = "macos", not(test)))]
-thread_local! {
-    static MACOS_ACTIVE_SOUND: std::cell::RefCell<Option<objc2::rc::Retained<objc2_app_kit::NSSound>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(all(target_os = "macos", not(test)))]
-struct AudioBackend;
-
-#[cfg(all(target_os = "macos", not(test)))]
-impl AudioBackend {
-    fn new() -> Self {
-        Self
-    }
-
-    fn play_data(&mut self, wav: &'static [u8], loops: bool) {
-        dispatch2::DispatchQueue::main().exec_async(move || {
-            objc2::rc::autoreleasepool(|_| {
-                use objc2::AnyThread as _;
-                use objc2_app_kit::NSSound;
-                use objc2_foundation::NSData;
-
-                MACOS_ACTIVE_SOUND.with(|slot| {
-                    let prev = slot.borrow_mut().take();
-                    if let Some(prev) = prev {
-                        prev.stop();
-                    }
-                    if wav.is_empty() {
-                        return;
-                    }
-                    let data = NSData::with_bytes(wav);
-                    if let Some(sound) = NSSound::initWithData(NSSound::alloc(), &data) {
-                        sound.setLoops(loops);
-                        if sound.play() {
-                            *slot.borrow_mut() = Some(sound);
-                        }
-                    }
-                });
-            });
-        });
-    }
-
-    fn play_once(&mut self, _tag: &str, wav: &'static [u8]) {
-        self.play_data(wav, false);
-    }
-
-    fn play_loop(&mut self, wav: &'static [u8]) {
-        self.play_data(wav, true);
-    }
-
-    fn stop(&mut self) {
-        dispatch2::DispatchQueue::main().exec_async(|| {
-            objc2::rc::autoreleasepool(|_| {
-                MACOS_ACTIVE_SOUND.with(|slot| {
-                    let prev = slot.borrow_mut().take();
-                    if let Some(prev) = prev {
-                        prev.stop();
-                    }
-                });
-            });
-        });
-    }
-
-    fn reap_deadline(&self) -> Option<std::time::Instant> {
-        None
-    }
-
-    fn poll_reap(&mut self, _now: std::time::Instant) {}
-}
-
-#[cfg(any(all(target_os = "linux", not(test)), test))]
-fn audio_cache_dir(
-    xdg_runtime_dir: Option<&std::ffi::OsStr>,
-    temp_dir: &std::path::Path,
-    uid: u32,
-) -> std::path::PathBuf {
-    if let Some(dir) = xdg_runtime_dir.filter(|d| !d.is_empty()) {
-        std::path::PathBuf::from(dir).join("fern-audio")
-    } else {
-        temp_dir.join(format!("fern-audio-{uid}"))
-    }
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-#[derive(Default)]
-struct AudioBackend {
-    chime_child: Option<std::process::Child>,
-    chime_reap_at: Option<std::time::Instant>,
-    loop_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    loop_child: Option<std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>>,
-    loop_thread: Option<std::thread::JoinHandle<()>>,
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-#[derive(Clone, Copy)]
-enum LinuxPlayer {
-    PwPlay,
-    Pulse,
-    Alsa,
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-fn has_binary(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
-    })
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-fn linux_player() -> Option<LinuxPlayer> {
-    static PLAYER: std::sync::OnceLock<Option<LinuxPlayer>> = std::sync::OnceLock::new();
-    *PLAYER.get_or_init(|| {
-        if has_binary("pw-play") {
-            Some(LinuxPlayer::PwPlay)
-        } else if has_binary("paplay") {
-            Some(LinuxPlayer::Pulse)
-        } else if has_binary("aplay") {
-            Some(LinuxPlayer::Alsa)
-        } else {
-            None
-        }
-    })
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-fn cached_wav_path(tag: &str, wav: &[u8]) -> Option<std::path::PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
-
-    let uid = std::fs::metadata("/proc/self")
-        .ok()
-        .map(|m| m.uid())
-        .unwrap_or_else(std::process::id);
-    let xdg = std::env::var_os("XDG_RUNTIME_DIR");
-    let base = audio_cache_dir(xdg.as_deref(), &std::env::temp_dir(), uid);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&base)
-        .ok()?;
-    let path = base.join(format!("{tag}.wav"));
-    if path.metadata().ok().map(|m| m.len()) != Some(wav.len() as u64) {
-        std::fs::write(&path, wav).ok()?;
-    }
-    Some(path)
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-impl AudioBackend {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn stop_chime(&mut self) {
-        self.chime_reap_at = None;
-        if let Some(mut child) = self.chime_child.take()
-            && !matches!(child.try_wait(), Ok(Some(_)))
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
-    fn reap_deadline(&self) -> Option<std::time::Instant> {
-        self.chime_reap_at
-    }
-
-    fn poll_reap(&mut self, now: std::time::Instant) {
-        let Some(child) = self.chime_child.as_mut() else {
-            self.chime_reap_at = None;
-            return;
-        };
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => {
-                self.chime_child = None;
-                self.chime_reap_at = None;
-            }
-            Ok(None) => {
-                if self.chime_reap_at.is_none_or(|t| now >= t) {
-                    self.chime_reap_at = Some(now + std::time::Duration::from_millis(250));
-                }
-            }
-        }
-    }
-
-    fn stop_loop(&mut self) {
-        if let Some(flag) = self.loop_stop.take() {
-            flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        if let Some(slot) = self.loop_child.take()
-            && let Ok(mut guard) = slot.lock()
-            && let Some(mut child) = guard.take()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(handle) = self.loop_thread.take() {
-            let _ = handle.join();
-        }
-    }
-
-    fn play_once(&mut self, tag: &str, wav: &'static [u8]) {
-        use std::process::{Command, Stdio};
-
-        self.stop();
-        let Some(player) = linux_player() else { return };
-        let Some(path) = cached_wav_path(tag, wav) else { return };
-        let mut cmd = match player {
-            LinuxPlayer::PwPlay => {
-                let mut c = Command::new("pw-play");
-                c.arg(&path);
-                c
-            }
-            LinuxPlayer::Pulse => {
-                let mut c = Command::new("paplay");
-                c.arg(&path);
-                c
-            }
-            LinuxPlayer::Alsa => {
-                let mut c = Command::new("aplay");
-                c.args(["-q"]).arg(&path);
-                c
-            }
-        };
-        if let Ok(child) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-            self.chime_child = Some(child);
-            self.chime_reap_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
-        }
-    }
-
-    fn play_loop(&mut self, wav: &'static [u8]) {
-        use std::io::Write as _;
-        use std::process::{Command, Stdio};
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, Mutex};
-
-        self.stop();
-        if wav.len() <= 44 {
-            return;
-        }
-        let Some(player) = linux_player() else { return };
-        let pcm = &wav[44..];
-        let mut cmd = match player {
-            LinuxPlayer::PwPlay => {
-                let mut c = Command::new("pw-play");
-                c.args(["--rate=22050", "--channels=1", "--format=s16", "-"]);
-                c
-            }
-            LinuxPlayer::Pulse if has_binary("pacat") => {
-                let mut c = Command::new("pacat");
-                c.args(["--playback", "--rate=22050", "--channels=1", "--format=s16le", "--raw"]);
-                c
-            }
-            LinuxPlayer::Pulse => {
-                // Fallback when only `paplay` is present without `pacat`.
-                let mut c = Command::new("paplay");
-                c.args(["--rate=22050", "--channels=1", "--format=s16le", "--raw"]);
-                c
-            }
-            LinuxPlayer::Alsa => {
-                let mut c = Command::new("aplay");
-                c.args(["-q", "-f", "S16_LE", "-r", "22050", "-c", "1", "-"]);
-                c
-            }
-        };
-        let Ok(mut child) = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
-            return;
-        };
-        let Some(mut stdin) = child.stdin.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return;
-        };
-        let stop = Arc::new(AtomicBool::new(false));
-        let child_slot = Arc::new(Mutex::new(Some(child)));
-        let stop_bg = Arc::clone(&stop);
-        let child_bg = Arc::clone(&child_slot);
-        let handle = std::thread::Builder::new()
-            .name("fern-audio-loop".into())
-            .spawn(move || {
-                'outer: while !stop_bg.load(Ordering::Relaxed) {
-                    for chunk in pcm.chunks(4096) {
-                        if stop_bg.load(Ordering::Relaxed) || stdin.write_all(chunk).is_err() {
-                            break 'outer;
-                        }
-                    }
-                }
-                drop(stdin);
-                if let Ok(mut guard) = child_bg.lock()
-                    && let Some(mut c) = guard.take()
-                {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-            })
-            .ok();
-        self.loop_stop = Some(stop);
-        self.loop_child = Some(child_slot);
-        self.loop_thread = handle;
-    }
-
-    fn stop(&mut self) {
-        self.stop_chime();
-        self.stop_loop();
-    }
-}
-
-#[cfg(all(not(any(windows, target_os = "macos", target_os = "linux", target_arch = "wasm32")), not(test)))]
-struct AudioBackend;
-
-#[cfg(all(not(any(windows, target_os = "macos", target_os = "linux", target_arch = "wasm32")), not(test)))]
-impl AudioBackend {
-    fn new() -> Self {
-        Self
-    }
-    fn play_once(&mut self, _tag: &str, _wav: &'static [u8]) {}
-    fn play_loop(&mut self, _wav: &'static [u8]) {}
-    fn stop(&mut self) {}
-    fn reap_deadline(&self) -> Option<std::time::Instant> {
-        None
-    }
-    fn poll_reap(&mut self, _now: std::time::Instant) {}
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn completion_sound_defaults_on_and_persists() {
+    #[gpui::test]
+    fn completion_sound_defaults_on_and_persists(cx: &mut gpui::TestAppContext) {
         let store = Store::open_in_memory().unwrap();
         assert!(enabled(&store));
-        set_enabled(&store, false).unwrap();
-        assert!(!enabled(&store));
-        set_enabled(&store, true).unwrap();
-        assert!(enabled(&store));
+        cx.update(|cx| {
+            set_enabled(&store, false, cx).unwrap();
+            assert!(!enabled(&store));
+            assert!(!ActivePreferences::get(cx).completion_sound);
+            set_enabled(&store, true, cx).unwrap();
+            assert!(enabled(&store));
+            assert!(ActivePreferences::get(cx).completion_sound);
+        });
     }
 
     #[test]
@@ -827,7 +458,6 @@ mod tests {
         set_white_noise(&store, WhiteNoise::Off).unwrap();
         assert_eq!(white_noise(&store), WhiteNoise::Off);
 
-        // Removed/unknown presets gracefully fall back to Off.
         assert_eq!(WhiteNoise::from_key("rain"), WhiteNoise::Off);
         assert_eq!(WhiteNoise::from_key("ocean"), WhiteNoise::Off);
     }
@@ -855,24 +485,20 @@ mod tests {
         );
         assert!(state.resume_at.is_none());
 
-        // Chime interrupts Win32 PlaySoundW loop and schedules an automatic resume.
         assert_eq!(
             state.handle(AudioCommand::PlayChime(Chime::Complete), now),
             AudioEffect::PlayChime(Chime::Complete)
         );
         assert!(state.resume_at.is_some());
 
-        // Periodic sync ticks for the same preset do not cut off the chime.
         assert_eq!(
             state.handle(AudioCommand::SetWhiteNoise(WhiteNoise::Ticking), now),
             AudioEffect::None
         );
 
-        // Once the chime finishes, white noise resumes automatically.
         assert_eq!(state.on_timeout(), AudioEffect::LoopWhiteNoise(WhiteNoise::Ticking));
         assert!(state.resume_at.is_none());
 
-        // Stopping white noise during a chime cancels pending resume.
         state.handle(AudioCommand::PlayChime(Chime::FocusDone), now);
         assert!(state.resume_at.is_some());
         assert_eq!(
@@ -890,15 +516,15 @@ mod tests {
 
         let tmp = Path::new("/tmp");
         assert_eq!(
-            audio_cache_dir(Some(OsStr::new("/run/user/1000")), tmp, 1000),
+            linux::audio_cache_dir(Some(OsStr::new("/run/user/1000")), tmp, 1000),
             PathBuf::from("/run/user/1000").join("fern-audio")
         );
         assert_eq!(
-            audio_cache_dir(None, tmp, 1000),
+            linux::audio_cache_dir(None, tmp, 1000),
             PathBuf::from("/tmp").join("fern-audio-1000")
         );
         assert_eq!(
-            audio_cache_dir(Some(OsStr::new("")), tmp, 42),
+            linux::audio_cache_dir(Some(OsStr::new("")), tmp, 42),
             PathBuf::from("/tmp").join("fern-audio-42")
         );
     }

@@ -164,7 +164,7 @@ pub fn render<V: 'static>(
             .tooltip(ui::Tooltip::text(tip))
             .on_click(on_click(&act, action, cx))
     }));
-    let horizon_section: Option<(AnyElement, AnyElement)> = crate::calendar::horizons_enabled().then(|| {
+    let horizon_section: Option<(AnyElement, AnyElement)> = crate::calendar::horizons_enabled(cx).then(|| {
         let today = Local::now().date_naive();
         let week = Horizon::current_week(today);
         let month = Horizon::current_month(today);

@@ -299,7 +299,7 @@ impl CalendarView {
         let today = Local::now().date_naive();
         let Some(date) = NaiveDate::parse_from_str(&date_raw, "%Y-%m-%d")
             .ok()
-            .or_else(|| calendar::parse_date(&date_raw, today, strings))
+            .or_else(|| calendar::parse_date(&date_raw, today, strings, cx))
         else {
             if let Some(ed) = self.event_editor.as_mut() {
                 ed.error = Some(strings.calendar_invalid_year_date.to_owned());
@@ -401,7 +401,10 @@ impl CalendarView {
                 window.focus(&self.focus_handle, cx);
             }
             Err(err) => {
-                eprintln!("failed to save CalDAV event: {err:#}");
+                desktop_common::logging::log_error(
+                    "calendar_ui",
+                    format!("failed to save CalDAV event: {err:#}"),
+                );
                 if let Some(ed) = self.event_editor.as_mut() {
                     ed.error = Some(format!("{err:#}"));
                 }
@@ -568,7 +571,10 @@ impl CalendarView {
         };
         feeds.update(cx, |feeds, cx| {
             if let Err(err) = feeds.save_event(dragged.subscription_id, &draft, cx) {
-                eprintln!("failed to move CalDAV event: {err:#}");
+                desktop_common::logging::log_error(
+                    "calendar_ui",
+                    format!("failed to move CalDAV event: {err:#}"),
+                );
             }
         });
         cx.notify();

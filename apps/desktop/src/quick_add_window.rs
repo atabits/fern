@@ -2,11 +2,11 @@
 //! without bringing the app forward, with live date recognition, quick date chips, priority,
 //! and list selection. Enter adds the task, Escape or a click elsewhere closes it.
 
-use chrono::{Duration, Local, NaiveDate, NaiveTime, Timelike as _};
+use chrono::{Duration, Local, NaiveDate, NaiveTime};
 use fern_core::{Id, List, Preferences, Priority};
 use gpui::{
-    AnyWindowHandle, Bounds, Entity, FocusHandle, Focusable as _, Global, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, point, size,
+    AnyWindowHandle, Entity, FocusHandle, Focusable as _, Global, WindowBounds, WindowHandle,
+    WindowKind, WindowOptions,
 };
 use ui::prelude::*;
 
@@ -31,17 +31,20 @@ pub fn open(main: WindowHandle<AppView>, cx: &mut App) {
     {
         return;
     }
+    let linux = cfg!(any(target_os = "linux", target_os = "freebsd"));
     // Centered, a third of the way down the screen, as launchers sit.
-    let mut bounds = Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx);
-    if let Some(display) = cx.primary_display() {
-        let screen = display.bounds();
-        bounds.origin = point(bounds.origin.x, screen.origin.y + screen.size.height / 3.);
-    }
+    let bounds = desktop_common::window_chrome::launcher_bounds(WIDTH, HEIGHT, 1.0 / 3.0, cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: None,
-        kind: WindowKind::PopUp,
-        app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),
+        titlebar: linux.then(|| gpui::TitlebarOptions {
+            title: Some(i18n::t(cx).global_quick_add.into()),
+            appears_transparent: true,
+            traffic_light_position: None,
+        }),
+        window_decorations: linux.then_some(gpui::WindowDecorations::Client),
+        is_resizable: !linux,
+        kind: if linux { WindowKind::Normal } else { WindowKind::PopUp },
+        app_id: Some(desktop_common::app_id()),
         ..Default::default()
     };
     match cx.open_window(options, |window, cx| cx.new(|cx| QuickAddWindow::new(main, window, cx))) {
@@ -49,7 +52,7 @@ pub fn open(main: WindowHandle<AppView>, cx: &mut App) {
             handle.update(cx, |_, window, _| window.activate_window()).ok();
             cx.set_global(OpenQuickAdd(handle.into()));
         }
-        Err(err) => eprintln!("failed to open Quick Add: {err:#}"),
+        Err(err) => desktop_common::logging::log_error("quick_add", format!("failed to open Quick Add: {err:#}")),
     }
 }
 
@@ -156,7 +159,7 @@ impl QuickAddWindow {
         let today = Local::now().date_naive();
         let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
         let recognize_horizons =
-            self.preferences.features.horizons && crate::calendar::horizons_enabled();
+            self.preferences.features.horizons && crate::calendar::horizons_enabled(cx);
         let parsed = fern_core::parse_quick_add_with_horizons(
             &text,
             today,
@@ -202,12 +205,14 @@ impl QuickAddWindow {
             self.focus_input(window, cx);
             return;
         }
-        if let Some(mgr) = active_hook_manager(cx) {
+        if desktop_common::plugin_bus::PluginHooksGlobal::global(cx)
+            .is_some_and(|hooks| hooks.is_active())
+        {
             let main = self.main;
             let lists = self.lists.clone();
             let preferences = self.preferences.clone();
             close(window, cx);
-            run_quick_add_plugins(mgr, main, lines, date, priority, list, lists, preferences, None, cx);
+            run_quick_add_plugins(main, lines, date, priority, list, lists, preferences, None, cx);
             return;
         }
         self.main
@@ -263,7 +268,7 @@ fn close(window: &mut Window, cx: &mut App) {
 }
 
 impl Render for QuickAddWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let strings = i18n::t(cx);
         let today = Local::now().date_naive();
@@ -294,7 +299,7 @@ impl Render for QuickAddWindow {
                 .cursor_pointer()
                 .when(active, |el| el.bg(theme.colors().accent.opacity(0.15)))
                 .hover(|s| s.bg(theme.colors().ghost_element_hover))
-                .tooltip(Tooltip::text(desktop_common::calendar::format_date(date, strings)))
+                .tooltip(Tooltip::text(desktop_common::calendar::format_date(date, strings, cx)))
                 .child(Label::new(label).size(LabelSize::XSmall).color(if active { Color::Accent } else { Color::Muted }))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.toggle_date(date, cx);
@@ -325,7 +330,7 @@ impl Render for QuickAddWindow {
             Priority::None => strings.filter_priority,
         };
 
-        v_flex()
+        let root = v_flex()
             .size_full()
             .track_focus(&self.focus)
             .on_action(|_: &CloseWindow, window, cx| {
@@ -368,7 +373,7 @@ impl Render for QuickAddWindow {
                     .overflow_hidden()
                     .debug_selector(|| "qa-badges".to_owned())
                     .when_some(shown_due, |el, (date, time)| {
-                        let (label, _) = task_rows::due_label(date, time, today, strings);
+                        let (label, _) = task_rows::due_label(date, time, today, strings, cx);
                         el.child(
                             h_flex()
                                 .flex_none()
@@ -517,7 +522,8 @@ impl Render for QuickAddWindow {
                                     .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                             ),
                     ),
-            )
+            );
+        desktop_common::layout::linux_window_frame(root, px(10.), window, cx)
     }
 }
 
@@ -538,186 +544,8 @@ pub(crate) fn active_hook_manager(cx: &App) -> Option<plugin_ui::PluginManager> 
     host.manager().cloned()
 }
 
-fn extract_transformed_text(val: &serde_json::Value) -> Option<String> {
-    val.as_str()
-        .or_else(|| val.get("text").and_then(serde_json::Value::as_str))
-        .or_else(|| val.get("title").and_then(serde_json::Value::as_str))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-}
-
-fn priority_to_str(priority: Priority) -> &'static str {
-    match priority {
-        Priority::None => "none",
-        Priority::Low => "low",
-        Priority::Medium => "medium",
-        Priority::High => "high",
-    }
-}
-
-/// Builds the `beforeTaskCreate` JSON draft using the exact same typed > picked > defaults
-/// precedence as `TodoView::add_task_as` (for `View::All`), including user `task_defaults`.
-fn build_quick_add_draft_json(
-    text: &str,
-    picked_date: Option<NaiveDate>,
-    picked_priority: Option<Priority>,
-    picked_list: Option<Option<Id>>,
-    lists: &[List],
-    preferences: &Preferences,
-) -> serde_json::Value {
-    let today = Local::now().date_naive();
-    let list_names: Vec<String> = lists.iter().map(|l| l.name.clone()).collect();
-    let recognize_horizons = preferences.features.horizons && crate::calendar::horizons_enabled();
-    let parsed = fern_core::parse_quick_add_with_horizons(
-        text,
-        today,
-        &list_names,
-        preferences.recognition,
-        recognize_horizons,
-    );
-    let defaults = &preferences.task_defaults;
-    let title = if parsed.title.trim().is_empty() {
-        text.trim().to_owned()
-    } else {
-        parsed.title
-    };
-    // Match `TodoView::add_task_as`: typed date wins over picked date, then typed horizon,
-    // then task_defaults.date.
-    let from_picker = parsed.due_date.is_none() && picked_date.is_some();
-    let due_date = parsed
-        .due_date
-        .or(picked_date)
-        .or_else(|| parsed.horizon.is_none().then(|| defaults.date.map(|d| d.date(today))).flatten());
-    let horizon = if due_date.is_some() {
-        None
-    } else {
-        parsed.horizon
-    };
-    let due_time = if from_picker { None } else { parsed.due_time };
-    let reminders: Vec<i64> = if due_date.is_some() {
-        let offset = if due_time.is_some() {
-            defaults.timed_reminder
-        } else {
-            defaults.all_day_reminder
-        };
-        offset.into_iter().collect()
-    } else {
-        Vec::new()
-    };
-    let mut tags = parsed.tags;
-    if let Some(tag) = &defaults.tag
-        && !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
-    {
-        tags.push(tag.clone());
-    }
-    let picked_priority = picked_priority.filter(|p| *p != Priority::None);
-    let priority = parsed
-        .priority
-        .or(picked_priority)
-        .or((defaults.priority != Priority::None).then_some(defaults.priority))
-        .unwrap_or(Priority::None);
-    let parsed_list = parsed
-        .list
-        .and_then(|name| lists.iter().find(|l| l.name == name).map(|l| l.id));
-    let list_id = parsed_list
-        .map(Some)
-        .or(picked_list)
-        .or(preferences.default_list.map(Some))
-        .flatten();
-    let kind = if list_id
-        .is_some_and(|id| lists.iter().any(|l| l.id == id && l.kind == fern_core::Kind::Note))
-    {
-        fern_core::Kind::Note
-    } else {
-        fern_core::Kind::Task
-    };
-    let mut obj = serde_json::Map::new();
-    obj.insert("title".to_owned(), serde_json::Value::String(title));
-    obj.insert(
-        "kind".to_owned(),
-        serde_json::Value::String(kind.as_str().to_owned()),
-    );
-    obj.insert(
-        "priority".to_owned(),
-        serde_json::Value::String(priority_to_str(priority).to_owned()),
-    );
-    obj.insert(
-        "top".to_owned(),
-        serde_json::Value::Bool(!defaults.add_to_bottom),
-    );
-    if let Some(d) = due_date {
-        obj.insert("dueDate".to_owned(), serde_json::Value::String(d.format("%Y-%m-%d").to_string()));
-    }
-    if let Some(t) = due_time {
-        obj.insert(
-            "dueTime".to_owned(),
-            serde_json::Value::String(format!("{:02}:{:02}", t.hour(), t.minute())),
-        );
-    }
-    if !reminders.is_empty() {
-        obj.insert(
-            "reminders".to_owned(),
-            serde_json::Value::Array(reminders.into_iter().map(serde_json::Value::from).collect()),
-        );
-    }
-    if let Some(id) = list_id {
-        obj.insert("listId".to_owned(), serde_json::Value::String(id.to_string()));
-    }
-    if !tags.is_empty() {
-        obj.insert(
-            "tags".to_owned(),
-            serde_json::Value::Array(tags.into_iter().map(serde_json::Value::String).collect()),
-        );
-    }
-    if let Some(rep) = parsed.repeat {
-        obj.insert("repeat".to_owned(), serde_json::Value::String(rep.to_string()));
-    }
-    if let Some(horizon) = horizon {
-        obj.insert("horizon".to_owned(), serde_json::Value::String(horizon.as_code()));
-    }
-    serde_json::Value::Object(obj)
-}
-
-pub(crate) fn push_hook_cancel_toast(reason: &str, fallback: &str, cx: &mut App) {
-    desktop_common::plugin_bus::push_hook_cancel_toast(reason, fallback, cx);
-}
-
-/// Runs `beforeTaskComplete` off the UI thread; invokes `on_done(true, cx)` unless a plugin cancels
-/// (in which case it shows a warning toast and invokes `on_done(false, cx)`).
-pub(crate) fn run_before_task_complete(
-    mgr: plugin_ui::PluginManager,
-    task: &fern_core::Task,
-    cx: &mut App,
-    on_done: impl FnOnce(bool, &mut App) + 'static,
-) {
-    let task_json = plugin_ui::api::task_to_json(task);
-    let bg_task = cx.background_spawn(async move { mgr.run_before_task_complete(task_json) });
-    cx.spawn(async move |cx| {
-        let res = bg_task.await;
-        cx.update(|cx| match res {
-            Ok(plugin_ui::HookDecision::Cancel(reason)) => {
-                push_hook_cancel_toast(&reason, i18n::t(cx).plugins_task_complete_cancelled, cx);
-                on_done(false, cx);
-            }
-            Ok(
-                plugin_ui::HookDecision::Allow
-                | plugin_ui::HookDecision::Modify(_),
-            ) => {
-                on_done(true, cx);
-            }
-            Err(err) => {
-                eprintln!("plugin beforeTaskComplete hook failed: {err:#}");
-                on_done(true, cx);
-            }
-        });
-    })
-    .detach();
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_quick_add_plugins(
-    mgr: plugin_ui::PluginManager,
     main: WindowHandle<AppView>,
     lines: Vec<String>,
     date: Option<NaiveDate>,
@@ -728,105 +556,31 @@ pub(crate) fn run_quick_add_plugins(
     select_after: Option<crate::sidebar::Section>,
     cx: &mut App,
 ) {
-    cx.spawn(async move |cx| {
-        let mut created_any = false;
-        for line in lines {
-            let mgr_c = mgr.clone();
-            let raw_line = line.clone();
-            let transform = cx
-                .background_spawn(async move { mgr_c.run_quick_add_transform(raw_line) })
-                .await;
-            let transformed = match transform {
-                Ok(plugin_ui::HookDecision::Cancel(reason)) => {
-                    cx.update(|cx| {
-                        push_hook_cancel_toast(&reason, i18n::t(cx).plugins_task_create_cancelled, cx);
-                    });
-                    continue;
-                }
-                Ok(plugin_ui::HookDecision::Modify(val)) => {
-                    extract_transformed_text(&val).unwrap_or(line)
-                }
-                Ok(plugin_ui::HookDecision::Allow) => line,
-                Err(err) => {
-                    eprintln!("plugin quickAddTransform hook failed: {err:#}");
-                    line
-                }
-            };
-
-            let draft_json =
-                build_quick_add_draft_json(&transformed, date, priority, list, &lists, &preferences);
-            let mgr_c = mgr.clone();
-            let before_res = cx
-                .background_spawn(async move { mgr_c.run_before_task_create(draft_json) })
-                .await;
-            match before_res {
-                Ok(plugin_ui::HookDecision::Cancel(reason)) => {
-                    cx.update(|cx| {
-                        push_hook_cancel_toast(&reason, i18n::t(cx).plugins_task_create_cancelled, cx);
-                    });
-                }
-                Ok(plugin_ui::HookDecision::Modify(modified_json)) => {
-                    match plugin_ui::api::parse_task_draft(&modified_json) {
-                        Ok((draft, parsed_top)) => {
-                            let top = if modified_json.get("top").is_some() {
-                                parsed_top
-                            } else {
-                                !preferences.task_defaults.add_to_bottom
-                            };
-                            if main
-                                .update(cx, |view, _, cx| {
-                                    view.add_plugin_task_draft(&draft, top, cx);
-                                })
-                                .is_ok()
-                            {
-                                created_any = true;
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("plugin beforeTaskCreate returned invalid draft: {err:#}");
-                            if main
-                                .update(cx, |view, _, cx| {
-                                    view.add_quick_task_with(&transformed, date, priority, list, cx);
-                                })
-                                .is_ok()
-                            {
-                                created_any = true;
-                            }
-                        }
-                    }
-                }
-                Ok(plugin_ui::HookDecision::Allow) => {
-                    if main
-                        .update(cx, |view, _, cx| {
-                            view.add_quick_task_with(&transformed, date, priority, list, cx);
-                        })
-                        .is_ok()
-                    {
-                        created_any = true;
-                    }
-                }
-                Err(err) => {
-                    eprintln!("plugin beforeTaskCreate hook failed: {err:#}");
-                    if main
-                        .update(cx, |view, _, cx| {
-                            view.add_quick_task_with(&transformed, date, priority, list, cx);
-                        })
-                        .is_ok()
-                    {
-                        created_any = true;
-                    }
-                }
-            }
-        }
-        if created_any
-            && let Some(target) = select_after
-        {
-            let _ = main.update(cx, |view, window, cx| {
-                let _ = view.select(target, window, cx);
+    use desktop_common::plugin_bus::{QuickAddCreation, run_quick_add_hooks};
+    run_quick_add_hooks(
+        lines,
+        date,
+        priority,
+        list,
+        lists,
+        preferences,
+        cx,
+        move |item, cx| {
+            let _ = main.update(cx, |view, _, cx| match item {
+                QuickAddCreation::Draft { draft, top } => view.add_plugin_task_draft(&draft, top, cx),
+                QuickAddCreation::RawLine(line) => view.add_quick_task_with(&line, date, priority, list, cx),
             });
-        }
-    })
-    .detach();
+        },
+        move |created_any, cx| {
+            if created_any
+                && let Some(target) = select_after
+            {
+                let _ = main.update(cx, |view, window, cx| {
+                    let _ = view.select(target, window, cx);
+                });
+            }
+        },
+    );
 }
 
 #[cfg(test)]
@@ -867,15 +621,16 @@ mod tests {
 
     #[test]
     fn hook_transform_and_draft_json_roundtrip_via_parse_task_draft() {
+        use desktop_common::plugin_bus::{build_quick_add_draft_json, extract_transformed_quick_add};
         assert_eq!(
-            extract_transformed_text(&serde_json::json!("  Buy milk tomorrow  ")).as_deref(),
+            extract_transformed_quick_add(&serde_json::json!("  Buy milk tomorrow  ")).as_deref(),
             Some("Buy milk tomorrow")
         );
         assert_eq!(
-            extract_transformed_text(&serde_json::json!({ "text": "Write docs" })).as_deref(),
+            extract_transformed_quick_add(&serde_json::json!({ "text": "Write docs" })).as_deref(),
             Some("Write docs")
         );
-        assert_eq!(extract_transformed_text(&serde_json::json!("")), None);
+        assert_eq!(extract_transformed_quick_add(&serde_json::json!("")), None);
 
         let store = fern_core::Store::open_in_memory().unwrap();
         let work = store
@@ -894,6 +649,7 @@ mod tests {
             Some(Some(work_id)),
             &lists,
             &Preferences::default(),
+            true,
         );
         let (draft, _) = plugin_ui::api::parse_task_draft(&json).unwrap();
         assert_eq!(draft.priority, Priority::High);
@@ -904,6 +660,7 @@ mod tests {
 
     #[test]
     fn quick_add_draft_respects_typed_over_picked_and_preserves_task_defaults() {
+        use desktop_common::plugin_bus::build_quick_add_draft_json;
         let store = fern_core::Store::open_in_memory().unwrap();
         let work = store
             .add_list(&fern_core::ListDraft {
@@ -936,6 +693,7 @@ mod tests {
             None,
             &lists,
             &prefs,
+            true,
         );
         let (defaults_draft, defaults_top) = plugin_ui::api::parse_task_draft(&defaults_json).unwrap();
         assert_eq!(defaults_draft.title, "Review PR");
@@ -955,6 +713,7 @@ mod tests {
             Some(Some(work.id)),
             &lists,
             &prefs,
+            true,
         );
         let (typed_draft, _) = plugin_ui::api::parse_task_draft(&typed_json).unwrap();
         assert_eq!(typed_draft.due_date, Some(Local::now().date_naive() + Duration::days(1)));
@@ -994,13 +753,20 @@ mod tests {
 
     #[test]
     fn quick_add_draft_parses_horizon_when_enabled_and_ignores_when_disabled() {
-        let _horizons_guard = crate::app_view::lock_horizons_flag();
         let today = Local::now().date_naive();
         let mut prefs = Preferences::default();
         prefs.task_defaults.date = Some(fern_core::DefaultDate::Today);
 
         // When Horizons is enabled, a horizon phrase wins over task_defaults.date and serializes "horizon".
-        let json = build_quick_add_draft_json("Ship roadmap this month", None, None, None, &[], &prefs);
+        let json = desktop_common::plugin_bus::build_quick_add_draft_json(
+            "Ship roadmap this month",
+            None,
+            None,
+            None,
+            &[],
+            &prefs,
+            true,
+        );
         let (draft, _) = plugin_ui::api::parse_task_draft(&json).unwrap();
         assert_eq!(draft.title, "Ship roadmap");
         assert_eq!(draft.due_date, None);
@@ -1008,7 +774,15 @@ mod tests {
 
         // When Horizons is disabled, the phrase stays in the title and no horizon is parsed.
         prefs.features.horizons = false;
-        let disabled_json = build_quick_add_draft_json("Ship roadmap this month", None, None, None, &[], &prefs);
+        let disabled_json = desktop_common::plugin_bus::build_quick_add_draft_json(
+            "Ship roadmap this month",
+            None,
+            None,
+            None,
+            &[],
+            &prefs,
+            false,
+        );
         let (disabled_draft, _) = plugin_ui::api::parse_task_draft(&disabled_json).unwrap();
         assert_eq!(disabled_draft.title, "Ship roadmap this month");
         assert_eq!(disabled_draft.horizon, None);
@@ -1019,7 +793,6 @@ mod tests {
     fn quick_add_window_creates_horizon_task_when_enabled_and_plain_when_disabled(
         cx: &mut gpui::TestAppContext,
     ) {
-        let _horizons_guard = crate::app_view::lock_horizons_flag();
         cx.update(theme::init);
         let today = Local::now().date_naive();
 
@@ -1168,7 +941,7 @@ mod tests {
 
         let (qa, qa_cx) =
             cx.add_window_view(|window, cx| QuickAddWindow::new(main_handle, window, cx));
-        qa_cx.simulate_resize(size(px(WIDTH), px(HEIGHT)));
+        qa_cx.simulate_resize(gpui::size(px(WIDTH), px(HEIGHT)));
         qa_cx.run_until_parked();
 
         // Clicking disabled Add when empty does not close window or create a task.
@@ -1238,7 +1011,7 @@ mod tests {
         let sun_main_handle = sun_main_cx.window_handle().downcast::<AppView>().unwrap();
         let (sun_qa, sun_qa_cx) =
             cx.add_window_view(|window, cx| QuickAddWindow::new(sun_main_handle, window, cx));
-        sun_qa_cx.simulate_resize(size(px(WIDTH), px(HEIGHT)));
+        sun_qa_cx.simulate_resize(gpui::size(px(WIDTH), px(HEIGHT)));
         sun_qa_cx.run_until_parked();
         let next_week_bounds = sun_qa_cx.debug_bounds("qa-next-week").unwrap();
         sun_qa_cx.simulate_click(next_week_bounds.center(), gpui::Modifiers::default());

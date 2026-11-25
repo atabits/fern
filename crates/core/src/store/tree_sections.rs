@@ -26,25 +26,54 @@ fn list_section_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::mod
 }
 
 impl Store {
-    /// Moves a task right before (or after) `target` in the manual order, then renumbers the
-    /// order with gaps. Renumbering everything keeps the code simple; personal task lists are
-    /// small enough for that.
+    /// Moves a task right before (or after) `target` in the manual order. Uses midpoint `sort_order`
+    /// so only the moved task updates (avoiding full-table `sync_log` churn), falling back to a full
+    /// rebalance only when no integer slot remains between neighbors.
     pub fn move_task(&self, id: Id, target: Id, after: bool) -> Result<()> {
         if id == target {
             return Ok(());
         }
         self.in_tx(|| {
-            let mut stmt = self.conn.prepare_cached("SELECT id FROM tasks ORDER BY sort_order, rowid DESC")?;
-            let mut order: Vec<String> = stmt.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
-            let (id, target) = (id.to_string(), target.to_string());
-            order.retain(|other| *other != id);
-            let index = order.iter().position(|other| *other == target).context("target task not found")?;
-            order.insert(if after { index + 1 } else { index }, id);
-
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT id, sort_order FROM tasks ORDER BY sort_order, rowid DESC")?;
+            let mut order: Vec<(String, i64)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            let (id_str, target_str) = (id.to_string(), target.to_string());
+            let old_sort = order
+                .iter()
+                .find(|(other, _)| *other == id_str)
+                .map(|(_, s)| *s)
+                .context("task not found")?;
+            order.retain(|(other, _)| *other != id_str);
+            let target_idx = order
+                .iter()
+                .position(|(other, _)| *other == target_str)
+                .context("target task not found")?;
+            let insert_idx = if after { target_idx + 1 } else { target_idx };
+            let prev = insert_idx.checked_sub(1).and_then(|i| order.get(i)).map(|(_, s)| *s);
+            let next = order.get(insert_idx).map(|(_, s)| *s);
+            let slot = match (prev, next) {
+                (Some(p), Some(n)) if n - p >= 2 => Some(p + (n - p) / 2),
+                (Some(_), Some(_)) => None,
+                (None, Some(n)) => Some(n - 1024),
+                (Some(p), None) => Some(p + 1024),
+                (None, None) => Some(0),
+            };
+            if let Some(new_sort) = slot {
+                if new_sort != old_sort {
+                    self.conn
+                        .prepare_cached("UPDATE tasks SET sort_order = ?2 WHERE id = ?1")?
+                        .execute(params![id_str, new_sort])?;
+                }
+                return Ok(());
+            }
+            order.insert(insert_idx, (id_str, 0));
             let mut update = self
                 .conn
                 .prepare_cached("UPDATE tasks SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2")?;
-            for (position, task) in order.iter().enumerate() {
+            for (position, (task, _)) in order.iter().enumerate() {
                 update.execute(params![task, position as i64 * 1024])?;
             }
             Ok(())
@@ -195,9 +224,15 @@ impl Store {
                 "UPDATE list_sections SET list_id = ?2, sort_order = ?3 WHERE id = ?1",
                 params![id.to_string(), to.map(|l| l.to_string()), order],
             )?;
+            let mut update_tasks = self
+                .conn
+                .prepare_cached("UPDATE tasks SET list_id = ?2, section_id = ?3 WHERE id = ?1")?;
+            let list_str = to.map(|l| l.to_string());
+            let sec_str = id.to_string();
             for task in tasks {
-                self.set_list(task, to)?;
-                self.set_section(task, Some(id))?;
+                for sub in std::iter::once(task).chain(self.descendants(task)?) {
+                    update_tasks.execute(params![sub.to_string(), &list_str, &sec_str])?;
+                }
             }
             Ok(())
         })
@@ -269,26 +304,30 @@ impl Store {
         })
     }
 
-    /// Ancestor IDs of `id`, from its immediate parent up to the root (cycle-safe).
+    /// Ancestor IDs of `id`, from its immediate parent up to the root (cycle-safe via recursive CTE).
     pub fn ancestors(&self, id: Id) -> Result<Vec<Id>> {
-        let mut out = Vec::new();
-        let mut seen = HashSet::from([id]);
-        let mut current = id;
-        while let Some(parent_str) = self
-            .conn
-            .prepare_cached("SELECT parent_id FROM tasks WHERE id = ?1")?
-            .query_row([current.to_string()], |row| row.get::<_, Option<String>>(0))
-            .optional()?
-            .flatten()
-        {
-            let Ok(parent) = Uuid::parse_str(&parent_str) else { break };
-            if !seen.insert(parent) {
-                break;
-            }
-            out.push(parent);
-            current = parent;
-        }
-        Ok(out)
+        let mut stmt = self.conn.prepare_cached(
+            "WITH RECURSIVE anc(id, depth, path) AS (
+                 SELECT t.parent_id, 1, ',' || ?1 || ',' || t.parent_id || ','
+                 FROM tasks t
+                 WHERE t.id = ?1 AND t.parent_id IS NOT NULL
+                 UNION ALL
+                 SELECT p.parent_id, anc.depth + 1, anc.path || p.parent_id || ','
+                 FROM tasks p
+                 JOIN anc ON p.id = anc.id
+                 WHERE p.parent_id IS NOT NULL
+                   AND anc.depth < 64
+                   AND instr(anc.path, ',' || p.parent_id || ',') = 0
+             )
+             SELECT id FROM anc ORDER BY depth",
+        )?;
+        let ids = stmt
+            .query_map([id.to_string()], |row| {
+                let raw: String = row.get(0)?;
+                parse_uuid(&raw, 0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
     }
 
     /// Nesting depth of `id` (`0` for a top-level task, up to `MAX_SUBTASK_DEPTH`).

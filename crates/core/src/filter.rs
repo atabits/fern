@@ -521,17 +521,23 @@ impl FilterRules {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SmartFilter {
     pub id: Id,
     pub name: String,
     pub rules: FilterRules,
 }
+impl Default for SmartFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl SmartFilter {
     pub fn new() -> Self {
         Self {
             id: uuid::Uuid::now_v7(),
-            ..Self::default()
+            name: String::new(),
+            rules: FilterRules::default(),
         }
     }
     pub fn matches(&self, task: &Task, today: NaiveDate, week_start: Weekday) -> bool {
@@ -631,7 +637,7 @@ pub fn examples() -> [SmartFilter; 4] {
             conditions,
             ..FilterRules::default()
         },
-        ..SmartFilter::default()
+        ..SmartFilter::new()
     };
     [
         make(vec![

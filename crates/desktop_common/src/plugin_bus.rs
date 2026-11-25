@@ -396,7 +396,7 @@ pub fn run_before_task_complete_hook(
                 on_done(true, cx);
             }
             Err(err) => {
-                eprintln!("plugin beforeTaskComplete hook failed: {err:#}");
+                crate::logging::log_error("plugin_bus", format!("plugin beforeTaskComplete hook failed: {err:#}"));
                 on_done(true, cx);
             }
         });
@@ -436,7 +436,7 @@ pub fn extract_transformed_quick_add(val: &serde_json::Value) -> Option<String> 
         return (!trimmed.is_empty()).then(|| trimmed.to_owned());
     }
     if let Some(obj) = val.as_object() {
-        for key in ["text", "input"] {
+        for key in ["text", "input", "title"] {
             if let Some(s) = obj.get(key).and_then(serde_json::Value::as_str) {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
@@ -446,6 +446,249 @@ pub fn extract_transformed_quick_add(val: &serde_json::Value) -> Option<String> 
         }
     }
     None
+}
+
+fn hook_priority_str(priority: Priority) -> &'static str {
+    match priority {
+        Priority::None => "none",
+        Priority::Low => "low",
+        Priority::Medium => "medium",
+        Priority::High => "high",
+    }
+}
+
+/// Builds the `beforeTaskCreate` JSON draft using the exact typed > picked > defaults precedence
+/// of quick-add creation (`View::All`), including user `task_defaults`.
+pub fn build_quick_add_draft_json(
+    text: &str,
+    picked_date: Option<NaiveDate>,
+    picked_priority: Option<Priority>,
+    picked_list: Option<Option<Id>>,
+    lists: &[fern_core::List],
+    preferences: &fern_core::Preferences,
+    horizons_enabled: bool,
+) -> serde_json::Value {
+    let today = chrono::Local::now().date_naive();
+    let list_names: Vec<String> = lists.iter().map(|l| l.name.clone()).collect();
+    let recognize_horizons = preferences.features.horizons && horizons_enabled;
+    let parsed = fern_core::parse_quick_add_with_horizons(
+        text,
+        today,
+        &list_names,
+        preferences.recognition,
+        recognize_horizons,
+    );
+    let defaults = &preferences.task_defaults;
+    let title = if parsed.title.trim().is_empty() {
+        text.trim().to_owned()
+    } else {
+        parsed.title
+    };
+    let from_picker = parsed.due_date.is_none() && picked_date.is_some();
+    let due_date = parsed
+        .due_date
+        .or(picked_date)
+        .or_else(|| parsed.horizon.is_none().then(|| defaults.date.map(|d| d.date(today))).flatten());
+    let horizon = if due_date.is_some() {
+        None
+    } else {
+        parsed.horizon
+    };
+    let due_time = if from_picker { None } else { parsed.due_time };
+    let reminders: Vec<i64> = if due_date.is_some() {
+        let offset = if due_time.is_some() {
+            defaults.timed_reminder
+        } else {
+            defaults.all_day_reminder
+        };
+        offset.into_iter().collect()
+    } else {
+        Vec::new()
+    };
+    let mut tags = parsed.tags;
+    if let Some(tag) = &defaults.tag
+        && !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
+    {
+        tags.push(tag.clone());
+    }
+    let picked_priority = picked_priority.filter(|p| *p != Priority::None);
+    let priority = parsed
+        .priority
+        .or(picked_priority)
+        .or((defaults.priority != Priority::None).then_some(defaults.priority))
+        .unwrap_or(Priority::None);
+    let parsed_list = parsed
+        .list
+        .and_then(|name| lists.iter().find(|l| l.name == name).map(|l| l.id));
+    let list_id = parsed_list
+        .map(Some)
+        .or(picked_list)
+        .or(preferences.default_list.map(Some))
+        .flatten();
+    let kind = if list_id
+        .is_some_and(|id| lists.iter().any(|l| l.id == id && l.kind == Kind::Note))
+    {
+        Kind::Note
+    } else {
+        Kind::Task
+    };
+    let mut obj = serde_json::Map::new();
+    obj.insert("title".to_owned(), serde_json::Value::String(title));
+    obj.insert("kind".to_owned(), serde_json::Value::String(kind.as_str().to_owned()));
+    obj.insert(
+        "priority".to_owned(),
+        serde_json::Value::String(hook_priority_str(priority).to_owned()),
+    );
+    obj.insert(
+        "top".to_owned(),
+        serde_json::Value::Bool(!defaults.add_to_bottom),
+    );
+    if let Some(d) = due_date {
+        obj.insert("dueDate".to_owned(), serde_json::Value::String(d.format("%Y-%m-%d").to_string()));
+    }
+    if let Some(t) = due_time {
+        obj.insert(
+            "dueTime".to_owned(),
+            serde_json::Value::String(format!("{:02}:{:02}", t.hour(), t.minute())),
+        );
+    }
+    if !reminders.is_empty() {
+        obj.insert(
+            "reminders".to_owned(),
+            serde_json::Value::Array(reminders.into_iter().map(serde_json::Value::from).collect()),
+        );
+    }
+    if let Some(id) = list_id {
+        obj.insert("listId".to_owned(), serde_json::Value::String(id.to_string()));
+    }
+    if !tags.is_empty() {
+        obj.insert(
+            "tags".to_owned(),
+            serde_json::Value::Array(tags.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+    if let Some(rep) = parsed.repeat {
+        obj.insert("repeat".to_owned(), serde_json::Value::String(rep.to_string()));
+    }
+    if let Some(horizon) = horizon {
+        obj.insert("horizon".to_owned(), serde_json::Value::String(horizon.as_code()));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Output item produced by [`run_quick_add_hooks`] for each non-cancelled line.
+pub enum QuickAddCreation {
+    Draft { draft: Box<TaskDraft>, top: bool },
+    RawLine(String),
+}
+
+/// Runs `quickAddTransform` and `beforeTaskCreate` plugin hooks off the UI thread for a batch of
+/// quick-add input lines, calling `on_each` for each accepted task and `on_finished(created_any, cx)`
+/// once all lines complete.
+#[allow(clippy::too_many_arguments)]
+pub fn run_quick_add_hooks(
+    lines: Vec<String>,
+    picked_date: Option<NaiveDate>,
+    picked_priority: Option<Priority>,
+    picked_list: Option<Option<Id>>,
+    lists: Vec<fern_core::List>,
+    preferences: fern_core::Preferences,
+    cx: &mut App,
+    mut on_each: impl FnMut(QuickAddCreation, &mut App) + 'static,
+    on_finished: impl FnOnce(bool, &mut App) + 'static,
+) {
+    let Some(hooks) = PluginHooksGlobal::global(cx).filter(PluginHooksGlobal::is_active) else {
+        let any = !lines.is_empty();
+        for line in lines {
+            on_each(QuickAddCreation::RawLine(line), cx);
+        }
+        on_finished(any, cx);
+        return;
+    };
+    let horizons_on = crate::active_preferences::ActivePreferences::get(cx).horizons_enabled;
+    cx.spawn(async move |cx| {
+        let mut created_any = false;
+        for line in lines {
+            let hooks_t = hooks.clone();
+            let raw_line = line.clone();
+            let transform = cx
+                .background_spawn(async move {
+                    hooks_t.run_quick_add_transform(raw_line)
+                })
+                .await;
+            let transformed = match transform {
+                Ok(PluginHookDecision::Cancel(reason)) => {
+                    cx.update(|cx| {
+                        let fallback = i18n::t(cx).plugins_task_create_cancelled;
+                        push_hook_cancel_toast(&reason, fallback, cx);
+                    });
+                    continue;
+                }
+                Ok(PluginHookDecision::Modify(val)) => {
+                    extract_transformed_quick_add(&val).unwrap_or(line)
+                }
+                Ok(PluginHookDecision::Allow) => line,
+                Err(err) => {
+                    crate::logging::log_error("plugin_bus", format!("plugin quickAddTransform hook failed: {err:#}"));
+                    line
+                }
+            };
+
+            let draft_json = build_quick_add_draft_json(
+                &transformed,
+                picked_date,
+                picked_priority,
+                picked_list,
+                &lists,
+                &preferences,
+                horizons_on,
+            );
+            let hooks_c = hooks.clone();
+            let before_res = cx
+                .background_spawn(async move { hooks_c.run_before_task_create(draft_json) })
+                .await;
+            match before_res {
+                Ok(PluginHookDecision::Cancel(reason)) => {
+                    cx.update(|cx| {
+                        let fallback = i18n::t(cx).plugins_task_create_cancelled;
+                        push_hook_cancel_toast(&reason, fallback, cx);
+                    });
+                }
+                Ok(PluginHookDecision::Modify(modified_json)) => {
+                    match parse_task_draft_from_hook_json(&modified_json, !preferences.task_defaults.add_to_bottom) {
+                        Ok((draft, parsed_top)) => {
+                            let top = if modified_json.get("top").is_some() {
+                                parsed_top
+                            } else {
+                                !preferences.task_defaults.add_to_bottom
+                            };
+                            cx.update(|cx| on_each(QuickAddCreation::Draft { draft: Box::new(draft), top }, cx));
+                            created_any = true;
+                        }
+                        Err(err) => {
+                            crate::logging::log_error(
+                                "plugin_bus",
+                                format!("plugin beforeTaskCreate returned invalid draft: {err:#}"),
+                            );
+                            cx.update(|cx| on_each(QuickAddCreation::RawLine(transformed), cx));
+                            created_any = true;
+                        }
+                    }
+                }
+                Ok(PluginHookDecision::Allow) => {
+                    cx.update(|cx| on_each(QuickAddCreation::RawLine(transformed), cx));
+                    created_any = true;
+                }
+                Err(err) => {
+                    crate::logging::log_error("plugin_bus", format!("plugin beforeTaskCreate hook failed: {err:#}"));
+                    cx.update(|cx| on_each(QuickAddCreation::RawLine(transformed), cx));
+                    created_any = true;
+                }
+            }
+        }
+        cx.update(|cx| on_finished(created_any, cx));
+    })
+    .detach();
 }
 
 /// Serializes a [`TaskDraft`] + `top` insertion hint into the canonical JSON shape expected by

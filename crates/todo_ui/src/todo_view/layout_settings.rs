@@ -12,9 +12,9 @@ impl TodoView {
     /// `render()`, `rows()`, `board_columns()`, and `move_task_drag()` perform zero DB queries.
     pub(super) fn reload_view_settings(&mut self) {
         self.show_details = self.load_view_flag("show_details", false);
-        self.kanban = self.load_view_flag("kanban", false);
-        self.timeline = self.load_view_flag("timeline", false);
-        self.kanban_workflow = self.load_view_flag("kanban_workflow", false);
+        self.kanban.enabled = self.load_view_flag("kanban", false);
+        self.timeline.enabled = self.load_view_flag("timeline", false);
+        self.kanban.workflow = self.load_view_flag("kanban_workflow", false);
         self.show_completed = self.load_view_flag("show_completed", true);
         self.sort_descending = self.load_view_flag("descending", false);
         self.hide_new_section = self.load_view_flag("kanban:hide_new_section", false);
@@ -25,10 +25,10 @@ impl TodoView {
         let group = match get("group") {
             g if g.is_empty() && matches!(self.view, View::Tag(_)) => GroupBy::List,
             // The original's board of a smart list has a column per list.
-            g if g.is_empty() && self.kanban && self.view.shows_list_names() => GroupBy::List,
+            g if g.is_empty() && self.kanban.enabled && self.view.shows_list_names() => GroupBy::List,
             g => GroupBy::from_key(&g),
         };
-        let group = if self.kanban && !self.timeline && group == GroupBy::None {
+        let group = if self.kanban.enabled && !self.timeline.enabled && group == GroupBy::None {
             if self.view.shows_list_names() { GroupBy::List } else { GroupBy::Custom }
         } else {
             group
@@ -43,9 +43,9 @@ impl TodoView {
     pub(super) fn view_flag(&self, name: &str, default: bool) -> bool {
         match name {
             "show_details" => self.show_details,
-            "kanban" => self.kanban,
-            "timeline" => self.timeline,
-            "kanban_workflow" => self.kanban_workflow,
+            "kanban" => self.kanban.enabled,
+            "timeline" => self.timeline.enabled,
+            "kanban_workflow" => self.kanban.workflow,
             "show_completed" => self.show_completed,
             "descending" => self.sort_descending,
             "kanban:hide_new_section" => self.hide_new_section,
@@ -59,7 +59,7 @@ impl TodoView {
         let result = self.store.set_setting(&key, if value { "1" } else { "0" });
         self.check(result);
         self.reload_view_settings();
-        self.header_menu_open = false;
+        self.overlays.header_menu_open = false;
         if name == "show_completed" && matches!(self.view, View::Today | View::Tomorrow | View::Next7Days) {
             if value {
                 self.collapsed_sections.remove(&Section::Completed);
@@ -82,8 +82,8 @@ impl TodoView {
             self.check(result);
         }
         self.reload_view_settings();
-        self.timeline_from = Self::today();
-        self.header_menu_open = false;
+        self.timeline.from = Self::today();
+        self.overlays.header_menu_open = false;
         if kanban && !timeline {
             let strings = i18n::t(cx);
             self.ensure_kanban_sections(strings, cx);
@@ -168,7 +168,10 @@ impl TodoView {
             this.update(cx, |this, _| {
                 for (key, width) in [("lists_width", this.lists_width), ("detail_width", this.detail_width)] {
                     if let Err(err) = this.store.set_setting(key, &width.round().to_string()) {
-                        eprintln!("failed to save the panel width: {err:#}");
+                        desktop_common::logging::log_error(
+                            "todo_ui",
+                            format!("failed to save the panel width: {err:#}"),
+                        );
                     }
                 }
             })

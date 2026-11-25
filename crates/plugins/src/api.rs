@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, ensure};
 use fern_core::Store;
@@ -46,6 +46,9 @@ pub const MAX_TIMER_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_TIMERS_PER_PLUGIN: usize = 8;
 pub const MAX_OAUTH_PER_PLUGIN: usize = 2;
 pub const MAX_OAUTH_GLOBAL: usize = 4;
+pub const MAX_PENDING_UI_EFFECTS: usize = 64;
+const MAX_OPEN_EXTERNAL_PER_WINDOW: usize = 3;
+const OPEN_EXTERNAL_WINDOW: Duration = Duration::from_secs(5);
 const MAX_DEFAULT_SCOPE_HANDLERS: usize = 256;
 const MAX_SCOPE_HANDLERS: usize = 4096;
 
@@ -141,7 +144,7 @@ pub enum PromptReplyValue {
 pub type PromptSenders = Rc<RefCell<HashMap<u64, (String, oneshot::Sender<PromptReplyValue>)>>>;
 pub type ServiceCallerFn =
     Rc<dyn Fn(String, JsonValue, usize) -> oneshot::Receiver<Result<JsonValue>>>;
-pub type ServiceRegistrarFn = Rc<dyn Fn(String)>;
+pub type ServiceRegistrarFn = Rc<dyn Fn(String) -> Result<()>>;
 pub type ViewRefresherFn = Rc<dyn Fn(String)>;
 pub type EffectEmitterFn = Arc<dyn Fn(PluginUiEffect) + Send + Sync>;
 
@@ -242,6 +245,30 @@ pub struct PluginHooks {
 
 pub type EventListenerMap = HashMap<String, Vec<(u64, Persistent<Function<'static>>)>>;
 
+pub struct PluginApiInit {
+    pub plugin_id: String,
+    pub permissions: PermissionSet,
+    pub store: Rc<Store>,
+    pub vault: SecretsVault,
+    pub http_pool: Arc<HttpPool>,
+    pub oauth_limiter: Arc<OAuthConcurrencyLimiter>,
+    pub write_depth: u32,
+    pub enforce_declared_views: bool,
+    pub declared_views: HashSet<String>,
+    pub settings: Map<String, JsonValue>,
+    pub secret_keys: HashSet<String>,
+    pub locale: Rc<RefCell<String>>,
+    pub theme_appearance: Rc<RefCell<String>>,
+    pub logs: VecDeque<LogEntry>,
+    pub prompt_senders: PromptSenders,
+    pub next_prompt_id: Rc<Cell<u64>>,
+    pub service_registrar: ServiceRegistrarFn,
+    pub service_caller: ServiceCallerFn,
+    pub view_refresher: ViewRefresherFn,
+    pub effect_emitter: EffectEmitterFn,
+    pub shutdown_flag: Arc<AtomicBool>,
+}
+
 /// Shared per-plugin (or per-script) host bridge accessed by QuickJS bindings on `PluginWorker`.
 pub struct PluginApiState {
     pub plugin_id: String,
@@ -254,6 +281,7 @@ pub struct PluginApiState {
     pub active_service_depth: Cell<usize>,
     pub batch_dirty_stack: RefCell<Vec<bool>>,
     pub data_dirty: Cell<bool>,
+    pub enforce_declared_views: bool,
     pub declared_views: HashSet<String>,
     pub settings: RefCell<Map<String, JsonValue>>,
     pub secret_keys: HashSet<String>,
@@ -274,6 +302,7 @@ pub struct PluginApiState {
     pub timers: RefCell<HashMap<String, RegisteredTimer>>,
     pub services: RefCell<HashMap<String, Persistent<Function<'static>>>>,
     pub pending_ui_effects: RefCell<VecDeque<PluginUiEffect>>,
+    pub open_external_timestamps: RefCell<VecDeque<Instant>>,
     pub prompt_senders: PromptSenders,
     pub next_prompt_id: Rc<Cell<u64>>,
     pub service_registrar: ServiceRegistrarFn,
@@ -284,6 +313,50 @@ pub struct PluginApiState {
 }
 
 impl PluginApiState {
+    pub fn new(init: PluginApiInit) -> Self {
+        Self {
+            plugin_id: init.plugin_id,
+            permissions: init.permissions,
+            store: init.store,
+            vault: init.vault,
+            http_pool: init.http_pool,
+            oauth_limiter: init.oauth_limiter,
+            write_depth: Cell::new(init.write_depth),
+            active_service_depth: Cell::new(0),
+            batch_dirty_stack: RefCell::new(Vec::new()),
+            data_dirty: Cell::new(false),
+            enforce_declared_views: init.enforce_declared_views,
+            declared_views: init.declared_views,
+            settings: RefCell::new(init.settings),
+            secret_keys: init.secret_keys,
+            locale: init.locale,
+            theme_appearance: init.theme_appearance,
+            logs: RefCell::new(init.logs),
+            active_render_scope: RefCell::new(None),
+            handlers: RefCell::new(HashMap::new()),
+            next_handler_id: Cell::new(1),
+            views: RefCell::new(HashMap::new()),
+            modal_view: RefCell::new(None),
+            commands: RefCell::new(HashMap::new()),
+            search_providers: RefCell::new(HashMap::new()),
+            event_listeners: RefCell::new(HashMap::new()),
+            next_listener_id: Cell::new(1),
+            settings_listeners: RefCell::new(Vec::new()),
+            hooks: RefCell::new(PluginHooks::default()),
+            timers: RefCell::new(HashMap::new()),
+            services: RefCell::new(HashMap::new()),
+            pending_ui_effects: RefCell::new(VecDeque::new()),
+            open_external_timestamps: RefCell::new(VecDeque::new()),
+            prompt_senders: init.prompt_senders,
+            next_prompt_id: init.next_prompt_id,
+            service_registrar: init.service_registrar,
+            service_caller: init.service_caller,
+            view_refresher: init.view_refresher,
+            effect_emitter: init.effect_emitter,
+            shutdown_flag: init.shutdown_flag,
+        }
+    }
+
     pub fn push_log(&self, level: LogLevel, raw_msg: &str) {
         let scrubbed = self.vault.scrub_secrets(&self.plugin_id, raw_msg);
         let mut logs = self.logs.borrow_mut();
@@ -297,12 +370,60 @@ impl PluginApiState {
         });
     }
 
+    pub fn push_ui_effect(&self, effect: PluginUiEffect) -> Result<()> {
+        let mut queue = self.pending_ui_effects.borrow_mut();
+        if queue.len() >= MAX_PENDING_UI_EFFECTS {
+            if matches!(effect, PluginUiEffect::Toast { .. })
+                && let Some(oldest_toast) =
+                    queue.iter().position(|e| matches!(e, PluginUiEffect::Toast { .. }))
+            {
+                queue.remove(oldest_toast);
+            } else {
+                anyhow::bail!(
+                    "pending UI effect queue full (max {MAX_PENDING_UI_EFFECTS} effects per invocation)"
+                );
+            }
+        }
+        queue.push_back(effect);
+        Ok(())
+    }
+
+    pub fn check_open_external_rate_limit(&self) -> Result<()> {
+        let now = Instant::now();
+        let mut history = self.open_external_timestamps.borrow_mut();
+        while history
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= OPEN_EXTERNAL_WINDOW)
+        {
+            history.pop_front();
+        }
+        ensure!(
+            history.len() < MAX_OPEN_EXTERNAL_PER_WINDOW,
+            "openExternal rate limit exceeded (max {MAX_OPEN_EXTERNAL_PER_WINDOW} per {}s)",
+            OPEN_EXTERNAL_WINDOW.as_secs()
+        );
+        history.push_back(now);
+        Ok(())
+    }
+
     pub fn scrub(&self, text: &str) -> String {
         self.vault.scrub_secrets(&self.plugin_id, text)
     }
 
     pub fn clear_scope_handlers(&self, scope: &str) {
         self.handlers.borrow_mut().remove(scope);
+    }
+
+    pub fn swap_scope_handlers(&self, staging_scope: &str, target_scope: &str) {
+        if staging_scope == target_scope {
+            return;
+        }
+        let mut handlers = self.handlers.borrow_mut();
+        if let Some(staged) = handlers.remove(staging_scope) {
+            handlers.insert(target_scope.to_owned(), staged);
+        } else {
+            handlers.remove(target_scope);
+        }
     }
 
     pub fn set_active_scope(&self, scope: Option<String>) {

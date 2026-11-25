@@ -21,10 +21,11 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context as _, Result, bail};
 use fern_core::attachment::MAX_ATTACHMENT_BYTES;
 use fern_core::sync::{
-    MAX_FILE_KEY_BYTES, MIN_SYNC_PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION, encode_file_key, file_key,
+    MAX_FILE_KEY_BYTES, MIN_SYNC_PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION, encode_file_key,
+    extract_plaintext_file_name, file_key,
 };
-use rusqlite::{Connection, OptionalExtension as _, params};
-use serde_json::{Map, Value, json};
+use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
+use serde_json::{Value, json};
 
 /// Default grace period before unreferenced files in `<data>.files` are eligible for garbage
 /// collection (24 hours), protecting in-flight uploads that have not yet committed metadata.
@@ -65,6 +66,22 @@ impl fmt::Display for ProtocolMismatchError {
 }
 
 impl std::error::Error for ProtocolMismatchError {}
+
+/// Typed client-side validation error returned with HTTP 400 (as opposed to 500 internal failures).
+#[derive(Debug, Clone)]
+pub struct ClientInputError(pub String);
+
+impl fmt::Display for ClientInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ClientInputError {}
+
+fn client_err(msg: impl Into<String>) -> anyhow::Error {
+    ClientInputError(msg.into()).into()
+}
 
 /// Summary of a `.files` garbage-collection pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -107,11 +124,11 @@ impl Server {
 
     /// Where a sent file goes: `None` for a name that is not a plain file name.
     pub fn file_path(&self, name: &str) -> Option<std::path::PathBuf> {
-        let plain = !name.is_empty()
-            && name.len() <= MAX_FILE_KEY_BYTES
-            && !name.starts_with('.')
-            && !name.contains(['/', '\\', ':', '\0']);
-        self.files.as_ref().filter(|_| plain).map(|dir| dir.join(name))
+        file_path_in_dir(self.files.as_deref(), name)
+    }
+
+    pub(crate) fn files_dir(&self) -> Option<&std::path::Path> {
+        self.files.as_deref()
     }
 
     fn init(conn: Connection, files: Option<std::path::PathBuf>) -> Result<Self> {
@@ -141,15 +158,19 @@ impl Server {
              );",
         )?;
 
-        let has_file_key = {
-            let mut stmt = conn.prepare("PRAGMA table_info(changes)")?;
-            let columns: Vec<String> = stmt
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            columns.iter().any(|column| column == "file_key")
-        };
-        if !has_file_key {
-            conn.execute_batch("ALTER TABLE changes ADD COLUMN file_key TEXT;")?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 1 {
+            let has_file_key = {
+                let mut stmt = conn.prepare("PRAGMA table_info(changes)")?;
+                let columns: Vec<String> = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                columns.iter().any(|column| column == "file_key")
+            };
+            if !has_file_key {
+                conn.execute_batch("ALTER TABLE changes ADD COLUMN file_key TEXT;")?;
+            }
+            conn.pragma_update(None, "user_version", 1)?;
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_changes_file_gc ON changes(entity, file_key) WHERE row IS NOT NULL;",
@@ -165,12 +186,14 @@ impl Server {
     /// other devices' changes after `since`.
     pub fn sync(&mut self, request: &Value) -> Result<Value> {
         if !request.is_object() {
-            bail!("sync request must be a JSON object");
+            return Err(client_err("sync request must be a JSON object"));
         }
         let client_proto = match &request["protocol"] {
             Value::Null => 1,
-            Value::Number(num) => num.as_u64().context("protocol must be a non-negative integer")?,
-            _ => bail!("protocol must be a non-negative integer"),
+            Value::Number(num) => num
+                .as_u64()
+                .ok_or_else(|| client_err("protocol must be a non-negative integer"))?,
+            _ => return Err(client_err("protocol must be a non-negative integer")),
         };
         if client_proto < u64::from(MIN_SYNC_PROTOCOL_VERSION)
             || client_proto > u64::from(SYNC_PROTOCOL_VERSION)
@@ -186,16 +209,16 @@ impl Server {
         let device = request["device"]
             .as_str()
             .filter(|d| !d.is_empty())
-            .context("a sync needs a device id")?;
+            .ok_or_else(|| client_err("a sync needs a device id"))?;
         let since = request["since"].as_i64().unwrap_or(0);
         let empty = Vec::new();
         let incoming = match &request["changes"] {
             Value::Null => &empty,
             Value::Array(changes) => changes,
-            _ => bail!("changes must be a list"),
+            _ => return Err(client_err("changes must be a list")),
         };
 
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
             let mut select_at =
                 tx.prepare_cached("SELECT at FROM changes WHERE entity = ?1 AND key = ?2")?;
@@ -205,9 +228,15 @@ impl Server {
                 "INSERT INTO changes (entity, key, at, row, device, file_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             for change in incoming {
-                let entity = change["entity"].as_str().context("a change needs an entity")?;
-                let key = change["key"].as_str().context("a change needs a key")?;
-                let at = change["at"].as_i64().context("a change needs a time")?;
+                let entity = change["entity"]
+                    .as_str()
+                    .ok_or_else(|| client_err("a change needs an entity"))?;
+                let key = change["key"]
+                    .as_str()
+                    .ok_or_else(|| client_err("a change needs a key"))?;
+                let at = change["at"]
+                    .as_i64()
+                    .ok_or_else(|| client_err("a change needs a time"))?;
                 let (row, stored_file_key) = match &change["row"] {
                     Value::Null => (None, None),
                     row @ Value::Object(map) => {
@@ -219,7 +248,7 @@ impl Server {
                             .or_else(|| extract_plaintext_file_name(entity, map).map(|name| file_key(&name)));
                         (Some(row.to_string()), fk)
                     }
-                    _ => bail!("a change's row must be an object or null"),
+                    _ => return Err(client_err("a change's row must be an object or null")),
                 };
                 let stored: Option<i64> = select_at
                     .query_row(params![entity, key], |r| r.get(0))
@@ -382,28 +411,11 @@ impl Server {
     }
 }
 
-/// Extracts the raw local attachment or countdown background filename from a plaintext synced row.
-fn extract_plaintext_file_name(entity: &str, row: &Map<String, Value>) -> Option<String> {
-    match entity {
-        "task_attachments" => {
-            if let Some(stored) = row.get("stored_name").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                return Some(stored.to_owned());
-            }
-            let id = row.get("id").and_then(Value::as_str).filter(|s| !s.is_empty())?;
-            let name = row.get("name").and_then(Value::as_str).filter(|s| !s.is_empty())?;
-            Some(format!("{id}-{name}"))
-        }
-        "countdowns" => {
-            if let Some(bg) = row.get("background").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                return Some(bg.to_owned());
-            }
-            row.get("cover_image")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-        }
-        _ => None,
-    }
+fn file_path_in_dir(dir: Option<&std::path::Path>, name: &str) -> Option<std::path::PathBuf> {
+    let plain = fern_core::is_safe_attachment_name(name)
+        && name.len() <= MAX_FILE_KEY_BYTES
+        && !name.starts_with('.');
+    dir.filter(|_| plain).map(|d| d.join(name))
 }
 
 fn parse_gc_min_age(body: &str, default_grace: Duration) -> Result<Duration> {
@@ -473,28 +485,55 @@ struct SharedState {
     last_gc: Instant,
 }
 
-fn write_file_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+enum StreamUploadError {
+    TooLarge,
+    ClientRead,
+    ServerIo,
+}
+
+fn stream_file_atomic(
+    path: &std::path::Path,
+    reader: &mut dyn std::io::Read,
+    max_bytes: u64,
+) -> std::result::Result<(), StreamUploadError> {
+    use std::io::Write as _;
+
     static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let suffix = format!(".tmp.{}.{seq}", std::process::id());
-    let tmp = if path.file_name().is_some_and(|name| name.len() + suffix.len() <= MAX_FILE_KEY_BYTES) {
-        let mut tmp_os = path.as_os_str().to_owned();
-        tmp_os.push(&suffix);
-        std::path::PathBuf::from(tmp_os)
-    } else if let Some(parent) = path.parent() {
-        parent.join(format!("upload{suffix}"))
-    } else {
-        let mut tmp_os = path.as_os_str().to_owned();
-        tmp_os.push(&suffix);
-        std::path::PathBuf::from(tmp_os)
+    let pid = std::process::id();
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp_name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) if name.len() + 24 <= MAX_FILE_KEY_BYTES => format!(".{name}.tmp.{pid}.{seq}"),
+        _ => format!(".upload.tmp.{pid}.{seq}"),
     };
-    if let Err(err) = std::fs::write(&tmp, data) {
+    let tmp = parent.join(tmp_name);
+
+    let write_res = (|| -> std::result::Result<(), StreamUploadError> {
+        let mut file = std::fs::File::create(&tmp).map_err(|_| StreamUploadError::ServerIo)?;
+        let mut limited = reader.take(max_bytes + 1);
+        let mut buf = [0u8; 64 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = limited.read(&mut buf).map_err(|_| StreamUploadError::ClientRead)?;
+            if n == 0 {
+                break;
+            }
+            total = total.saturating_add(n as u64);
+            if total > max_bytes {
+                return Err(StreamUploadError::TooLarge);
+            }
+            file.write_all(&buf[..n]).map_err(|_| StreamUploadError::ServerIo)?;
+        }
+        file.flush().map_err(|_| StreamUploadError::ServerIo)?;
+        Ok(())
+    })();
+    if let Err(err) = write_res {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
-    if let Err(err) = std::fs::rename(&tmp, path) {
+    if std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(err);
+        return Err(StreamUploadError::ServerIo);
     }
     Ok(())
 }
@@ -510,13 +549,13 @@ fn maybe_run_auto_gc(state: &Mutex<SharedState>, gc_grace: Duration) {
 fn handle_request(
     mut request: tiny_http::Request,
     state: &Mutex<SharedState>,
+    files_dir: Option<&std::path::Path>,
     token: &str,
     gc_grace: Duration,
 ) {
     use tiny_http::{Method, Response};
 
     if request.method() == &Method::Get && request.url() == "/health" {
-        maybe_run_auto_gc(state, gc_grace);
         if let Err(err) = request.respond(json_response(200, health_payload())) {
             eprintln!("failed to answer: {err}");
         }
@@ -534,44 +573,44 @@ fn handle_request(
     }
 
     if let Some(name) = request.url().strip_prefix("/files/").map(str::to_owned) {
-        let path = state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .server
-            .file_path(&name);
-        let response = match (request.method(), path) {
-            (_, None) => Response::from_data(Vec::new()).with_status_code(400),
-            (Method::Put, Some(path)) => {
-                let mut data = Vec::new();
-                match request.as_reader().take(MAX_FILE_UPLOAD_BYTES + 1).read_to_end(&mut data) {
-                    Ok(n) if n as u64 > MAX_FILE_UPLOAD_BYTES => {
-                        Response::from_data(Vec::new()).with_status_code(413)
-                    }
-                    Ok(_) => match write_file_atomic(&path, &data) {
-                        Ok(()) => Response::from_data(Vec::new()).with_status_code(204),
-                        Err(_) => Response::from_data(Vec::new()).with_status_code(500),
-                    },
-                    Err(_) => Response::from_data(Vec::new()).with_status_code(400),
-                }
+        let path = file_path_in_dir(files_dir, &name);
+        match (request.method(), path) {
+            (_, None) => {
+                let _ = request.respond(Response::from_data(Vec::new()).with_status_code(400));
             }
-            (Method::Get, Some(path)) => match std::fs::read(&path) {
-                Ok(data) => Response::from_data(data),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    Response::from_data(Vec::new()).with_status_code(404)
+            (Method::Put, Some(path)) => {
+                let status = match stream_file_atomic(&path, request.as_reader(), MAX_FILE_UPLOAD_BYTES) {
+                    Ok(()) => 204,
+                    Err(StreamUploadError::TooLarge) => 413,
+                    Err(StreamUploadError::ClientRead) => 400,
+                    Err(StreamUploadError::ServerIo) => 500,
+                };
+                let _ = request.respond(Response::from_data(Vec::new()).with_status_code(status));
+            }
+            (Method::Get, Some(path)) => match std::fs::File::open(&path) {
+                Ok(file) => {
+                    if let Err(err) = request.respond(Response::from_file(file)) {
+                        eprintln!("failed to answer: {err}");
+                    }
                 }
-                Err(_) => Response::from_data(Vec::new()).with_status_code(500),
-            },
-            (Method::Delete, Some(path)) => match std::fs::remove_file(&path) {
-                Ok(()) => Response::from_data(Vec::new()).with_status_code(204),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    Response::from_data(Vec::new()).with_status_code(404)
+                    let _ = request.respond(Response::from_data(Vec::new()).with_status_code(404));
                 }
-                Err(_) => Response::from_data(Vec::new()).with_status_code(500),
+                Err(_) => {
+                    let _ = request.respond(Response::from_data(Vec::new()).with_status_code(500));
+                }
             },
-            _ => Response::from_data(Vec::new()).with_status_code(405),
-        };
-        if let Err(err) = request.respond(response) {
-            eprintln!("failed to answer: {err}");
+            (Method::Delete, Some(path)) => {
+                let status = match std::fs::remove_file(&path) {
+                    Ok(()) => 204,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => 404,
+                    Err(_) => 500,
+                };
+                let _ = request.respond(Response::from_data(Vec::new()).with_status_code(status));
+            }
+            _ => {
+                let _ = request.respond(Response::from_data(Vec::new()).with_status_code(405));
+            }
         }
         return;
     }
@@ -614,8 +653,11 @@ fn handle_request(
                                         })
                                         .to_string(),
                                     )
+                                } else if let Some(client) = err.downcast_ref::<ClientInputError>() {
+                                    (400, json!({ "error": client.0 }).to_string())
                                 } else {
-                                    (400, json!({ "error": format!("{err:#}") }).to_string())
+                                    eprintln!("fern-server sync internal error: {err:#}");
+                                    (500, r#"{"error":"internal server error"}"#.to_owned())
                                 }
                             }
                         }
@@ -643,7 +685,10 @@ fn handle_request(
                         };
                         match gc_res {
                             Ok(stats) => (200, stats.to_json().to_string()),
-                            Err(err) => (500, json!({ "error": format!("{err:#}") }).to_string()),
+                            Err(err) => {
+                                eprintln!("fern-server gc internal error: {err:#}");
+                                (500, r#"{"error":"internal server error"}"#.to_owned())
+                            }
                         }
                     }
                     Err(err) => (400, json!({ "error": format!("{err:#}") }).to_string()),
@@ -669,6 +714,7 @@ fn handle_request(
 /// - `PUT`/`GET`/`DELETE /files/<name>` (bearer auth)
 /// - `POST /gc` (bearer auth)
 pub fn serve_with_gc_grace(http: &tiny_http::Server, server: Server, token: &str, gc_grace: Duration) {
+    let files_dir: Arc<Option<std::path::PathBuf>> = Arc::new(server.files_dir().map(std::path::Path::to_path_buf));
     let state = Arc::new(Mutex::new(SharedState {
         server,
         syncs_since_gc: 0,
@@ -682,6 +728,7 @@ pub fn serve_with_gc_grace(http: &tiny_http::Server, server: Server, token: &str
     for _ in 0..WORKER_THREADS {
         let rx = Arc::clone(&rx);
         let state = Arc::clone(&state);
+        let files_dir = Arc::clone(&files_dir);
         let token = Arc::clone(&token);
         workers.push(std::thread::spawn(move || {
             loop {
@@ -692,7 +739,16 @@ pub fn serve_with_gc_grace(http: &tiny_http::Server, server: Server, token: &str
                 let Ok(request) = received else {
                     break;
                 };
-                handle_request(request, &state, &token, gc_grace);
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_request(request, &state, (*files_dir).as_deref(), &token, gc_grace);
+                })) {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("unknown panic");
+                    eprintln!("fern-server worker caught panic: {msg}");
+                }
             }
         }));
     }
@@ -713,7 +769,17 @@ pub fn authorized(header: Option<&str>, token: &str) -> bool {
     let Some(given) = header.and_then(|h| h.strip_prefix("Bearer ")) else {
         return false;
     };
-    given.len() == token.len() && given.bytes().zip(token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    let a = given.as_bytes();
+    let b = token.as_bytes();
+    let len_diff = a.len() ^ b.len();
+    let max_len = a.len().max(b.len());
+    let mut diff = 0u8;
+    for i in 0..max_len {
+        let ca = a.get(i).copied().unwrap_or(0);
+        let cb = b.get(i).copied().unwrap_or(0);
+        diff |= std::hint::black_box(ca ^ cb);
+    }
+    len_diff == 0 && diff == 0
 }
 
 #[cfg(test)]

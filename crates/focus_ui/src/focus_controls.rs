@@ -45,7 +45,7 @@ impl FocusView {
         }
         let value = if enabled { "1" } else { "0" };
         if let Err(err) = self.store.set_setting(key, value) {
-            eprintln!("failed to save the focus setting: {err:#}");
+            desktop_common::logging::log_error("focus_ui", format!("failed to save the focus setting: {err:#}"));
             self.message = Some(i18n::t(cx).focus_settings_save_failed.to_owned());
         }
         cx.notify();

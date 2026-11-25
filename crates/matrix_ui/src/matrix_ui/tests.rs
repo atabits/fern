@@ -541,16 +541,16 @@ fn new_inactive_skips_initial_reload_until_activated(cx: &mut gpui::TestAppConte
         let matrix = cx.new(|cx| MatrixView::new_inactive(store.clone(), cx));
         {
             let m = matrix.read(cx);
-            assert!(!m.active);
-            assert!(m.dirty);
+            assert!(!m.refresh.is_active());
+            assert!(m.refresh.is_dirty());
             assert!(m.tasks.is_empty());
             assert_eq!(m.cache[0].open_count, 0);
         }
 
         matrix.update(cx, |m, cx| m.set_active(true, cx));
         let m = matrix.read(cx);
-        assert!(m.active);
-        assert!(!m.dirty);
+        assert!(m.refresh.is_active());
+        assert!(!m.refresh.is_dirty());
         assert_eq!(m.tasks.len(), 1);
         assert_eq!(m.cache[0].open_count, 1);
     });
@@ -588,6 +588,8 @@ fn typing_in_detail_card_updates_matrix_tasks_and_cache_via_task_text_edited(cx:
         assert_eq!(m.cache[0].groups[0].1[0].title, "Original quadrant title!");
         assert!(cx.try_global::<desktop_common::data_version::DataVersion>().is_none());
     });
+    cx.executor().advance_clock(std::time::Duration::from_millis(260));
+    cx.run_until_parked();
     assert_eq!(store.task(task.id).unwrap().unwrap().title, "Original quadrant title!");
 
     let observer = cx.update(|_, cx| cx.new(|_| ()));

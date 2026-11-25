@@ -11,14 +11,13 @@ use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use fern_core::plugin_store::PluginState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use ureq::config::Config;
 use ureq::http::Uri;
-use ureq::unversioned::transport::DefaultConnector;
 use uuid::Uuid;
 use zip::ZipArchive;
 
 use crate::http::{
-    MAX_REDIRECTS, SsrfSafeResolver, is_ip_blocked, is_loopback_ip, resolve_redirect_uri,
+    MAX_REDIRECTS, build_ssrf_agent, is_ip_blocked, is_loopback_ip, origin_key,
+    resolve_redirect_uri,
 };
 use crate::manifest::{
     CURRENT_API_VERSION, LoadedManifest, PermissionApprovalStatus, PluginManifest,
@@ -524,19 +523,6 @@ fn validate_registry_url(url: &str, allow_local_http: bool) -> Result<Uri> {
     }
 }
 
-fn registry_origin_key(uri: &Uri) -> (String, String, u16) {
-    let scheme = uri
-        .scheme_str()
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    let host = uri
-        .host()
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
-    (scheme, host, port)
-}
-
 fn registry_get_with_redirects(
     url: &str,
     extra_headers: &[(&str, &str)],
@@ -544,7 +530,7 @@ fn registry_get_with_redirects(
 ) -> Result<ureq::http::Response<ureq::Body>> {
     let deadline = Instant::now() + REGISTRY_TOTAL_TIMEOUT;
     let mut current_uri = validate_registry_url(url, allow_local_http)?;
-    let initial_origin = registry_origin_key(&current_uri);
+    let initial_origin = origin_key(&current_uri);
     let mut same_origin = true;
 
     for hop in 0..=MAX_REDIRECTS {
@@ -556,16 +542,12 @@ fn registry_get_with_redirects(
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
         let loopback_only = allow_local_http && cur_scheme == "http";
-
-        let config = Config::builder()
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .proxy(None)
-            .timeout_connect(Some(REGISTRY_CONNECT_TIMEOUT.min(remaining)))
-            .timeout_global(Some(remaining))
-            .build();
-        let resolver = SsrfSafeResolver::new(allow_local_http, loopback_only);
-        let agent = ureq::Agent::with_parts(config, DefaultConnector::default(), resolver);
+        let agent = build_ssrf_agent(
+            allow_local_http,
+            loopback_only,
+            REGISTRY_CONNECT_TIMEOUT.min(remaining),
+            remaining,
+        );
 
         let mut builder = ureq::http::Request::builder()
             .method("GET")
@@ -601,7 +583,7 @@ fn registry_get_with_redirects(
                 !(cur_scheme == "https" && next_scheme == "http"),
                 "registry redirect blocked: HTTPS to HTTP downgrade is forbidden"
             );
-            same_origin &= registry_origin_key(&validated_next) == initial_origin;
+            same_origin &= origin_key(&validated_next) == initial_origin;
             current_uri = validated_next;
             continue;
         }

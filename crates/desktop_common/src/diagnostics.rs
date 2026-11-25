@@ -56,6 +56,9 @@ pub fn clear_events() {
     guard.clear();
 }
 
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Redacts credentials, passphrases, tokens, and HTTP(S) URLs (preserving only scheme +
 /// `<redacted-host>`) so error strings and diagnostic reports never leak secrets or private hosts.
 pub fn redact_sensitive(text: &str) -> String {
@@ -511,15 +514,10 @@ fn file_basename(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use fern_core::CountdownKind;
     use fern_core::sync::SyncConfig;
 
     use super::*;
-
-    /// Serializes tests in this module that clear/inspect the global diagnostic ring buffer.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn ring_buffer_caps_at_200_entries_and_formats_timestamps() {

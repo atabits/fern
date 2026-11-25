@@ -14,7 +14,7 @@ fn long_quick_add_keeps_the_caret_inside_both_input_layouts(cx: &mut TestAppCont
     for detailed in [false, true] {
         cx.update(|window, cx| view.update(cx, |view, cx| {
             view.preferences.detailed_input = detailed;
-            window.focus(&view.input.focus_handle(cx), cx);
+            window.focus(&view.quick_add.input.focus_handle(cx), cx);
             cx.notify();
         }));
         cx.simulate_resize(gpui::size(px(540.), px(480.)));
@@ -30,7 +30,7 @@ fn long_quick_add_keeps_the_caret_inside_both_input_layouts(cx: &mut TestAppCont
                 cx.simulate_keystrokes(key);
                 cx.run_until_parked();
                 cx.update(|window, cx| {
-                    let input = view.read(cx).input.clone();
+                    let input = view.read(cx).quick_add.input.clone();
                     let caret = input.update(cx, |input, cx| {
                         input.bounds_for_range(offset..offset, gpui::Bounds::default(), window, cx).unwrap()
                     });
@@ -39,7 +39,7 @@ fn long_quick_add_keeps_the_caret_inside_both_input_layouts(cx: &mut TestAppCont
             }
         }
         cx.simulate_keystrokes("enter");
-        cx.update(|_, cx| assert!(view.read(cx).input.read(cx).text().is_empty()));
+        cx.update(|_, cx| assert!(view.read(cx).quick_add.input.read(cx).text().is_empty()));
     }
     let tasks = store.tasks().unwrap();
     assert_eq!(tasks.len(), 2);
@@ -274,7 +274,7 @@ fn unchecking_a_completed_row_reopens_the_task(cx: &mut TestAppContext) {
         let view = view.read(cx);
         assert_eq!(view.tasks[0].id, task.id);
         assert!(!view.tasks[0].is_closed());
-        assert!(!view.rows(i18n::t(cx)).iter().any(|row| {
+        assert!(!view.rows(i18n::t(cx), cx).iter().any(|row| {
             matches!(row, Row::Section { section: Section::Completed, .. })
         }));
     });
@@ -354,13 +354,13 @@ fn escape_closes_the_sort_menu_and_restores_focus(cx: &mut TestAppContext) {
     cx.simulate_click(sort, modifiers);
     cx.update(|window, cx| {
         let view = view.read(cx);
-        assert_eq!(view.sort_menu, Some(None));
-        assert!(view.sort_menu_focus.is_focused(window));
+        assert_eq!(view.overlays.sort_menu, Some(None));
+        assert!(view.overlays.sort_menu_focus.is_focused(window));
     });
 
     cx.simulate_keystrokes("escape");
     cx.update(|window, cx| {
-        assert!(view.read(cx).sort_menu.is_none());
+        assert!(view.read(cx).overlays.sort_menu.is_none());
         assert!(previous.is_focused(window));
     });
 }
@@ -413,8 +413,8 @@ fn a_rejected_quick_add_attachment_does_not_repeat_the_saved_task(cx: &mut TestA
     });
     let (view, cx) = cx.add_window_view(|window, cx| {
         let mut view = TodoView::new(store.clone(), window, cx);
-        view.add_draft.files.push(file.clone());
-        window.focus(&view.input.focus_handle(cx), cx);
+        view.quick_add.draft.files.push(file.clone());
+        window.focus(&view.quick_add.input.focus_handle(cx), cx);
         view
     });
     cx.simulate_input("One task");
@@ -424,8 +424,8 @@ fn a_rejected_quick_add_attachment_does_not_repeat_the_saved_task(cx: &mut TestA
     assert_eq!(tasks.len(), 1);
     assert!(store.attachments(tasks[0].id).unwrap().is_empty());
     cx.update(|_, cx| {
-        assert!(view.read(cx).input.read(cx).text().is_empty());
-        assert!(view.read(cx).add_attachment_error.as_deref().is_some_and(|error| error.contains("32 MiB")));
+        assert!(view.read(cx).quick_add.input.read(cx).text().is_empty());
+        assert!(view.read(cx).quick_add.attachment_error.as_deref().is_some_and(|error| error.contains("32 MiB")));
     });
 }
 
@@ -523,12 +523,11 @@ fn backspace_edits_text_and_modified_delete_trashes_the_selected_task(cx: &mut T
     cx.simulate_keystrokes("secondary-backspace");
     cx.run_until_parked();
     assert!(store.task(task.id).unwrap().is_some(), "Trash shortcut must not purge");
-    cx.update(|_, cx| assert!(view.read(cx).confirm_delete.is_none()));
+    cx.update(|_, cx| assert!(view.read(cx).overlays.confirm_delete.is_none()));
 }
 
 #[gpui::test]
 fn switching_views_selects_the_first_visible_row_and_syncs_details(cx: &mut TestAppContext) {
-    let _horizons_read = HORIZONS_FLAG_LOCK.read().unwrap_or_else(|e| e.into_inner());
     let store = Rc::new(Store::open_in_memory().unwrap());
     let l1 = store.create_list("L1").unwrap();
     let l2 = store.create_list("L2").unwrap();
@@ -704,7 +703,7 @@ fn kanban_keeps_pinned_completed_and_subtasks_inside_their_own_columns(cx: &mut 
 
     cx.update(|_, cx| {
         let v = view.read(cx);
-        let cols = v.board_columns(i18n::t(cx));
+        let cols = v.board_columns(i18n::t(cx), cx);
         assert_eq!(cols.len(), 2, "only the two real sections exist, no separate Completed column");
         assert_eq!(cols[0].title, "Not Sectioned");
         assert_eq!(cols[0].open_count(), 2);
@@ -723,7 +722,7 @@ fn kanban_keeps_pinned_completed_and_subtasks_inside_their_own_columns(cx: &mut 
     cx.update(|window, cx| view.update(cx, |view, cx| view.set_sort(None, Some(GroupBy::Priority), window, cx)));
     cx.update(|_, cx| {
         let v = view.read(cx);
-        let cols = v.board_columns(i18n::t(cx));
+        let cols = v.board_columns(i18n::t(cx), cx);
         let high = cols.iter().find(|c| c.title == "High").expect("High priority column");
         assert_eq!(high.open_cards.len(), 1);
         assert_eq!(high.open_cards[0].0.id, t_open.id);
@@ -732,13 +731,10 @@ fn kanban_keeps_pinned_completed_and_subtasks_inside_their_own_columns(cx: &mut 
     });
 }
 
-static HORIZONS_FLAG_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
 #[gpui::test]
 fn sidebar_drag_and_drop_reorders_smart_lists_sections_lists_folders_tags_and_filters(
     cx: &mut TestAppContext,
 ) {
-    let _horizons_read = HORIZONS_FLAG_LOCK.read().unwrap_or_else(|e| e.into_inner());
     use fern_core::{
         FilterRules, SidebarSection, SmartFilter, SmartList,
     };
@@ -909,10 +905,10 @@ fn sidebar_drag_and_drop_reorders_smart_lists_sections_lists_folders_tags_and_fi
     let folders = store.list_folders().unwrap();
     assert_eq!(folders.len(), 1);
     let folder = folders[0].clone();
-    cx.update(|_, cx| assert!(view.read(cx).folder_dialog.is_some(), "grouping opens folder rename dialog"));
+    cx.update(|_, cx| assert!(view.read(cx).overlays.folder_dialog.is_some(), "grouping opens folder rename dialog"));
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
-    cx.update(|_, cx| assert!(view.read(cx).folder_dialog.is_none(), "escape closes folder rename dialog"));
+    cx.update(|_, cx| assert!(view.read(cx).overlays.folder_dialog.is_none(), "escape closes folder rename dialog"));
     let grouped: Vec<(String, Option<Id>)> = store.lists().unwrap().into_iter().map(|l| (l.name, l.folder)).collect();
     assert_eq!(
         grouped,
@@ -1014,7 +1010,7 @@ fn nested_tasks_drag_unnest_unlink_and_toggle_all(cx: &mut TestAppContext) {
         cx.run_until_parked();
     };
     let visible_ids = |cx: &mut gpui::VisualTestContext| -> Vec<Id> {
-        cx.update(|_, cx| view.read(cx).visible_task_ids(i18n::t(cx)))
+        cx.update(|_, cx| view.read(cx).visible_task_ids(i18n::t(cx), cx))
     };
 
     // 1. Two-task list: drag Child left by grabbing directly on its title text -> unnested without opening title edit.
@@ -1151,7 +1147,7 @@ fn kanban_nested_tasks_drag_nest_outdent_reorder_and_cross_column(cx: &mut TestA
         cx.run_until_parked();
     };
     let visible_ids = |cx: &mut gpui::VisualTestContext| -> Vec<Id> {
-        cx.update(|_, cx| view.read(cx).visible_task_ids(i18n::t(cx)))
+        cx.update(|_, cx| view.read(cx).visible_task_ids(i18n::t(cx), cx))
     };
 
     // 1. Nest Sibling under Child (depth 2) by dragging right onto Child's bottom half.
@@ -1273,7 +1269,7 @@ fn task_list_scrollbar_scrolls_and_lists_resize_edge_stays_unobstructed(cx: &mut
 
     // Verify lists_panel rows stay clear of the inset scrollbar thumb (8..14 px from the inner right edge)
     // and lists-resize at the right 6 px edge stays unobstructed.
-    let initial_lists_y = cx.update(|_, cx| view.read(cx).lists_scroll.offset().y);
+    let initial_lists_y = cx.update(|_, cx| view.read(cx).panel_dnd.lists_scroll.offset().y);
     let lists_bounds = cx.debug_bounds("lists-column").unwrap();
     let inbox_bounds = cx.debug_bounds("lists-item-view-Inbox").unwrap();
     assert!(
@@ -1285,7 +1281,7 @@ fn task_list_scrollbar_scrolls_and_lists_resize_edge_stays_unobstructed(cx: &mut
     let lists_bar = point(lists_bounds.right() - px(10.), lists_bounds.top() + px(240.));
     cx.simulate_mouse_move(lists_bar, None, modifiers);
     cx.simulate_click(lists_bar, modifiers);
-    let scrolled_lists_y = cx.update(|_, cx| view.read(cx).lists_scroll.offset().y);
+    let scrolled_lists_y = cx.update(|_, cx| view.read(cx).panel_dnd.lists_scroll.offset().y);
     assert!(
         scrolled_lists_y < initial_lists_y,
         "lists-panel scrollbar should scroll when clicked inside inset track: {initial_lists_y:?} -> {scrolled_lists_y:?}"
@@ -1416,7 +1412,7 @@ fn workflow_kanban_partitions_and_transitions_task_status(cx: &mut TestAppContex
     cx.run_until_parked();
 
     cx.update(|_, cx| {
-        let cols = view.read(cx).board_columns(&i18n::EN);
+        let cols = view.read(cx).board_columns(&i18n::EN, cx);
         assert_eq!(cols.len(), 3);
         assert_eq!(cols[0].key, "workflow:todo");
         assert_eq!(cols[0].open_cards.iter().map(|(t, _)| t.id).collect::<Vec<_>>(), vec![t_todo.id]);
@@ -1460,9 +1456,9 @@ fn timeline_resize_weekends_and_secondary_timezone(cx: &mut TestAppContext) {
     let target_end = day + Duration::days(3);
     let target_start = day - Duration::days(1);
     view.update(cx, |v, cx| {
-        assert!(!v.timeline_show_weekends);
-        assert_eq!(v.timeline_color_by, ColorBy::Priority);
-        assert_eq!(v.timeline_secondary_tz.as_deref(), Some("UTC"));
+        assert!(!v.timeline.show_weekends);
+        assert_eq!(v.timeline.color_by, ColorBy::Priority);
+        assert_eq!(v.timeline.secondary_tz.as_deref(), Some("UTC"));
         v.resize_timeline_task(
             &ResizedTask { id: t.id, title: "Timeline Bar".into(), start: day, end: day, edge: ResizeEdge::End },
             target_end,
@@ -1532,7 +1528,7 @@ fn batch_add_multiline_paste_creates_multiple_tasks(cx: &mut gpui::TestAppContex
 
     cx.update(|window, cx| {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("Buy milk\nCall dentist\n\nSend report".into()));
-        let input = view.read(cx).input.clone();
+        let input = view.read(cx).quick_add.input.clone();
         window.focus(&input.focus_handle(cx), cx);
         window.dispatch_action(Box::new(crate::text_input::Paste), cx);
     });
@@ -1566,16 +1562,16 @@ fn dismiss_transient_clears_timeline_tz_column_add_and_new_section(cx: &mut Test
     cx.update(|window, cx| {
         view.update(cx, |v, cx| {
             // 1. Timeline secondary timezone menu
-            v.timeline_tz_menu = true;
+            v.timeline.tz_menu = true;
             assert!(v.dismiss_transient(window, cx));
-            assert!(!v.timeline_tz_menu);
+            assert!(!v.timeline.tz_menu);
 
             // 2. Kanban column quick-add input
             let col_input = cx.new(|cx| TextInput::new(crate::text_input::Mode::SingleLine, "Add", cx));
             window.focus(&col_input.focus_handle(cx), cx);
-            v.column_add = Some((0, DropTarget::Section(None), col_input));
+            v.kanban.column_add = Some((0, DropTarget::Section(None), col_input));
             assert!(v.dismiss_transient(window, cx));
-            assert!(v.column_add.is_none());
+            assert!(v.kanban.column_add.is_none());
             assert!(v.list_focus.is_focused(window));
 
             // 3. Inline "Add Section" input
@@ -1625,11 +1621,11 @@ fn kanban_scroll_handles_keyed_by_column_key_and_synced_outside_render(cx: &mut 
             v.select_view(View::List(list.id), window, cx);
             v.toggle_kanban_quick_add(cx);
             v.set_layout(true, false, cx);
-            assert!(v.kanban_col_scrolls.contains_key(&key_a));
-            assert!(v.kanban_col_scrolls.contains_key(&key_b));
-            assert!(v.kanban_quick_adds.contains_key(&key_a));
-            assert!(v.kanban_quick_adds.contains_key(&key_b));
-            v.kanban_col_scrolls.get(&key_b).unwrap().clone()
+            assert!(v.kanban.col_scrolls.contains_key(&key_a));
+            assert!(v.kanban.col_scrolls.contains_key(&key_b));
+            assert!(v.kanban.quick_adds.contains_key(&key_a));
+            assert!(v.kanban.quick_adds.contains_key(&key_b));
+            v.kanban.col_scrolls.get(&key_b).unwrap().clone()
         })
     });
 
@@ -1640,9 +1636,9 @@ fn kanban_scroll_handles_keyed_by_column_key_and_synced_outside_render(cx: &mut 
         view.update(cx, |v, cx| {
             v.reload(cx);
             handle_b_before.set_offset(gpui::point(px(0.), px(-42.)));
-            let handle_b_after = v.kanban_col_scrolls.get(&key_b).unwrap();
+            let handle_b_after = v.kanban.col_scrolls.get(&key_b).unwrap();
             assert_eq!(handle_b_after.offset(), gpui::point(px(0.), px(-42.)));
-            assert_eq!(v.kanban_col_scrolls.get(&key_a).unwrap().offset(), gpui::point(px(0.), px(0.)));
+            assert_eq!(v.kanban.col_scrolls.get(&key_a).unwrap().offset(), gpui::point(px(0.), px(0.)));
         });
     });
 
@@ -1651,9 +1647,9 @@ fn kanban_scroll_handles_keyed_by_column_key_and_synced_outside_render(cx: &mut 
     cx.update(|_, cx| {
         view.update(cx, |v, cx| {
             v.reload(cx);
-            assert!(!v.kanban_col_scrolls.contains_key(&key_a));
-            assert!(!v.kanban_quick_adds.contains_key(&key_a));
-            assert!(v.kanban_col_scrolls.contains_key(&key_b));
+            assert!(!v.kanban.col_scrolls.contains_key(&key_a));
+            assert!(!v.kanban.quick_adds.contains_key(&key_a));
+            assert!(v.kanban.col_scrolls.contains_key(&key_b));
         });
     });
 }
@@ -1765,7 +1761,7 @@ fn kanban_section_rename_keeps_focus_on_click_and_submits(cx: &mut TestAppContex
         let v = view.read(cx);
         let (_, input) = v.section_rename.as_ref().expect("section rename stays open after clicking input");
         assert!(input.focus_handle(cx).is_focused(window), "section rename input must keep keyboard focus");
-        assert!(v.kanban_pan.is_none(), "clicking section rename input must not start kanban panning");
+        assert!(v.kanban.pan.is_none(), "clicking section rename input must not start kanban panning");
         window.dispatch_action(Box::new(crate::text_input::SelectAll), cx);
     });
     cx.simulate_input("Renamed");
@@ -1812,7 +1808,7 @@ fn archived_list_is_read_only_and_restores_editability_when_unarchived(cx: &mut 
             v.start_title_edit(archived_task.id, None, window, cx);
             assert!(v.title_edit.is_none(), "cannot inline-edit archived task");
             v.open_context_menu(archived_task.id, gpui::point(px(200.), px(200.)), false, window, cx);
-            assert!(v.context_menu.is_none(), "archived task must not open context menu");
+            assert!(v.overlays.context_menu.is_none(), "archived task must not open context menu");
             v.start_new_section(window, cx);
             assert!(v.new_section.is_none(), "cannot add section to archived list");
             v.drop_on_view(View::List(list.id), inbox_task.id, cx);
@@ -1881,7 +1877,7 @@ fn trash_delete_forever_requires_confirmation_and_supports_restore(cx: &mut Test
     cx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.open_context_menu(to_restore.id, gpui::point(px(200.), px(200.)), false, window, cx);
-            assert!(v.context_menu.is_some(), "Trash allows Restore / Delete Forever context menu");
+            assert!(v.overlays.context_menu.is_some(), "Trash allows Restore / Delete Forever context menu");
             v.context_action(crate::task_menu::MenuAction::Restore, window, cx);
         });
     });
@@ -1907,21 +1903,12 @@ fn trash_delete_forever_requires_confirmation_and_supports_restore(cx: &mut Test
 
 #[gpui::test]
 fn horizons_embedded_view_quick_add_due_picker_and_feature_toggle(cx: &mut TestAppContext) {
-    let _horizons_write = HORIZONS_FLAG_LOCK.write().unwrap_or_else(|e| e.into_inner());
-    struct RestoreHorizonsEnabled;
-    impl Drop for RestoreHorizonsEnabled {
-        fn drop(&mut self) {
-            crate::calendar::set_horizons_enabled(true);
-        }
-    }
-    let _guard = RestoreHorizonsEnabled;
-    crate::calendar::set_horizons_enabled(true);
-
     let store = Rc::new(Store::open_in_memory().unwrap());
     cx.update(|cx| {
         theme::init(cx);
         cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
         crate::keymap::load_default(&assets::Assets, cx).unwrap();
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true);
     });
     let today = TodoView::today();
     let cur_week = fern_core::Horizon::current_week(today);
@@ -1935,7 +1922,7 @@ fn horizons_embedded_view_quick_add_due_picker_and_feature_toggle(cx: &mut TestA
     let parsed_task = cx.update(|_, cx| {
         view.update(cx, |v, cx| {
             let task = v
-                .add_task_as("Read 2 books this month", &View::Inbox, &AddDraft::default())
+                .add_task_as("Read 2 books this month", &View::Inbox, &AddDraft::default(), cx)
                 .unwrap();
             v.reload(cx);
             task
@@ -2008,15 +1995,17 @@ fn horizons_embedded_view_quick_add_due_picker_and_feature_toggle(cx: &mut TestA
     cx.run_until_parked();
     assert_eq!(view.read_with(cx, |v, _| v.view.clone()), View::Horizons);
 
-    crate::calendar::set_horizons_enabled(false);
-    cx.update(|_, cx| view.update(cx, |v, cx| v.reload(cx)));
+    cx.update(|_, cx| {
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = false);
+        view.update(cx, |v, cx| v.reload(cx));
+    });
     cx.run_until_parked();
     assert_eq!(view.read_with(cx, |v, _| v.view.clone()), View::Today);
     assert!(cx.debug_bounds("lists-item-view-Horizons").is_none());
 
     let plain_task = cx.update(|_, cx| {
-        view.update(cx, |v, _| {
-            v.add_task_as("Read 2 books this month", &View::Inbox, &AddDraft::default())
+        view.update(cx, |v, cx| {
+            v.add_task_as("Read 2 books this month", &View::Inbox, &AddDraft::default(), cx)
                 .unwrap()
         })
     });
@@ -2061,8 +2050,8 @@ fn lazy_inactive_text_edit_in_place_and_kanban_cache(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|window, cx| TodoView::new_inactive(store.clone(), window, cx));
     cx.update(|_, cx| {
         let v = view.read(cx);
-        assert!(!v.active);
-        assert!(v.dirty);
+        assert!(!v.refresh.is_active());
+        assert!(v.refresh.is_dirty());
         assert!(v.tasks.is_empty());
         assert!(v.lists.is_empty());
     });
@@ -2070,8 +2059,8 @@ fn lazy_inactive_text_edit_in_place_and_kanban_cache(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|_, cx| {
         let v = view.read(cx);
-        assert!(v.active);
-        assert!(!v.dirty);
+        assert!(v.refresh.is_active());
+        assert!(!v.refresh.is_dirty());
         assert_eq!(v.tasks.len(), 1);
         assert!(v.list_colors.contains_key(&list.id));
     });
@@ -2090,14 +2079,16 @@ fn lazy_inactive_text_edit_in_place_and_kanban_cache(cx: &mut TestAppContext) {
         assert_eq!(v.tasks[0].title, "Initial title!");
         assert_eq!(v.detail.read(cx).task_title(), Some("Initial title!"));
     });
+    cx.executor().advance_clock(std::time::Duration::from_millis(260));
+    cx.run_until_parked();
     assert_eq!(store.task(task.id).unwrap().unwrap().title, "Initial title!");
 
     // 3. board_columns returns cached Rc across repeated calls at the same rows_version.
     cx.update(|_, cx| {
         view.update(cx, |v, cx| {
             v.set_layout(true, false, cx);
-            let a = v.board_columns(&i18n::EN);
-            let b = v.board_columns(&i18n::EN);
+            let a = v.board_columns(&i18n::EN, cx);
+            let b = v.board_columns(&i18n::EN, cx);
             assert!(Rc::ptr_eq(&a, &b));
         });
     });
@@ -2133,8 +2124,8 @@ fn list_section_and_template_delete_require_confirmation_and_summary_focus(cx: &
     cx.simulate_click(del_sec_pos, Modifiers::default());
     cx.run_until_parked();
     view.read_with(cx, |v, _| {
-        assert_eq!(v.section_menu, None);
-        assert_eq!(v.confirm_delete, Some(ConfirmDeleteTarget::Section(section.id, "Backlog".to_owned())));
+        assert_eq!(v.overlays.section_menu, None);
+        assert_eq!(v.overlays.confirm_delete, Some(ConfirmDeleteTarget::Section(section.id, "Backlog".to_owned())));
     });
     assert!(cx.debug_bounds("confirm-delete-modal").is_some());
     assert_eq!(store.list_sections(Some(list.id)).unwrap().len(), 1);
@@ -2142,7 +2133,7 @@ fn list_section_and_template_delete_require_confirmation_and_summary_focus(cx: &
     // Escape cancels section delete without touching SQLite; confirming deletes it.
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
-    view.read_with(cx, |v, _| assert!(v.confirm_delete.is_none()));
+    view.read_with(cx, |v, _| assert!(v.overlays.confirm_delete.is_none()));
     assert_eq!(store.list_sections(Some(list.id)).unwrap().len(), 1);
 
     cx.simulate_mouse_move(more_pos, None, Modifiers::default());
@@ -2164,7 +2155,7 @@ fn list_section_and_template_delete_require_confirmation_and_summary_focus(cx: &
     cx.update(|_, cx| {
         view.update(cx, |v, cx| {
             v.cached_templates = v.store.templates().unwrap_or_default();
-            v.templates_open = true;
+            v.quick_add.templates_open = true;
             cx.notify();
         });
     });
@@ -2176,14 +2167,14 @@ fn list_section_and_template_delete_require_confirmation_and_summary_focus(cx: &
     cx.simulate_click(tpl_del_pos, Modifiers::default());
     cx.run_until_parked();
     view.read_with(cx, |v, _| {
-        assert!(!v.templates_open);
-        assert_eq!(v.confirm_delete, Some(ConfirmDeleteTarget::Template(template.id, "Standup".to_owned())));
+        assert!(!v.quick_add.templates_open);
+        assert_eq!(v.overlays.confirm_delete, Some(ConfirmDeleteTarget::Template(template.id, "Standup".to_owned())));
     });
     assert_eq!(store.templates().unwrap().len(), 1);
 
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
-    view.read_with(cx, |v, _| assert!(v.confirm_delete.is_none()));
+    view.read_with(cx, |v, _| assert!(v.overlays.confirm_delete.is_none()));
     assert_eq!(store.templates().unwrap().len(), 1);
 
     let other = cx.update(|_, cx| {
@@ -2193,7 +2184,7 @@ fn list_section_and_template_delete_require_confirmation_and_summary_focus(cx: &
     });
     cx.update(|_, cx| {
         view.update(cx, |v, cx| {
-            v.templates_open = true;
+            v.quick_add.templates_open = true;
             cx.notify();
         });
     });
@@ -2208,7 +2199,7 @@ fn list_section_and_template_delete_require_confirmation_and_summary_focus(cx: &
     cx.simulate_click(confirm_pos, Modifiers::default());
     cx.run_until_parked();
     view.read_with(cx, |v, cx| {
-        assert!(v.confirm_delete.is_none());
+        assert!(v.overlays.confirm_delete.is_none());
         assert!(v.cached_templates.is_empty());
         assert!(crate::data_version::changed_elsewhere(other.entity_id(), cx));
     });
@@ -2244,21 +2235,21 @@ fn escape_in_filter_modal_and_kanban_quick_add_clears_or_restores_focus(cx: &mut
         view.update(cx, |v, cx| {
             v.open_filter_edit(None, window, cx);
             v.set_filter_advanced(true, window, cx);
-            let edit = v.filter_edit.as_mut().expect("filter dialog opens");
+            let edit = v.overlays.filter_edit.as_mut().expect("filter dialog opens");
             edit.examples_open = true;
             assert!(edit.name_focus(cx).is_focused(window));
         });
     });
     cx.simulate_keystrokes("escape");
     cx.update(|window, cx| {
-        let edit = view.read(cx).filter_edit.as_ref().expect("filter dialog remains open");
+        let edit = view.read(cx).overlays.filter_edit.as_ref().expect("filter dialog remains open");
         assert!(!edit.examples_open, "first Escape dismisses nested examples popup");
         assert!(edit.name_focus(cx).is_focused(window));
     });
 
     cx.simulate_keystrokes("escape");
     cx.update(|window, cx| {
-        assert!(view.read(cx).filter_edit.is_none(), "second Escape closes filter modal");
+        assert!(view.read(cx).overlays.filter_edit.is_none(), "second Escape closes filter modal");
         assert!(previous.is_focused(window), "focus restores to prior owner");
     });
 
@@ -2267,7 +2258,7 @@ fn escape_in_filter_modal_and_kanban_quick_add_clears_or_restores_focus(cx: &mut
         view.update(cx, |v, cx| {
             window.focus(&v.list_focus, cx);
             v.open_filter_edit(None, window, cx);
-            let edit = v.filter_edit.as_ref().expect("filter dialog opens");
+            let edit = v.overlays.filter_edit.as_ref().expect("filter dialog opens");
             let include_ix = edit
                 .draft
                 .rules
@@ -2281,7 +2272,7 @@ fn escape_in_filter_modal_and_kanban_quick_add_clears_or_restores_focus(cx: &mut
     cx.simulate_keystrokes("escape");
     cx.update(|window, cx| {
         let v = view.read(cx);
-        assert!(v.filter_edit.is_none());
+        assert!(v.overlays.filter_edit.is_none());
         assert!(v.list_focus.is_focused(window));
     });
 
@@ -2292,7 +2283,7 @@ fn escape_in_filter_modal_and_kanban_quick_add_clears_or_restores_focus(cx: &mut
             v.select_view(View::List(list.id), window, cx);
             v.toggle_kanban_quick_add(cx);
             v.set_layout(true, false, cx);
-            let (_, input) = v.kanban_quick_adds.get(&col_key).expect("column quick-add exists");
+            let (_, input) = v.kanban.quick_adds.get(&col_key).expect("column quick-add exists");
             window.focus(&input.focus_handle(cx), cx);
         });
     });
@@ -2301,7 +2292,7 @@ fn escape_in_filter_modal_and_kanban_quick_add_clears_or_restores_focus(cx: &mut
     cx.simulate_keystrokes("escape");
     cx.update(|window, cx| {
         let v = view.read(cx);
-        let (_, input) = v.kanban_quick_adds.get(&col_key).expect("column quick-add exists");
+        let (_, input) = v.kanban.quick_adds.get(&col_key).expect("column quick-add exists");
         assert!(input.read(cx).text().is_empty(), "first Escape clears non-empty quick-add text");
         assert!(input.focus_handle(cx).is_focused(window));
     });
@@ -2316,13 +2307,13 @@ fn escape_in_filter_modal_and_kanban_quick_add_clears_or_restores_focus(cx: &mut
         view.update(cx, |v, cx| {
             v.toggle_kanban_quick_add(cx);
             v.start_column_add(0, DropTarget::Section(Some(sec.id)), window, cx);
-            assert!(v.column_add.is_some());
+            assert!(v.kanban.column_add.is_some());
         });
     });
     cx.simulate_keystrokes("escape");
     cx.update(|window, cx| {
         let v = view.read(cx);
-        assert!(v.column_add.is_none());
+        assert!(v.kanban.column_add.is_none());
         assert!(v.list_focus.is_focused(window));
     });
 }

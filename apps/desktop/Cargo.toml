@@ -27,6 +27,7 @@ matrix_ui.workspace = true
 plugin_ui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+settings_ui.workspace = true
 sha2.workspace = true
 sticky_ui.workspace = true
 task_ui.workspace = true

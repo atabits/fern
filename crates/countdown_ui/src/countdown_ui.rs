@@ -16,7 +16,7 @@ use gpui::{Focusable as _, FontWeight, prelude::*};
 use ui::prelude::*;
 use ui::{ConfirmDialog, EmptyState, Placement, PopoverAttachment, popover};
 
-use desktop_common::data_version::{DataVersion, changed_elsewhere, data_changed};
+use desktop_common::data_version::{DataScope, DataVersion, ViewRefreshState, data_changed_scoped};
 use desktop_common::{actions, layout, paths::attachments_dir, touch};
 use fern_i18n::{self as i18n, Strings};
 
@@ -63,8 +63,7 @@ pub struct CountdownView {
     hide_group: bool,
     /// Resolved on-disk background image paths, refreshed in `reload` so `render_card` performs zero `stat()` calls.
     resolved_backgrounds: HashMap<Id, PathBuf>,
-    pub(crate) active: bool,
-    pub(crate) dirty: bool,
+    pub(crate) refresh: ViewRefreshState,
 }
 
 /// Hides the kind tabs (the header "…" menu's Hide Group).
@@ -115,15 +114,14 @@ impl CountdownView {
             show_archived: false,
             hide_group: false,
             resolved_backgrounds: HashMap::new(),
-            active: initial_active,
-            dirty: !initial_active,
+            refresh: ViewRefreshState::new(initial_active, DataScope::COUNTDOWN | DataScope::PREFS, cx),
         };
         if initial_active {
             this.reload(cx);
         }
         cx.observe_global::<DataVersion>(|this, cx| {
-            if changed_elsewhere(cx.entity_id(), cx) {
-                this.sync_external(cx);
+            if this.refresh.on_data_version(cx.entity_id(), cx) {
+                this.reload(cx);
             }
         })
         .detach();
@@ -131,23 +129,19 @@ impl CountdownView {
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
-        self.active = active;
-        if active && self.dirty {
-            self.dirty = false;
+        if self.refresh.set_active(active, cx) {
             self.reload(cx);
         }
     }
 
     pub fn sync_external(&mut self, cx: &mut Context<Self>) {
-        if self.active {
+        if self.refresh.mark_dirty_or_reload() {
             self.reload(cx);
-        } else {
-            self.dirty = true;
         }
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.dirty = false;
+        self.refresh.mark_clean(cx);
         self.countdowns = self.store.countdowns().unwrap_or_default();
         self.hide_group = self
             .store
@@ -205,7 +199,7 @@ impl CountdownView {
     /// `menu` opens the card's "…" menu, `edit` its edit popover, with a monthly repeat.
     #[cfg(debug_assertions)]
     pub fn dev_open(&mut self, name: &str, edit: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         let Some(id) = self
@@ -248,18 +242,18 @@ impl CountdownView {
 
     fn delete(&mut self, id: Id, cx: &mut Context<Self>) {
         if let Err(err) = self.store.delete_countdown(id) {
-            eprintln!("failed to delete the countdown: {err:#}");
+            desktop_common::logging::log_error("countdown_ui", format!("failed to delete the countdown: {err:#}"));
         } else {
-            data_changed(cx.entity_id(), cx);
+            data_changed_scoped(cx.entity_id(), DataScope::COUNTDOWN, cx);
         }
         self.reload(cx);
     }
 
     fn toggle_pin(&mut self, id: Id, pinned: bool, cx: &mut Context<Self>) {
         if let Err(err) = self.store.set_countdown_pinned(id, !pinned) {
-            eprintln!("failed to pin the countdown: {err:#}");
+            desktop_common::logging::log_error("countdown_ui", format!("failed to pin the countdown: {err:#}"));
         } else {
-            data_changed(cx.entity_id(), cx);
+            data_changed_scoped(cx.entity_id(), DataScope::COUNTDOWN, cx);
         }
         self.reload(cx);
     }
@@ -267,9 +261,9 @@ impl CountdownView {
     fn toggle_archive(&mut self, id: Id, archived: bool, cx: &mut Context<Self>) {
         self.card_menu = None;
         if let Err(err) = self.store.set_countdown_archived(id, !archived) {
-            eprintln!("failed to archive the countdown: {err:#}");
+            desktop_common::logging::log_error("countdown_ui", format!("failed to archive the countdown: {err:#}"));
         } else {
-            data_changed(cx.entity_id(), cx);
+            data_changed_scoped(cx.entity_id(), DataScope::COUNTDOWN, cx);
         }
         self.reload(cx);
     }
@@ -534,7 +528,7 @@ impl Render for CountdownView {
             .text_color(theme.colors().text)
             .child(
                 h_flex()
-                    .mt(layout::header_inset())
+                    .mt(layout::header_inset(window, cx))
                     .h(px(52.))
                     .flex_none()
                     .px(px(22.))
@@ -687,7 +681,7 @@ impl Render for CountdownView {
                                                         HIDE_GROUP_SETTING,
                                                         if next { "1" } else { "0" },
                                                     ) {
-                                                        eprintln!("failed to save the countdown setting: {err:#}");
+                                                        desktop_common::logging::log_error("countdown_ui", format!("failed to save the countdown setting: {err:#}"));
                                                     }
                                                     cx.notify();
                                                 })),
@@ -759,11 +753,14 @@ impl Render for CountdownView {
             .children(modal)
             .when_some(self.confirm_delete.clone(), |el, (id, name)| {
                 el.child(
-                    ConfirmDialog::new("countdown-delete-modal", strings.confirm_delete_countdown)
+                    ConfirmDialog::new(
+                        "countdown-delete-modal",
+                        strings.confirm_delete_countdown,
+                        strings.cancel,
+                        strings.delete,
+                    )
                         .width(px(340.))
                         .description(name)
-                        .cancel_label(strings.cancel)
-                        .confirm_label(strings.delete)
                         .destructive(true)
                         .on_cancel(cx.listener(|this, _, _, cx| {
                             this.confirm_delete = None;

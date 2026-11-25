@@ -86,7 +86,7 @@ impl CountdownView {
             _ => None,
         };
         let in_popover = draft.date_in_popover();
-        let fields = h_flex().gap_2().w_full().children(DateField::ordered(strings).map(|field| {
+        let fields = h_flex().gap_2().w_full().children(DateField::ordered(strings, cx).map(|field| {
             let input = &draft.date_inputs.fields[field as usize];
             let is_open = active == Some(field);
             let invalid = field.parse(draft.date, input.read(cx).text()).is_none();
@@ -187,7 +187,7 @@ impl CountdownView {
                     .border_1()
                     .border_color(if open { colors.accent } else { colors.border })
                     .cursor_pointer()
-                    .child(div().flex_1().min_w_0().child(Label::new(format_date(draft.date, strings)).truncate()))
+                    .child(div().flex_1().min_w_0().child(Label::new(format_date(draft.date, strings, cx)).truncate()))
                     .child(
                         Icon::new(IconName::ChevronDown)
                             .size(IconSize::XSmall)
@@ -199,7 +199,7 @@ impl CountdownView {
                             let target = if open {
                                 draft.name.focus_handle(cx)
                             } else {
-                                let field = DateField::ordered(i18n::t(cx))[0];
+                                let field = DateField::ordered(i18n::t(cx), cx)[0];
                                 draft.date_inputs.fields[field as usize].focus_handle(cx)
                             };
                             window.focus(&target, cx);
@@ -369,7 +369,7 @@ impl CountdownView {
             format!(
                 "{} ({})",
                 strings.countdown_custom_label.replace("{n}", &days.to_string()),
-                calendar::format_time(time, strings)
+                calendar::format_time(time, strings, cx)
             )
         };
         let reminder_text = if draft.reminders.is_empty() && draft.custom_reminders.is_empty() {
@@ -388,7 +388,7 @@ impl CountdownView {
             return (reminder_text, self.render_custom_reminder_form(custom, cx));
         }
 
-        let time = calendar::format_time(fern_core::countdown::reminder_time(), strings);
+        let time = calendar::format_time(fern_core::countdown::reminder_time(), strings, cx);
         let constant = draft.constant_reminder;
         let menu = v_flex()
             .child(

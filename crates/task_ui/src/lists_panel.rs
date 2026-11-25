@@ -27,7 +27,7 @@ pub const COLLAPSE_BELOW: f32 = 120.;
 pub use desktop_common::colors::{LIST_COLORS, parse_color};
 
 /// The title of a view for the list header.
-pub fn title(view: &View, lists: &[List], filters: &[fern_core::SmartFilter], strings: &Strings) -> SharedString {
+pub fn title(view: &View, lists: &[List], filters: &[fern_core::SmartFilter], strings: &Strings, cx: &App) -> SharedString {
     match view {
         View::Inbox => strings.inbox.into(),
         View::All => strings.all.into(),
@@ -45,7 +45,7 @@ pub fn title(view: &View, lists: &[List], filters: &[fern_core::SmartFilter], st
         View::Filter(id) => filters.iter().find(|f| f.id == *id).map(|f| f.name.clone()).unwrap_or_default().into(),
         View::Horizons => strings.section_horizons.into(),
         View::Summary => strings.summary.into(),
-        View::Day(day) => calendar::format_date(*day, strings).into(),
+        View::Day(day) => calendar::format_date(*day, strings, cx).into(),
     }
 }
 
@@ -92,6 +92,78 @@ pub enum PanelChild {
     BottomSmart(View),
 }
 
+/// Precomputed lookup tables and ordering for the lists panel so `render()` avoids rebuilding
+/// `HashMap`s, `HashSet`s, and sorted tag vectors on every frame.
+#[derive(Default)]
+pub struct ListsPanelIndex {
+    archived_list_ids: HashSet<Id>,
+    folder_by_id: HashMap<Id, usize>,
+    lists_by_folder: HashMap<Id, Vec<usize>>,
+    active_list_indices: Vec<usize>,
+    archived_list_indices: Vec<usize>,
+    tag_children: HashMap<String, Vec<usize>>,
+    tag_family_counts: HashMap<String, usize>,
+    ordered_root_tags: Vec<usize>,
+}
+
+impl ListsPanelIndex {
+    pub fn build(lists: &[List], folders: &[ListFolder], tags: &[Tag]) -> Self {
+        let mut archived_list_ids = HashSet::new();
+        let mut lists_by_folder: HashMap<Id, Vec<usize>> = HashMap::new();
+        let mut active_list_indices = Vec::with_capacity(lists.len());
+        let mut archived_list_indices = Vec::new();
+        for (idx, list) in lists.iter().enumerate() {
+            if list.archived {
+                archived_list_ids.insert(list.id);
+                archived_list_indices.push(idx);
+            } else {
+                if let Some(fid) = list.folder {
+                    lists_by_folder.entry(fid).or_default().push(idx);
+                }
+                active_list_indices.push(idx);
+            }
+        }
+        let folder_by_id: HashMap<Id, usize> =
+            folders.iter().enumerate().map(|(idx, f)| (f.id, idx)).collect();
+
+        let tag_names: HashSet<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+        let mut tag_children: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, tag) in tags.iter().enumerate() {
+            if let Some(parent) = tag.parent.as_deref() {
+                tag_children.entry(parent.to_owned()).or_default().push(idx);
+            }
+        }
+        let tag_family_counts: HashMap<String, usize> = tags
+            .iter()
+            .map(|tag| {
+                let children_sum: usize = tag_children
+                    .get(tag.name.as_str())
+                    .map(|cs| cs.iter().map(|&idx| tags[idx].open_count).sum())
+                    .unwrap_or(0);
+                (tag.name.clone(), tag.open_count + children_sum)
+            })
+            .collect();
+        let mut ordered_root_tags: Vec<usize> = tags
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.parent.as_deref().is_none_or(|p| !tag_names.contains(p)))
+            .map(|(idx, _)| idx)
+            .collect();
+        ordered_root_tags.sort_by_key(|&idx| !tags[idx].pinned);
+
+        Self {
+            archived_list_ids,
+            folder_by_id,
+            lists_by_folder,
+            active_list_indices,
+            archived_list_indices,
+            tag_children,
+            tag_family_counts,
+            ordered_root_tags,
+        }
+    }
+}
+
 pub struct Props<'a> {
     pub active: &'a View,
     pub counts: &'a ViewCounts,
@@ -100,6 +172,7 @@ pub struct Props<'a> {
     pub strings: &'static Strings,
     /// The folders of lists, and the ones folded up.
     pub folders: &'a [ListFolder],
+    pub index: &'a ListsPanelIndex,
     pub collapsed_folders: &'a HashSet<Id>,
     /// Whether "Archived Lists" is unfolded.
     pub archived_open: bool,
@@ -167,6 +240,7 @@ pub fn render(
     on_drop_task: impl Fn(View, fern_core::Id, &mut Window, &mut App) + Clone + 'static,
     on_add_filter: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_mini: impl Fn(MiniAction, &mut Window, &mut App) + Clone + 'static,
+    window: &Window,
     cx: &App,
 ) -> impl IntoElement {
     let on_add_list = std::rc::Rc::new(on_add_list);
@@ -178,6 +252,7 @@ pub fn render(
         tags,
         strings,
         folders,
+        index,
         collapsed_folders,
         archived_open,
         collapsed_tags,
@@ -192,38 +267,6 @@ pub fn render(
         highlight_target,
     } = props;
     let shows = |list: SmartList, count: usize| preferences.visibility(list).shows(count);
-    let archived_list_ids: HashSet<Id> = lists.iter().filter(|l| l.archived).map(|l| l.id).collect();
-    let folder_by_id: HashMap<Id, &ListFolder> = folders.iter().map(|f| (f.id, f)).collect();
-    let mut lists_by_folder: HashMap<Id, Vec<&List>> = HashMap::new();
-    let mut active_lists: Vec<&List> = Vec::with_capacity(lists.len());
-    let mut archived: Vec<&List> = Vec::new();
-    for list in lists {
-        if list.archived {
-            archived.push(list);
-        } else {
-            if let Some(fid) = list.folder {
-                lists_by_folder.entry(fid).or_default().push(list);
-            }
-            active_lists.push(list);
-        }
-    }
-    let tag_names: HashSet<&str> = tags.iter().map(|t| t.name.as_str()).collect();
-    let mut tag_children: HashMap<&str, Vec<&Tag>> = HashMap::new();
-    for tag in tags {
-        if let Some(parent) = tag.parent.as_deref() {
-            tag_children.entry(parent).or_default().push(tag);
-        }
-    }
-    let tag_family_counts: HashMap<&str, usize> = tags
-        .iter()
-        .map(|tag| {
-            let children_sum: usize = tag_children
-                .get(tag.name.as_str())
-                .map(|cs| cs.iter().map(|c| c.open_count).sum())
-                .unwrap_or(0);
-            (tag.name.as_str(), tag.open_count + children_sum)
-        })
-        .collect();
     let colors = cx.theme().colors();
     let accent = colors.accent;
     let active_drag = active_drag.filter(|_| cx.has_active_drag());
@@ -301,7 +344,7 @@ pub fn render(
             .on_click(move |_, window, cx| on_select(view.clone(), window, cx));
         let selector_id = id.clone();
         let accepts_task_drop = !matches!(drop_view, View::All | View::Horizons | View::Summary | View::Filter(_) | View::Search(_))
-            && !matches!(drop_view, View::List(list_id) if archived_list_ids.contains(&list_id));
+            && !matches!(drop_view, View::List(list_id) if index.archived_list_ids.contains(&list_id));
         div()
             .id(SharedString::from(format!("drop-{id}")))
             .debug_selector(move || format!("lists-item-{selector_id}"))
@@ -461,15 +504,15 @@ pub fn render(
             .child(entry)
             .into_any_element()
     };
-    let folder_entry = |folder: &ListFolder, inside: &[&List]| -> AnyElement {
+    let folder_entry = |folder: &ListFolder, inside_indices: &[usize]| -> AnyElement {
         let id = folder.id;
         if active_drag == Some(&ActiveDragItem::Folder(id)) {
             return vacant_slot(36., false, format!("lists-folder-{id}"), cx);
         }
         let highlighted = highlight_target == Some(&HighlightTarget::Folder(id));
         let collapsed = collapsed_folders.contains(&id);
-        let inside_empty = inside.is_empty();
-        let count: usize = inside.iter().map(|l| l.open_count).sum();
+        let inside_empty = inside_indices.is_empty();
+        let count: usize = inside_indices.iter().map(|&idx| lists[idx].open_count).sum();
         let on_toggle = on_panel.clone();
         let on_menu = on_panel.clone();
         let on_start = on_panel.clone();
@@ -514,26 +557,28 @@ pub fn render(
     };
     let mut list_entries: Vec<(PanelChild, AnyElement)> = Vec::new();
     let mut shown_folders: HashSet<Id> = HashSet::new();
-    for list in &active_lists {
-        match list.folder.and_then(|f| folder_by_id.get(&f).copied()) {
+    for &list_idx in &index.active_list_indices {
+        let list = &lists[list_idx];
+        match list.folder.and_then(|f| index.folder_by_id.get(&f).copied()) {
             None => list_entries.push((PanelChild::TopList(list.id), list_entry(list, false, false))),
-            Some(folder) if shown_folders.insert(folder.id) => {
-                let inside = lists_by_folder.get(&folder.id).map(Vec::as_slice).unwrap_or(&[]);
-                let collapsed = collapsed_folders.contains(&folder.id);
-                let folder_dragged = active_drag == Some(&ActiveDragItem::Folder(folder.id));
-                list_entries.push((
-                    PanelChild::FolderHeader { id: folder.id, collapsed: collapsed || folder_dragged, empty: false },
-                    folder_entry(folder, inside),
-                ));
-                if !collapsed && !folder_dragged {
-                    list_entries.extend(
-                        inside
-                            .iter()
-                            .map(|l| (PanelChild::SubList { id: l.id, folder: folder.id }, list_entry(l, true, false))),
-                    );
+            Some(folder_idx) => {
+                let folder = &folders[folder_idx];
+                if shown_folders.insert(folder.id) {
+                    let inside = index.lists_by_folder.get(&folder.id).map(Vec::as_slice).unwrap_or(&[]);
+                    let collapsed = collapsed_folders.contains(&folder.id);
+                    let folder_dragged = active_drag == Some(&ActiveDragItem::Folder(folder.id));
+                    list_entries.push((
+                        PanelChild::FolderHeader { id: folder.id, collapsed: collapsed || folder_dragged, empty: false },
+                        folder_entry(folder, inside),
+                    ));
+                    if !collapsed && !folder_dragged {
+                        list_entries.extend(inside.iter().map(|&idx| {
+                            let l = &lists[idx];
+                            (PanelChild::SubList { id: l.id, folder: folder.id }, list_entry(l, true, false))
+                        }));
+                    }
                 }
             }
-            Some(_) => {}
         }
     }
     for folder in folders.iter().filter(|f| !shown_folders.contains(&f.id)) {
@@ -543,7 +588,7 @@ pub fn render(
             folder_entry(folder, &[]),
         ));
     }
-    if !archived.is_empty() {
+    if !index.archived_list_indices.is_empty() {
         let on_panel = on_panel.clone();
         list_entries.push((
             PanelChild::ArchivedHeader,
@@ -558,13 +603,16 @@ pub fn render(
                 .into_any_element(),
         ));
         if archived_open {
-            list_entries.extend(archived.iter().map(|l| (PanelChild::ArchivedList(l.id), list_entry(l, true, true))));
+            list_entries.extend(index.archived_list_indices.iter().map(|&idx| {
+                let l = &lists[idx];
+                (PanelChild::ArchivedList(l.id), list_entry(l, true, true))
+            }));
         }
     }
 
     // Tags as in the original: pinned ones first, sub-tags indented under their parent (which
     // folds them up), a right click for the tag's menu; the heading shows "…" and "+" on hover.
-    let family_count = |tag: &Tag| tag_family_counts.get(tag.name.as_str()).copied().unwrap_or(tag.open_count);
+    let family_count = |tag: &Tag| index.tag_family_counts.get(tag.name.as_str()).copied().unwrap_or(tag.open_count);
     let tag_entry = |tag: &Tag, indent: bool, fold: Option<bool>| -> AnyElement {
         let name = tag.name.clone();
         if active_drag.is_some_and(|d| matches!(d, ActiveDragItem::Tag(dragged) if dragged == &name)) {
@@ -651,17 +699,14 @@ pub fn render(
             })
             .into_any_element()
     };
-    let mut ordered: Vec<&Tag> = tags
-        .iter()
-        .filter(|t| t.parent.as_deref().is_none_or(|p| !tag_names.contains(p)))
-        .collect();
-    ordered.sort_by_key(|t| !t.pinned);
     let mut tag_entries: Vec<(PanelChild, AnyElement)> = Vec::new();
     if !tags_collapsed {
-        for tag in ordered {
-            let children = tag_children.get(tag.name.as_str()).map(Vec::as_slice).unwrap_or(&[]);
+        for &tag_idx in &index.ordered_root_tags {
+            let tag = &tags[tag_idx];
+            let children = index.tag_children.get(tag.name.as_str()).map(Vec::as_slice).unwrap_or(&[]);
             let is_dragged_root = active_drag.is_some_and(|d| matches!(d, ActiveDragItem::Tag(n) if n == &tag.name));
-            let has_dragged_child = children.iter().any(|c| {
+            let has_dragged_child = children.iter().any(|&c_idx| {
+                let c = &tags[c_idx];
                 active_drag.is_some_and(|d| matches!(d, ActiveDragItem::Tag(n) if n == &c.name))
             });
             if !is_dragged_root && !has_dragged_child && !shows(SmartList::Tags, family_count(tag)) {
@@ -679,7 +724,8 @@ pub fn render(
                 tag_entry(tag, false, is_parent.then_some(folded)),
             ));
             if !folded && !is_dragged_root {
-                for &child in children {
+                for &child_idx in children {
+                    let child = &tags[child_idx];
                     let is_dragged_child =
                         active_drag.is_some_and(|d| matches!(d, ActiveDragItem::Tag(n) if n == &child.name));
                     if is_dragged_child || shows(SmartList::Tags, child.open_count) {
@@ -964,7 +1010,7 @@ pub fn render(
                 IconName::CalendarRange,
                 Some(counts.next_7_days),
             )),
-            SmartList::Horizons if crate::calendar::horizons_enabled() && shows(SmartList::Horizons, 1) => Some(draggable_smart(
+            SmartList::Horizons if crate::calendar::horizons_enabled(cx) && shows(SmartList::Horizons, 1) => Some(draggable_smart(
                 SmartList::Horizons,
                 View::Horizons,
                 strings.section_horizons,
@@ -1102,7 +1148,7 @@ pub fn render(
         .flex_none()
         .w(px(width))
         .h_full()
-        .pt(desktop_common::layout::title_bar_height())
+        .pt(desktop_common::layout::title_bar_height(window, cx))
         .bg(colors.lists_background)
         .border_r_1()
         .border_color(colors.lists_border)
@@ -1167,7 +1213,7 @@ fn mini_calendar(
                 .cursor_pointer()
                 .when(!filled, |el| el.hover(|s| s.bg(colors.list_hover)))
                 .when(filled, |el| el.bg(colors.accent).hover(|s| s.opacity(0.9)))
-                .tooltip(Tooltip::text(calendar::format_date(date, strings)))
+                .tooltip(Tooltip::text(calendar::format_date(date, strings, cx)))
                 .on_click(move |_, window, cx| on_select(View::Day(date), window, cx))
                 .items_center()
                 .justify_center()
@@ -1190,7 +1236,7 @@ fn mini_calendar(
                 .when(busy, |el| el.child(div().absolute().bottom(px(2.)).size(px(3.)).rounded_full().bg(if filled { colors.icon_on_accent } else { colors.accent }))),
         )
     };
-    let weekdays = h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|day| {
+    let weekdays = h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_short, cx).iter().map(|day| {
         div().flex_1().min_w_0().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(colors.list_text_muted))
     }));
     let toggle = on_mini.clone();
@@ -1227,31 +1273,38 @@ fn mini_calendar(
                 .on_click(move |_, window, cx| toggle(MiniAction::Toggle, window, cx)),
         );
     let body = if mini.expanded {
-        let arrows = |id: &'static str, icon: IconName, action: MiniAction| {
-            let on_mini = on_mini.clone();
-            IconButton::new(id, icon)
-                .size(px(20.))
-                .icon_size(IconSize::XSmall)
-                .icon_color(colors.list_text_muted)
-                .hover_icon_color(colors.list_text)
-                .hover_color(colors.list_hover)
-                .on_click(move |_, window, cx| on_mini(action, window, cx))
-        };
+        let on_shift = on_mini.clone();
+        let on_today = on_mini;
+        let mut header_cfg = desktop_common::month_calendar::MonthHeaderConfig::surface(
+            mini.month,
+            strings,
+            "mini-back",
+            "mini-forward",
+        );
+        header_cfg.today_id = Some("mini-this-month");
+        header_cfg.today_tooltip = Some(strings.today);
+        header_cfg.small_title = true;
+        header_cfg.title_weight = gpui::FontWeight::NORMAL;
+        header_cfg.sidebar_palette = true;
+        header_cfg.arrow_size = px(20.);
         v_flex()
             .gap_1()
-            .child(
-                h_flex()
-                    .child(div().flex_1().child(Label::new(calendar::month_title(mini.month, strings)).color(colors.list_text).size(LabelSize::Small)))
-                    .child(arrows("mini-back", IconName::ChevronLeft, MiniAction::Shift(-1)).tooltip(Tooltip::text("←")))
-                    .child(arrows("mini-this-month", IconName::Circle, MiniAction::ThisMonth).tooltip(Tooltip::text(strings.today)))
-                    .child(arrows("mini-forward", IconName::ChevronRight, MiniAction::Shift(1)).tooltip(Tooltip::text("→"))),
-            )
+            .child(desktop_common::month_calendar::render_month_header(
+                header_cfg,
+                cx,
+                move |delta, window, cx| on_shift(MiniAction::Shift(delta), window, cx),
+                Some(Box::new(move |window, cx| {
+                    on_today(MiniAction::ThisMonth, window, cx)
+                })),
+            ))
             .child(weekdays)
-            .children(calendar::month_grid(mini.month).chunks(7).map(|week| {
-                h_flex().children(week.iter().map(|&date| day_cell(date, date.month() != mini.month.month())))
-            }))
+            .children(desktop_common::month_calendar::render_month_weeks(
+                mini.month,
+                cx,
+                |date, in_month| day_cell(date, !in_month).into_any_element(),
+            ))
     } else {
-        v_flex().gap_2().child(weekdays).child(h_flex().children(calendar::week_of(today).map(|date| day_cell(date, false))))
+        v_flex().gap_2().child(weekdays).child(h_flex().children(calendar::week_of(today, cx).map(|date| day_cell(date, false))))
     };
     v_flex()
         .id("mini-calendar")

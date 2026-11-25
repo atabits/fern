@@ -212,8 +212,27 @@ pub fn order_tasks(tasks: &mut [Task], sort: SortBy, descending: bool) {
 /// Rows grouped by date, creation day, tag or priority (or not at all), with completed tasks in
 /// a last group. Groups follow a fixed order: by date, overdue first (or, with `overdue_last` —
 /// Settings → "Overdue Section shows at" — after the undated ones) and undated last.
-pub fn grouped_rows(tasks: &[Task], group: GroupBy, today: NaiveDate, overdue_last: bool, strings: &Strings) -> Vec<Row> {
-    grouped_rows_in(tasks, group, today, overdue_last, &[], strings)
+pub fn grouped_rows(
+    tasks: &[Task],
+    group: GroupBy,
+    today: NaiveDate,
+    overdue_last: bool,
+    strings: &Strings,
+    cx: &gpui::App,
+) -> Vec<Row> {
+    grouped_rows_in(tasks, group, today, overdue_last, &[], strings, cx)
+}
+
+/// Pure variant of [`grouped_rows`] for headless/unit-test callers.
+pub fn grouped_rows_with(
+    tasks: &[Task],
+    group: GroupBy,
+    today: NaiveDate,
+    overdue_last: bool,
+    horizons_enabled: bool,
+    strings: &Strings,
+) -> Vec<Row> {
+    grouped_rows_in_with(tasks, group, today, overdue_last, horizons_enabled, &[], strings)
 }
 
 /// `grouped_rows` knowing the lists, for Group by List: their names, in their order.
@@ -222,6 +241,28 @@ pub fn grouped_rows_in(
     group: GroupBy,
     today: NaiveDate,
     overdue_last: bool,
+    lists: &[(fern_core::Id, String)],
+    strings: &Strings,
+    cx: &gpui::App,
+) -> Vec<Row> {
+    grouped_rows_in_with(
+        tasks,
+        group,
+        today,
+        overdue_last,
+        desktop_common::calendar::horizons_enabled(cx),
+        lists,
+        strings,
+    )
+}
+
+/// Pure variant of [`grouped_rows_in`] for headless/unit-test callers.
+pub fn grouped_rows_in_with(
+    tasks: &[Task],
+    group: GroupBy,
+    today: NaiveDate,
+    overdue_last: bool,
+    horizons_enabled: bool,
     lists: &[(fern_core::Id, String)],
     strings: &Strings,
 ) -> Vec<Row> {
@@ -235,7 +276,7 @@ pub fn grouped_rows_in(
                 Some(d) if d == today + chrono::Duration::days(1) => (2, strings.tomorrow.to_owned()),
                 Some(d) if d <= today + chrono::Duration::days(7) => (3, strings.next_7_days.to_owned()),
                 Some(_) => (4, strings.group_later.to_owned()),
-                None => match task.horizon.filter(|_| desktop_common::calendar::horizons_enabled()) {
+                None => match task.horizon.filter(|_| horizons_enabled) {
                     Some(h @ fern_core::Horizon::Week { .. }) if h <= fern_core::Horizon::current_week(today) => {
                         let badge = desktop_common::calendar::format_horizon_badge(
                             fern_core::Horizon::current_week(today),
@@ -462,8 +503,8 @@ impl ClosedRange {
         }
     }
 
-    pub fn contains(self, day: NaiveDate, today: NaiveDate) -> bool {
-        let monday = crate::calendar::week_of(today)[0];
+    pub fn contains(self, day: NaiveDate, today: NaiveDate, week_start: chrono::Weekday) -> bool {
+        let monday = crate::calendar::week_from(today, week_start)[0];
         match self {
             Self::All => true,
             Self::ThisWeek => day >= monday && day < monday + chrono::Duration::weeks(1),
@@ -563,7 +604,24 @@ pub fn next_days_header(day: NaiveDate, today: NaiveDate, week_start: chrono::We
 
 /// Next 7 Days' rows, as the original groups them: the overdue tasks, then a group for each day
 /// with tasks, its header from `next_days_header`; completed tasks last.
-pub fn next_days_rows(tasks: &[Task], today: NaiveDate, week_start: chrono::Weekday, strings: &Strings) -> Vec<Row> {
+pub fn next_days_rows(tasks: &[Task], today: NaiveDate, strings: &Strings, cx: &gpui::App) -> Vec<Row> {
+    next_days_rows_with(
+        tasks,
+        today,
+        crate::calendar::week_start(cx),
+        desktop_common::calendar::horizons_enabled(cx),
+        strings,
+    )
+}
+
+/// Pure variant of [`next_days_rows`] for headless/unit-test callers.
+pub fn next_days_rows_with(
+    tasks: &[Task],
+    today: NaiveDate,
+    week_start: chrono::Weekday,
+    horizons_enabled: bool,
+    strings: &Strings,
+) -> Vec<Row> {
     let (open, done): (Vec<&Task>, Vec<&Task>) = tasks.iter().partition(|t| !t.is_completed());
     let task_row = |task: &Task| Row::Task { task: task.clone(), depth: 0, has_children: false, collapsed: false };
     let mut rows = Vec::new();
@@ -581,7 +639,7 @@ pub fn next_days_rows(tasks: &[Task], today: NaiveDate, week_start: chrono::Week
         rows.push(Row::Day { label: next_days_header(day, today, week_start, strings), count: on_day.len(), drop: Some(DropTarget::Due(Some(day))) });
         rows.extend(on_day.into_iter().map(|t| task_row(t)));
     }
-    if desktop_common::calendar::horizons_enabled() {
+    if horizons_enabled {
         let cur_week = fern_core::Horizon::current_week(today);
         let week_goals: Vec<&&Task> = open
             .iter()
@@ -624,6 +682,18 @@ pub fn due_label(
     time: Option<NaiveTime>,
     today: NaiveDate,
     strings: &Strings,
+    cx: &gpui::App,
+) -> (String, bool) {
+    due_label_with(date, time, today, strings, crate::calendar::hour12(cx))
+}
+
+/// Pure variant of [`due_label`] for headless/print callers.
+pub fn due_label_with(
+    date: NaiveDate,
+    time: Option<NaiveTime>,
+    today: NaiveDate,
+    strings: &Strings,
+    hour12: bool,
 ) -> (String, bool) {
     let days = (date - today).num_days();
     let mut label = match days {
@@ -634,18 +704,35 @@ pub fn due_label(
         _ => format_day(strings.short_date[usize::from(date.year() != today.year())], date, strings),
     };
     if let Some(time) = time {
-        label.push_str(&format!(" {}", crate::calendar::format_time(time, strings)));
+        label.push_str(&format!(" {}", crate::calendar::format_time_with(time, hour12, strings)));
     }
     (label, days < 0)
 }
 
 /// The date in the calendar's task card, as the original's: the weekday and the date,
 /// "Sat, Oct 24" ("Sat, Oct 24, 2027" in another year), with the time when there is one.
-pub fn card_due_label(date: NaiveDate, time: Option<NaiveTime>, today: NaiveDate, strings: &Strings) -> String {
+pub fn card_due_label(
+    date: NaiveDate,
+    time: Option<NaiveTime>,
+    today: NaiveDate,
+    strings: &Strings,
+    cx: &gpui::App,
+) -> String {
+    card_due_label_with(date, time, today, strings, crate::calendar::hour12(cx))
+}
+
+/// Pure variant of [`card_due_label`] for headless/unit-test callers.
+pub fn card_due_label_with(
+    date: NaiveDate,
+    time: Option<NaiveTime>,
+    today: NaiveDate,
+    strings: &Strings,
+    hour12: bool,
+) -> String {
     let weekday = strings.weekdays_short[date.weekday().num_days_from_monday() as usize];
     let mut label = format!("{weekday}, {}", closed_due_label(date, today, strings));
     if let Some(time) = time {
-        label.push_str(&format!(" {}", crate::calendar::format_time(time, strings)));
+        label.push_str(&format!(" {}", crate::calendar::format_time_with(time, hour12, strings)));
     }
     label
 }
@@ -670,10 +757,29 @@ pub fn closed_due_label(date: NaiveDate, today: NaiveDate, strings: &Strings) ->
 /// A task row's date with the View Options' "Show Date by": Task Time is `due_label`; Countdown
 /// says how far away the date is ("in 3 days", "2 days ago"), today, tomorrow and yesterday
 /// keeping their names.
-pub fn row_due_label(date: NaiveDate, time: Option<NaiveTime>, today: NaiveDate, strings: &Strings, countdown: bool) -> (String, bool) {
+pub fn row_due_label(
+    date: NaiveDate,
+    time: Option<NaiveTime>,
+    today: NaiveDate,
+    strings: &Strings,
+    countdown: bool,
+    cx: &gpui::App,
+) -> (String, bool) {
+    row_due_label_with(date, time, today, strings, countdown, crate::calendar::hour12(cx))
+}
+
+/// Pure variant of [`row_due_label`] for headless/unit-test callers.
+pub fn row_due_label_with(
+    date: NaiveDate,
+    time: Option<NaiveTime>,
+    today: NaiveDate,
+    strings: &Strings,
+    countdown: bool,
+    hour12: bool,
+) -> (String, bool) {
     let days = (date - today).num_days();
     if !countdown || (-1..=1).contains(&days) {
-        return due_label(date, time, today, strings);
+        return due_label_with(date, time, today, strings, hour12);
     }
     let text = if days > 0 { strings.in_days.replace("{n}", &days.to_string()) } else { strings.days_ago.replace("{n}", &(-days).to_string()) };
     (text, days < 0)
@@ -711,13 +817,31 @@ pub fn horizon_badge_for_group(
     group: GroupBy,
     today: NaiveDate,
     strings: &Strings,
+    cx: &gpui::App,
+) -> Option<(String, bool)> {
+    horizon_badge_for_group_with(
+        task,
+        group,
+        today,
+        desktop_common::calendar::horizons_enabled(cx),
+        strings,
+    )
+}
+
+/// Pure variant of [`horizon_badge_for_group`] for headless/unit-test callers.
+pub fn horizon_badge_for_group_with(
+    task: &Task,
+    group: GroupBy,
+    today: NaiveDate,
+    horizons_enabled: bool,
+    strings: &Strings,
 ) -> Option<(String, bool)> {
     if task.due_date.is_some() {
         return None;
     }
     let horizon = task.horizon?;
     let is_past = horizon.is_past_relative_to(today);
-    if group == GroupBy::Date && desktop_common::calendar::horizons_enabled() && !is_past {
+    if group == GroupBy::Date && horizons_enabled && !is_past {
         let redundant_with_bucket = match horizon {
             fern_core::Horizon::Week { .. } => horizon == fern_core::Horizon::current_week(today),
             fern_core::Horizon::Month { .. } => horizon == fern_core::Horizon::current_month(today),

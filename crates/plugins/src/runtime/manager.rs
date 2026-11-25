@@ -213,7 +213,6 @@ pub(super) enum WorkerCmd {
         plugin_id: String,
         reply: ReplyTx<()>,
     },
-    Shutdown,
 }
 
 pub(super) struct WorkerWake {
@@ -319,7 +318,6 @@ impl ManagerInner {
             return;
         }
         self.shutdown_flag.store(true, Ordering::Release);
-        let _ = self.queue.push(WorkerCmd::Shutdown);
         self.queue.close_and_clear();
         if let Ok(mut guard) = self.handle.lock()
             && let Some(handle) = guard.take()

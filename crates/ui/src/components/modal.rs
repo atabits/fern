@@ -144,7 +144,12 @@ impl RenderOnce for Modal {
             .justify_center()
             .bg(gpui::black().opacity(scrim_opacity))
             .occlude()
-            .when_some(self.on_dismiss, |el, handler| el.on_click(handler))
+            .when_some(self.on_dismiss, |el, handler| {
+                el.on_click(move |ev, window, cx| {
+                    cx.stop_propagation();
+                    handler(ev, window, cx);
+                })
+            })
             .child(card)
     }
 }

@@ -18,13 +18,13 @@ h1{font-size:22px}ul{list-style:none;padding:0}li{padding:6px 0;border-bottom:1p
 .done{color:#999;text-decoration:line-through}.notes{white-space:pre-wrap;color:#444}\
 .sub{margin-left:1.6em}";
 
-fn task_line(task: &Task, today: NaiveDate, strings: &Strings, depth: usize) -> String {
+fn task_line(task: &Task, today: NaiveDate, strings: &Strings, hour12: bool, depth: usize) -> String {
     let done = task.is_completed();
     let wont_do = task.is_wont_do();
     let is_note = task.kind == fern_core::Kind::Note;
     let mut meta = Vec::new();
     if let Some(date) = task.due_date {
-        meta.push(task_rows::due_label(date, task.due_time, today, strings).0);
+        meta.push(task_rows::due_label_with(date, task.due_time, today, strings, hour12).0);
     }
     match task.priority {
         fern_core::Priority::High => meta.push(strings.priority_high.to_owned()),
@@ -59,20 +59,20 @@ fn task_line(task: &Task, today: NaiveDate, strings: &Strings, depth: usize) -> 
 }
 
 /// A list page: its title and tasks, subtasks indented recursively under their parents.
-pub fn list_html(title: &str, tasks: &[Task], today: NaiveDate, strings: &Strings) -> String {
+pub fn list_html(title: &str, tasks: &[Task], today: NaiveDate, strings: &Strings, hour12: bool) -> String {
     let tree = fern_core::TaskTree::build(tasks);
     let mut body = String::new();
     for (task, depth) in tree.flatten_with_depth(|_| true) {
         if depth <= 8 {
-            body.push_str(&task_line(task, today, strings, depth));
+            body.push_str(&task_line(task, today, strings, hour12, depth));
         }
     }
     page(title, &format!("<ul>{body}</ul>"))
 }
 
 /// A task page: title, date and tags, notes and checklist.
-pub fn task_html(task: &Task, checklist: &[ChecklistItem], today: NaiveDate, strings: &Strings) -> String {
-    let mut body = format!("<ul>{}</ul>", task_line(task, today, strings, 0));
+pub fn task_html(task: &Task, checklist: &[ChecklistItem], today: NaiveDate, strings: &Strings, hour12: bool) -> String {
+    let mut body = format!("<ul>{}</ul>", task_line(task, today, strings, hour12, 0));
     if !task.notes.trim().is_empty() {
         body.push_str(&format!("<p class=\"notes\">{}</p>", escape(&task.notes)));
     }
@@ -119,6 +119,7 @@ pub fn year_html(
     today: NaiveDate,
     counts: &BTreeMap<NaiveDate, usize>,
     week_numbers: bool,
+    week_start: chrono::Weekday,
     strings: &Strings,
 ) -> String {
     use crate::calendar;
@@ -131,11 +132,11 @@ pub fn year_html(
         if week_numbers {
             months.push_str("<th></th>");
         }
-        for label in calendar::weekday_labels(&strings.weekdays_year) {
+        for label in calendar::weekday_labels_with(&strings.weekdays_year, week_start) {
             let _ = write!(months, "<th>{}</th>", escape(label));
         }
         months.push_str("</tr></thead><tbody>");
-        for week in calendar::month_grid(first).as_chunks::<7>().0 {
+        for week in calendar::month_grid_with(first, week_start).as_chunks::<7>().0 {
             months.push_str("<tr>");
             if week_numbers {
                 let _ = write!(months, "<th>{}</th>", calendar::week_number(week));
@@ -187,7 +188,7 @@ pub fn open_in_background(name: impl Into<String>, html: String, cx: &gpui::App)
     cx.background_executor()
         .spawn(async move {
             if let Err(err) = open(&name, &html) {
-                eprintln!("failed to print: {err}");
+                desktop_common::logging::log_error("print", format!("failed to print: {err}"));
             }
         })
         .detach();
@@ -235,13 +236,13 @@ mod tests {
         store.add_checklist_item(parent.id, "turn off water", None).unwrap();
         let tasks = store.tasks().unwrap();
 
-        let list = list_html("Home", &tasks, today, &EN);
+        let list = list_html("Home", &tasks, today, &EN, false);
         assert!(list.contains("<h1>Home</h1>") && list.contains("Fix &lt;the&gt; tap"));
         assert!(list.contains("margin-left:1.6em\"><span class=\"box\">☑</span><span class=\"done\">buy a washer"));
         assert!(list.contains("margin-left:3.2em\"><span class=\"box\">☒</span><span class=\"done\">check size"));
 
         let parent = store.task(parent.id).unwrap().unwrap();
-        let page = task_html(&parent, &store.checklist(parent.id).unwrap(), today, &EN);
+        let page = task_html(&parent, &store.checklist(parent.id).unwrap(), today, &EN, false);
         assert!(page.contains("Kitchen &amp; bath") && page.contains("☐</span><span>turn off water"));
     }
 
@@ -249,7 +250,7 @@ mod tests {
     fn prints_twelve_months_and_the_heatmap() {
         let today = NaiveDate::from_ymd_opt(2032, 2, 29).unwrap();
         let busy = today.succ_opt().unwrap();
-        let html = year_html(2032, today, &BTreeMap::from([(busy, 7)]), true, &EN);
+        let html = year_html(2032, today, &BTreeMap::from([(busy, 7)]), true, chrono::Weekday::Mon, &EN);
         assert_eq!(html.matches("<section>").count(), 12);
         assert_eq!(html.matches("<td class=\"today\">29</td>").count(), 1);
         assert_eq!(html.matches("<td class=\"heat-3\">1</td>").count(), 1);

@@ -15,6 +15,12 @@ pub use desktop_common::sync_types::{
     SyncStatus, attachment_error, is_e2ee_error, is_incompatible_protocol,
 };
 
+/// Cached last sync status stored as a GPUI global so diagnostics & settings read it without polling.
+#[derive(Clone, Debug, Default)]
+pub struct LiveSyncStatus(pub SyncStatus);
+
+impl gpui::Global for LiveSyncStatus {}
+
 /// How often the app syncs even without local changes, to fetch other devices' changes.
 pub const PULL_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// How often it checks for local changes to send.
@@ -292,12 +298,7 @@ fn transfer_files_with_agent(
 }
 
 fn validate_file_name(name: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !name.contains(['/', '\\', '\0'])
-            && !(cfg!(windows) && name.contains(':'))
-            && Path::new(name).file_name().is_some_and(|part| part == name),
-        "invalid attachment name"
-    );
+    anyhow::ensure!(fern_core::is_safe_attachment_name(name), "invalid attachment name");
     Ok(())
 }
 

@@ -144,7 +144,7 @@ fn calendar_year_day_card_and_jumps_use_the_clicked_date(cx: &mut TestAppContext
     cx.simulate_input("2032-04-13");
     cx.simulate_keystrokes("enter");
     assert!(cx.debug_bounds("calendar-year-jump").is_none());
-    cx.update(|_, cx| assert_eq!(view.read(cx).new_task_day(Local::now().date_naive()), day));
+    cx.update(|_, cx| assert_eq!(view.read(cx).new_task_day(Local::now().date_naive(), cx), day));
 
     let selector = format!("year-date-{month}-{day}").leak();
     let modifiers = Modifiers::default();
@@ -169,7 +169,7 @@ fn calendar_year_day_card_and_jumps_use_the_clicked_date(cx: &mut TestAppContext
     cx.update(|_, cx| {
         let view = view.read(cx);
         assert_eq!(view.mode, CalendarMode::Week);
-        assert!(view.shown_days().contains(&day));
+        assert!(view.shown_days(cx).contains(&day));
     });
     cx.simulate_keystrokes("y");
     let october = cx.debug_bounds("year-heading-2032-10").unwrap().center();
@@ -560,6 +560,7 @@ fn unchecking_a_calendar_card_reopens_the_task(cx: &mut TestAppContext) {
     cx.update(|cx| {
         theme::init(cx);
         cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true);
     });
     let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
     let selector = format!("calendar-task-{}", task.id).leak();
@@ -596,6 +597,7 @@ fn calendar_row_checkbox_toggles_completion_without_opening_card_and_notes_skip_
     cx.update(|cx| {
         theme::init(cx);
         cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true);
     });
     let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
     let note_task: &'static str = format!("calendar-task-{}", note.id).leak();
@@ -1178,22 +1180,8 @@ fn dual_tz_reference_day_and_dst_offset_shift_detection() {
     assert_eq!(calendar::timezone_offset_label_on(d(2026, 11, 1), "Asia/Kolkata"), "UTC+5:30");
 }
 
-static HORIZONS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct RestoreHorizonsEnabled;
-
-impl Drop for RestoreHorizonsEnabled {
-    fn drop(&mut self) {
-        calendar::set_horizons_enabled(true);
-    }
-}
-
 #[gpui::test]
 fn horizon_goal_banners_render_in_week_month_year_and_respect_horizons_enabled(cx: &mut TestAppContext) {
-    let _lock = HORIZONS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _restore = RestoreHorizonsEnabled;
-    calendar::set_horizons_enabled(true);
-
     let store = Rc::new(Store::open_in_memory().unwrap());
     let today = Local::now().date_naive();
     let cur_week = fern_core::Horizon::current_week(today);
@@ -1228,6 +1216,7 @@ fn horizon_goal_banners_render_in_week_month_year_and_respect_horizons_enabled(c
     cx.update(|cx| {
         theme::init(cx);
         cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true);
     });
     let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
     cx.simulate_resize(size(px(1200.), px(720.)));
@@ -1300,8 +1289,10 @@ fn horizon_goal_banners_render_in_week_month_year_and_respect_horizons_enabled(c
     assert!(cx.debug_bounds(year_chip).is_some());
 
     // Disabling Horizons hides banners completely across Year, Month, and Week views.
-    calendar::set_horizons_enabled(false);
-    cx.update(|_, cx| view.update(cx, |cal, cx| cal.reload(cx)));
+    cx.update(|_, cx| {
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = false);
+        view.update(cx, |cal, cx| cal.reload(cx));
+    });
     cx.run_until_parked();
     assert!(cx.debug_bounds("calendar-year-goals-banner").is_none());
 
@@ -1312,16 +1303,10 @@ fn horizon_goal_banners_render_in_week_month_year_and_respect_horizons_enabled(c
     cx.update(|_, cx| view.update(cx, |cal, cx| cal.set_mode(CalendarMode::Week, cx)));
     cx.run_until_parked();
     assert!(cx.debug_bounds("calendar-week-goals-banner").is_none());
-
-    calendar::set_horizons_enabled(true);
 }
 
 #[gpui::test]
 fn dragging_horizon_goal_chip_onto_calendar_day_schedules_and_clears_horizon(cx: &mut TestAppContext) {
-    let _lock = HORIZONS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _restore = RestoreHorizonsEnabled;
-    calendar::set_horizons_enabled(true);
-
     let store = Rc::new(Store::open_in_memory().unwrap());
     let today = Local::now().date_naive();
     let cur_month = fern_core::Horizon::current_month(today);
@@ -1336,6 +1321,7 @@ fn dragging_horizon_goal_chip_onto_calendar_day_schedules_and_clears_horizon(cx:
     cx.update(|cx| {
         theme::init(cx);
         cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true);
     });
     let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
     cx.simulate_resize(size(px(1200.), px(720.)));
@@ -1599,7 +1585,7 @@ fn bucket_range_matches_per_day_queries_across_repeats_spans_and_events(cx: &mut
 
     cx.update(|_, cx| {
         let cal = view.read(cx);
-        let weeks = cal.month_grid_weeks();
+        let weeks = cal.month_grid_weeks(cx);
         let first = weeks[0][0];
         let last = weeks[weeks.len() - 1][6];
         let today = d(15);
@@ -1644,6 +1630,7 @@ fn year_to_agenda_restores_anchor_month_and_shift_advances_agenda(cx: &mut TestA
     cx.update(|cx| {
         theme::init(cx);
         cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true);
     });
     let (view, cx) = cx.add_window_view(|window, cx| {
         let mut cal = CalendarView::new(store.clone(), window, cx);
@@ -1667,7 +1654,7 @@ fn year_to_agenda_restores_anchor_month_and_shift_advances_agenda(cx: &mut TestA
     cx.update(|_, cx| {
         let cal = view.read(cx);
         assert_eq!(cal.month, nov_month);
-        assert_eq!(cal.toolbar_month(), nov_month);
+        assert_eq!(cal.toolbar_month(cx), nov_month);
         assert_eq!(calendar::month_start(cal.agenda_start()), nov_month);
         assert_eq!(cal.agenda.first().map(|(d, _)| *d), Some(nov_day));
     });
@@ -1680,11 +1667,11 @@ fn year_to_agenda_restores_anchor_month_and_shift_advances_agenda(cx: &mut TestA
             cal.month = NaiveDate::from_ymd_opt(today.year(), 1, 1).unwrap();
             cal.selected_day = None;
             cal.reload(cx);
-            assert_eq!(cal.toolbar_month(), current_month);
+            assert_eq!(cal.toolbar_month(cx), current_month);
             cal.shift(1, cx);
             assert_eq!(cal.month, next_month);
             assert_eq!(cal.agenda_start(), next_month);
-            assert_eq!(cal.toolbar_month(), next_month);
+            assert_eq!(cal.toolbar_month(cx), next_month);
         });
     });
 }
@@ -1704,6 +1691,7 @@ fn reload_skips_countdowns_when_disabled_and_loads_when_enabled(cx: &mut TestApp
     cx.update(|cx| {
         theme::init(cx);
         cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true);
     });
     let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
 

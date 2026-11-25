@@ -134,8 +134,7 @@ pub struct ThingsView {
     folder_dialog: Option<Entity<FolderDialog>>,
     tag_dialog: Option<Entity<TagDialog>>,
     pending_complete: HashSet<Id>,
-    active: bool,
-    dirty: bool,
+    refresh: data_version::ViewRefreshState,
 }
 
 impl Focusable for ThingsView {
@@ -193,15 +192,20 @@ impl ThingsView {
             folder_dialog: None,
             tag_dialog: None,
             pending_complete: HashSet::new(),
-            active: initial_active,
-            dirty: !initial_active,
+            refresh: data_version::ViewRefreshState::new(
+                initial_active,
+                data_version::DataScope::TASKS
+                    | data_version::DataScope::LISTS
+                    | data_version::DataScope::PREFS,
+                cx,
+            ),
         };
         if initial_active {
             this.reload(cx);
         }
         cx.observe_global::<data_version::DataVersion>(|this, cx| {
-            if data_version::changed_elsewhere(cx.entity_id(), cx) {
-                this.sync_external(cx);
+            if this.refresh.on_data_version(cx.entity_id(), cx) {
+                this.reload(cx);
             }
         })
         .detach();
@@ -244,7 +248,7 @@ impl ThingsView {
             self.show_logged_in_project = false;
             self.reload(cx);
             window.focus(&self.focus_handle, cx);
-        } else if self.dirty {
+        } else if self.refresh.is_dirty() {
             self.reload(cx);
         }
     }
@@ -252,13 +256,13 @@ impl ThingsView {
     /// Navigates to the task's appropriate view or project and expands its inline card.
     pub fn open_task(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
         let Ok(Some(task)) = self.store.task(id) else {
-            if self.dirty {
+            if self.refresh.is_dirty() {
                 self.reload(cx);
             }
             return;
         };
         if task.is_deleted() {
-            if self.dirty {
+            if self.refresh.is_dirty() {
                 self.reload(cx);
             }
             return;
@@ -303,24 +307,20 @@ impl ThingsView {
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
-        self.active = active;
-        if active && self.dirty {
-            self.dirty = false;
+        if self.refresh.set_active(active, cx) {
             self.reload(cx);
         }
     }
 
     pub fn sync_external(&mut self, cx: &mut Context<Self>) {
-        if self.active {
+        if self.refresh.mark_dirty_or_reload() {
             self.reload(cx);
-        } else {
-            self.dirty = true;
         }
     }
 
     /// Reloads cached queries from SQLite and synchronizes any open inline card or project notes.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.dirty = false;
+        self.refresh.mark_clean(cx);
         let today = Self::today();
         self.lists = self.store.lists().unwrap_or_default();
         self.list_names = self
@@ -352,7 +352,7 @@ impl ThingsView {
 
         self.invalidate_groups();
         let strings = i18n::t(cx);
-        let groups = self.groups_rc(today, strings);
+        let groups = self.groups_rc(today, strings, cx);
         self.visible_order = groups
             .iter()
             .flat_map(|g| g.tasks.iter().map(|t| t.id))
@@ -511,7 +511,11 @@ impl ThingsView {
                         .set_list_project_fields(list_id, &text, proj.deadline, proj.completed_at)
                         .is_ok()
                     {
-                        data_version::data_changed(cx.entity_id(), cx);
+                        data_version::data_changed_scoped(
+                            cx.entity_id(),
+                            data_version::DataScope::TASKS | data_version::DataScope::LISTS,
+                            cx,
+                        );
                     }
                 }
             });
@@ -620,13 +624,13 @@ impl ThingsView {
         self.cached_groups.borrow_mut().take();
     }
 
-    fn groups_rc(&self, today: NaiveDate, strings: &'static Strings) -> Rc<Vec<TaskGroup>> {
+    fn groups_rc(&self, today: NaiveDate, strings: &'static Strings, cx: &App) -> Rc<Vec<TaskGroup>> {
         let key = GroupsCacheKey {
             version: self.groups_version,
             today,
             strings_ptr: strings as *const Strings as usize,
             view: self.view,
-            week_start: calendar::week_start(),
+            week_start: calendar::week_start(cx),
         };
         if let Some((cached_key, groups)) = self.cached_groups.borrow().as_ref()
             && *cached_key == key
@@ -1014,7 +1018,10 @@ impl Render for ThingsView {
         }
         let today = Self::today();
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
+        let (bg, text_color) = {
+            let c = cx.theme().colors();
+            (c.background, c.text)
+        };
 
         let sidebar_el = sidebar::render_sidebar(
             SidebarProps {
@@ -1028,11 +1035,12 @@ impl Render for ThingsView {
                 strings,
                 scroll_handle: &self.sidebar_scroll,
             },
+            window,
             cx,
             |this, act, window, cx| this.handle_sidebar_action(act, window, cx),
         );
 
-        let main_el = self.render_task_pane(today, strings, cx);
+        let main_el = self.render_task_pane(today, strings, window, cx);
 
         div()
             .id("things-root")
@@ -1040,8 +1048,8 @@ impl Render for ThingsView {
             .size_full()
             .flex()
             .flex_row()
-            .bg(colors.background)
-            .text_color(colors.text)
+            .bg(bg)
+            .text_color(text_color)
             .track_focus(&self.focus_handle)
             .key_context("ThingsView")
             .on_action(cx.listener(|this, _: &OpenWhen, window, cx| {

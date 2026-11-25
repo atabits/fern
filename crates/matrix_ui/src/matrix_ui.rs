@@ -68,7 +68,6 @@ pub struct MatrixView {
     /// Floating task detail card (lazily initialized on first task click so `new` needs no `Window`).
     detail: Option<Entity<TaskDetail>>,
     detail_task: Option<Id>,
-    text_edit_sync_task: Option<gpui::Task<()>>,
     /// Right-click task context menu.
     task_menu: Option<(Id, Point<Pixels>)>,
     menu_row: Option<u8>,
@@ -88,8 +87,7 @@ pub struct MatrixView {
     confirm_delete_profile: Option<(Id, String)>,
     pending_complete: HashSet<Id>,
     submitting_quadrant_task: bool,
-    active: bool,
-    dirty: bool,
+    refresh: desktop_common::data_version::ViewRefreshState,
 }
 
 impl EventEmitter<OpenTask> for MatrixView {}
@@ -140,7 +138,6 @@ impl MatrixView {
             selected_task: None,
             detail: None,
             detail_task: None,
-            text_edit_sync_task: None,
             task_menu: None,
             menu_row: None,
             menu: None,
@@ -159,15 +156,20 @@ impl MatrixView {
             confirm_delete_profile: None,
             pending_complete: HashSet::new(),
             submitting_quadrant_task: false,
-            active: initial_active,
-            dirty: !initial_active,
+            refresh: desktop_common::data_version::ViewRefreshState::new(
+                initial_active,
+                desktop_common::data_version::DataScope::TASKS
+                    | desktop_common::data_version::DataScope::LISTS
+                    | desktop_common::data_version::DataScope::PREFS,
+                cx,
+            ),
         };
         if initial_active {
             this.reload(cx);
         }
         cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
-            if desktop_common::data_version::changed_elsewhere(cx.entity_id(), cx) {
-                this.sync_external(cx);
+            if this.refresh.on_data_version(cx.entity_id(), cx) {
+                this.reload(cx);
             }
         })
         .detach();
@@ -175,24 +177,19 @@ impl MatrixView {
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
-        self.active = active;
-        if active && self.dirty {
-            self.dirty = false;
+        if self.refresh.set_active(active, cx) {
             self.reload(cx);
         }
     }
 
     pub fn sync_external(&mut self, cx: &mut Context<Self>) {
-        self.text_edit_sync_task = None;
-        if self.active {
+        if self.refresh.mark_dirty_or_reload() {
             self.reload(cx);
-        } else {
-            self.dirty = true;
         }
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.dirty = false;
+        self.refresh.mark_clean(cx);
         self.preferences = self.store.preferences().unwrap_or_default();
         self.show_completed = self
             .store
@@ -319,6 +316,7 @@ impl MatrixView {
                 today,
                 strings,
                 &self.manual_order[q],
+                cx,
             );
             let mut completed = std::mem::take(&mut per_quadrant_done[q]);
             completed.sort_by_key(|t| std::cmp::Reverse(t.completed_at.unwrap_or(0)));
@@ -327,7 +325,7 @@ impl MatrixView {
     }
 
     fn apply_task_text_edit(&mut self, edit: &TaskTextEdited, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         } else {
             for task in self.tasks.iter_mut().filter(|t| t.id == edit.id) {
@@ -340,15 +338,6 @@ impl MatrixView {
             self.rebuild_cache(cx);
             cx.notify();
         }
-        self.text_edit_sync_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(300))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.text_edit_sync_task = None;
-                desktop_common::data_version::data_changed(cx.entity_id(), cx);
-            });
-        }));
     }
 
     fn open_detail_card(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
@@ -362,8 +351,11 @@ impl MatrixView {
                 let store = self.store.clone();
                 let entity = cx.new(|cx| TaskDetail::new(store, window, cx));
                 cx.subscribe(&entity, |this, _, _: &TaskUpdated, cx| {
-                    this.text_edit_sync_task = None;
-                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                    desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::TASKS,
+                        cx,
+                    );
                     this.reload(cx);
                 })
                 .detach();
@@ -391,9 +383,6 @@ impl MatrixView {
     }
 
     fn close_detail_card(&mut self, cx: &mut Context<Self>) {
-        if self.text_edit_sync_task.take().is_some() {
-            desktop_common::data_version::data_changed(cx.entity_id(), cx);
-        }
         self.detail_task = None;
         if let Some(detail) = self.detail.as_ref() {
             detail.update(cx, |d, cx| d.show(None, cx));
@@ -452,7 +441,7 @@ impl MatrixView {
                         }
                         Ok(desktop_common::plugin_bus::PluginHookDecision::Allow) => raw_title,
                         Err(err) => {
-                            eprintln!("plugin quickAddTransform hook failed: {err:#}");
+                            desktop_common::logging::log_error("matrix_ui", format!("plugin quickAddTransform hook failed: {err:#}"));
                             raw_title
                         }
                     };
@@ -461,7 +450,7 @@ impl MatrixView {
                     let (base_draft, default_top) = match built {
                         Ok(pair) => pair,
                         Err(err) => {
-                            eprintln!("failed to prepare matrix task: {err:#}");
+                            desktop_common::logging::log_error("matrix_ui", format!("failed to prepare matrix task: {err:#}"));
                             let _ = this.update(cx, |this, cx| {
                                 this.submitting_quadrant_task = false;
                                 this.notice = Some(MatrixNotice::Failed);
@@ -496,7 +485,7 @@ impl MatrixView {
                             ) {
                                 Ok(pair) => pair,
                                 Err(err) => {
-                                    eprintln!("plugin beforeTaskCreate returned invalid draft: {err:#}");
+                                    desktop_common::logging::log_error("matrix_ui", format!("plugin beforeTaskCreate returned invalid draft: {err:#}"));
                                     (base_draft, default_top)
                                 }
                             }
@@ -505,7 +494,7 @@ impl MatrixView {
                             (base_draft, default_top)
                         }
                         Err(err) => {
-                            eprintln!("plugin beforeTaskCreate hook failed: {err:#}");
+                            desktop_common::logging::log_error("matrix_ui", format!("plugin beforeTaskCreate hook failed: {err:#}"));
                             (base_draft, default_top)
                         }
                     };
@@ -516,13 +505,16 @@ impl MatrixView {
                         match this.store.create_task(final_draft, top) {
                             Ok(task) => {
                                 cleared = true;
-                                this.text_edit_sync_task = None;
-                                desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::TASKS,
+                        cx,
+                    );
                                 this.reload(cx);
                                 this.notice = this.destination_notice(quadrant, &task, today, i18n::t(cx));
                             }
                             Err(err) => {
-                                eprintln!("failed to add the task: {err:#}");
+                                desktop_common::logging::log_error("matrix_ui", format!("failed to add the task: {err:#}"));
                                 this.notice = Some(MatrixNotice::Failed);
                                 cx.notify();
                             }
@@ -540,15 +532,18 @@ impl MatrixView {
             let task = match this.add_quadrant_task(quadrant, title, today) {
                 Ok(task) => task,
                 Err(err) => {
-                    eprintln!("failed to add the task: {err:#}");
+                    desktop_common::logging::log_error("matrix_ui", format!("failed to add the task: {err:#}"));
                     this.notice = Some(MatrixNotice::Failed);
                     cx.notify();
                     return;
                 }
             };
             input.update(cx, |input, cx| input.clear(window, cx));
-            this.text_edit_sync_task = None;
-            desktop_common::data_version::data_changed(cx.entity_id(), cx);
+            desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::TASKS,
+                        cx,
+                    );
             this.reload(cx);
             this.notice = this.destination_notice(quadrant, &task, today, i18n::t(cx));
         })
@@ -693,7 +688,7 @@ impl MatrixView {
 
     #[cfg(debug_assertions)]
     pub fn dev_header(&mut self, what: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         match what {
@@ -709,7 +704,6 @@ impl MatrixView {
     }
 
     fn finish_toggle_complete(&mut self, task: &Task, done: bool, cx: &mut Context<Self>) {
-        self.text_edit_sync_task = None;
         if let Err(err) = desktop_common::task_ops::toggle_task_completion(
             &self.store,
             task,
@@ -717,7 +711,7 @@ impl MatrixView {
             cx.entity_id(),
             cx,
         ) {
-            eprintln!("failed to toggle completion: {err:#}");
+            desktop_common::logging::log_error("matrix_ui", format!("failed to toggle completion: {err:#}"));
         }
         self.reload(cx);
     }
@@ -778,7 +772,7 @@ impl MatrixView {
             return;
         }
         if let Err(err) = self.store.delete_task(id) {
-            eprintln!("failed to delete task: {err:#}");
+            desktop_common::logging::log_error("matrix_ui", format!("failed to delete task: {err:#}"));
         } else {
             if self.selected_task == Some(id) {
                 self.selected_task = None;
@@ -786,8 +780,11 @@ impl MatrixView {
             if self.detail_task == Some(id) {
                 self.close_detail_card(cx);
             }
-            self.text_edit_sync_task = None;
-            desktop_common::data_version::data_changed(cx.entity_id(), cx);
+            desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::TASKS,
+                        cx,
+                    );
         }
         self.reload(cx);
     }
@@ -819,26 +816,26 @@ impl MatrixView {
                 if let Some(kind) = patch.kind
                     && let Err(err) = self.store.set_kind(id, kind)
                 {
-                    eprintln!("failed to change task kind: {err:#}");
+                    desktop_common::logging::log_error("matrix_ui", format!("failed to change task kind: {err:#}"));
                     ok = false;
                 }
                 if let Some(priority) = patch.priority
                     && let Err(err) = self.store.set_priority(id, priority)
                 {
-                    eprintln!("failed to change priority: {err:#}");
+                    desktop_common::logging::log_error("matrix_ui", format!("failed to change priority: {err:#}"));
                     ok = false;
                 }
                 if let Some(due_date) = patch.due_date {
                     let due_time = due_date.and(task.due_time);
                     if let Err(err) = self.store.set_due(id, due_date, due_time) {
-                        eprintln!("failed to change due date: {err:#}");
+                        desktop_common::logging::log_error("matrix_ui", format!("failed to change due date: {err:#}"));
                         ok = false;
                     }
                 }
                 if let Some(list_id) = patch.list_id
                     && let Err(err) = self.store.set_list(id, list_id)
                 {
-                    eprintln!("failed to move task list: {err:#}");
+                    desktop_common::logging::log_error("matrix_ui", format!("failed to move task list: {err:#}"));
                     ok = false;
                 }
                 if let Some(new_tag) = patch.add_tag {
@@ -846,15 +843,18 @@ impl MatrixView {
                     if !tags.iter().any(|t| t.to_lowercase() == new_tag.to_lowercase()) {
                         tags.push(new_tag);
                         if let Err(err) = self.store.set_tags(id, &tags) {
-                            eprintln!("failed to add tag: {err:#}");
+                            desktop_common::logging::log_error("matrix_ui", format!("failed to add tag: {err:#}"));
                             ok = false;
                         }
                     }
                 }
                 if ok {
                     self.notice = None;
-                    self.text_edit_sync_task = None;
-                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                    desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::TASKS,
+                        cx,
+                    );
                 } else {
                     self.notice = Some(MatrixNotice::Failed);
                 }
@@ -956,10 +956,13 @@ impl MatrixView {
                 }
             };
             if let Err(err) = result {
-                eprintln!("failed to save the quadrant: {err:#}");
+                desktop_common::logging::log_error("matrix_ui", format!("failed to save the quadrant: {err:#}"));
             } else {
-                self.text_edit_sync_task = None;
-                desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                desktop_common::data_version::data_changed_scoped(
+                        cx.entity_id(),
+                        desktop_common::data_version::DataScope::TASKS,
+                        cx,
+                    );
             }
         }
         self.reload(cx);
@@ -993,7 +996,7 @@ impl MatrixView {
 
     #[cfg(debug_assertions)]
     pub fn dev_open(&mut self, quadrant: usize, edit: bool, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         if edit {
@@ -1047,7 +1050,7 @@ impl Render for MatrixView {
             .text_color(theme.colors().text)
             .child(
                 h_flex()
-                    .mt(layout::header_inset())
+                    .mt(layout::header_inset(window, cx))
                     .h(px(56.))
                     .flex_none()
                     .px(px(22.))

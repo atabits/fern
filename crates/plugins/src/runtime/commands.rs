@@ -15,14 +15,14 @@ use super::scripts::run_user_script;
 use super::{
     CIRCUIT_BREAKER_THRESHOLD, DEFAULT_COMMAND_TIMEOUT, DEFAULT_EVENT_TIMEOUT, DirFingerprint,
     HostUpdate, PluginInfo, PluginStatus, SearchHit, WorkerEnv, active_runtime_handles,
-    ensure_activated, maybe_spawn_startup_activation, spawn_startup_activations,
-    unload_runtime_async,
+    ensure_activated, finish_plugin_call, maybe_spawn_startup_activation, spawn_startup_activations,
+    unload_runtime_async, verify_manifest_permissions,
 };
 use crate::api::{
     LogLevel, MAX_TIMER_INTERVAL_MS, MIN_TIMER_INTERVAL_MS, PluginUiEffect, RenderScopeGuard,
     js_to_json, js_value_to_ui_node, json_to_js,
 };
-use crate::manifest::{LoadedManifest, PermissionApprovalStatus, validate_plugin_id};
+use crate::manifest::{LoadedManifest, validate_plugin_id};
 use crate::ui_ast::{UiEvent, UiTreePayload};
 
 pub(super) fn handle_worker_cmd(env: &Rc<WorkerEnv>, cmd: WorkerCmd) {
@@ -221,7 +221,6 @@ pub(super) fn handle_worker_cmd(env: &Rc<WorkerEnv>, cmd: WorkerCmd) {
                 let _ = reply.send(res);
             });
         }
-        WorkerCmd::Shutdown => {}
     }
 }
 
@@ -271,38 +270,8 @@ async fn set_plugin_enabled_async(
                 "plugin {plugin_id} requires permission approval or circuit breaker reset before enabling"
             );
         }
+        verify_manifest_permissions(env, plugin_id, &loaded_manifest, false)?;
         let state = env.store.plugin_state(plugin_id)?;
-        match loaded_manifest
-            .manifest
-            .check_permission_diff(&loaded_manifest.manifest_hash, state.as_ref())
-        {
-            PermissionApprovalStatus::NeedsApproval {
-                diff,
-                is_first_install,
-            } => {
-                if let Some(slot) = env.slots.borrow_mut().get_mut(plugin_id) {
-                    slot.enabled = false;
-                    slot.status = PluginStatus::NeedsApproval {
-                        added_permissions: diff.added,
-                        is_first_install,
-                    };
-                }
-                env.emit(HostUpdate::RegistryChanged(env.plugin_infos()));
-                bail!("plugin {plugin_id} requires permission approval before enabling");
-            }
-            PermissionApprovalStatus::Approved => {
-                if let Some(narrowed) = loaded_manifest
-                    .manifest
-                    .narrowed_permissions_to_persist(&loaded_manifest.manifest_hash, state.as_ref())
-                {
-                    let _ = env.store.set_plugin_permissions(
-                        plugin_id,
-                        &narrowed,
-                        &loaded_manifest.manifest_hash,
-                    );
-                }
-            }
-        }
         if state
             .as_ref()
             .is_some_and(|s| s.consecutive_errors >= CIRCUIT_BREAKER_THRESHOLD)
@@ -374,38 +343,7 @@ fn reset_and_enable(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<()> {
 
     // Re-verify persisted permission diff before enabling so a circuit-broken plugin whose
     // manifest changed on disk cannot escalate permissions via Reset & Enable.
-    let state = env.store.plugin_state(plugin_id)?;
-    match loaded_manifest
-        .manifest
-        .check_permission_diff(&loaded_manifest.manifest_hash, state.as_ref())
-    {
-        PermissionApprovalStatus::NeedsApproval {
-            diff,
-            is_first_install,
-        } => {
-            if let Some(slot) = env.slots.borrow_mut().get_mut(plugin_id) {
-                slot.enabled = false;
-                slot.status = PluginStatus::NeedsApproval {
-                    added_permissions: diff.added,
-                    is_first_install,
-                };
-            }
-            env.emit(HostUpdate::RegistryChanged(env.plugin_infos()));
-            bail!("plugin {plugin_id} requires permission approval first");
-        }
-        PermissionApprovalStatus::Approved => {
-            if let Some(narrowed) = loaded_manifest
-                .manifest
-                .narrowed_permissions_to_persist(&loaded_manifest.manifest_hash, state.as_ref())
-            {
-                let _ = env.store.set_plugin_permissions(
-                    plugin_id,
-                    &narrowed,
-                    &loaded_manifest.manifest_hash,
-                );
-            }
-        }
-    }
+    verify_manifest_permissions(env, plugin_id, &loaded_manifest, false)?;
 
     env.store.reset_plugin_errors(plugin_id)?;
     env.store.set_plugin_enabled(plugin_id, true)?;
@@ -636,30 +574,36 @@ pub(super) async fn render_plugin_view(
                 let r: MaybePromise = f.call(())?;
                 let _ = r.into_future::<Value>().await?;
             }
-            api_c.clear_scope_handlers(&view_id_own);
+            let staging_scope = format!("__staging:{view_id_own}__");
+            api_c.clear_scope_handlers(&staging_scope);
             let raw_node: MaybePromise = {
-                let _scope_guard = RenderScopeGuard::enter(Rc::clone(&api_c), view_id_own.clone());
+                let _scope_guard = RenderScopeGuard::enter(Rc::clone(&api_c), staging_scope.clone());
                 let f = render_fn.restore(&ctx)?;
                 f.call(())?
             };
             let val = raw_node.into_future::<Value>().await?;
             let parsed = {
-                let _scope_guard = RenderScopeGuard::enter(Rc::clone(&api_c), view_id_own.clone());
-                js_value_to_ui_node(&ctx, val, &api_c, &view_id_own)
+                let _scope_guard = RenderScopeGuard::enter(Rc::clone(&api_c), staging_scope.clone());
+                js_value_to_ui_node(&ctx, val, &api_c, &staging_scope)
             };
             match parsed {
-                Ok(root) => Ok(UiTreePayload {
-                    plugin_id: api_c.plugin_id.clone(),
-                    view_id: view_id_own,
-                    root,
-                }),
-                Err(err) => Err(rquickjs::Exception::throw_message(&ctx, &format!("{err:#}"))),
+                Ok(root) => {
+                    api_c.swap_scope_handlers(&staging_scope, &view_id_own);
+                    Ok(UiTreePayload {
+                        plugin_id: api_c.plugin_id.clone(),
+                        view_id: view_id_own,
+                        root,
+                    })
+                }
+                Err(err) => {
+                    api_c.clear_scope_handlers(&staging_scope);
+                    Err(rquickjs::Exception::throw_message(&ctx, &format!("{err:#}")))
+                }
             }
         },
     )
     .await;
 
-    let elapsed = start.elapsed().as_millis() as u64;
     let gen_current = env
         .slots
         .borrow()
@@ -670,23 +614,19 @@ pub(super) async fn render_plugin_view(
         bail!("plugin {plugin_id:?} was unloaded while rendering view {view_id:?}");
     }
 
-    match res {
+    match finish_plugin_call(env, plugin_id, &rt, rt_gen, start, res).await {
         Ok(payload) => {
-            let mem = rt.memory_usage().await.malloc_size.max(0) as u64;
-            env.record_success(plugin_id, Some(rt_gen), elapsed, mem);
-            env.flush_plugin_side_effects(plugin_id, Some(rt_gen));
             env.emit(HostUpdate::ViewRendered(payload.clone()));
             Ok(payload)
         }
         Err(err) => {
-            let msg = env.vault.scrub_secrets(plugin_id, &format!("{err:#}"));
-            env.record_failure(plugin_id, Some(rt_gen), &msg);
+            let msg = format!("{err:#}");
             env.emit(HostUpdate::ViewError {
                 plugin_id: plugin_id.to_owned(),
                 view_id: view_id.to_owned(),
-                error: msg.clone(),
+                error: msg,
             });
-            Err(anyhow!("{msg}"))
+            Err(err)
         }
     }
 }
@@ -714,36 +654,42 @@ async fn render_modal_view(
 
     let start = Instant::now();
     let api_c = Rc::clone(&api);
-    let modal_scope = "__modal__".to_owned();
     let res = run_with_gate(
         &ctx,
         &gate,
         GateOptions::for_runtime(DEFAULT_EVENT_TIMEOUT, driver_state, Rc::clone(&api)),
         async move |ctx| {
-            api_c.clear_scope_handlers(&modal_scope);
+            let modal_scope = "__modal__".to_owned();
+            let staging_scope = "__staging:__modal____".to_owned();
+            api_c.clear_scope_handlers(&staging_scope);
             let raw_node: MaybePromise = {
-                let _scope_guard = RenderScopeGuard::enter(Rc::clone(&api_c), modal_scope.clone());
+                let _scope_guard = RenderScopeGuard::enter(Rc::clone(&api_c), staging_scope.clone());
                 let f = render_fn.restore(&ctx)?;
                 f.call(())?
             };
             let val = raw_node.into_future::<Value>().await?;
             let parsed = {
-                let _scope_guard = RenderScopeGuard::enter(Rc::clone(&api_c), modal_scope.clone());
-                js_value_to_ui_node(&ctx, val, &api_c, &modal_scope)
+                let _scope_guard = RenderScopeGuard::enter(Rc::clone(&api_c), staging_scope.clone());
+                js_value_to_ui_node(&ctx, val, &api_c, &staging_scope)
             };
             match parsed {
-                Ok(root) => Ok(UiTreePayload {
-                    plugin_id: api_c.plugin_id.clone(),
-                    view_id: modal_scope,
-                    root,
-                }),
-                Err(err) => Err(rquickjs::Exception::throw_message(&ctx, &format!("{err:#}"))),
+                Ok(root) => {
+                    api_c.swap_scope_handlers(&staging_scope, &modal_scope);
+                    Ok(UiTreePayload {
+                        plugin_id: api_c.plugin_id.clone(),
+                        view_id: modal_scope,
+                        root,
+                    })
+                }
+                Err(err) => {
+                    api_c.clear_scope_handlers(&staging_scope);
+                    Err(rquickjs::Exception::throw_message(&ctx, &format!("{err:#}")))
+                }
             }
         },
     )
     .await;
 
-    let elapsed = start.elapsed().as_millis() as u64;
     let gen_current = env
         .slots
         .borrow()
@@ -754,25 +700,14 @@ async fn render_modal_view(
         return Ok(None);
     }
 
-    match res {
-        Ok(payload) => {
-            let mem = rt.memory_usage().await.malloc_size.max(0) as u64;
-            env.record_success(plugin_id, Some(rt_gen), elapsed, mem);
-            env.flush_plugin_side_effects(plugin_id, Some(rt_gen));
-            env.emit(HostUpdate::UiEffect(PluginUiEffect::OpenModal {
-                plugin_id: plugin_id.to_owned(),
-                view_id: payload.view_id.clone(),
-                title,
-                tree: payload.root.clone(),
-            }));
-            Ok(Some(payload))
-        }
-        Err(err) => {
-            let msg = env.vault.scrub_secrets(plugin_id, &format!("{err:#}"));
-            env.record_failure(plugin_id, Some(rt_gen), &msg);
-            Err(anyhow!("{msg}"))
-        }
-    }
+    let payload = finish_plugin_call(env, plugin_id, &rt, rt_gen, start, res).await?;
+    env.emit(HostUpdate::UiEffect(PluginUiEffect::OpenModal {
+        plugin_id: plugin_id.to_owned(),
+        view_id: payload.view_id.clone(),
+        title,
+        tree: payload.root.clone(),
+    }));
+    Ok(Some(payload))
 }
 
 async fn unmount_plugin_view(env: &Rc<WorkerEnv>, plugin_id: &str, view_id: &str) -> Result<()> {
@@ -918,20 +853,7 @@ async fn execute_plugin_command(
     )
     .await;
 
-    let elapsed = start.elapsed().as_millis() as u64;
-    match res {
-        Ok(val) => {
-            let mem = rt.memory_usage().await.malloc_size.max(0) as u64;
-            env.record_success(plugin_id, Some(rt_gen), elapsed, mem);
-            env.flush_plugin_side_effects(plugin_id, Some(rt_gen));
-            Ok(val)
-        }
-        Err(err) => {
-            let msg = env.vault.scrub_secrets(plugin_id, &format!("{err:#}"));
-            env.record_failure(plugin_id, Some(rt_gen), &msg);
-            Err(anyhow!("{msg}"))
-        }
-    }
+    finish_plugin_call(env, plugin_id, &rt, rt_gen, start, res).await
 }
 
 async fn run_search_providers(env: &Rc<WorkerEnv>, query: &str) -> Result<Vec<SearchHit>> {
@@ -1031,16 +953,8 @@ async fn run_search_providers(env: &Rc<WorkerEnv>, query: &str) -> Result<Vec<Se
         )
         .await;
 
-        let elapsed = start.elapsed().as_millis() as u64;
-        match res {
-            Ok(mut hits) => {
-                let mem = rt.memory_usage().await.malloc_size.max(0) as u64;
-                env.record_success(&pid, Some(rt_gen), elapsed, mem);
-                all_hits.append(&mut hits);
-            }
-            Err(err) => {
-                env.record_failure(&pid, Some(rt_gen), &format!("{err:#}"));
-            }
+        if let Ok(mut hits) = finish_plugin_call(env, &pid, &rt, rt_gen, start, res).await {
+            all_hits.append(&mut hits);
         }
     }
     Ok(all_hits)
@@ -1102,17 +1016,7 @@ pub(super) fn fire_due_timers(env: &Rc<WorkerEnv>) {
                 },
             )
             .await;
-            let elapsed = start.elapsed().as_millis() as u64;
-            match res {
-                Ok(()) => {
-                    let mem = rt.memory_usage().await.malloc_size.max(0) as u64;
-                    env_c.record_success(&pid, Some(rt_gen), elapsed, mem);
-                    env_c.flush_plugin_side_effects(&pid, Some(rt_gen));
-                }
-                Err(err) => {
-                    env_c.record_failure(&pid, Some(rt_gen), &format!("{err:#}"));
-                }
-            }
+            let _ = finish_plugin_call(&env_c, &pid, &rt, rt_gen, start, res).await;
         });
     }
 }

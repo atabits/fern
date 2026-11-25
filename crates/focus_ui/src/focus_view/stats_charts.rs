@@ -158,7 +158,7 @@ impl FocusView {
         let theme = cx.theme().clone();
         let status = theme.status().clone();
         let tasks = &self.stats_data.tasks;
-        let week_start = crate::calendar::week_start();
+        let week_start = crate::calendar::week_start(cx);
         let period = page.details_period;
         let (first, last) = stats::buckets(period, page.details_day, week_start, 1)[0];
         let totals = fern_core::focus::focus_by(&self.sessions, tasks, page.details_by, first, last);

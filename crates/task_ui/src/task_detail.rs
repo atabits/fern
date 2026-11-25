@@ -114,16 +114,16 @@ pub struct TaskDetail {
     subtask_input: Entity<TextInput>,
     /// The due-date popover's field for typing a time.
     time_input: Entity<TextInput>,
-    /// The due-date popover's time-zone search input.
-    tz_input: Entity<TextInput>,
+    /// The due-date popover's time-zone search input (created on demand).
+    tz_input: Option<Entity<TextInput>>,
     /// The task's location field and whether it is expanded when empty.
     location_input: Entity<TextInput>,
     location_open: bool,
-    /// The "Link Parent Task" search field.
-    link_search: Entity<TextInput>,
-    /// The list menu's search field, and the list (`Some(None)` for the Inbox) whose sections
-    /// show in the side menu.
-    list_search: Entity<TextInput>,
+    /// The "Link Parent Task" search field (created on demand).
+    link_search: Option<Entity<TextInput>>,
+    /// The list menu's search field (created on demand), and the list (`Some(None)` for the Inbox)
+    /// whose sections show in the side menu.
+    list_search: Option<Entity<TextInput>>,
     list_submenu: Option<Option<Id>>,
     /// The checklist is shown when it has items or the user asked to start one.
     show_checklist: bool,
@@ -143,7 +143,17 @@ pub struct TaskDetail {
     pending_delete: Option<PendingDelete>,
     confirm_return_focus: Option<WeakFocusHandle>,
     pending_complete: Option<Id>,
+    pending_text_edits: Option<PendingTextEdits>,
+    pending_text_timer: Option<gpui::Task<()>>,
     _session_subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PendingTextEdits {
+    task_id: Id,
+    title: Option<String>,
+    notes: Option<String>,
+    location: Option<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -181,6 +191,9 @@ pub struct TaskTextEdited {
     pub field: TaskTextField,
 }
 
+/// Debounced text edits for `id` finished flushing to SQLite.
+pub struct TaskTextFlushed(pub Id);
+
 /// The user asked to open another task (a subtask) in the panel.
 pub struct OpenTask(pub Id);
 
@@ -195,6 +208,7 @@ pub struct RequestDeleteForever(pub Id);
 
 impl EventEmitter<TaskUpdated> for TaskDetail {}
 impl EventEmitter<TaskTextEdited> for TaskDetail {}
+impl EventEmitter<TaskTextFlushed> for TaskDetail {}
 impl EventEmitter<StartFocus> for TaskDetail {}
 impl EventEmitter<Undoable> for TaskDetail {}
 impl EventEmitter<OpenTask> for TaskDetail {}
@@ -209,10 +223,7 @@ impl TaskDetail {
         let new_item = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_item, cx).without_cancel());
         let subtask_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_subtask, cx).without_cancel());
         let time_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.time_placeholder, cx).without_cancel());
-        let tz_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.timezone_search, cx).without_cancel());
         let location_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.location_placeholder, cx).without_cancel());
-        let link_search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx).without_cancel());
-        let list_search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_search, cx).without_cancel());
         let comment_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.write_comment, cx));
 
         let subscriptions = vec![
@@ -225,7 +236,7 @@ impl TaskDetail {
                     this.refresh_draft_title(cx);
                     return;
                 }
-                this.save_text(cx, TaskTextField::Title(text.clone()), |store, id| store.set_title(id, &text));
+                this.save_text(cx, TaskTextField::Title(text));
             }),
             cx.subscribe(&notes, |this, input, _: &Changed, cx| {
                 if this.is_read_only() {
@@ -234,7 +245,7 @@ impl TaskDetail {
                 let text = input.read(cx).text().to_owned();
                 this.word_count = fern_core::markdown::count_words(&text);
                 if this.edit_draft(cx, |task, _| task.notes = text.clone()) { return; }
-                this.save_text(cx, TaskTextField::Notes(text.clone()), |store, id| store.set_notes(id, &text));
+                this.save_text(cx, TaskTextField::Notes(text));
             }),
             cx.subscribe(&location_input, |this, input, _: &Changed, cx| {
                 if this.is_read_only() {
@@ -245,17 +256,18 @@ impl TaskDetail {
                 if this.edit_draft(cx, |task, _| task.location = value.clone()) {
                     return;
                 }
-                this.save_text(cx, TaskTextField::Location(value.clone()), |store, id| {
-                    store.set_location(id, value.as_deref())
-                });
+                this.save_text(cx, TaskTextField::Location(value));
+            }),
+            cx.on_focus_out(&title.focus_handle(cx), window, |this, _, _, cx| {
+                this.flush_pending_text_edits(cx);
+            }),
+            cx.on_focus_out(&notes.focus_handle(cx), window, |this, _, _, cx| {
+                this.flush_pending_text_edits(cx);
+            }),
+            cx.on_focus_out(&location_input.focus_handle(cx), window, |this, _, _, cx| {
+                this.flush_pending_text_edits(cx);
             }),
             cx.subscribe(&tag_input, |_, _, _: &Changed, cx| cx.notify()),
-            cx.subscribe(&tz_input, |_, _, _: &Changed, cx| cx.notify()),
-            cx.subscribe(&link_search, |_, _, _: &Changed, cx| cx.notify()),
-            cx.subscribe(&list_search, |this, _, _: &Changed, cx| {
-                this.list_submenu = None;
-                cx.notify();
-            }),
             cx.observe_global::<CurrentLocale>(|this, cx| {
                 let strings = i18n::t(cx);
                 let placeholder = if this.session.draft.is_some() { strings.new_task_prompt } else { strings.untitled };
@@ -265,10 +277,16 @@ impl TaskDetail {
                 this.new_item.update(cx, |input, cx| input.set_placeholder(strings.add_item, cx));
                 this.subtask_input.update(cx, |input, cx| input.set_placeholder(strings.add_subtask, cx));
                 this.time_input.update(cx, |input, cx| input.set_placeholder(strings.time_placeholder, cx));
-                this.tz_input.update(cx, |input, cx| input.set_placeholder(strings.timezone_search, cx));
+                if let Some(input) = &this.tz_input {
+                    input.update(cx, |input, cx| input.set_placeholder(strings.timezone_search, cx));
+                }
                 this.location_input.update(cx, |input, cx| input.set_placeholder(strings.location_placeholder, cx));
-                this.link_search.update(cx, |input, cx| input.set_placeholder(strings.search_placeholder, cx));
-                this.list_search.update(cx, |input, cx| input.set_placeholder(strings.section_search, cx));
+                if let Some(input) = &this.link_search {
+                    input.update(cx, |input, cx| input.set_placeholder(strings.search_placeholder, cx));
+                }
+                if let Some(input) = &this.list_search {
+                    input.update(cx, |input, cx| input.set_placeholder(strings.section_search, cx));
+                }
                 this.comment_input.update(cx, |input, cx| input.set_placeholder(strings.write_comment, cx));
             }),
         ];
@@ -294,11 +312,11 @@ impl TaskDetail {
             new_item,
             subtask_input,
             time_input,
-            tz_input,
+            tz_input: None,
             location_input,
             location_open: false,
-            link_search,
-            list_search,
+            link_search: None,
+            list_search: None,
             list_submenu: None,
             show_checklist: false,
             card: false,
@@ -312,8 +330,46 @@ impl TaskDetail {
             pending_delete: None,
             confirm_return_focus: None,
             pending_complete: None,
+            pending_text_edits: None,
+            pending_text_timer: None,
             _session_subscriptions: subscriptions,
         }
+    }
+
+    fn ensure_tz_input(&mut self, cx: &mut Context<Self>) -> Entity<TextInput> {
+        if let Some(input) = &self.tz_input {
+            return input.clone();
+        }
+        let placeholder = i18n::t(cx).timezone_search;
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, placeholder, cx).without_cancel());
+        self._session_subscriptions.push(cx.subscribe(&input, |_, _, _: &Changed, cx| cx.notify()));
+        self.tz_input = Some(input.clone());
+        input
+    }
+
+    fn ensure_link_search(&mut self, cx: &mut Context<Self>) -> Entity<TextInput> {
+        if let Some(input) = &self.link_search {
+            return input.clone();
+        }
+        let placeholder = i18n::t(cx).search_placeholder;
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, placeholder, cx).without_cancel());
+        self._session_subscriptions.push(cx.subscribe(&input, |_, _, _: &Changed, cx| cx.notify()));
+        self.link_search = Some(input.clone());
+        input
+    }
+
+    fn ensure_list_search(&mut self, cx: &mut Context<Self>) -> Entity<TextInput> {
+        if let Some(input) = &self.list_search {
+            return input.clone();
+        }
+        let placeholder = i18n::t(cx).section_search;
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, placeholder, cx).without_cancel());
+        self._session_subscriptions.push(cx.subscribe(&input, |this, _, _: &Changed, cx| {
+            this.list_submenu = None;
+            cx.notify();
+        }));
+        self.list_search = Some(input.clone());
+        input
     }
 
     /// Makes this a task card, which draws its own frame; `calendar` for the calendar's.
@@ -406,6 +462,7 @@ impl TaskDetail {
 
     /// Shows a task, or the empty panel for `None`.
     pub fn show(&mut self, task: Option<Task>, cx: &mut Context<Self>) {
+        self.flush_pending_text_edits(cx);
         let task_changed = self.session.task.as_ref().map(|t| t.id) != task.as_ref().map(|t| t.id);
         if task_changed {
             self.body_scroll.set_offset(gpui::point(px(0.), px(0.)));
@@ -479,7 +536,7 @@ impl TaskDetail {
                     let selection = input.selection();
                     let (text, selection) = match format {
                         Some(format) => fern_core::markdown::apply(input.text(), selection, format),
-                        None => fern_core::markdown::insert(input.text(), selection, &crate::calendar::format_time(Local::now().time(), i18n::t(cx))),
+                        None => fern_core::markdown::insert(input.text(), selection, &crate::calendar::format_time(Local::now().time(), i18n::t(cx), cx)),
                     };
                     input.edit(text, selection, window, cx);
                 });
@@ -537,7 +594,7 @@ impl TaskDetail {
             return;
         };
         if checked {
-            desktop_common::sound::play_complete(&self.session.store);
+            desktop_common::sound::play_complete(cx);
         }
         self.word_count = fern_core::markdown::count_words(&updated);
         self.notes.update(cx, |input, cx| input.set_text(updated.clone(), cx));
@@ -548,9 +605,11 @@ impl TaskDetail {
     }
 
     pub fn print_current(&mut self, cx: &mut Context<Self>) {
+        self.flush_pending_text_edits(cx);
         if let Some(task) = self.session.task.clone() {
             let checklist = self.session.store.checklist(task.id).unwrap_or_default();
-            let html = crate::print::task_html(&task, &checklist, Local::now().date_naive(), i18n::t(cx));
+            let hour12 = desktop_common::ActivePreferences::get(cx).hour12;
+            let html = crate::print::task_html(&task, &checklist, Local::now().date_naive(), i18n::t(cx), hour12);
             crate::print::open_in_background("task", html, cx);
         }
     }
@@ -595,7 +654,7 @@ impl TaskDetail {
             cx.notify();
         }
         let Some(dir) = self.session.attachments_dir.clone() else {
-            eprintln!("failed to locate the attachment folder");
+            desktop_common::logging::log_error("task_detail", "failed to locate the attachment folder");
             return;
         };
         let staging_dir = dir.clone();
@@ -643,7 +702,7 @@ impl TaskDetail {
                         }
                     });
                     if let Err(err) = result {
-                        eprintln!("failed to attach {}: {err:#}", path.display());
+                        desktop_common::logging::log_error("task_detail", format!("failed to attach {}: {err:#}", path.display()));
                         if this.task_id() == Some(task) {
                             let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
                             this.session.attachment_errors.push(strings.attachment_failed
@@ -670,19 +729,47 @@ impl TaskDetail {
         }
         self.session.preferences = self.session.store.preferences().unwrap_or_default();
         match task {
-            Some(task) if self.task_id() == Some(task.id) => {
-                if self.task_title() != Some(task.title.as_str()) && self.title.read(cx).text() != task.title {
+            Some(mut task) if self.task_id() == Some(task.id) => {
+                let pending_title = self
+                    .pending_text_edits
+                    .as_ref()
+                    .is_some_and(|p| p.task_id == task.id && p.title.is_some());
+                let pending_notes = self
+                    .pending_text_edits
+                    .as_ref()
+                    .is_some_and(|p| p.task_id == task.id && p.notes.is_some());
+                let pending_location = self
+                    .pending_text_edits
+                    .as_ref()
+                    .is_some_and(|p| p.task_id == task.id && p.location.is_some());
+                if pending_title {
+                    if let Some(current) = &self.session.task {
+                        task.title = current.title.clone();
+                    }
+                } else if self.task_title() != Some(task.title.as_str()) && self.title.read(cx).text() != task.title {
                     self.title.update(cx, |input, cx| input.set_text(task.title.clone(), cx));
                 }
-                let old_notes = self.session.task.as_ref().map(|t| t.notes.as_str());
-                if old_notes != Some(task.notes.as_str()) && self.notes.read(cx).text() != task.notes {
-                    self.word_count = fern_core::markdown::count_words(&task.notes);
-                    self.notes.update(cx, |input, cx| input.set_text(task.notes.clone(), cx));
+                if pending_notes {
+                    if let Some(current) = &self.session.task {
+                        task.notes = current.notes.clone();
+                    }
+                } else {
+                    let old_notes = self.session.task.as_ref().map(|t| t.notes.as_str());
+                    if old_notes != Some(task.notes.as_str()) && self.notes.read(cx).text() != task.notes {
+                        self.word_count = fern_core::markdown::count_words(&task.notes);
+                        self.notes.update(cx, |input, cx| input.set_text(task.notes.clone(), cx));
+                    }
                 }
-                let old_loc = self.session.task.as_ref().and_then(|t| t.location.as_deref());
-                let new_loc = task.location.as_deref().unwrap_or("");
-                if old_loc != task.location.as_deref() && self.location_input.read(cx).text() != new_loc {
-                    self.location_input.update(cx, |input, cx| input.set_text(new_loc.to_owned(), cx));
+                if pending_location {
+                    if let Some(current) = &self.session.task {
+                        task.location = current.location.clone();
+                    }
+                } else {
+                    let old_loc = self.session.task.as_ref().and_then(|t| t.location.as_deref());
+                    let new_loc = task.location.as_deref().unwrap_or("");
+                    if old_loc != task.location.as_deref() && self.location_input.read(cx).text() != new_loc {
+                        self.location_input.update(cx, |input, cx| input.set_text(new_loc.to_owned(), cx));
+                    }
                 }
                 self.location_open |= task.location.is_some();
                 self.session.task = Some(task);
@@ -702,30 +789,22 @@ impl TaskDetail {
     pub(super) fn save(&mut self, cx: &mut Context<Self>, write: impl FnOnce(&Store, Id) -> anyhow::Result<()>) {
         // A new task is written only by finish_draft, with all of its fields together.
         if self.session.draft.is_some() { return; }
+        self.flush_pending_text_edits(cx);
         let Some(id) = self.task_id() else { return };
         if let Err(err) = write(&self.session.store, id) {
-            eprintln!("failed to save the task: {err:#}");
+            desktop_common::logging::log_error("task_detail", format!("failed to save the task: {err:#}"));
             return;
         }
         cx.emit(TaskUpdated);
     }
 
-    fn save_text(
-        &mut self,
-        cx: &mut Context<Self>,
-        field: TaskTextField,
-        write: impl FnOnce(&Store, Id) -> anyhow::Result<()>,
-    ) {
+    fn save_text(&mut self, cx: &mut Context<Self>, field: TaskTextField) {
         if self.session.draft.is_some() {
             return;
         }
         let Some(id) = self.task_id() else {
             return;
         };
-        if let Err(err) = write(&self.session.store, id) {
-            eprintln!("failed to save the task: {err:#}");
-            return;
-        }
         if let Some(task) = self.session.task.as_mut() {
             match &field {
                 TaskTextField::Title(text) => task.title = text.clone(),
@@ -733,8 +812,63 @@ impl TaskDetail {
                 TaskTextField::Location(value) => task.location = value.clone(),
             }
         }
+        if self.pending_text_edits.as_ref().is_some_and(|p| p.task_id != id) {
+            self.flush_pending_text_edits(cx);
+        }
+        let pending = self.pending_text_edits.get_or_insert_with(|| PendingTextEdits {
+            task_id: id,
+            ..Default::default()
+        });
+        match &field {
+            TaskTextField::Title(text) => pending.title = Some(text.clone()),
+            TaskTextField::Notes(text) => pending.notes = Some(text.clone()),
+            TaskTextField::Location(value) => pending.location = Some(value.clone()),
+        }
         cx.emit(TaskTextEdited { id, field });
+        self.pending_text_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.flush_pending_text_edits(cx);
+            });
+        }));
         cx.notify();
+    }
+
+    fn flush_pending_edits_to_store(store: &Store, pending: &PendingTextEdits) -> bool {
+        let mut ok = true;
+        if let Some(title) = &pending.title
+            && let Err(err) = store.set_title(pending.task_id, title)
+        {
+            desktop_common::logging::log_error("task_detail", format!("failed to save the task title: {err:#}"));
+            ok = false;
+        }
+        if let Some(notes) = &pending.notes
+            && let Err(err) = store.set_notes(pending.task_id, notes)
+        {
+            desktop_common::logging::log_error("task_detail", format!("failed to save the task notes: {err:#}"));
+            ok = false;
+        }
+        if let Some(location) = &pending.location
+            && let Err(err) = store.set_location(pending.task_id, location.as_deref())
+        {
+            desktop_common::logging::log_error("task_detail", format!("failed to save the task location: {err:#}"));
+            ok = false;
+        }
+        ok
+    }
+
+    /// Writes any debounced title/notes/location edits to SQLite immediately.
+    pub fn flush_pending_text_edits(&mut self, cx: &mut Context<Self>) -> bool {
+        self.pending_text_timer = None;
+        let Some(pending) = self.pending_text_edits.take() else {
+            return false;
+        };
+        let ok = Self::flush_pending_edits_to_store(&self.session.store, &pending);
+        if ok {
+            desktop_common::data_version::data_changed(cx.entity_id(), cx);
+            cx.emit(TaskTextFlushed(pending.task_id));
+        }
+        ok
     }
 
     pub(super) fn restore(&mut self, cx: &mut Context<Self>) {
@@ -805,6 +939,7 @@ impl TaskDetail {
         if self.is_read_only() {
             return;
         }
+        self.flush_pending_text_edits(cx);
         let Some(task) = self.session.task.as_mut() else { return };
         if task.id != task_id {
             return;
@@ -819,14 +954,14 @@ impl TaskDetail {
             self.session.store.set_completed(task.id, false)
         };
         if let Err(err) = result {
-            eprintln!("failed to update the task: {err:#}");
+            desktop_common::logging::log_error("task_detail", format!("failed to update the task: {err:#}"));
             return;
         }
         if let Some(action) = undo {
             let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
             cx.emit(Undoable(action, label));
             crate::completion_mark::record(task.id, cx);
-            desktop_common::sound::play_complete(&self.session.store);
+            desktop_common::sound::play_complete(cx);
         }
         if let Ok(Some(fresh)) = self.session.store.task(task.id) {
             *task = fresh;
@@ -840,6 +975,7 @@ impl TaskDetail {
         if self.is_read_only() {
             return;
         }
+        self.flush_pending_text_edits(cx);
         let Some(task) = self.session.task.clone() else { return };
         let completed = !task.is_completed();
         if completed
@@ -1034,6 +1170,14 @@ impl TaskDetail {
         self.editor_window.inline_popup = None;
         self.sync_sticky_inputs(cx);
         cx.notify();
+    }
+}
+
+impl Drop for TaskDetail {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending_text_edits.take() {
+            Self::flush_pending_edits_to_store(&self.session.store, &pending);
+        }
     }
 }
 

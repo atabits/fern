@@ -94,7 +94,7 @@ impl EditorWindow {
                             input.update(cx, |input, cx| input.clear(window, cx));
                             cx.emit(TaskUpdated);
                         }
-                        Err(err) => eprintln!("failed to add the comment: {err:#}"),
+                        Err(err) => desktop_common::logging::log_error("task_detail", format!("failed to add the comment: {err:#}")),
                     }
                     this.sync_comments();
                     cx.notify();

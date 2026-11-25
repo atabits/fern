@@ -23,14 +23,18 @@ pub fn open(focus: Entity<FocusView>, cx: &mut App) {
     {
         return;
     }
-    let bounds = Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx);
+    let bounds = Bounds::centered(
+        None,
+        desktop_common::layout::with_linux_csd_pad(size(px(WIDTH), px(HEIGHT))),
+        cx,
+    );
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions { title: Some(i18n::t(cx).focus.into()), appears_transparent: true, traffic_light_position: None }),
         window_decorations: Some(WindowDecorations::Client),
         app_owns_titlebar_drag: true,
         is_resizable: false,
-        app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),
+        app_id: Some(desktop_common::app_id()),
         ..Default::default()
     };
     let opened = cx.open_window(options, |window, cx| {
@@ -44,7 +48,7 @@ pub fn open(focus: Entity<FocusView>, cx: &mut App) {
     });
     match opened {
         Ok(handle) => cx.set_global(OpenFocusMini(Some(handle))),
-        Err(err) => eprintln!("failed to open the focus mini window: {err:#}"),
+        Err(err) => desktop_common::logging::log_error("focus_ui", format!("failed to open the focus mini window: {err:#}")),
     }
 }
 
@@ -69,7 +73,7 @@ pub struct FocusMini {
 }
 
 impl Render for FocusMini {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let now = chrono::Local::now().timestamp_millis();
@@ -79,7 +83,7 @@ impl Render for FocusMini {
         let active_noise = noise != desktop_common::sound::WhiteNoise::Off;
         let noise_name = strings.focus_white_noise_names[noise.index()];
         let button = |id: &'static str, icon: IconName| IconButton::new(id, icon).size(px(28.)).icon_size(IconSize::Small);
-        v_flex()
+        let root = v_flex()
             .relative()
             .size_full()
             .track_focus(&self.focus_handle)
@@ -187,16 +191,18 @@ impl Render for FocusMini {
                                 cx.notify();
                             })),
                     )
-                    .child(
-                        button("focus-mini-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
-                            .icon_color(if self.pinned { Color::Accent } else { Color::Muted })
-                            .tooltip(Tooltip::text(if self.pinned { strings.unpin } else { strings.pin }))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.pinned = !this.pinned;
-                                desktop_common::sticky_windows::set_topmost(window, this.pinned);
-                                cx.notify();
-                            })),
-                    )
+                    .when(!desktop_common::is_wayland_session(), |el| {
+                        el.child(
+                            button("focus-mini-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
+                                .icon_color(if self.pinned { Color::Accent } else { Color::Muted })
+                                .tooltip(Tooltip::text(if self.pinned { strings.unpin } else { strings.pin }))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.pinned = !this.pinned;
+                                    desktop_common::sticky_windows::set_topmost(window, this.pinned);
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
                         button("focus-mini-close", IconName::X)
                             .icon_color(Color::Muted)
@@ -220,6 +226,7 @@ impl Render for FocusMini {
                                 .bg(if paused { theme.status().warning } else { theme.colors().accent }),
                         ),
                 )
-            })
+            });
+        desktop_common::layout::linux_window_frame(root, px(8.), window, cx)
     }
 }

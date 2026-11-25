@@ -7,7 +7,7 @@ use gpui::{Entity, Focusable as _, FontWeight, ScrollHandle, Subscription};
 use ui::prelude::*;
 use ui::{Button, ButtonVariant, Modal, Placement, PopoverAttachment, popover};
 
-use desktop_common::data_version::data_changed;
+use desktop_common::data_version::{DataScope, data_changed_scoped};
 use desktop_common::paths::attachments_dir;
 use desktop_common::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 use desktop_common::{calendar, colors as lists_panel};
@@ -87,8 +87,8 @@ pub(crate) enum DateField {
 impl DateField {
     const ALL: [Self; 3] = [Self::Year, Self::Month, Self::Day];
 
-    pub(crate) fn ordered(strings: &Strings) -> [Self; 3] {
-        match calendar::effective_date_format(strings) {
+    pub(crate) fn ordered(strings: &Strings, cx: &App) -> [Self; 3] {
+        match calendar::effective_date_format(strings, cx) {
             DateFormat::MonthDayYear => [Self::Month, Self::Day, Self::Year],
             DateFormat::DayMonthYear => [Self::Day, Self::Month, Self::Year],
             DateFormat::YearMonthDay | DateFormat::IsoYearMonthDay => Self::ALL,
@@ -224,7 +224,7 @@ impl CountdownView {
                     return;
                 }
                 draft.close_date_part();
-                let order = DateField::ordered(i18n::t(cx));
+                let order = DateField::ordered(i18n::t(cx), cx);
                 if let Some(next) = order.windows(2).find(|pair| pair[0] == field).map(|pair| pair[1]) {
                     window.focus(&draft.date_inputs.fields[next as usize].focus_handle(cx), cx);
                 }
@@ -360,7 +360,7 @@ impl CountdownView {
 
     /// "Edit" in a card's "…" menu: the countdown's popover, filled in.
     pub fn start_edit(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         let Some(countdown) = self.countdowns.iter().find(|c| c.id == id).cloned() else {
@@ -438,7 +438,7 @@ impl CountdownView {
             })
         };
         let count = field("1", cx);
-        let time = field(&calendar::format_time(fern_core::countdown::reminder_time(), i18n::t(cx)), cx);
+        let time = field(&calendar::format_time(fern_core::countdown::reminder_time(), i18n::t(cx), cx), cx);
         for input in [&count, &time] {
             cx.subscribe(input, |_, _, _: &Changed, cx| cx.notify()).detach();
             cx.subscribe_in(input, window, |this, _, _: &Submitted, window, cx| {
@@ -540,10 +540,10 @@ impl CountdownView {
             )
         });
         if let Err(err) = added {
-            eprintln!("failed to add the countdown: {err:#}");
+            desktop_common::logging::log_error("countdown_ui", format!("failed to add the countdown: {err:#}"));
         }
         if mutated {
-            data_changed(cx.entity_id(), cx);
+            data_changed_scoped(cx.entity_id(), DataScope::COUNTDOWN, cx);
         }
         self.reload(cx);
     }

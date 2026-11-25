@@ -1737,6 +1737,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "web-time",
+ "zeroize",
  "zip",
 ]
 
@@ -1775,6 +1776,7 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
+ "settings_ui",
  "sha2 0.10.9",
  "sticky_ui",
  "task_ui",
@@ -5469,6 +5471,26 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "settings_ui"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "assets",
+ "chrono",
+ "desktop_common",
+ "desktop_sync",
+ "fern_core",
+ "fern_i18n",
+ "gpui",
+ "icons",
+ "serde_json",
+ "task_ui",
+ "theme",
+ "ui",
+ "uuid",
 ]
 
 [[package]]

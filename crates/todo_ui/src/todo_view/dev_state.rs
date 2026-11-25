@@ -6,7 +6,7 @@ impl TodoView {
     /// `FERN_DEV_STATE="add=<quick-add text>;list=<new list>;view=<list name>;select=<title part>;
     /// popup=due|priority|tags|list;menu=header;new-list=1"`
     pub(super) fn apply_dev_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Ok(state) = std::env::var("FERN_DEV_STATE") else { return };
+        let Some(state) = desktop_common::dev_state_value() else { return };
         for part in state.split(';') {
             match part.split_once('=') {
                 Some(("add", text)) => {
@@ -33,7 +33,7 @@ impl TodoView {
                 Some(("view", "tomorrow")) => self.set_view(View::Tomorrow, cx),
                 // `type=<text>`: text in the quick-add field, as if typed (not added).
                 Some(("type", text)) => {
-                    self.input.update(cx, |input, cx| input.set_text(text.to_owned(), cx));
+                    self.quick_add.input.update(cx, |input, cx| input.set_text(text.to_owned(), cx));
                     self.update_quick_add_hint(cx);
                 }
                 // `mini=month`: the mini calendar expanded to the month.
@@ -126,7 +126,7 @@ impl TodoView {
                 Some(("kdrop", spec)) => {
                     // `kdrop=<task title part>><column number>`: drop a card on a kanban column.
                     let strings = i18n::t(cx);
-                    let columns = self.board_columns(strings);
+                    let columns = self.board_columns(strings, cx);
                     if let Some((needle, column)) = spec.split_once('>')
                         && let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id)
                         && let Some(target) = column.parse::<usize>().ok().and_then(|c| columns.get(c)).and_then(|col| col.drop.clone())
@@ -135,10 +135,10 @@ impl TodoView {
                     }
                 }
                 Some(("column-menu", name)) => {
-                    self.column_menu = self.sections.iter().find(|s| s.name == name).map(|s| (s.id, false));
+                    self.kanban.column_menu = self.sections.iter().find(|s| s.name == name).map(|s| (s.id, false));
                 }
                 Some(("section-menu", name)) => {
-                    self.section_menu = self.sections.iter().find(|s| s.name == name).map(|s| s.id);
+                    self.overlays.section_menu = self.sections.iter().find(|s| s.name == name).map(|s| s.id);
                 }
                 Some(("template", needle)) => {
                     if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
@@ -147,56 +147,56 @@ impl TodoView {
                 }
                 Some(("menu", "templates")) => {
                     self.cached_templates = self.store.templates().unwrap_or_default();
-                    self.templates_open = true;
+                    self.quick_add.templates_open = true;
                 }
-                Some(("menu", "input-box")) => self.input_box_open = true,
+                Some(("menu", "input-box")) => self.quick_add.input_box_open = true,
                 Some(("menu", "timeline")) => self.set_layout(false, true, cx),
                 Some(("menu", "kanban")) => self.set_layout(true, false, cx),
-                Some(("menu", "view-options")) => self.view_options = Some(false),
+                Some(("menu", "view-options")) => self.overlays.view_options = Some(false),
                 Some(("menu", "suggestions")) => {
                     self.suggestions_open = Some(false);
                     self.refresh_suggestions();
                 }
-                Some(("menu", "view-options-date")) => self.view_options = Some(true),
+                Some(("menu", "view-options-date")) => self.overlays.view_options = Some(true),
                 Some(("show-date", "countdown")) => self.save_preferences(|p| p.countdown_dates = true, cx),
                 Some(("menu", "arrange")) => {
                     self.set_layout(false, true, cx);
-                    self.arrange_open = true;
+                    self.timeline.arrange_open = true;
                 }
                 Some(("menu", "timeline-week")) => {
                     self.set_layout(false, true, cx);
-                    self.timeline_scale = 1;
+                    self.timeline.scale = 1;
                 }
                 // `menu=add-date-repeat`: the picker with a time and a weekly repeat, Repeat open.
                 Some(("menu", "add-date-repeat")) => {
-                    self.add_draft.date = Some(Self::today() + chrono::Duration::days(1));
-                    self.add_draft.time = chrono::NaiveTime::from_hms_opt(9, 0, 0);
-                    self.add_draft.repeat = Some(fern_core::Recurrence::new(fern_core::Frequency::Weekly, 1));
-                    self.add_date_month = Some(crate::calendar::month_start(Self::today()));
-                    self.add_date_row = Some(2);
+                    self.quick_add.draft.date = Some(Self::today() + chrono::Duration::days(1));
+                    self.quick_add.draft.time = chrono::NaiveTime::from_hms_opt(9, 0, 0);
+                    self.quick_add.draft.repeat = Some(fern_core::Recurrence::new(fern_core::Frequency::Weekly, 1));
+                    self.quick_add.date_month = Some(crate::calendar::month_start(Self::today()));
+                    self.quick_add.date_row = Some(2);
                 }
                 // `menu=add-date`: the field's date picker open, with tomorrow picked.
                 // The add field's picker on its Duration tab, from the next full hour.
                 Some(("menu", "add-duration")) => {
-                    self.add_date_month = Some(crate::calendar::month_start(Self::today()));
+                    self.quick_add.date_month = Some(crate::calendar::month_start(Self::today()));
                     let mut range = crate::due_picker::DueDraft { month: crate::calendar::month_start(Self::today()), ..Default::default() };
                     range.start_duration(Local::now().naive_local(), self.preferences.task_defaults.duration);
-                    self.add_range = Some(range);
+                    self.quick_add.range = Some(range);
                 }
                 Some(("menu", "add-date")) => {
-                    self.add_draft.date = Some(Self::today() + chrono::Duration::days(1));
-                    self.add_date_month = Some(crate::calendar::month_start(Self::today()));
+                    self.quick_add.draft.date = Some(Self::today() + chrono::Duration::days(1));
+                    self.quick_add.date_month = Some(crate::calendar::month_start(Self::today()));
                 }
                 Some(("menu", "detailed-input")) => {
                     self.save_preferences(|p| p.detailed_input = true, cx);
                     self.sync_input_placeholder(cx);
                 }
                 Some(("menu", "add-tags")) => {
-                    self.add_tags = Some(vec!["home".to_owned()]);
+                    self.quick_add.tags = Some(vec!["home".to_owned()]);
                 }
                 Some(("menu", "add")) => {
-                    self.add_menu_open = true;
-                    self.add_list_side = true;
+                    self.quick_add.menu_open = true;
+                    self.quick_add.list_side = true;
                 }
                 Some(("menu", "activity")) => self.open_list_activity(cx),
                 // `context=<title part>`: that task's right-click menu, opened beside its row.
@@ -212,12 +212,12 @@ impl TodoView {
                     if mode != "normal" {
                         self.set_filter_advanced(true, window, cx);
                     }
-                    if let Some(edit) = self.filter_edit.as_mut() {
+                    if let Some(edit) = self.overlays.filter_edit.as_mut() {
                         edit.preview = mode == "preview";
                         edit.examples_open = mode == "examples";
                     }
                     if mode == "chain"
-                        && let Some(edit) = self.filter_edit.as_mut()
+                        && let Some(edit) = self.overlays.filter_edit.as_mut()
                     {
                         edit.draft.rules = fern_core::filter::examples()[2].rules.clone();
                         edit.inputs = Self::filter_inputs(&edit.draft, window, cx);
@@ -268,13 +268,13 @@ impl TodoView {
                     let popup = popup.to_owned();
                     self.detail.update(cx, |detail, cx| detail.dev_open_popup(&popup, cx));
                 }
-                Some(("menu", "header")) => self.header_menu_open = true,
-                Some(("menu", "sort")) => self.sort_menu = Some(Some(SortMenu::Sort)),
-                Some(("menu", "sort-root")) => self.sort_menu = Some(None),
-                Some(("menu", "group")) => self.sort_menu = Some(Some(SortMenu::Group)),
+                Some(("menu", "header")) => self.overlays.header_menu_open = true,
+                Some(("menu", "sort")) => self.overlays.sort_menu = Some(Some(SortMenu::Sort)),
+                Some(("menu", "sort-root")) => self.overlays.sort_menu = Some(None),
+                Some(("menu", "group")) => self.overlays.sort_menu = Some(Some(SortMenu::Group)),
                 Some(("group", key)) => self.set_sort(None, Some(GroupBy::from_key(key)), window, cx),
                 Some(("sort", key)) => self.set_sort(Some(SortBy::from_key(key)), None, window, cx),
-                Some(("menu", "dates")) => self.closed_menu = Some(ClosedMenu::Dates),
+                Some(("menu", "dates")) => self.overlays.closed_menu = Some(ClosedMenu::Dates),
                 Some(("menu", "other-date")) => {
                     self.open_other_date(cx);
                     self.update_other_date(cx, |start, _, picking, _| {
@@ -282,7 +282,7 @@ impl TodoView {
                         *picking = Some(RangeEnd::End);
                     });
                 }
-                Some(("menu", "lists")) => self.closed_menu = Some(ClosedMenu::Lists(self.closed_lists.clone())),
+                Some(("menu", "lists")) => self.overlays.closed_menu = Some(ClosedMenu::Lists(self.closed_lists.clone())),
                 Some(("range", "this-week")) => {
                     self.closed_range = ClosedRange::ThisWeek;
                     self.invalidate_rows();
@@ -305,7 +305,7 @@ impl TodoView {
                     let (which, menu) = spec.split_once('>').unwrap_or((spec, ""));
                     let list = self.lists.iter().find(|l| l.name == which).map(|l| l.id);
                     self.open_list_dialog(list, None, window, cx);
-                    if let Some(dialog) = &self.list_dialog {
+                    if let Some(dialog) = &self.overlays.list_dialog {
                         dialog.update(cx, |dialog, cx| dialog.dev_open(menu, window, cx));
                     }
                 }
@@ -345,7 +345,7 @@ impl TodoView {
                     let tag = (which != "new").then(|| which.to_owned());
                     self.open_tag_dialog(tag, None, window, cx);
                     if menu == "parent"
-                        && let Some(dialog) = &self.tag_dialog
+                        && let Some(dialog) = &self.overlays.tag_dialog
                     {
                         dialog.update(cx, |dialog, cx| dialog.dev_open_parent(cx));
                     }
@@ -354,13 +354,13 @@ impl TodoView {
                     let (tag, menu) = spec.split_once('>').unwrap_or((spec, ""));
                     self.open_merge_dialog(tag.to_owned(), window, cx);
                     if menu == "open"
-                        && let Some(dialog) = &self.merge_dialog
+                        && let Some(dialog) = &self.overlays.merge_dialog
                     {
                         dialog.update(cx, |dialog, cx| dialog.dev_open(cx));
                     }
                 }
-                Some(("tag-menu", tag)) => self.list_menu = Some((ListMenuTarget::Tag(tag.to_owned()), gpui::point(px(150.), px(420.)))),
-                Some(("tags-menu", _)) => self.list_menu = Some((ListMenuTarget::TagsHeading, gpui::point(px(170.), px(330.)))),
+                Some(("tag-menu", tag)) => self.overlays.list_menu = Some((ListMenuTarget::Tag(tag.to_owned()), gpui::point(px(150.), px(420.)))),
+                Some(("tags-menu", _)) => self.overlays.list_menu = Some((ListMenuTarget::TagsHeading, gpui::point(px(170.), px(330.)))),
                 Some(("sub-tag", spec)) => {
                     let (tag, parent) = spec.split_once('>').unwrap_or((spec, ""));
                     let result = self.store.update_tag(tag, tag, None, Some(parent));
@@ -370,12 +370,12 @@ impl TodoView {
                 // `list-menu=<list>` and `folder-menu=<folder>` open their right-click menus.
                 Some(("list-menu", name)) => {
                     if let Some(id) = self.lists.iter().find(|l| l.name == name).map(|l| l.id) {
-                        self.list_menu = Some((ListMenuTarget::List(id), gpui::point(px(180.), px(260.))));
+                        self.overlays.list_menu = Some((ListMenuTarget::List(id), gpui::point(px(180.), px(260.))));
                     }
                 }
                 Some(("folder-menu", name)) => {
                     if let Some(id) = self.folders.iter().find(|f| f.name == name).map(|f| f.id) {
-                        self.list_menu = Some((ListMenuTarget::Folder(id), gpui::point(px(180.), px(260.))));
+                        self.overlays.list_menu = Some((ListMenuTarget::Folder(id), gpui::point(px(180.), px(260.))));
                     }
                 }
                 _ => {}

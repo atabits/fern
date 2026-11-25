@@ -202,22 +202,32 @@ pub struct SyncRequest {
     sent: i64,
 }
 
-fn change_file_key(entity: &str, row: &Map<String, Json>) -> Option<String> {
+/// Extracts the raw local attachment or countdown background filename from a plaintext synced row.
+pub fn extract_plaintext_file_name(entity: &str, row: &Map<String, Json>) -> Option<String> {
     match entity {
         "task_attachments" => {
             if let Some(stored) = row.get("stored_name").and_then(Json::as_str).filter(|s| !s.is_empty()) {
-                return Some(file_key(stored));
+                return Some(stored.to_owned());
             }
-            let id = row.get("id").and_then(Json::as_str)?;
-            let name = row.get("name").and_then(Json::as_str)?;
-            Some(file_key(&format!("{id}-{name}")))
+            let id = row.get("id").and_then(Json::as_str).filter(|s| !s.is_empty())?;
+            let name = row.get("name").and_then(Json::as_str).filter(|s| !s.is_empty())?;
+            Some(format!("{id}-{name}"))
         }
         "countdowns" => {
-            let bg = row.get("background").and_then(Json::as_str).filter(|s| !s.is_empty())?;
-            Some(file_key(bg))
+            if let Some(bg) = row.get("background").and_then(Json::as_str).filter(|s| !s.is_empty()) {
+                return Some(bg.to_owned());
+            }
+            row.get("cover_image")
+                .and_then(Json::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
         }
         _ => None,
     }
+}
+
+fn change_file_key(entity: &str, row: &Map<String, Json>) -> Option<String> {
+    extract_plaintext_file_name(entity, row).map(|name| file_key(&name))
 }
 
 impl Store {

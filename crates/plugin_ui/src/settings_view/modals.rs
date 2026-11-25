@@ -481,11 +481,9 @@ impl PluginSettingsView {
                 el.debug_selector(|| "plugin-script-delete-modal".to_owned())
             })
             .child(
-                ConfirmDialog::new("plugin-script-delete", strings.confirm_delete_script)
+                ConfirmDialog::new("plugin-script-delete", strings.confirm_delete_script, strings.cancel, strings.delete)
                     .width(px(340.))
                     .description(name.to_owned())
-                    .cancel_label(strings.cancel)
-                    .confirm_label(strings.delete)
                     .destructive(true)
                     .on_cancel(cx.listener(|this, _, _, cx| {
                         this.confirm_delete_script = None;

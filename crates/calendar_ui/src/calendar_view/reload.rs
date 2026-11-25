@@ -20,35 +20,32 @@ pub(super) enum ReloadWindow {
 
 impl CalendarView {
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
-        self.active = active;
-        if active && self.dirty {
-            self.dirty = false;
+        if self.refresh.set_active(active, cx) {
             self.card_updated(cx);
         }
     }
 
     pub fn sync_external(&mut self, cx: &mut Context<Self>) {
-        if self.active {
+        if self.refresh.mark_dirty_or_reload() {
             self.card_updated(cx);
         } else {
-            self.dirty = true;
             self.loaded_window = None;
         }
     }
 
     /// The days on the hour axis: the anchor's week, the anchor, or several days from it.
-    pub(super) fn shown_days(&self) -> Vec<NaiveDate> {
+    pub(super) fn shown_days(&self, cx: &App) -> Vec<NaiveDate> {
         match self.mode {
             CalendarMode::Day => vec![self.anchor],
             CalendarMode::MultiDay(n) => (0..n as i64).map(|i| self.anchor + chrono::Duration::days(i)).collect(),
-            _ => calendar::week_of(self.anchor).into_iter().filter(|d| self.options.shows_day(*d)).collect(),
+            _ => calendar::week_of(self.anchor, cx).into_iter().filter(|d| self.options.shows_day(*d)).collect(),
         }
     }
 
-    pub(super) fn month_grid_weeks(&self) -> Vec<[NaiveDate; 7]> {
+    pub(super) fn month_grid_weeks(&self, cx: &App) -> Vec<[NaiveDate; 7]> {
         match self.mode {
-            CalendarMode::MultiWeek(n) => calendar::weeks_from(self.anchor, n as usize),
-            _ => calendar::month_weeks(self.month),
+            CalendarMode::MultiWeek(n) => calendar::weeks_from(self.anchor, n as usize, cx),
+            _ => calendar::month_weeks(self.month, cx),
         }
     }
 
@@ -76,6 +73,15 @@ impl CalendarView {
     pub(super) fn events_between(&self, from: NaiveDate, to: NaiveDate, cx: &App) -> Vec<EventBar> {
         let Some(feeds) = crate::subscriptions::feeds(cx) else { return Vec::new() };
         let accent = cx.theme().colors().accent;
+        let key = (
+            from,
+            to,
+            self.feeds_revision,
+            [accent.h.to_bits(), accent.s.to_bits(), accent.l.to_bits(), accent.a.to_bits()],
+        );
+        if let Some(cached) = self.events_cache.borrow().get(&key) {
+            return cached.clone();
+        }
         let mut events: Vec<EventBar> = feeds
             .read(cx)
             .occurrences(from, to)
@@ -97,6 +103,11 @@ impl CalendarView {
             })
             .collect();
         events.sort_by_key(|event| (event.start_time.is_some(), event.start_time));
+        let mut cache = self.events_cache.borrow_mut();
+        if cache.len() > 32 {
+            cache.clear();
+        }
+        cache.insert(key, events.clone());
         events
     }
 
@@ -112,7 +123,7 @@ impl CalendarView {
     }
 
     pub(super) fn apply_task_text_edit(&mut self, edit: &TaskTextEdited, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         } else if self.mode == CalendarMode::Agenda {
             if let TaskTextField::Title(title) = &edit.field {
@@ -135,28 +146,21 @@ impl CalendarView {
             }
             cx.notify();
         }
-        self.text_edit_sync_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(300)).await;
-            let _ = this.update(cx, |this, cx| {
-                this.text_edit_sync_task = None;
-                crate::data_version::data_changed(cx.entity_id(), cx);
-            });
-        }));
     }
 
-    fn reload_window(&self) -> ReloadWindow {
+    fn reload_window(&self, cx: &App) -> ReloadWindow {
         match self.mode {
             CalendarMode::Agenda => ReloadWindow::Agenda(self.agenda_start()),
             CalendarMode::Year => ReloadWindow::Year,
             CalendarMode::Month | CalendarMode::MultiWeek(_) => {
-                let weeks = self.month_grid_weeks();
+                let weeks = self.month_grid_weeks(cx);
                 match weeks.first().zip(weeks.last()) {
                     Some((first, last)) => ReloadWindow::Grid(first[0], last[6]),
                     None => ReloadWindow::Grid(self.month, self.month),
                 }
             }
             _ => {
-                let days = self.shown_days();
+                let days = self.shown_days(cx);
                 match days.first().copied().zip(days.last().copied()) {
                     Some((start, end)) => ReloadWindow::Grid(start, end),
                     None => ReloadWindow::Grid(self.anchor, self.anchor),
@@ -166,9 +170,9 @@ impl CalendarView {
     }
 
     fn reload_if_needed(&mut self, cx: &mut Context<Self>) {
-        if self.dirty
+        if self.refresh.is_dirty()
             || self.context_menu.is_some()
-            || self.loaded_window != Some(self.reload_window())
+            || self.loaded_window != Some(self.reload_window(cx))
         {
             self.reload(cx);
         } else {
@@ -177,8 +181,9 @@ impl CalendarView {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.dirty = false;
+        self.refresh.mark_clean(cx);
         self.year_heatmap.clear();
+        self.events_cache.borrow_mut().clear();
         self.options = self.store.calendar_options().unwrap_or_default();
         self.preferences = self.store.preferences().unwrap_or_default();
         let lists = self.store.lists().unwrap_or_default();
@@ -264,18 +269,26 @@ impl CalendarView {
                 }
                 Err(err) => {
                     self.loaded_window = None;
-                    eprintln!("failed to load the agenda: {err:#}");
+                    desktop_common::logging::log_error(
+                        "calendar_ui",
+                        format!("failed to load the agenda: {err:#}"),
+                    );
                 }
             }
             cx.notify();
             return;
         }
-        let window = self.reload_window();
+        let window = self.reload_window(cx);
         let range = match window {
             ReloadWindow::Grid(start, end) => Some((start, end)),
             ReloadWindow::Year | ReloadWindow::Agenda(_) => None,
         };
-        let Ok(mut all) = self.store.tasks().inspect_err(|err| eprintln!("failed to load calendar tasks: {err:#}")) else {
+        let Ok(mut all) = self.store.tasks().inspect_err(|err| {
+            desktop_common::logging::log_error(
+                "calendar_ui",
+                format!("failed to load calendar tasks: {err:#}"),
+            );
+        }) else {
             self.loaded_window = None;
             cx.notify();
             return;
@@ -288,7 +301,7 @@ impl CalendarView {
         self.undated.clear();
         self.horizon_tasks.clear();
         let mut repeats_before_range = Vec::new();
-        let horizons_enabled = calendar::horizons_enabled();
+        let horizons_enabled = calendar::horizons_enabled(cx);
         for task in all.into_iter().filter(|task| !task.is_deleted()) {
             let closed = task.is_closed();
             if !closed && let Some(due) = task.due_date {
@@ -496,7 +509,7 @@ impl CalendarView {
         self.reload_if_needed(cx);
     }
 
-    pub(super) fn new_task_day(&self, today: NaiveDate) -> NaiveDate {
+    pub(super) fn new_task_day(&self, today: NaiveDate, cx: &App) -> NaiveDate {
         use chrono::Duration;
         let (start, end) = match self.mode {
             CalendarMode::Month => (self.month, calendar::add_months(self.month, 1).pred_opt().unwrap_or(self.month)),
@@ -504,12 +517,12 @@ impl CalendarView {
                 (self.month, calendar::add_months(self.month, 12).pred_opt().unwrap_or(self.month))
             }
             CalendarMode::MultiWeek(count) => {
-                let start = calendar::week_of(self.anchor)[0];
+                let start = calendar::week_of(self.anchor, cx)[0];
                 (start, start + Duration::days(i64::from(count) * 7 - 1))
             }
             CalendarMode::Agenda => (self.agenda_start(), self.agenda_start() + Duration::days(AGENDA_DAYS)),
             _ => {
-                let days = self.shown_days();
+                let days = self.shown_days(cx);
                 (days[0], days[days.len() - 1])
             }
         };
@@ -551,8 +564,8 @@ impl CalendarView {
     }
 
     /// ISO week horizon for the currently displayed week in Week view.
-    pub(super) fn displayed_week_horizon(&self) -> fern_core::Horizon {
-        let week = calendar::week_of(self.anchor);
+    pub(super) fn displayed_week_horizon(&self, cx: &App) -> fern_core::Horizon {
+        let week = calendar::week_of(self.anchor, cx);
         let ref_day = week
             .iter()
             .find(|d| d.weekday() == chrono::Weekday::Thu)
@@ -569,8 +582,9 @@ impl CalendarView {
         target: fern_core::Horizon,
         today: NaiveDate,
         include_past_when_current: bool,
+        cx: &App,
     ) -> Vec<(&Task, bool)> {
-        if !calendar::horizons_enabled() {
+        if !calendar::horizons_enabled(cx) {
             return Vec::new();
         }
         let lists: &[fern_core::List] = if self.filter.all { &self.lists } else { &[] };
@@ -588,11 +602,11 @@ impl CalendarView {
         out
     }
 
-    pub(super) fn toolbar_month(&self) -> NaiveDate {
+    pub(super) fn toolbar_month(&self, cx: &App) -> NaiveDate {
         match self.mode {
             CalendarMode::Month | CalendarMode::Year => self.month,
             CalendarMode::Agenda => calendar::month_start(self.agenda_start()),
-            CalendarMode::Week | CalendarMode::MultiWeek(_) => calendar::week_of(self.anchor)[0],
+            CalendarMode::Week | CalendarMode::MultiWeek(_) => calendar::week_of(self.anchor, cx)[0],
             _ => self.anchor,
         }
     }

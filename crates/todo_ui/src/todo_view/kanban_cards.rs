@@ -93,7 +93,16 @@ impl TodoView {
             .then(|| task.notes.lines().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_owned()))
             .flatten();
         let has_note_icon = details_line.is_none() && !task.notes.trim().is_empty();
-        let due = task.due_date.map(|date| task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates));
+        let due = task.due_date.map(|date| {
+            task_rows::row_due_label(
+                date,
+                task.due_time,
+                today,
+                strings,
+                self.preferences.countdown_dates,
+                cx,
+            )
+        });
         let horizon_badge = task_rows::horizon_badge(task, today, strings);
         let has_reminders = !task.reminders.is_empty() && !settled_done;
         let has_location = task.location.as_deref().is_some_and(|l| !l.trim().is_empty());
@@ -136,9 +145,9 @@ impl TodoView {
         let draggable = self.view != View::Trash && !read_only && title_input.is_none();
         let dragged = DraggedTask { id, title: task.title.clone().into() };
         let dragging_active = cx.has_active_drag();
-        let is_being_dragged = dragging_active && self.task_drag_origin.is_some_and(|(d, _)| d == id);
+        let is_being_dragged = dragging_active && self.panel_dnd.task_drag_origin.is_some_and(|(d, _)| d == id);
         let drop_indicator = dragging_active
-            .then(|| self.task_drop.as_ref().filter(|plan| plan.target_id == id).cloned())
+            .then(|| self.panel_dnd.task_drop.as_ref().filter(|plan| plan.target_id == id).cloned())
             .flatten();
 
         // Match TickTick's `.kanban-bg-el`: `bg-main-background`, subtle dark/light border,
@@ -170,7 +179,7 @@ impl TodoView {
             base_surface.blend(theme.colors().ghost_element_hover)
         };
         let accent = theme.colors().accent;
-        let row_bounds = self.kanban_row_bounds.clone();
+        let row_bounds = self.kanban.row_bounds.clone();
         let card_open_here = self.card == Some(id);
 
         let content_line = h_flex()
@@ -433,14 +442,14 @@ impl TodoView {
                     let fallback_x = window.mouse_position().x;
                     view.update(cx, |this, cx| {
                         let start_x = this
-                            .kanban_row_bounds
+                            .kanban.row_bounds
                             .borrow()
                             .get(&dragged_id)
                             .copied()
                             .map_or(fallback_x, |area| area.left() + cursor_offset.x);
-                        this.task_drag_origin = Some((dragged_id, start_x));
-                        this.task_drop = None;
-                        this.kanban_hover_col = None;
+                        this.panel_dnd.task_drag_origin = Some((dragged_id, start_x));
+                        this.panel_dnd.task_drop = None;
+                        this.kanban.hover_col = None;
                         cx.notify();
                     })
                     .ok();
@@ -531,7 +540,7 @@ impl TodoView {
                     .border_color(habit_border)
                     .bg(base_surface)
                     .when(checked, |el| el.opacity(0.62))
-                    .when(!dark && !self.kanban_column_color, |el| el.shadow_xs())
+                    .when(!dark && !self.kanban.column_color, |el| el.shadow_xs())
                     .hover(move |s| s.bg(habit_hover))
                     .cursor_pointer()
                     .child(
@@ -561,14 +570,14 @@ impl TodoView {
                         };
                         this.check(result);
                         desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                        this.reload_today_habits();
+                        this.reload_today_habits(cx);
                         cx.notify();
                     }))
                     .on_mouse_down(
                         gpui::MouseButton::Right,
                         cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
                             cx.stop_propagation();
-                            this.habit_menu = Some((id, ev.position));
+                            this.overlays.habit_menu = Some((id, ev.position));
                             cx.notify();
                         }),
                     )
@@ -577,8 +586,8 @@ impl TodoView {
             .collect();
         let col_width = self.kanban_column_width();
         let dark = theme.is_dark();
-        let tint = self.kanban_column_color.then(|| lists_panel::parse_color(Some("#A5A5A5"))).flatten();
-        let card_px = if self.kanban_column_color { px(10.) } else { px(12.) };
+        let tint = self.kanban.column_color.then(|| lists_panel::parse_color(Some("#A5A5A5"))).flatten();
+        let card_px = if self.kanban.column_color { px(10.) } else { px(12.) };
         Some(
             v_flex()
                 .w(px(col_width))

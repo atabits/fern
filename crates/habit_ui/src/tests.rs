@@ -43,7 +43,7 @@ fn restoring_the_last_archived_habit_shows_its_weekly_progress_only_in_active(cx
         });
     });
     assert!(cx.debug_bounds("habit-week-progress").is_some());
-    cx.update(|_, cx| assert_eq!(view.read(cx).day_progress(today), DayProgress::Fraction(1.0)));
+    cx.update(|_, cx| assert_eq!(view.read(cx).day_progress(today, cx), DayProgress::Fraction(1.0)));
 }
 
 #[gpui::test]
@@ -206,22 +206,22 @@ fn new_inactive_defers_reload_until_activated_or_selected(cx: &mut TestAppContex
         let view = cx.new(|cx| HabitView::new_inactive(store.clone(), cx));
         {
             let v = view.read(cx);
-            assert!(!v.active);
-            assert!(v.dirty);
+            assert!(!v.refresh.is_active());
+            assert!(v.refresh.is_dirty());
             assert!(v.habits.is_empty());
         }
 
         view.update(cx, |v, cx| v.set_active(true, cx));
         let v = view.read(cx);
-        assert!(v.active);
-        assert!(!v.dirty);
+        assert!(v.refresh.is_active());
+        assert!(!v.refresh.is_dirty());
         assert_eq!(v.habits.len(), 2);
 
         let view_select = cx.new(|cx| HabitView::new_inactive(store.clone(), cx));
-        assert!(view_select.read(cx).dirty);
+        assert!(view_select.read(cx).refresh.is_dirty());
         view_select.update(cx, |v, cx| v.select(archived_habit.id, cx));
         let vs = view_select.read(cx);
-        assert!(!vs.dirty);
+        assert!(!vs.refresh.is_dirty());
         assert!(vs.show_archived);
         assert_eq!(vs.selected, Some(archived_habit.id));
         assert!(vs.habits.iter().any(|h| h.id == active_habit.id));

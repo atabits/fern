@@ -44,7 +44,7 @@ impl FocusView {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(parent.display(cx).map(|display| display.id()), size(px(460.), px(400.)), cx))),
             titlebar: Some(TitlebarOptions { title: Some(strings.focus_review_title.into()), ..Default::default() }),
             is_resizable: false,
-            app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),
+            app_id: Some(desktop_common::app_id()),
             ..Default::default()
         };
         self.finish_prompt = true;
@@ -53,7 +53,7 @@ impl FocusView {
             Err(error) => {
                 self.finish_prompt = false;
                 if !paused && !limited && let Some(running) = self.running.as_mut() { running.timer.resume(now_ms()); }
-                eprintln!("failed to open the focus review: {error:#}");
+                desktop_common::logging::log_error("focus_ui", format!("failed to open the focus review: {error:#}"));
                 self.message = Some(strings.focus_review_open_failed.to_owned());
             }
         }
@@ -231,7 +231,7 @@ impl FocusReview {
                 .map_or((None, None, strings.focus), |t| (t.task_id, t.habit_id, t.title.as_str()));
             let start = running.timer.started_at;
             focus.store.add_focus_session_for(task, habit, title, start, start + value, true).map_err(|error| {
-                eprintln!("failed to save the focus session: {error:#}");
+                desktop_common::logging::log_error("focus_ui", format!("failed to save the focus session: {error:#}"));
                 strings.focus_save_failed
             })?;
             focus.auto_checkin_habit(habit, value, cx);
@@ -242,7 +242,11 @@ impl FocusReview {
             focus.review_window = None;
             focus.message = None;
             focus.reload(cx);
-            desktop_common::data_version::data_changed(cx.entity_id(), cx);
+            desktop_common::data_version::data_changed_scoped(
+                cx.entity_id(),
+                desktop_common::data_version::DataScope::FOCUS,
+                cx,
+            );
             Ok(())
         });
         match result {
@@ -260,7 +264,12 @@ impl FocusReview {
 impl Render for FocusReview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
+        let surface_bg = cx.theme().colors().surface_background;
+        let accent = cx.theme().colors().accent;
+        let border = cx.theme().colors().border;
+        let element_hover = cx.theme().colors().element_hover;
+        let bg = cx.theme().colors().background;
+        let text_color = cx.theme().colors().text;
         let can_save = self.selected_duration(cx).is_some();
         let hours_focused = self.hours.focus_handle(cx).is_focused(window);
         let minutes_focused = self.minutes.focus_handle(cx).is_focused(window);
@@ -268,8 +277,8 @@ impl Render for FocusReview {
             .size_full()
             .p_5()
             .gap_3()
-            .bg(colors.background)
-            .text_color(colors.text)
+            .bg(bg)
+            .text_color(text_color)
             .key_context("FocusReview")
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 let m = &event.keystroke.modifiers;
@@ -294,9 +303,9 @@ impl Render for FocusReview {
                         div()
                             .p_2()
                             .rounded(px(6.))
-                            .bg(colors.surface_background)
+                            .bg(surface_bg)
                             .border_1()
-                            .border_color(if hours_focused { colors.accent } else { colors.border })
+                            .border_color(if hours_focused { accent } else { border })
                             .child(self.hours.clone()),
                     ))
                 .child(v_flex().flex_1().gap_2()
@@ -305,9 +314,9 @@ impl Render for FocusReview {
                         div()
                             .p_2()
                             .rounded(px(6.))
-                            .bg(colors.surface_background)
+                            .bg(surface_bg)
                             .border_1()
-                            .border_color(if minutes_focused { colors.accent } else { colors.border })
+                            .border_color(if minutes_focused { accent } else { border })
                             .child(self.minutes.clone()),
                     )))
             .child(Label::new(format!("{} – {}", clock(MIN_FOCUS_MS), clock(self.maximum))).size(LabelSize::Small).color(Color::Muted))
@@ -334,7 +343,7 @@ impl Render for FocusReview {
                             .py_2()
                             .rounded(px(6.))
                             .cursor_pointer()
-                            .hover(|el| el.bg(colors.element_hover))
+                            .hover(move |el| el.bg(element_hover))
                             .child(Label::new(strings.focus_continue))
                             .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
                     )
@@ -345,7 +354,7 @@ impl Render for FocusReview {
                         .px_3()
                         .py_2()
                         .rounded(px(6.))
-                        .bg(colors.accent)
+                        .bg(accent)
                         .when(can_save, |el| el.cursor_pointer().hover(|s| s.opacity(0.9)))
                         .when(!can_save, |el| el.opacity(0.5))
                         .child(Label::new(strings.save).color(Color::OnAccent))

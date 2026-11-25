@@ -94,7 +94,7 @@ impl TodoView {
             input
         });
         cx.subscribe(&input, |this, _, _: &Changed, cx| {
-            if let Some(edit) = this.filter_edit.as_mut() {
+            if let Some(edit) = this.overlays.filter_edit.as_mut() {
                 edit.error = None;
             }
             cx.notify();
@@ -161,7 +161,7 @@ impl TodoView {
             });
         }
         let return_focus = self
-            .filter_edit
+            .overlays.filter_edit
             .as_ref()
             .and_then(|edit| edit.return_focus.clone())
             .or_else(|| window.focused(cx));
@@ -169,8 +169,8 @@ impl TodoView {
         let inputs = Self::filter_inputs(&draft, window, cx);
         let all_tasks = self.store.tasks().unwrap_or_default();
         window.focus(&name.focus_handle(cx), cx);
-        self.header_menu_open = false;
-        self.filter_edit = Some(FilterEdit {
+        self.overlays.header_menu_open = false;
+        self.overlays.filter_edit = Some(FilterEdit {
             draft,
             is_new,
             name,
@@ -185,7 +185,7 @@ impl TodoView {
         cx.notify();
     }
     pub(super) fn dismiss_filter_edit_nested(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(edit) = self.filter_edit.as_mut() else {
+        let Some(edit) = self.overlays.filter_edit.as_mut() else {
             return false;
         };
         if std::mem::take(&mut edit.examples_open) || edit.chain_menu.take().is_some() {
@@ -195,7 +195,7 @@ impl TodoView {
         false
     }
     pub(super) fn close_filter_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(edit) = self.filter_edit.take() else {
+        let Some(edit) = self.overlays.filter_edit.take() else {
             return;
         };
         let focus = edit.return_focus.unwrap_or_else(|| self.list_focus.clone());
@@ -213,7 +213,7 @@ impl TodoView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(edit) = self.filter_edit.as_mut() else {
+        let Some(edit) = self.overlays.filter_edit.as_mut() else {
             return;
         };
         match edit.snapshot(cx) {
@@ -237,7 +237,7 @@ impl TodoView {
         cx: &mut Context<Self>,
         update: impl FnOnce(&mut Condition),
     ) {
-        if let Some(edit) = self.filter_edit.as_mut()
+        if let Some(edit) = self.overlays.filter_edit.as_mut()
             && let Some(condition) = edit.draft.rules.conditions.get_mut(i)
         {
             update(condition);
@@ -252,7 +252,7 @@ impl TodoView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(edit) = self.filter_edit.as_mut()
+        if let Some(edit) = self.overlays.filter_edit.as_mut()
             && let Some(condition) = edit.draft.rules.conditions.get_mut(i)
         {
             if condition.value.field() != field {
@@ -265,7 +265,7 @@ impl TodoView {
         cx.notify();
     }
     pub(super) fn set_filter_preview(&mut self, preview: bool, cx: &mut Context<Self>) {
-        if let Some(edit) = self.filter_edit.as_mut() {
+        if let Some(edit) = self.overlays.filter_edit.as_mut() {
             if preview {
                 if let Err(error) = edit.snapshot(cx) {
                     edit.error = Some(input_error(error, i18n::t(cx)));
@@ -282,7 +282,7 @@ impl TodoView {
         cx.notify();
     }
     fn save_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(edit) = self.filter_edit.as_mut() else {
+        let Some(edit) = self.overlays.filter_edit.as_mut() else {
             return;
         };
         let filter = match edit.snapshot(cx) {
@@ -303,7 +303,7 @@ impl TodoView {
         };
         let result = self.store.save_filter(&filter);
         if self.check(result).is_some() {
-            self.filter_edit = None;
+            self.overlays.filter_edit = None;
             window.focus(&self.list_focus, cx);
             if self.view != View::Filter(filter.id) {
                 self.set_view(View::Filter(filter.id), cx);
@@ -320,8 +320,8 @@ impl TodoView {
                 .find(|(f, _)| f.id == id)
                 .map(|(f, _)| f.name.clone())
                 .unwrap_or_default();
-            self.header_menu_open = false;
-            self.confirm_delete = Some(ConfirmDeleteTarget::Filter(id, name));
+            self.overlays.header_menu_open = false;
+            self.overlays.confirm_delete = Some(ConfirmDeleteTarget::Filter(id, name));
             cx.notify();
         }
     }
@@ -389,7 +389,7 @@ impl TodoView {
             for task in in_list {
                 let due = task
                     .due_date
-                    .map(|date| crate::task_rows::due_label(date, task.due_time, today, strings));
+                    .map(|date| crate::task_rows::due_label(date, task.due_time, today, strings, cx));
                 let horizon_badge = crate::task_rows::horizon_badge(task, today, strings);
                 body = body.child(
                     h_flex()
@@ -768,7 +768,7 @@ impl TodoView {
                 popover(cx)
                     .min_w(px(180.))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        if let Some(edit) = this.filter_edit.as_mut() {
+                        if let Some(edit) = this.overlays.filter_edit.as_mut() {
                             edit.chain_menu = None;
                         }
                         cx.notify();
@@ -822,7 +822,7 @@ impl TodoView {
                                 )
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        if let Some(edit) = this.filter_edit.as_mut() {
+                                        if let Some(edit) = this.overlays.filter_edit.as_mut() {
                                             edit.chain_menu = if edit.chain_menu == Some(i) {
                                                 None
                                             } else {
@@ -857,7 +857,7 @@ impl TodoView {
                             .hover(|s| s.bg(cx.theme().status().error.opacity(0.14)))
                             .child(Label::new(strings.delete).size(LabelSize::Small).color(Color::Error))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(edit) = this.filter_edit.as_mut() {
+                                if let Some(edit) = this.overlays.filter_edit.as_mut() {
                                     edit.draft.rules.conditions.remove(i);
                                     edit.inputs.remove(i);
                                     edit.chain_menu = None;
@@ -892,7 +892,7 @@ impl TodoView {
             body = body.child(
                 chip("filter-add", strings.filter_add_condition, false, cx).on_click(cx.listener(
                     |this, _, window, cx| {
-                        if let Some(edit) = this.filter_edit.as_mut() {
+                        if let Some(edit) = this.overlays.filter_edit.as_mut() {
                             let field = Field::ALL
                                 .into_iter()
                                 .find(|field| {
@@ -928,7 +928,7 @@ impl TodoView {
                                         .size(LabelSize::Small),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    if let Some(edit) = this.filter_edit.as_mut() {
+                                    if let Some(edit) = this.overlays.filter_edit.as_mut() {
                                         edit.draft.rules = example.rules.clone();
                                         edit.inputs = Self::filter_inputs(&edit.draft, window, cx);
                                         edit.examples_open = false;
@@ -1013,7 +1013,7 @@ impl TodoView {
                                     )
                                     .on_click(
                                         cx.listener(|this, _, _, cx| {
-                                            if let Some(edit) = this.filter_edit.as_mut() {
+                                            if let Some(edit) = this.overlays.filter_edit.as_mut() {
                                                 edit.examples_open = !edit.examples_open;
                                             }
                                             cx.notify();
@@ -1075,7 +1075,7 @@ mod tests {
         cx.simulate_mouse_move(save.center(), None, modifiers);
         cx.simulate_click(save.center(), modifiers);
         cx.update(|_, cx| {
-            let edit = view.read(cx).filter_edit.as_ref().expect("filter form remains open");
+            let edit = view.read(cx).overlays.filter_edit.as_ref().expect("filter form remains open");
             assert!(!edit.preview);
             assert_eq!(edit.error, Some(i18n::EN.filter_name_error));
         });
@@ -1098,7 +1098,7 @@ mod tests {
         cx.update(|window, cx| {
             view.update(cx, |todo, cx| {
                 todo.open_filter_edit(None, window, cx);
-                let edit = todo.filter_edit.as_mut().expect("filter dialog is open");
+                let edit = todo.overlays.filter_edit.as_mut().expect("filter dialog is open");
                 edit.name.update(cx, |input, cx| input.set_text("In Progress", cx));
                 let status_idx = edit
                     .draft
@@ -1117,7 +1117,7 @@ mod tests {
 
         let saved_id = cx.update(|_, cx| {
             let todo = view.read(cx);
-            assert!(todo.filter_edit.is_none());
+            assert!(todo.overlays.filter_edit.is_none());
             assert_eq!(todo.filters.len(), 1);
             assert_eq!(todo.filters[0].1, 1);
             let id = todo.filters[0].0.id;
@@ -1148,10 +1148,68 @@ mod tests {
         cx.update(|window, cx| {
             view.update(cx, |todo, cx| {
                 todo.open_filter_edit(Some(legacy), window, cx);
-                let edit = todo.filter_edit.as_ref().expect("filter dialog is open");
+                let edit = todo.overlays.filter_edit.as_ref().expect("filter dialog is open");
                 assert_eq!(edit.draft.rules.conditions.len(), Field::ALL.len());
                 assert!(edit.draft.rules.conditions.iter().any(|c| c.value == Value::Status(None)));
             });
         });
+    }
+
+    #[gpui::test]
+    fn adding_multiple_filters_keeps_all_presets_distinct(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        // Seed a pre-existing nil-UUID filter like one created before the fix to verify it
+        // remains editable in place and does not collide with newly added filters.
+        let legacy_nil = SmartFilter {
+            id: Id::nil(),
+            name: "Legacy Nil".into(),
+            rules: fern_core::FilterRules::default(),
+        };
+        store.save_filter(&legacy_nil).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+
+        let create_filter = |name: &str, cx: &mut gpui::VisualTestContext| {
+            let name = name.to_owned();
+            cx.update(|window, cx| {
+                view.update(cx, |todo, cx| {
+                    todo.open_filter_edit(None, window, cx);
+                    let edit = todo.overlays.filter_edit.as_mut().expect("filter dialog is open");
+                    edit.name.update(cx, |input, cx| input.set_text(name.clone(), cx));
+                    todo.save_filter(window, cx);
+                });
+            });
+            cx.run_until_parked();
+        };
+
+        create_filter("First Filter", cx);
+        create_filter("Second Filter", cx);
+
+        let saved = store.filters().unwrap();
+        assert_eq!(saved.len(), 3);
+        let first = saved.iter().find(|f| f.name == "First Filter").expect("first filter saved");
+        let second = saved.iter().find(|f| f.name == "Second Filter").expect("second filter saved");
+        assert!(!first.id.is_nil());
+        assert!(!second.id.is_nil());
+        assert_ne!(first.id, second.id);
+
+        // Editing the pre-existing nil-UUID filter updates it in place instead of duplicating it.
+        cx.update(|window, cx| {
+            view.update(cx, |todo, cx| {
+                todo.open_filter_edit(Some(legacy_nil.clone()), window, cx);
+                let edit = todo.overlays.filter_edit.as_mut().expect("filter dialog is open");
+                edit.name.update(cx, |input, cx| input.set_text("Legacy Renamed", cx));
+                todo.save_filter(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let saved_after_edit = store.filters().unwrap();
+        assert_eq!(saved_after_edit.len(), 3);
+        assert!(saved_after_edit.iter().any(|f| f.id.is_nil() && f.name == "Legacy Renamed"));
     }
 }

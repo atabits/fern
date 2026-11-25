@@ -576,7 +576,7 @@ impl PluginView {
 }
 
 impl Render for PluginView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let safe_mode = PluginHost::global(cx).is_some_and(|h| h.is_safe_mode());
         if safe_mode {
@@ -646,7 +646,7 @@ impl Render for PluginView {
             .size_full()
             .min_h_0()
             .when(!self.embedded, |el| {
-                el.pt(desktop_common::layout::header_inset())
+                el.pt(desktop_common::layout::header_inset(window, cx))
                     .bg(cx.theme().colors().background)
             })
             .track_focus(&self.focus_handle)

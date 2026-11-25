@@ -286,10 +286,11 @@ pub(super) fn install_services<'js>(
                     if trimmed.is_empty() {
                         return Err(Exception::throw_message(&ctx, "service name must not be empty"));
                     }
+                    (st.service_registrar)(trimmed.to_owned())
+                        .map_err(|e| throw_scrubbed(&ctx, &st, e))?;
                     st.services
                         .borrow_mut()
                         .insert(trimmed.to_owned(), Persistent::save(&ctx, handler));
-                    (st.service_registrar)(trimmed.to_owned());
                     Ok(())
                 },
             )?,
@@ -350,7 +351,13 @@ pub(super) fn install_views<'js>(
                 if id.is_empty() {
                     return Err(Exception::throw_message(&ctx, "view id must not be empty"));
                 }
-                if !st.declared_views.is_empty() && !st.declared_views.contains(id) {
+                if id == "__modal__" || id == "__default__" || id.starts_with("__staging:") {
+                    return Err(Exception::throw_message(
+                        &ctx,
+                        &format!("view id {id:?} is reserved"),
+                    ));
+                }
+                if st.enforce_declared_views && !st.declared_views.contains(id) {
                     return Err(Exception::throw_message(
                         &ctx,
                         &format!(
@@ -408,15 +415,19 @@ pub(super) fn install_ui<'js>(
         let st = Rc::clone(&state);
         obj.set(
             "toast",
-            Function::new(ctx.clone(), move |message: String, level: Opt<Option<String>>| {
-                let level_owned = level.0.flatten();
-                st.pending_ui_effects.borrow_mut().push_back(PluginUiEffect::Toast {
-                    plugin_id: st.plugin_id.clone(),
-                    message,
-                    level: ToastLevel::parse(level_owned.as_deref()),
-                    created_at_ms: now_ms(),
-                });
-            })?,
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, message: String, level: Opt<Option<String>>| -> rquickjs::Result<()> {
+                    let level_owned = level.0.flatten();
+                    st.push_ui_effect(PluginUiEffect::Toast {
+                        plugin_id: st.plugin_id.clone(),
+                        message,
+                        level: ToastLevel::parse(level_owned.as_deref()),
+                        created_at_ms: now_ms(),
+                    })
+                    .map_err(|e| throw_scrubbed(&ctx, &st, e))
+                },
+            )?,
         )?;
     }
 
@@ -558,15 +569,13 @@ pub(super) fn install_ui<'js>(
                     };
                     *st.modal_view.borrow_mut() = pending_modal_view;
 
-                    st.pending_ui_effects
-                        .borrow_mut()
-                        .push_back(PluginUiEffect::OpenModal {
-                            plugin_id: st.plugin_id.clone(),
-                            view_id: modal_scope.to_owned(),
-                            title,
-                            tree,
-                        });
-                    Ok(())
+                    st.push_ui_effect(PluginUiEffect::OpenModal {
+                        plugin_id: st.plugin_id.clone(),
+                        view_id: modal_scope.to_owned(),
+                        title,
+                        tree,
+                    })
+                    .map_err(|e| throw_scrubbed(&ctx, &st, e))
                 },
             )?,
         )?;
@@ -576,7 +585,7 @@ pub(super) fn install_ui<'js>(
         let st = Rc::clone(&state);
         obj.set(
             "closeModal",
-            Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<()> {
                 if let Some((_, prev_view)) = st.modal_view.borrow_mut().take()
                     && let Some(unmount_pers) = prev_view.unmount
                     && let Ok(unmount_fn) = unmount_pers.restore(&ctx)
@@ -584,11 +593,10 @@ pub(super) fn install_ui<'js>(
                     let _ = unmount_fn.call::<_, Value<'js>>(());
                 }
                 st.clear_scope_handlers("__modal__");
-                st.pending_ui_effects
-                    .borrow_mut()
-                    .push_back(PluginUiEffect::CloseModal {
-                        plugin_id: st.plugin_id.clone(),
-                    });
+                st.push_ui_effect(PluginUiEffect::CloseModal {
+                    plugin_id: st.plugin_id.clone(),
+                })
+                .map_err(|e| throw_scrubbed(&ctx, &st, e))
             })?,
         )?;
     }
@@ -599,10 +607,8 @@ pub(super) fn install_ui<'js>(
             "openTask",
             Function::new(ctx.clone(), move |ctx: Ctx<'js>, id_str: String| -> rquickjs::Result<()> {
                 let task_id = parse_uuid(&id_str).map_err(|e| throw_scrubbed(&ctx, &st, e))?;
-                st.pending_ui_effects
-                    .borrow_mut()
-                    .push_back(PluginUiEffect::OpenTask { task_id });
-                Ok(())
+                st.push_ui_effect(PluginUiEffect::OpenTask { task_id })
+                    .map_err(|e| throw_scrubbed(&ctx, &st, e))
             })?,
         )?;
     }
@@ -611,12 +617,11 @@ pub(super) fn install_ui<'js>(
         let st = Rc::clone(&state);
         obj.set(
             "openSettings",
-            Function::new(ctx.clone(), move || {
-                st.pending_ui_effects
-                    .borrow_mut()
-                    .push_back(PluginUiEffect::OpenSettings {
-                        plugin_id: st.plugin_id.clone(),
-                    });
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<()> {
+                st.push_ui_effect(PluginUiEffect::OpenSettings {
+                    plugin_id: st.plugin_id.clone(),
+                })
+                .map_err(|e| throw_scrubbed(&ctx, &st, e))
             })?,
         )?;
     }
@@ -655,20 +660,36 @@ pub(super) fn install_system<'js>(
         obj.set(
             "openExternal",
             Function::new(ctx.clone(), move |ctx: Ctx<'js>, url: String| -> rquickjs::Result<()> {
+                const MAX_EXTERNAL_URL_LEN: usize = 2048;
                 let trimmed = url.trim();
-                let lower = trimmed.to_ascii_lowercase();
-                if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+                if trimmed.is_empty()
+                    || trimmed.len() > MAX_EXTERNAL_URL_LEN
+                    || trimmed.chars().any(char::is_control)
+                {
+                    return Err(Exception::throw_message(
+                        &ctx,
+                        "openExternal URL must be non-empty, <= 2048 chars, and contain no control characters",
+                    ));
+                }
+                let uri = trimmed.parse::<ureq::http::Uri>().map_err(|_| {
+                    Exception::throw_message(&ctx, "openExternal only allows valid http:// or https:// URLs")
+                })?;
+                let scheme = uri.scheme_str().unwrap_or("");
+                let has_host = uri.host().is_some_and(|h| !h.is_empty());
+                if !((scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
+                    && has_host)
+                {
                     return Err(Exception::throw_message(
                         &ctx,
                         "openExternal only allows http:// or https:// URLs",
                     ));
                 }
-                st.pending_ui_effects
-                    .borrow_mut()
-                    .push_back(PluginUiEffect::OpenExternal {
-                        url: trimmed.to_owned(),
-                    });
-                Ok(())
+                st.check_open_external_rate_limit()
+                    .map_err(|e| throw_scrubbed(&ctx, &st, e))?;
+                st.push_ui_effect(PluginUiEffect::OpenExternal {
+                    url: trimmed.to_owned(),
+                })
+                .map_err(|e| throw_scrubbed(&ctx, &st, e))
             })?,
         )?;
     }
@@ -679,10 +700,8 @@ pub(super) fn install_system<'js>(
             "clipboardWrite",
             Function::new(ctx.clone(), move |ctx: Ctx<'js>, text: String| -> rquickjs::Result<()> {
                 st.require_perm(&ctx, &Permission::Clipboard)?;
-                st.pending_ui_effects
-                    .borrow_mut()
-                    .push_back(PluginUiEffect::ClipboardWrite { text });
-                Ok(())
+                st.push_ui_effect(PluginUiEffect::ClipboardWrite { text })
+                    .map_err(|e| throw_scrubbed(&ctx, &st, e))
             })?,
         )?;
     }

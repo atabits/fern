@@ -12,8 +12,7 @@ pub fn data_dir() -> Option<&'static Path> {
     static DATA_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DATA_DIR
         .get_or_init(|| {
-            #[cfg(debug_assertions)]
-            if std::env::var_os("FERN_DATA_DIR").is_some() {
+            if std::env::var_os("FERN_DATA_DIR").is_some_and(|v| !v.is_empty()) {
                 return None;
             }
             let exe = std::env::current_exe().ok()?;

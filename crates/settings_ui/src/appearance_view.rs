@@ -5,11 +5,12 @@ use gpui::{FontWeight, SharedString};
 use theme::{Theme, ThemeRegistry};
 use ui::prelude::*;
 
-use super::{ROW_HEIGHT, SettingsWindow};
-use crate::user_themes::{
+use desktop_common::i18n;
+use desktop_common::user_themes::{
     self, TemporaryTheme, apply_theme, clear_temporary, remembered, set_temporary, system_dark,
 };
-use crate::i18n;
+
+use super::{ActiveConfirm, ROW_HEIGHT, SettingsWindow};
 
 fn night_swatches(
     night: &Theme,
@@ -28,7 +29,13 @@ fn night_swatches(
             let name = if theme.is_custom() {
                 SharedString::from(theme.name().to_owned())
             } else {
-                SharedString::from(dark_names.get(idx).copied().unwrap_or_else(|| theme.name()).to_owned())
+                SharedString::from(
+                    dark_names
+                        .get(idx)
+                        .copied()
+                        .unwrap_or_else(|| theme.name())
+                        .to_owned(),
+                )
             };
             (theme.clone(), name)
         });
@@ -37,42 +44,49 @@ fn night_swatches(
         (theme.clone(), name)
     });
 
-    h_flex().flex_wrap().gap_2().children(bundled.chain(custom).map(|(theme, name)| {
-        let selected = theme.id() == night.id();
-        let click_pick = pick.clone();
-        let key_pick = pick.clone();
-        let key_theme = theme.clone();
-        let id = SharedString::from(format!("night-swatch-{}", theme.id()));
-        div()
-            .id(id)
-            .tab_index(0)
-            .aria_label(name.clone())
-            .role(gpui::Role::RadioButton)
-            .aria_toggled(selected.into())
-            .size(px(30.))
-            .flex_none()
-            .rounded_full()
-            .border_2()
-            .p(px(2.))
-            .border_color(if selected { theme.swatch_color() } else { gpui::transparent_black() })
-            .cursor_pointer()
-            .hover(|s| s.bg(colors.element_hover))
-            .focus_visible(|s| s.border_color(colors.text))
-            .when(show_tooltips, |el| el.tooltip(Tooltip::text(name)))
-            .child(div().size_full().rounded_full().bg(theme.swatch()))
-            .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
-                let key = event.keystroke.key.as_str();
-                let m = &event.keystroke.modifiers;
-                if !m.control && !m.alt && !m.platform && !m.shift && matches!(key, "enter" | "space") {
+    h_flex()
+        .flex_wrap()
+        .gap_2()
+        .children(bundled.chain(custom).map(|(theme, name)| {
+            let selected = theme.id() == night.id();
+            let click_pick = pick.clone();
+            let key_pick = pick.clone();
+            let key_theme = theme.clone();
+            let id = SharedString::from(format!("night-swatch-{}", theme.id()));
+            div()
+                .id(id)
+                .tab_index(0)
+                .aria_label(name.clone())
+                .role(gpui::Role::RadioButton)
+                .aria_toggled(selected.into())
+                .size(px(30.))
+                .flex_none()
+                .rounded_full()
+                .border_2()
+                .p(px(2.))
+                .border_color(if selected {
+                    theme.swatch_color()
+                } else {
+                    gpui::transparent_black()
+                })
+                .cursor_pointer()
+                .hover(|s| s.bg(colors.element_hover))
+                .focus_visible(|s| s.border_color(colors.text))
+                .when(show_tooltips, |el| el.tooltip(Tooltip::text(name)))
+                .child(div().size_full().rounded_full().bg(theme.swatch()))
+                .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
+                    let key = event.keystroke.key.as_str();
+                    let m = &event.keystroke.modifiers;
+                    if !m.control && !m.alt && !m.platform && !m.shift && matches!(key, "enter" | "space") {
+                        cx.stop_propagation();
+                        key_pick(key_theme.clone(), window, cx);
+                    }
+                })
+                .on_click(move |_, window, cx| {
                     cx.stop_propagation();
-                    key_pick(key_theme.clone(), window, cx);
-                }
-            })
-            .on_click(move |_, window, cx| {
-                cx.stop_propagation();
-                click_pick(theme.clone(), window, cx)
-            })
-    }))
+                    click_pick(theme.clone(), window, cx)
+                })
+        }))
 }
 
 impl SettingsWindow {
@@ -84,7 +98,7 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) {
         if let Err(error) = self.store.save_theme_selection(&selection) {
-            self.theme_save_error = Some(error.to_string());
+            self.themes.save_error = Some(error.to_string());
             cx.notify();
             return;
         }
@@ -107,98 +121,71 @@ impl SettingsWindow {
             && theme.is_dark() != system_dark
             && cx.theme().is_dark() == system_dark
         {
-            self.pending_theme_switch = Some(theme);
+            self.confirm = Some(ActiveConfirm::SwitchTheme(theme));
             cx.notify();
         } else {
             self.use_theme(theme, false, window, cx);
         }
     }
 
-    fn confirm_theme_switch(&mut self, always: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(theme) = self.pending_theme_switch.take() {
+    pub(super) fn confirm_theme_switch(
+        &mut self,
+        always: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ActiveConfirm::SwitchTheme(theme)) = self.confirm.take() {
             self.use_theme(theme, always, window, cx);
         }
     }
 
-    pub(super) fn render_theme_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.pending_theme_switch.is_some() {
-            let strings = i18n::t(cx);
-            return Some(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .when(cfg!(test), |el| el.debug_selector(|| "confirm-switch-theme".to_owned()))
-                    .child(
-                        ConfirmDialog::new("confirm-switch-theme", strings.switch_theme)
-                            .width(px(480.))
-                            .description(strings.theme_override_hint)
-                            .cancel_label(strings.cancel)
-                            .secondary_action(
-                                strings.theme_once,
-                                cx.listener(|this, _, window, cx| {
-                                    this.confirm_theme_switch(false, window, cx);
-                                }),
-                            )
-                            .confirm_label(strings.theme_always)
-                            .on_cancel(cx.listener(|this, _, _, cx| {
-                                this.pending_theme_switch = None;
-                                cx.notify();
-                            }))
-                            .on_confirm(cx.listener(|this, _, window, cx| {
-                                this.confirm_theme_switch(true, window, cx);
-                            })),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if let Some(error) = self.theme_save_error.as_ref() {
-            let strings = i18n::t(cx);
-            let colors = cx.theme().colors();
-            return Some(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .when(cfg!(test), |el| el.debug_selector(|| "theme-save-error".to_owned()))
-                    .child(
-                        Modal::new("theme-save-error-modal")
-                            .width(px(380.))
-                            .on_dismiss(cx.listener(|this, _, _, cx| {
-                                this.theme_save_error = None;
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .text_size(px(16.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(colors.text)
-                                    .child(strings.theme_save_failed),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .text_size(LabelSize::Small.pixels())
-                                    .line_height(px(18.))
-                                    .text_color(colors.text_muted)
-                                    .child(error.clone()),
-                            )
-                            .child(
-                                h_flex().w_full().pt_1().justify_end().child(
-                                    Button::new("theme-save-error-ok", strings.ok)
-                                        .variant(ButtonVariant::Primary)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.theme_save_error = None;
-                                            cx.notify();
-                                        })),
-                                ),
+    pub(super) fn render_theme_save_error(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let error = self.themes.save_error.as_ref()?;
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .when(cfg!(test), |el| el.debug_selector(|| "theme-save-error".to_owned()))
+                .child(
+                    Modal::new("theme-save-error-modal")
+                        .width(px(380.))
+                        .on_dismiss(cx.listener(|this, _, _, cx| {
+                            this.themes.save_error = None;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_size(px(16.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(colors.text)
+                                .child(strings.theme_save_failed),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_size(LabelSize::Small.pixels())
+                                .line_height(px(18.))
+                                .text_color(colors.text_muted)
+                                .child(error.clone()),
+                        )
+                        .child(
+                            h_flex().w_full().pt_1().justify_end().child(
+                                Button::new("theme-save-error-ok", strings.ok)
+                                    .variant(ButtonVariant::Primary)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.themes.save_error = None;
+                                        cx.notify();
+                                    })),
                             ),
-                    )
-                    .into_any_element(),
-            );
-        }
-        None
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn use_theme(
@@ -231,7 +218,11 @@ impl SettingsWindow {
             selection.light = Some(theme.id().into());
         }
         if fixed || selection.mode != ThemeMode::System {
-            selection.mode = if dark { ThemeMode::Dark } else { ThemeMode::Light };
+            selection.mode = if dark {
+                ThemeMode::Dark
+            } else {
+                ThemeMode::Light
+            };
         }
         self.save_theme(selection, None, window, cx);
     }
@@ -259,7 +250,6 @@ impl SettingsWindow {
             && !system_dark(window)
             && cx.theme().is_light()
         {
-            // Configure the next night in daylight without switching the workspace.
             let mut selection = self.preferences.theme.clone();
             selection.dark = Some(theme.id().into());
             self.save_theme(selection, None, window, cx);
@@ -274,8 +264,12 @@ impl SettingsWindow {
         let bundled_light = registry.bundled_light().to_vec();
         let bundled_dark = registry.bundled_dark().to_vec();
         let custom_themes = registry.custom_themes().to_vec();
-        let theme_errors: Vec<SharedString> =
-            registry.errors().iter().cloned().map(SharedString::from).collect();
+        let theme_errors: Vec<SharedString> = registry
+            .errors()
+            .iter()
+            .cloned()
+            .map(SharedString::from)
+            .collect();
         let active = cx.theme().clone();
         let night = if active.is_dark() {
             active.clone()
@@ -296,7 +290,9 @@ impl SettingsWindow {
             let key_theme = theme.clone();
             v_flex()
                 .id(id)
-                .when(cfg!(test), |el| el.debug_selector(move || format!("theme-tile-{debug_id}")))
+                .when(cfg!(test), |el| {
+                    el.debug_selector(move || format!("theme-tile-{debug_id}"))
+                })
                 .tab_index(0)
                 .role(gpui::Role::RadioButton)
                 .aria_toggled(selected.into())
@@ -358,7 +354,11 @@ impl SettingsWindow {
                             .size(LabelSize::Small)
                             .centered()
                             .truncate()
-                            .color(if selected { Color::Default } else { Color::Muted }),
+                            .color(if selected {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            }),
                     ),
                 )
                 .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
@@ -539,23 +539,21 @@ impl SettingsWindow {
                             .items_start()
                             .gap_x_1()
                             .gap_y_2()
-                            .children(bundled_light.into_iter().enumerate().map(
-                                |(idx, theme)| {
-                                    let selected = active.id() == theme.id();
-                                    let label: SharedString = if theme.is_custom() {
-                                        theme.name().to_owned().into()
-                                    } else {
-                                        strings
-                                            .light_theme_names
-                                            .get(idx)
-                                            .copied()
-                                            .unwrap_or_else(|| theme.name())
-                                            .to_owned()
-                                            .into()
-                                    };
-                                    tile(theme.id_shared(), theme, label, selected, None)
-                                },
-                            )),
+                            .children(bundled_light.into_iter().enumerate().map(|(idx, theme)| {
+                                let selected = active.id() == theme.id();
+                                let label: SharedString = if theme.is_custom() {
+                                    theme.name().to_owned().into()
+                                } else {
+                                    strings
+                                        .light_theme_names
+                                        .get(idx)
+                                        .copied()
+                                        .unwrap_or_else(|| theme.name())
+                                        .to_owned()
+                                        .into()
+                                };
+                                tile(theme.id_shared(), theme, label, selected, None)
+                            })),
                     ),
             )
             .child(
@@ -568,23 +566,21 @@ impl SettingsWindow {
                             .items_start()
                             .gap_x_1()
                             .gap_y_2()
-                            .children(bundled_dark.into_iter().enumerate().map(
-                                |(idx, theme)| {
-                                    let selected = active.id() == theme.id();
-                                    let label: SharedString = if theme.is_custom() {
-                                        theme.name().to_owned().into()
-                                    } else {
-                                        strings
-                                            .dark_theme_names
-                                            .get(idx)
-                                            .copied()
-                                            .unwrap_or_else(|| theme.name())
-                                            .to_owned()
-                                            .into()
-                                    };
-                                    tile(theme.id_shared(), theme, label, selected, None)
-                                },
-                            )),
+                            .children(bundled_dark.into_iter().enumerate().map(|(idx, theme)| {
+                                let selected = active.id() == theme.id();
+                                let label: SharedString = if theme.is_custom() {
+                                    theme.name().to_owned().into()
+                                } else {
+                                    strings
+                                        .dark_theme_names
+                                        .get(idx)
+                                        .copied()
+                                        .unwrap_or_else(|| theme.name())
+                                        .to_owned()
+                                        .into()
+                                };
+                                tile(theme.id_shared(), theme, label, selected, None)
+                            })),
                     ),
             )
             .child(custom_section)
@@ -598,6 +594,7 @@ mod tests {
     use fern_core::{Store, ThemeMode, ThemeSelection};
 
     use super::*;
+    use crate::SettingsHost;
 
     #[gpui::test]
     fn temporary_override_preserves_saved_palettes_and_locks_on_system_toggle(
@@ -612,7 +609,8 @@ mod tests {
         };
         store.save_theme_selection(&initial).unwrap();
         let (settings, cx) = cx.add_window_view(|window, cx| {
-            let settings = SettingsWindow::new(store.clone(), cx);
+            let host = SettingsHost::noop(cx);
+            let settings = SettingsWindow::new(store.clone(), host, cx);
             apply_theme(&settings.preferences.theme, window, cx);
             settings
         });
@@ -621,7 +619,6 @@ mod tests {
         assert!(!dark_system, "headless test window defaults to light appearance");
         cx.update(|_, cx| assert_eq!(cx.theme().id(), "matcha"));
 
-        // Configuring the night theme in daylight saves it without switching the active light theme.
         let darkpink = cx.update(|_, cx| ThemeRegistry::global(cx).resolve(true, Some("darkpink")));
         cx.update(|window, cx| {
             settings.update(cx, |settings, cx| settings.pick_night_theme(darkpink, window, cx));
@@ -629,7 +626,6 @@ mod tests {
         assert_eq!(store.preferences().unwrap().theme.dark.as_deref(), Some("darkpink"));
         cx.update(|_, cx| assert_eq!(cx.theme().id(), "matcha"));
 
-        // "Just this time" applies darkpurple temporarily without clobbering saved darkpink.
         let darkpurple =
             cx.update(|_, cx| ThemeRegistry::global(cx).resolve(true, Some("darkpurple")));
         cx.update(|window, cx| {
@@ -639,7 +635,6 @@ mod tests {
         assert_eq!(store.preferences().unwrap().theme.mode, ThemeMode::System);
         cx.update(|_, cx| assert_eq!(cx.theme().id(), "darkpurple"));
 
-        // Picking another dark preset while already temporarily dark switches immediately without prompting.
         let darkgreen =
             cx.update(|_, cx| ThemeRegistry::global(cx).resolve(true, Some("darkgreen")));
         cx.update(|window, cx| {
@@ -648,7 +643,6 @@ mod tests {
         assert_eq!(store.preferences().unwrap().theme.dark.as_deref(), Some("darkpink"));
         cx.update(|_, cx| assert_eq!(cx.theme().id(), "darkgreen"));
 
-        // Turning off "Follow System Dark Mode" keeps the active temporary theme and persists it.
         cx.update(|window, cx| {
             settings.update(cx, |settings, cx| settings.toggle_system_theme(window, cx));
         });
@@ -657,7 +651,6 @@ mod tests {
         assert_eq!(saved.dark.as_deref(), Some("darkgreen"));
         cx.update(|_, cx| assert_eq!(cx.theme().id(), "darkgreen"));
 
-        // Turning "Follow System Dark Mode" back on restores the saved light palette.
         cx.update(|window, cx| {
             settings.update(cx, |settings, cx| settings.toggle_system_theme(window, cx));
         });
@@ -685,7 +678,8 @@ mod tests {
 
         let store = Rc::new(Store::open_in_memory().unwrap());
         let (settings, cx) = cx.add_window_view(|window, cx| {
-            let settings = SettingsWindow::new(store.clone(), cx);
+            let host = SettingsHost::noop(cx);
+            let settings = SettingsWindow::new(store.clone(), host, cx);
             apply_theme(&settings.preferences.theme, window, cx);
             settings
         });
@@ -701,7 +695,6 @@ mod tests {
             assert_eq!(cx.theme().colors().accent, theme::try_parse_color("#38bdf8").unwrap());
         });
 
-        // In-place live-reload of the active custom theme updates colors even when its ID stays unchanged.
         let v2_json = r##"{
             "name": "Ocean",
             "themes": [
@@ -724,7 +717,6 @@ mod tests {
             assert_eq!(cx.theme().colors().accent, theme::try_parse_color("#f97316").unwrap());
         });
 
-        // Removing the custom theme file falls back gracefully to the default dark preset ("night").
         cx.update(|window, cx| {
             theme::reload_user_themes(Vec::new(), Vec::new(), cx);
             apply_theme(&store.preferences().unwrap().theme, window, cx);
@@ -738,7 +730,7 @@ mod tests {
     ) {
         cx.update(|cx| {
             theme::init(cx);
-            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+            assert!(desktop_common::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
             cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
         });
         let store = Rc::new(Store::open_in_memory().unwrap());
@@ -749,7 +741,8 @@ mod tests {
         };
         store.save_theme_selection(&initial).unwrap();
         let (settings, cx) = cx.add_window_view(|window, cx| {
-            let mut settings = SettingsWindow::new(store.clone(), cx);
+            let host = SettingsHost::noop(cx);
+            let mut settings = SettingsWindow::new(store.clone(), host, cx);
             apply_theme(&settings.preferences.theme, window, cx);
             settings.set_page(super::super::Page::Appearance, cx);
             window.focus(&settings.focus_handle, cx);
@@ -758,20 +751,17 @@ mod tests {
         cx.simulate_resize(gpui::size(px(900.), px(780.)));
         cx.run_until_parked();
 
-        // All 6 dark preset tiles render inline even when active theme is light.
         for id in ["night", "darkcyan", "darkgreen", "darkyellow", "darkpink", "darkpurple"] {
             let sel: &'static str = Box::leak(format!("theme-tile-{id}").into_boxed_str());
             assert!(cx.debug_bounds(sel).is_some(), "missing inline dark tile {sel}");
         }
 
-        // Clicking a dark tile while Follow System is active opens ConfirmDialog instead of OS prompt.
         let purple_tile = cx.debug_bounds("theme-tile-darkpurple").unwrap().center();
         cx.simulate_click(purple_tile, gpui::Modifiers::default());
         cx.run_until_parked();
         assert!(cx.debug_bounds("confirm-switch-theme").is_some());
         cx.update(|_, cx| assert_eq!(cx.theme().id(), "matcha"));
 
-        // Escape dismisses the ConfirmDialog without closing SettingsWindow or switching theme.
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         assert!(cx.debug_bounds("confirm-switch-theme").is_none());
@@ -780,7 +770,6 @@ mod tests {
             assert_eq!(cx.theme().id(), "matcha");
         });
 
-        // Clicking darkpurple again and choosing "Just this time" applies temporary dark theme.
         let purple_tile = cx.debug_bounds("theme-tile-darkpurple").unwrap().center();
         cx.simulate_click(purple_tile, gpui::Modifiers::default());
         cx.run_until_parked();
@@ -794,8 +783,6 @@ mod tests {
         assert_eq!(store.preferences().unwrap().theme.dark.as_deref(), Some("darkcyan"));
         cx.update(|_, cx| assert_eq!(cx.theme().id(), "darkpurple"));
 
-        // Picking matcha returns to Follow System light, then choosing "Keep this theme" on darkgreen
-        // disables Follow System and persists darkgreen.
         let matcha_tile = cx.debug_bounds("theme-tile-matcha").unwrap().center();
         cx.simulate_click(matcha_tile, gpui::Modifiers::default());
         cx.run_until_parked();

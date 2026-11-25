@@ -4,7 +4,6 @@ use ui::popover;
 use ui::prelude::*;
 
 use crate::i18n;
-use crate::release_notes::action_button;
 use crate::settings_window;
 use crate::sidebar::{self, Section};
 use crate::title_bar;
@@ -103,7 +102,7 @@ impl AppView {
             self.cancel_rail_drag(window, cx);
             return;
         }
-        let top_y = title_bar::height() + px(sidebar::SECTIONS_TOP_OFFSET);
+        let top_y = title_bar::height(window, cx) + px(sidebar::SECTIONS_TOP_OFFSET);
         let content_y = event.event.position.y - top_y - self.rail_scroll.offset().y;
         let slot = ((f32::from(content_y) / sidebar::SLOT_HEIGHT).floor() as isize)
             .clamp(0, (visible.len() - 1) as isize) as usize;
@@ -149,27 +148,27 @@ impl AppView {
                         this.open_settings_page(settings_window::Page::Shortcuts, window, cx);
                     })),
             )
-            .child(div().my_1().child(Divider::horizontal()))
-            .child(
-                ListItem::new("account-always-on-top")
-                    .start_slot(Icon::new(if topmost { IconName::PinOff } else { IconName::Pin }).color(if topmost { Color::Accent } else { Color::Icon }))
-                    .child(Label::new(strings.tray_always_on_top).color(if topmost { Color::Accent } else { Color::Default }))
-                    .when(topmost, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.account_menu_open = false;
-                        if let Err(err) = crate::tray::set_always_on_top(&this.store, !topmost, cx) {
-                            eprintln!("failed to toggle always_on_top: {err:#}");
-                        }
-                        cx.notify();
-                    })),
-            )
+            .when(!desktop_common::is_wayland_session(), |menu| {
+                menu.child(div().my_1().child(Divider::horizontal())).child(
+                    ListItem::new("account-always-on-top")
+                        .start_slot(Icon::new(if topmost { IconName::PinOff } else { IconName::Pin }).color(if topmost { Color::Accent } else { Color::Icon }))
+                        .child(Label::new(strings.tray_always_on_top).color(if topmost { Color::Accent } else { Color::Default }))
+                        .when(topmost, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.account_menu_open = false;
+                            if let Err(err) = crate::tray::set_always_on_top(&this.store, !topmost, cx) {
+                                desktop_common::logging::log_error("tray", format!("failed to toggle always_on_top: {err:#}"));
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
             .into_any_element()
     }
 
     pub(super) fn render_update_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let notes = self.update_notice.as_ref()?;
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
         let message = strings.update_installed.replace("{version}", &notes.version);
         Some(
             popover(cx)
@@ -187,31 +186,34 @@ impl AppView {
                             Label::new(message).weight(gpui::FontWeight::MEDIUM),
                         ))
                         .child(
-                            action_button("dismiss-update-notice", cx)
+                            div()
                                 .debug_selector(|| "dismiss-update-notice".to_owned())
-                                .size(px(26.))
-                                .min_h(px(26.))
-                                .px_0()
-                                .justify_center()
-                                .tooltip(Tooltip::text(strings.close))
-                                .child(Icon::new(IconName::X).size(IconSize::Small).color(Color::Muted))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.update_notice = None;
-                                    cx.notify();
-                                })),
+                                .child(
+                                    IconButton::new("dismiss-update-notice", IconName::X)
+                                        .icon_size(IconSize::Small)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text(strings.close))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.update_notice = None;
+                                            cx.notify();
+                                        })),
+                                ),
                         ),
                 )
                 .child(
                     h_flex().pl(px(26.)).pb_1().child(
-                        action_button("updated-whats-new", cx)
+                        div()
                             .debug_selector(|| "updated-whats-new".to_owned())
-                            .border_color(colors.border)
-                            .child(Label::new(strings.whats_new).size(LabelSize::Small).weight(gpui::FontWeight::MEDIUM))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(notes) = this.update_notice.take() {
-                                    this.open_settings(Some(notes), window, cx);
-                                }
-                            })),
+                            .child(
+                                Button::new("updated-whats-new", strings.whats_new)
+                                    .variant(ButtonVariant::Secondary)
+                                    .size(ButtonSize::Sm)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if let Some(notes) = this.update_notice.take() {
+                                            this.open_settings(Some(notes), window, cx);
+                                        }
+                                    })),
+                            ),
                     ),
                 )
                 .into_any_element(),

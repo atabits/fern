@@ -1,4 +1,5 @@
 use super::*;
+use desktop_common::data_version::changed_elsewhere;
 use gpui::{Modifiers, TestAppContext, point, size};
 
 fn setup_app(cx: &mut TestAppContext) {
@@ -14,22 +15,27 @@ fn setup_app(cx: &mut TestAppContext) {
 
 #[test]
 fn birth_date_part_ordering_follows_effective_date_format() {
-    calendar::set_date_format(Some(DateFormat::DayMonthYear));
     assert_eq!(
-        BirthDatePart::ordered(&fern_i18n::EN),
+        BirthDatePart::ordered_for_format(calendar::effective_date_format_with(
+            Some(DateFormat::DayMonthYear),
+            &fern_i18n::EN,
+        )),
         [BirthDatePart::Day, BirthDatePart::Month, BirthDatePart::Year]
     );
-    calendar::set_date_format(Some(DateFormat::MonthDayYear));
     assert_eq!(
-        BirthDatePart::ordered(&fern_i18n::EN),
+        BirthDatePart::ordered_for_format(calendar::effective_date_format_with(
+            Some(DateFormat::MonthDayYear),
+            &fern_i18n::EN,
+        )),
         [BirthDatePart::Month, BirthDatePart::Day, BirthDatePart::Year]
     );
-    calendar::set_date_format(Some(DateFormat::IsoYearMonthDay));
     assert_eq!(
-        BirthDatePart::ordered(&fern_i18n::EN),
+        BirthDatePart::ordered_for_format(calendar::effective_date_format_with(
+            Some(DateFormat::IsoYearMonthDay),
+            &fern_i18n::EN,
+        )),
         [BirthDatePart::Year, BirthDatePart::Month, BirthDatePart::Day]
     );
-    calendar::set_date_format(None);
 }
 
 #[gpui::test]
@@ -438,8 +444,8 @@ fn new_inactive_preserves_palette_mode_and_defers_birth_date_until_activated(
         let view = cx.new(|cx| LifeClockView::new_inactive(store.clone(), cx));
         {
             let v = view.read(cx);
-            assert!(!v.active);
-            assert!(v.dirty);
+            assert!(!v.refresh.is_active());
+            assert!(v.refresh.is_dirty());
             assert_eq!(v.palette_mode(), LifeClockPaletteMode::FernTheme);
             assert_eq!(v.birth_date, None);
             assert_eq!(v.year_input.read(cx).text(), "");
@@ -447,8 +453,8 @@ fn new_inactive_preserves_palette_mode_and_defers_birth_date_until_activated(
 
         view.update(cx, |v, cx| v.set_active(true, cx));
         let v = view.read(cx);
-        assert!(v.active);
-        assert!(!v.dirty);
+        assert!(v.refresh.is_active());
+        assert!(!v.refresh.is_dirty());
         assert_eq!(v.palette_mode(), LifeClockPaletteMode::FernTheme);
         assert_eq!(v.birth_date, NaiveDate::from_ymd_opt(1998, 11, 20));
         assert_eq!(v.year_input.read(cx).text(), "1998");

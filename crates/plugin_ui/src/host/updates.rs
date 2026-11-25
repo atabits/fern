@@ -100,13 +100,13 @@ pub(super) fn apply_host_update(update: HostUpdate, cx: &mut App) {
                         info.metrics = metrics;
                     }
                     if deactivated {
-                        host.views.retain(|(p, _), _| p != &plugin_id);
-                        host.view_revisions.retain(|(p, _), _| p != &plugin_id);
+                        host.views.remove(&plugin_id);
+                        host.view_revisions.remove(&plugin_id);
                         host.op_state.borrow_mut().invalidate_plugin_views(&plugin_id);
                     }
                     if host.pending_hot_reload.remove(&plugin_id) {
-                        host.views.retain(|(p, _), _| p != &plugin_id);
-                        host.view_revisions.retain(|(p, _), _| p != &plugin_id);
+                        host.views.remove(&plugin_id);
+                        host.view_revisions.remove(&plugin_id);
                         host.op_state.borrow_mut().invalidate_plugin_views(&plugin_id);
                         let rev = host
                             .plugin_revisions
@@ -176,9 +176,8 @@ pub(super) fn apply_registry_changed(infos: Vec<PluginInfo>, cx: &mut App) {
                     .in_flight_reload_or_reset
                     .contains(&info.manifest.id);
                 if changed && !reloading_or_resetting {
-                    host.views.retain(|(pid, _), _| pid != &info.manifest.id);
-                    host.view_revisions
-                        .retain(|(pid, _), _| pid != &info.manifest.id);
+                    host.views.remove(&info.manifest.id);
+                    host.view_revisions.remove(&info.manifest.id);
                     host.op_state
                         .borrow_mut()
                         .invalidate_plugin_views(&info.manifest.id);
@@ -198,22 +197,19 @@ pub(super) fn apply_registry_changed(infos: Vec<PluginInfo>, cx: &mut App) {
                             | PluginStatus::CircuitBroken { .. }
                     );
                 if inactive {
-                    host.views.retain(|(pid, _), _| pid != &info.manifest.id);
-                    host.view_errors
-                        .retain(|(pid, _), _| pid != &info.manifest.id);
-                    host.view_revisions
-                        .retain(|(pid, _), _| pid != &info.manifest.id);
+                    host.views.remove(&info.manifest.id);
+                    host.view_errors.remove(&info.manifest.id);
+                    host.view_revisions.remove(&info.manifest.id);
                     host.op_state
                         .borrow_mut()
                         .invalidate_plugin_views(&info.manifest.id);
                 }
             }
             let alive: HashSet<&str> = infos.iter().map(|p| p.manifest.id.as_str()).collect();
-            host.views.retain(|(pid, _), _| alive.contains(pid.as_str()));
-            host.view_errors
-                .retain(|(pid, _), _| alive.contains(pid.as_str()));
+            host.views.retain(|pid, _| alive.contains(pid.as_str()));
+            host.view_errors.retain(|pid, _| alive.contains(pid.as_str()));
             host.view_revisions
-                .retain(|(pid, _), _| alive.contains(pid.as_str()));
+                .retain(|pid, _| alive.contains(pid.as_str()));
             host.pending_hot_reload
                 .retain(|pid| alive.contains(pid.as_str()));
             should_sync_themes = host.loaded_theme_signature.as_ref() != Some(&next_theme_sig);

@@ -24,7 +24,7 @@ struct FernTray {
 
 impl Tray for FernTray {
     fn id(&self) -> String {
-        "fern-tasks".into()
+        desktop_common::app_id()
     }
 
     fn title(&self) -> String {
@@ -33,7 +33,7 @@ impl Tray for FernTray {
 
     fn icon_name(&self) -> String {
         if self.icon.is_empty() {
-            "fern-tasks".into()
+            desktop_common::desktop_icon_name()
         } else {
             String::new()
         }
@@ -55,7 +55,7 @@ impl Tray for FernTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        vec![
+        let mut items: Vec<MenuItem<Self>> = vec![
             StandardItem {
                 label: "Fern".into(),
                 activate: Box::new(|tray: &mut Self| {
@@ -88,17 +88,23 @@ impl Tray for FernTray {
                 ..Default::default()
             }
             .into(),
-            MenuItem::Separator,
-            CheckmarkItem {
-                label: self.labels.always_on_top.into(),
-                checked: self.always_on_top,
-                activate: Box::new(|tray: &mut Self| {
-                    let _ = tray.tx.unbounded_send(TrayAction::ToggleAlwaysOnTop);
-                }),
-                ..Default::default()
-            }
-            .into(),
-            MenuItem::Separator,
+        ];
+        if !desktop_common::is_wayland_session() {
+            items.push(MenuItem::Separator);
+            items.push(
+                CheckmarkItem {
+                    label: self.labels.always_on_top.into(),
+                    checked: self.always_on_top,
+                    activate: Box::new(|tray: &mut Self| {
+                        let _ = tray.tx.unbounded_send(TrayAction::ToggleAlwaysOnTop);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items.push(MenuItem::Separator);
+        items.push(
             StandardItem {
                 label: self.labels.quit.into(),
                 activate: Box::new(|tray: &mut Self| {
@@ -107,7 +113,8 @@ impl Tray for FernTray {
                 ..Default::default()
             }
             .into(),
-        ]
+        );
+        items
     }
 }
 
@@ -281,7 +288,7 @@ pub(super) fn init(window: &Window, prefs: TrayPrefs, labels: TrayLabels) {
                     }
                 }
                 Err(err) => {
-                    eprintln!("system tray unavailable: {err}");
+                    desktop_common::logging::log_warn("tray", format!("system tray unavailable: {err}"));
                 }
             }
         });

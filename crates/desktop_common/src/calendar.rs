@@ -1,11 +1,10 @@
 //! Date math for the due-date calendar.
 
-use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, Timelike, Weekday};
-
 use fern_i18n::Strings;
+use gpui::App;
+
+use crate::active_preferences::ActivePreferences;
 
 /// The first day of the month that contains `date`.
 pub fn month_start(date: NaiveDate) -> NaiveDate {
@@ -21,49 +20,16 @@ pub fn add_months(month: NaiveDate, delta: i32) -> NaiveDate {
     }
 }
 
-thread_local! {
-    /// The first day of the week from the Settings ("Start Week on"). The UI runs on one thread,
-    /// so every calendar reads it without threading it through each view.
-    static WEEK_START: Cell<Weekday> = const { Cell::new(Weekday::Mon) };
+pub fn explicit_date_format(cx: &App) -> Option<fern_core::DateFormat> {
+    ActivePreferences::get(cx).date_format
 }
 
-thread_local! {
-    /// Settings → Time Format: "1:00 PM" instead of "13:00".
-    static HOUR12: Cell<bool> = const { Cell::new(false) };
+pub fn week_numbers(cx: &App) -> bool {
+    ActivePreferences::get(cx).week_numbers
 }
 
-thread_local! {
-    /// Settings → Date Format; `None` follows the UI language.
-    static DATE_FORMAT: Cell<Option<fern_core::DateFormat>> = const { Cell::new(None) };
-    /// Settings → Show Week Numbers.
-    static WEEK_NUMBERS: Cell<bool> = const { Cell::new(false) };
-}
-
-pub fn set_date_format(format: Option<fern_core::DateFormat>) {
-    DATE_FORMAT.with(|f| f.set(format));
-}
-
-pub fn explicit_date_format() -> Option<fern_core::DateFormat> {
-    DATE_FORMAT.with(Cell::get)
-}
-
-pub fn set_week_numbers(on: bool) {
-    WEEK_NUMBERS.with(|w| w.set(on));
-}
-
-pub fn week_numbers() -> bool {
-    WEEK_NUMBERS.with(Cell::get)
-}
-
-/// Global master switch mirroring `Preferences.features.horizons` for cross-app Horizons UI.
-static HORIZONS_ENABLED: AtomicBool = AtomicBool::new(true);
-
-pub fn horizons_enabled() -> bool {
-    HORIZONS_ENABLED.load(Ordering::Relaxed)
-}
-
-pub fn set_horizons_enabled(enabled: bool) {
-    HORIZONS_ENABLED.store(enabled, Ordering::Relaxed);
+pub fn horizons_enabled(cx: &App) -> bool {
+    ActivePreferences::get(cx).horizons_enabled
 }
 
 /// The ISO week number shown for a calendar row: the week of its Thursday-most day, which is
@@ -73,13 +39,29 @@ pub fn week_number(week: &[NaiveDate; 7]) -> u32 {
 }
 
 /// A numeric date in the chosen format, such as "2026-12-31", or in the locale's default.
-pub fn format_date(date: NaiveDate, strings: &Strings) -> String {
-    format_date_as(date, selected_date_format(strings), strings.dotted_dates, true)
+pub fn format_date(date: NaiveDate, strings: &Strings, cx: &App) -> String {
+    format_date_with(date, explicit_date_format(cx), strings)
+}
+
+pub fn format_date_with(
+    date: NaiveDate,
+    explicit: Option<fern_core::DateFormat>,
+    strings: &Strings,
+) -> String {
+    format_date_as(date, selected_date_format(explicit, strings), strings.dotted_dates, true)
 }
 
 /// A numeric date with the year omitted.
-pub fn format_day_month(date: NaiveDate, strings: &Strings) -> String {
-    format_date_as(date, selected_date_format(strings), strings.dotted_dates, false)
+pub fn format_day_month(date: NaiveDate, strings: &Strings, cx: &App) -> String {
+    format_day_month_with(date, explicit_date_format(cx), strings)
+}
+
+pub fn format_day_month_with(
+    date: NaiveDate,
+    explicit: Option<fern_core::DateFormat>,
+    strings: &Strings,
+) -> String {
+    format_date_as(date, selected_date_format(explicit, strings), strings.dotted_dates, false)
 }
 
 /// Localized label for a filter's date rule chip.
@@ -101,13 +83,24 @@ pub fn filter_date_label(rule: fern_core::DateRule, strings: &Strings) -> &'stat
     }
 }
 
-fn selected_date_format(strings: &Strings) -> Option<fern_core::DateFormat> {
-    explicit_date_format().or(strings.year_first_dates.then_some(fern_core::DateFormat::YearMonthDay))
+fn selected_date_format(
+    explicit: Option<fern_core::DateFormat>,
+    strings: &Strings,
+) -> Option<fern_core::DateFormat> {
+    explicit.or(strings.year_first_dates.then_some(fern_core::DateFormat::YearMonthDay))
 }
 
-pub fn effective_date_format(strings: &Strings) -> fern_core::DateFormat {
+pub fn effective_date_format_with(
+    explicit: Option<fern_core::DateFormat>,
+    strings: &Strings,
+) -> fern_core::DateFormat {
     use fern_core::DateFormat::{DayMonthYear, MonthDayYear};
-    selected_date_format(strings).unwrap_or(if strings.dotted_dates { DayMonthYear } else { MonthDayYear })
+    selected_date_format(explicit, strings)
+        .unwrap_or(if strings.dotted_dates { DayMonthYear } else { MonthDayYear })
+}
+
+pub fn effective_date_format(strings: &Strings, cx: &App) -> fern_core::DateFormat {
+    effective_date_format_with(explicit_date_format(cx), strings)
 }
 
 /// Writes `date` by a template of the language: `{weekday}` and `{wd}` the full and short
@@ -126,16 +119,19 @@ pub fn format_day(template: &str, date: NaiveDate, strings: &Strings) -> String 
         .replace("{yyyy}", &date.year().to_string())
 }
 
-/// A typed date: ISO ("2026-10-18"), or the numeric format dates are shown in, with or without
-/// the year (the current year then).
-pub fn parse_date(text: &str, today: NaiveDate, strings: &Strings) -> Option<NaiveDate> {
+pub fn parse_date_with(
+    text: &str,
+    today: NaiveDate,
+    explicit: Option<fern_core::DateFormat>,
+    strings: &Strings,
+) -> Option<NaiveDate> {
     let text = text.trim();
     if let Ok(date) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
         return Some(date);
     }
     let parts: Vec<u32> = text.split(['.', '/', '-']).map(|p| p.trim().parse().ok()).collect::<Option<_>>()?;
     use fern_core::DateFormat::*;
-    let format = effective_date_format(strings);
+    let format = effective_date_format_with(explicit, strings);
     let (y, m, d) = match (format, parts.as_slice()) {
         (YearMonthDay | IsoYearMonthDay, &[y, m, d]) => (y as i32, m, d),
         (DayMonthYear, &[d, m, y]) => (y as i32, m, d),
@@ -145,6 +141,12 @@ pub fn parse_date(text: &str, today: NaiveDate, strings: &Strings) -> Option<Nai
         _ => return None,
     };
     NaiveDate::from_ymd_opt(y, m, d)
+}
+
+/// A typed date: ISO ("2026-10-18"), or the numeric format dates are shown in, with or without
+/// the year (the current year then).
+pub fn parse_date(text: &str, today: NaiveDate, strings: &Strings, cx: &App) -> Option<NaiveDate> {
+    parse_date_with(text, today, explicit_date_format(cx), strings)
 }
 
 pub fn format_date_as(date: NaiveDate, format: Option<fern_core::DateFormat>, dotted: bool, year: bool) -> String {
@@ -165,13 +167,17 @@ pub fn format_date_as(date: NaiveDate, format: Option<fern_core::DateFormat>, do
     date.format(pattern).to_string()
 }
 
-pub fn set_hour12(on: bool) {
-    HOUR12.with(|hour12| hour12.set(on));
+pub fn hour12(cx: &App) -> bool {
+    ActivePreferences::get(cx).hour12
 }
 
 /// A time of day in the chosen format, with the locale's 12-hour labels.
-pub fn format_time(time: impl Timelike, strings: &Strings) -> String {
-    format_time_as(time, HOUR12.with(Cell::get), strings)
+pub fn format_time(time: impl Timelike, strings: &Strings, cx: &App) -> String {
+    format_time_as(time, hour12(cx), strings)
+}
+
+pub fn format_time_with(time: impl Timelike, use_hour12: bool, strings: &Strings) -> String {
+    format_time_as(time, use_hour12, strings)
 }
 
 /// Parses a typed time such as `"9"`, `"09:30"`, `"9.30pm"`, `"930"`, or `"下午3:15"`.
@@ -229,8 +235,8 @@ fn format_time_as(time: impl Timelike, hour12: bool, strings: &Strings) -> Strin
 }
 
 /// A whole hour for time axes and hints: "09:00" or "9 AM".
-pub fn format_hour(hour: u32, strings: &Strings) -> String {
-    if HOUR12.with(Cell::get) {
+pub fn format_hour_with(hour: u32, use_hour12: bool, strings: &Strings) -> String {
+    if use_hour12 {
         let (pm, hour) = NaiveTime::from_hms_opt(hour % 24, 0, 0).expect("a valid hour").hour12();
         strings.time_meridiem[usize::from(pm)].replace("{time}", &hour.to_string())
     } else {
@@ -238,43 +244,59 @@ pub fn format_hour(hour: u32, strings: &Strings) -> String {
     }
 }
 
-pub fn set_week_start(day: Weekday) {
-    WEEK_START.with(|start| start.set(day));
+pub fn format_hour(hour: u32, strings: &Strings, cx: &App) -> String {
+    format_hour_with(hour, hour12(cx), strings)
 }
 
-pub fn week_start() -> Weekday {
-    WEEK_START.with(Cell::get)
+pub fn week_start(cx: &App) -> Weekday {
+    ActivePreferences::get(cx).week_start
 }
 
 /// Weekday labels (given Monday first) in display order, starting with the first day of the week.
-pub fn weekday_labels<T: Copy>(monday_first: &[T; 7]) -> [T; 7] {
-    let offset = week_start().num_days_from_monday() as usize;
+pub fn weekday_labels_with<T: Copy>(monday_first: &[T; 7], start: Weekday) -> [T; 7] {
+    let offset = start.num_days_from_monday() as usize;
     std::array::from_fn(|i| monday_first[(i + offset) % 7])
 }
 
+pub fn weekday_labels<T: Copy>(monday_first: &[T; 7], cx: &App) -> [T; 7] {
+    weekday_labels_with(monday_first, week_start(cx))
+}
+
 /// The weeks that contain days of `month`: four to six of them.
-pub fn month_weeks(month: NaiveDate) -> Vec<[NaiveDate; 7]> {
+pub fn month_weeks_with(month: NaiveDate, start_day: Weekday) -> Vec<[NaiveDate; 7]> {
     let first = month_start(month);
     let next_month = add_months(first, 1);
     let mut weeks = Vec::new();
-    let mut start = week_of(first)[0];
+    let mut start = week_from(first, start_day)[0];
     while start < next_month {
-        weeks.push(week_of(start));
+        weeks.push(week_from(start, start_day));
         start += Duration::days(7);
     }
     weeks
 }
 
+pub fn month_weeks(month: NaiveDate, cx: &App) -> Vec<[NaiveDate; 7]> {
+    month_weeks_with(month, week_start(cx))
+}
+
 /// `count` weeks from the one that contains `date`: the original's Multi-Week.
-pub fn weeks_from(date: NaiveDate, count: usize) -> Vec<[NaiveDate; 7]> {
-    let first = week_of(date)[0];
-    (0..count).map(|i| week_of(first + Duration::weeks(i as i64))).collect()
+pub fn weeks_from_with(date: NaiveDate, count: usize, start_day: Weekday) -> Vec<[NaiveDate; 7]> {
+    let first = week_from(date, start_day)[0];
+    (0..count).map(|i| week_from(first + Duration::weeks(i as i64), start_day)).collect()
+}
+
+pub fn weeks_from(date: NaiveDate, count: usize, cx: &App) -> Vec<[NaiveDate; 7]> {
+    weeks_from_with(date, count, week_start(cx))
 }
 
 /// 42 days (six weeks) covering `month`.
-pub fn month_grid(month: NaiveDate) -> Vec<NaiveDate> {
-    let start = week_of(month_start(month))[0];
+pub fn month_grid_with(month: NaiveDate, start_day: Weekday) -> Vec<NaiveDate> {
+    let start = week_from(month_start(month), start_day)[0];
     (0..42).map(|i| start + Duration::days(i)).collect()
+}
+
+pub fn month_grid(month: NaiveDate, cx: &App) -> Vec<NaiveDate> {
+    month_grid_with(month, week_start(cx))
 }
 
 /// The year overview's heatmap levels, based on the number of visible items.
@@ -289,8 +311,8 @@ pub fn heatmap_level(count: usize) -> u8 {
 }
 
 /// The seven days of the week that contains `date`.
-pub fn week_of(date: NaiveDate) -> [NaiveDate; 7] {
-    week_from(date, week_start())
+pub fn week_of(date: NaiveDate, cx: &App) -> [NaiveDate; 7] {
+    week_from(date, week_start(cx))
 }
 
 /// The seven days of the week that contains `date`, for weeks starting on `start`.
@@ -668,7 +690,7 @@ mod tests {
     #[test]
     fn grid_starts_on_monday_and_covers_month() {
         // 1 October 2026 is a Thursday.
-        let grid = month_grid(d(2026, 10, 18));
+        let grid = month_grid_with(d(2026, 10, 18), Weekday::Mon);
         assert_eq!(grid.len(), 42);
         assert_eq!(grid[0], d(2026, 9, 28));
         assert_eq!(grid[3], d(2026, 10, 1));
@@ -678,12 +700,12 @@ mod tests {
     #[test]
     fn month_weeks_cover_only_the_month() {
         // October 2026 spans five weeks: Sep 28 – Nov 1.
-        let weeks = month_weeks(d(2026, 10, 18));
+        let weeks = month_weeks_with(d(2026, 10, 18), Weekday::Mon);
         assert_eq!(weeks.len(), 5);
         assert_eq!(weeks[0][0], d(2026, 9, 28));
         assert_eq!(weeks[4][6], d(2026, 11, 1));
         // February 2027 starts on a Monday and fits in four weeks.
-        assert_eq!(month_weeks(d(2027, 2, 1)).len(), 4);
+        assert_eq!(month_weeks_with(d(2027, 2, 1), Weekday::Mon).len(), 4);
     }
 
     #[test]
@@ -703,10 +725,10 @@ mod tests {
 
     #[test]
     fn week_starts_on_monday() {
-        let week = week_of(d(2026, 10, 18)); // a Sunday
+        let week = week_from(d(2026, 10, 18), Weekday::Mon); // a Sunday
         assert_eq!(week[0], d(2026, 10, 12));
         assert_eq!(week[6], d(2026, 10, 18));
-        assert_eq!(week_of(d(2026, 10, 12))[0], d(2026, 10, 12));
+        assert_eq!(week_from(d(2026, 10, 12), Weekday::Mon)[0], d(2026, 10, 12));
     }
 
     #[test]
@@ -729,37 +751,38 @@ mod tests {
     #[test]
     fn parses_typed_dates() {
         let today = d(2026, 10, 18);
-        assert_eq!(parse_date("2026-11-02", today, &fern_i18n::EN), Some(d(2026, 11, 2)));
-        assert_eq!(parse_date("11/02/2026", today, &fern_i18n::EN), Some(d(2026, 11, 2)));
-        assert_eq!(parse_date("11/2", today, &fern_i18n::EN), Some(d(2026, 11, 2)));
-        assert_eq!(parse_date("2.11.2026", today, &fern_i18n::RU), Some(d(2026, 11, 2)));
-        assert_eq!(parse_date("someday", today, &fern_i18n::EN), None);
+        assert_eq!(parse_date_with("2026-11-02", today, None, &fern_i18n::EN), Some(d(2026, 11, 2)));
+        assert_eq!(parse_date_with("11/02/2026", today, None, &fern_i18n::EN), Some(d(2026, 11, 2)));
+        assert_eq!(parse_date_with("11/2", today, None, &fern_i18n::EN), Some(d(2026, 11, 2)));
+        assert_eq!(parse_date_with("2.11.2026", today, None, &fern_i18n::RU), Some(d(2026, 11, 2)));
+        assert_eq!(parse_date_with("someday", today, None, &fern_i18n::EN), None);
     }
 
-    #[test]
-    fn chinese_dates_follow_the_locale_and_explicit_overrides() {
+    #[gpui::test]
+    fn chinese_dates_follow_the_locale_and_explicit_overrides(cx: &mut gpui::TestAppContext) {
         use fern_core::DateFormat::DayMonthYear;
         let date = d(2026, 11, 2);
-        assert_eq!(format_date(date, &ZH_CN), "2026/11/02");
-        assert_eq!(format_day_month(date, &ZH_CN), "11/02");
-        assert_eq!(parse_date("2026/11/02", date, &ZH_CN), Some(date));
-        assert_eq!(parse_date("11/02", date, &ZH_CN), Some(date));
+        cx.update(|cx| {
+            assert_eq!(format_date(date, &ZH_CN, cx), "2026/11/02");
+            assert_eq!(format_day_month(date, &ZH_CN, cx), "11/02");
+            assert_eq!(parse_date("2026/11/02", date, &ZH_CN, cx), Some(date));
+            assert_eq!(parse_date("11/02", date, &ZH_CN, cx), Some(date));
 
-        set_date_format(Some(DayMonthYear));
-        assert_eq!(format_date(date, &ZH_CN), "02/11/2026");
-        assert_eq!(format_day_month(date, &ZH_CN), "02/11");
-        assert_eq!(parse_date("02/11/2026", date, &ZH_CN), Some(date));
-        assert_eq!(parse_date("02/11", date, &ZH_CN), Some(date));
+            ActivePreferences::update(cx, |p| p.date_format = Some(DayMonthYear));
+            assert_eq!(format_date(date, &ZH_CN, cx), "02/11/2026");
+            assert_eq!(format_day_month(date, &ZH_CN, cx), "02/11");
+            assert_eq!(parse_date("02/11/2026", date, &ZH_CN, cx), Some(date));
+            assert_eq!(parse_date("02/11", date, &ZH_CN, cx), Some(date));
 
-        set_date_format(Some(fern_core::DateFormat::IsoYearMonthDay));
-        assert_eq!(format_date(date, &RU), "2026-11-02");
-        assert_eq!(parse_date("2026-11-02", date, &RU), Some(date));
-        assert_eq!(parse_date("11-02", date, &RU), Some(date));
-        set_date_format(None);
+            ActivePreferences::update(cx, |p| p.date_format = Some(fern_core::DateFormat::IsoYearMonthDay));
+            assert_eq!(format_date(date, &RU, cx), "2026-11-02");
+            assert_eq!(parse_date("2026-11-02", date, &RU, cx), Some(date));
+            assert_eq!(parse_date("11-02", date, &RU, cx), Some(date));
+        });
     }
 
-    #[test]
-    fn twelve_and_twenty_four_hour_times() {
+    #[gpui::test]
+    fn twelve_and_twenty_four_hour_times(cx: &mut gpui::TestAppContext) {
         let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
         assert_eq!(format_time_as(t(13, 5), false, &EN), "13:05");
         assert_eq!(format_time_as(t(13, 5), true, &EN), "1:05 PM");
@@ -768,26 +791,29 @@ mod tests {
         assert_eq!(format_time_as(t(13, 5), false, &ZH_CN), "13:05");
         assert_eq!(format_time_as(t(0, 30), true, &ZH_CN), "上午12:30");
         assert_eq!(format_time_as(t(12, 0), true, &ZH_CN), "下午12:00");
-        set_hour12(true);
-        assert_eq!(format_hour(9, &EN), "9 AM");
-        assert_eq!(format_hour(9, &ZH_CN), "上午9");
-        assert_eq!(format_time(t(21, 0), &EN), "9:00 PM");
-        assert_eq!(format_time(t(21, 0), &ZH_CN), "下午9:00");
-        set_hour12(false);
-        assert_eq!(format_hour(9, &EN), "09:00");
+        cx.update(|cx| {
+            ActivePreferences::update(cx, |p| p.hour12 = true);
+            assert_eq!(format_hour(9, &EN, cx), "9 AM");
+            assert_eq!(format_hour(9, &ZH_CN, cx), "上午9");
+            assert_eq!(format_time(t(21, 0), &EN, cx), "9:00 PM");
+            assert_eq!(format_time(t(21, 0), &ZH_CN, cx), "下午9:00");
+            ActivePreferences::update(cx, |p| p.hour12 = false);
+            assert_eq!(format_hour(9, &EN, cx), "09:00");
+        });
     }
 
-    #[test]
-    fn weeks_can_start_on_sunday_or_saturday() {
+    #[gpui::test]
+    fn weeks_can_start_on_sunday_or_saturday(cx: &mut gpui::TestAppContext) {
         let sunday = d(2026, 10, 18);
         assert_eq!(week_from(sunday, Weekday::Sun)[0], sunday);
         assert_eq!(week_from(d(2026, 10, 24), Weekday::Sun)[6], d(2026, 10, 24));
         assert_eq!(week_from(sunday, Weekday::Sat)[0], d(2026, 10, 17));
 
-        set_week_start(Weekday::Sun);
-        assert_eq!(month_grid(d(2026, 10, 1))[0], d(2026, 9, 27));
-        assert_eq!(weekday_labels(&["M", "T", "W", "T", "F", "S", "Su"])[0], "Su");
-        set_week_start(Weekday::Mon);
+        cx.update(|cx| {
+            ActivePreferences::update(cx, |p| p.week_start = Weekday::Sun);
+            assert_eq!(month_grid(d(2026, 10, 1), cx)[0], d(2026, 9, 27));
+            assert_eq!(weekday_labels(&["M", "T", "W", "T", "F", "S", "Su"], cx)[0], "Su");
+        });
     }
 
     #[test]
@@ -802,9 +828,9 @@ mod tests {
     #[test]
     fn multi_week_weeks() {
         let day = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
-        let weeks = weeks_from(day, 5);
+        let weeks = weeks_from_with(day, 5, Weekday::Mon);
         assert_eq!(weeks.len(), 5);
-        assert_eq!(weeks[0], week_of(day));
+        assert_eq!(weeks[0], week_from(day, Weekday::Mon));
         assert_eq!(weeks[4][0], weeks[0][0] + Duration::weeks(4));
     }
 
@@ -902,13 +928,14 @@ mod tests {
         assert_eq!(format_horizon_heading(Horizon::Life, today, &RU), ("Жизнь".into(), None));
     }
 
-    #[test]
-    fn horizons_enabled_flag_toggles_and_restores() {
-        let initial = horizons_enabled();
-        assert!(initial);
-        set_horizons_enabled(false);
-        assert!(!horizons_enabled());
-        set_horizons_enabled(true);
-        assert!(horizons_enabled());
+    #[gpui::test]
+    fn horizons_enabled_flag_toggles_and_restores(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assert!(horizons_enabled(cx));
+            ActivePreferences::update(cx, |p| p.horizons_enabled = false);
+            assert!(!horizons_enabled(cx));
+            ActivePreferences::update(cx, |p| p.horizons_enabled = true);
+            assert!(horizons_enabled(cx));
+        });
     }
 }

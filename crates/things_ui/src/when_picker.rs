@@ -1,6 +1,6 @@
 //! Things-style "When" scheduling popover and Deadline picker reusing `task_ui::due_picker`.
 
-use chrono::{Datelike, Duration, NaiveDate};
+use chrono::{Duration, NaiveDate};
 use desktop_common::calendar;
 use desktop_common::text_input::TextInput;
 use fern_core::{Horizon, Id, ScheduleBucket, Task};
@@ -10,7 +10,7 @@ use task_ui::due_picker::{self, DueDraft};
 use task_ui::task_rows;
 use ui::prelude::*;
 use ui::{
-    Button, ButtonSize, ButtonVariant, Divider, Icon, IconButton, IconName, IconSize, Label,
+    Button, ButtonSize, ButtonVariant, Divider, Icon, IconName, IconSize, Label,
     LabelSize, ListItem, Tooltip, popover, v_scroll,
 };
 
@@ -59,7 +59,12 @@ pub enum DeadlineAction {
 }
 
 /// Formats a task's Things "When" schedule label for chips and card footers.
-pub fn format_when_label(task: &Task, today: NaiveDate, strings: &Strings) -> Option<String> {
+pub fn format_when_label(
+    task: &Task,
+    today: NaiveDate,
+    strings: &Strings,
+    cx: &App,
+) -> Option<String> {
     match task.schedule_bucket {
         ScheduleBucket::Someday => Some(strings.things_someday.to_owned()),
         ScheduleBucket::Evening if task.start_date.is_none_or(|d| d <= today) => {
@@ -67,7 +72,7 @@ pub fn format_when_label(task: &Task, today: NaiveDate, strings: &Strings) -> Op
         }
         _ => task
             .start_date
-            .map(|date| task_rows::due_label(date, None, today, strings).0),
+            .map(|date| task_rows::due_label(date, None, today, strings, cx).0),
     }
 }
 
@@ -82,105 +87,49 @@ fn render_month_grid<V: 'static>(
     on_shift: impl Fn(&mut V, i32, &mut Window, &mut Context<V>) + Clone + 'static,
     on_pick: impl Fn(&mut V, NaiveDate, &mut Window, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
-    let colors = cx.theme().colors().clone();
-    let month_title = strings
-        .month_title
-        .replace("{month}", strings.months[month.month0() as usize])
-        .replace("{yyyy}", &month.year().to_string());
-    let weekdays = calendar::weekday_labels(&strings.weekdays_narrow);
-    let shift_prev = on_shift.clone();
-    let shift_next = on_shift;
+    use desktop_common::month_calendar::{
+        MonthGridConfig, MonthHeaderConfig, WeekdayStyle, render_month_grid as shared_grid,
+        render_month_header, render_weekday_row,
+    };
 
-    let weeks: Vec<AnyElement> = calendar::month_grid(month)
-        .chunks(7)
-        .map(|week| {
-            h_flex()
-                .children(week.iter().map(|&date| {
-                    let in_month = date.month() == month.month();
-                    let is_selected = selected == Some(date);
-                    let is_today = date == today;
-                    let on_pick = on_pick.clone();
-                    div()
-                        .flex_1()
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("{id_prefix}-day-{date}")))
-                                .size(px(26.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .cursor_pointer()
-                                .when(is_selected, |el| el.bg(colors.accent))
-                                .when(!is_selected && is_today, |el| {
-                                    el.bg(colors.accent.opacity(0.16))
-                                })
-                                .when(!is_selected, |el| el.hover(|s| s.bg(colors.element_hover)))
-                                .child(
-                                    Label::new(date.day().to_string())
-                                        .centered()
-                                        .size(LabelSize::XSmall)
-                                        .color(if is_selected {
-                                            Color::OnAccent
-                                        } else if is_today {
-                                            Color::Accent
-                                        } else if in_month {
-                                            Color::Default
-                                        } else {
-                                            Color::Muted
-                                        }),
-                                )
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    on_pick(this, date, window, cx);
-                                })),
-                        )
-                }))
-                .into_any_element()
-        })
-        .collect();
+    let entity_shift = cx.entity();
+    let entity_pick = cx.entity();
+    let prev_id: &'static str = if id_prefix == "when-cal" {
+        "when-cal-prev"
+    } else {
+        "deadline-cal-prev"
+    };
+    let next_id: &'static str = if id_prefix == "when-cal" {
+        "when-cal-next"
+    } else {
+        "deadline-cal-next"
+    };
+    let mut header = MonthHeaderConfig::surface(month, strings, prev_id, next_id);
+    header.small_title = true;
+    header.title_weight = FontWeight::MEDIUM;
+    header.header_height = Some(px(26.));
+
+    let mut cfg = MonthGridConfig::single(id_prefix, month, today);
+    cfg.selected = selected;
+    cfg.label_size = LabelSize::XSmall;
+
+    let weeks = shared_grid(&cfg, cx, move |date, window, cx| {
+        let on_pick = on_pick.clone();
+        entity_pick.update(cx, |this, cx| on_pick(this, date, window, cx));
+    });
 
     v_flex()
         .gap_1()
-        .child(
-            h_flex()
-                .h(px(26.))
-                .px_1()
-                .child(
-                    div().flex_1().child(
-                        Label::new(month_title)
-                            .size(LabelSize::Small)
-                            .weight(FontWeight::MEDIUM),
-                    ),
-                )
-                .child(
-                    IconButton::new(SharedString::from(format!("{id_prefix}-prev")), IconName::ChevronLeft)
-                        .size(px(22.))
-                        .icon_size(IconSize::XSmall)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            shift_prev(this, -1, window, cx);
-                        })),
-                )
-                .child(
-                    IconButton::new(SharedString::from(format!("{id_prefix}-next")), IconName::ChevronRight)
-                        .size(px(22.))
-                        .icon_size(IconSize::XSmall)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            shift_next(this, 1, window, cx);
-                        })),
-                ),
-        )
-        .child(
-            h_flex().children(weekdays.into_iter().map(|wd| {
-                div().flex_1().flex().justify_center().child(
-                    Label::new(wd)
-                        .centered()
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-            })),
-        )
+        .child(div().px_1().child(render_month_header(
+            header,
+            cx,
+            move |delta, window, cx| {
+                let on_shift = on_shift.clone();
+                entity_shift.update(cx, |this, cx| on_shift(this, delta, window, cx));
+            },
+            None,
+        )))
+        .child(render_weekday_row(strings, WeekdayStyle::Narrow, false, cx))
         .children(weeks)
         .into_any_element()
 }
@@ -194,11 +143,14 @@ pub fn render_when_popover<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, WhenAction, &mut Window, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
-    let theme = cx.theme().clone();
-    let colors = theme.colors().clone();
-    let status = theme.status().clone();
+    let (accent, border_variant, surface_background, element_hover, warn_color, info_color) = {
+        let t = cx.theme();
+        let c = t.colors();
+        let s = t.status();
+        (c.accent, c.border_variant, c.surface_background, c.element_hover, s.warning, s.info)
+    };
     let tomorrow = today + Duration::days(1);
-    let next_week = fern_core::next_week_date(today, calendar::week_start());
+    let next_week = fern_core::next_week_date(today, calendar::week_start(cx));
 
     let preset_row = |id: &'static str,
                       icon: IconName,
@@ -257,7 +209,7 @@ pub fn render_when_popover<V: 'static>(
         },
     );
 
-    let horizons_enabled = calendar::horizons_enabled();
+    let horizons_enabled = calendar::horizons_enabled(cx);
     let has_clearable_schedule = state.start_date.is_some()
         || state.bucket != ScheduleBucket::None
         || (horizons_enabled && state.horizon.is_some());
@@ -271,7 +223,7 @@ pub fn render_when_popover<V: 'static>(
         .child(preset_row(
             "when-today",
             IconName::Sun,
-            Color::Custom(status.warning),
+            Color::Custom(warn_color),
             strings.things_today,
             is_today,
             Some(today),
@@ -291,7 +243,7 @@ pub fn render_when_popover<V: 'static>(
         .child(preset_row(
             "when-tomorrow",
             IconName::Sunrise,
-            Color::Custom(status.info),
+            Color::Custom(info_color),
             strings.tomorrow,
             is_tomorrow,
             Some(tomorrow),
@@ -325,9 +277,9 @@ pub fn render_when_popover<V: 'static>(
                 .px_2()
                 .gap_1p5()
                 .rounded(px(6.))
-                .bg(colors.surface_background)
+                .bg(surface_background)
                 .border_1()
-                .border_color(colors.border_variant)
+                .border_color(border_variant)
                 .child(Icon::new(IconName::CalendarDays).size(IconSize::XSmall).color(Color::Muted))
                 .child(div().flex_1().min_w_0().child(state.date_input.clone())),
         )
@@ -405,16 +357,16 @@ pub fn render_when_popover<V: 'static>(
                     .rounded(px(6.))
                     .border_1()
                     .border_color(if active {
-                        colors.accent.opacity(0.6)
+                        accent.opacity(0.6)
                     } else {
-                        colors.border_variant
+                        border_variant
                     })
                     .bg(if active {
-                        colors.accent.opacity(0.14)
+                        accent.opacity(0.14)
                     } else {
-                        colors.surface_background
+                        surface_background
                     })
-                    .when(!active, |el| el.hover(|s| s.bg(colors.element_hover)))
+                    .when(!active, |el| el.hover(|s| s.bg(element_hover)))
                     .cursor_pointer()
                     .tooltip(Tooltip::text(tip))
                     .child(
@@ -453,8 +405,11 @@ pub fn render_deadline_popover<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, DeadlineAction, &mut Window, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
-    let colors = cx.theme().colors().clone();
-    let [d_today, d_tomorrow, d_week, d_month] = due_picker::quick_dates(today);
+    let (accent, element_hover) = {
+        let c = cx.theme().colors();
+        (c.accent, c.element_hover)
+    };
+    let [d_today, d_tomorrow, d_week, d_month] = due_picker::quick_dates(today, cx);
 
     let quick_btn = |id: &'static str, icon: IconName, tip: &'static str, date: NaiveDate, cx: &mut Context<V>| {
         let on_action = on_action.clone();
@@ -468,8 +423,8 @@ pub fn render_deadline_popover<V: 'static>(
             .justify_center()
             .rounded(px(6.))
             .cursor_pointer()
-            .when(active, |el| el.bg(colors.accent.opacity(0.14)))
-            .when(!active, |el| el.hover(|s| s.bg(colors.element_hover)))
+            .when(active, |el| el.bg(accent.opacity(0.14)))
+            .when(!active, |el| el.hover(|s| s.bg(element_hover)))
             .tooltip(Tooltip::text(tip))
             .child(Icon::new(icon).size(IconSize::Medium).color(if active {
                 Color::Accent

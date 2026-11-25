@@ -204,11 +204,11 @@ pub(crate) fn capitalize_first(s: &str) -> String {
 }
 
 /// Formats a task's compact time range (e.g. `"11:00 – 11:30"` or `"11:00"`).
-fn format_task_time_range(task: &Task, strings: &Strings) -> Option<String> {
+fn format_task_time_range(task: &Task, strings: &Strings, cx: &App) -> Option<String> {
     let start = task.due_time?;
-    let start_str = calendar::format_time(start, strings);
+    let start_str = calendar::format_time(start, strings, cx);
     match task.end_time {
-        Some(end) if end != start => Some(format!("{start_str} – {}", calendar::format_time(end, strings))),
+        Some(end) if end != start => Some(format!("{start_str} – {}", calendar::format_time(end, strings, cx))),
         _ => Some(start_str),
     }
 }
@@ -766,7 +766,7 @@ impl HorizonsView {
         } else {
             task.title.clone()
         };
-        let time_range = format_task_time_range(task, strings);
+        let time_range = format_task_time_range(task, strings, cx);
         let board_badge = show_board_badge
             .then(|| task.list_id.and_then(|lid| self.list_meta.get(&lid)))
             .flatten();

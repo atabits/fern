@@ -42,13 +42,13 @@ pub fn render_move_popover<V: 'static>(
     on_pick: impl Fn(&mut V, Option<Id>, &mut Window, &mut Context<V>) + Clone + 'static,
     on_close: impl Fn(&mut V, &mut Window, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
-    let theme_colors = cx.theme().colors().clone();
+    let accent = cx.theme().colors().accent;
     let active_lists: Vec<&List> = lists.iter().filter(|l| !l.archived).collect();
 
     let project_item = |list: &List, indented: bool, cx: &mut Context<V>| {
         let id = list.id;
         let selected = current_list == Some(id);
-        let dot_color = colors::parse_color(list.color.as_deref()).unwrap_or(theme_colors.accent);
+        let dot_color = colors::parse_color(list.color.as_deref()).unwrap_or(accent);
         let pick = on_pick.clone();
         div()
             .when(indented, |el| el.pl_3())
@@ -167,7 +167,10 @@ pub fn render_bottom_bar<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, BottomBarAction, &mut Window, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
-    let colors = cx.theme().colors().clone();
+    let (border_variant, background) = {
+        let c = cx.theme().colors();
+        (c.border_variant, c.background)
+    };
     let strings = props.strings;
     let has_selected = props.selected_task.is_some();
     let current_list = props.selected_task.and_then(|t| t.list_id);
@@ -185,8 +188,8 @@ pub fn render_bottom_bar<V: 'static>(
         .h(px(48.))
         .px_5()
         .border_t_1()
-        .border_color(colors.border_variant)
-        .bg(colors.background)
+        .border_color(border_variant)
+        .bg(background)
         .justify_between()
         .child(div().w(px(34.)).flex_none())
         .child(

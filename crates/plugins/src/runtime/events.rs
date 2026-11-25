@@ -99,10 +99,10 @@ async fn dispatch_outbox_batch(env: &Rc<WorkerEnv>) -> Result<(usize, usize)> {
 
     for ev in events {
         if ev.depth >= MAX_EVENT_DEPTH {
-            eprintln!(
+            crate::log_host_warn(&format!(
                 "plugin_outbox stopping causal event {:?} at depth {} (>= MAX_EVENT_DEPTH {})",
                 ev.event_kind, ev.depth, MAX_EVENT_DEPTH
-            );
+            ));
             continue;
         }
         let next_depth = ev.depth.saturating_add(1);
@@ -461,12 +461,7 @@ fn load_outbox_entity_json(store: &Store, event_kind: &str, entity_id: &str) -> 
     {
         let habit_obj = Uuid::parse_str(habit_id_str)
             .ok()
-            .and_then(|hid| {
-                store
-                    .habits()
-                    .ok()
-                    .and_then(|list| list.into_iter().find(|h| h.id == hid))
-            })
+            .and_then(|hid| store.habit(hid).ok().flatten())
             .map(|h| {
                 json!({
                     "id": h.id.to_string(),
@@ -483,8 +478,7 @@ fn load_outbox_entity_json(store: &Store, event_kind: &str, entity_id: &str) -> 
     }
     if event_kind == "focus.completed"
         && let Ok(id) = Uuid::parse_str(entity_id)
-        && let Ok(sessions) = store.focus_sessions()
-        && let Some(s) = sessions.into_iter().find(|s| s.id == id)
+        && let Ok(Some(s)) = store.focus_session(id)
     {
         return json!({
             "id": s.id.to_string(),

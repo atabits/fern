@@ -65,8 +65,8 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         match self.store.complete(id, true) {
-            Ok(_) => desktop_common::sound::play_complete(&self.store),
-            Err(err) => eprintln!("failed to answer the reminder: {err:#}"),
+            Ok(_) => desktop_common::sound::play_complete(cx),
+            Err(err) => desktop_common::logging::log_error("reminders", format!("failed to answer the reminder: {err:#}")),
         }
         self.notices.items.retain(|n| n != notice);
         desktop_common::data_version::data_changed(cx.entity_id(), cx);
@@ -87,12 +87,13 @@ impl AppView {
         };
         if let Target::Task(id) = notice.target
             && action == NoticeAction::Complete
-            && let Some(mgr) = crate::quick_add_window::active_hook_manager(cx)
+            && desktop_common::plugin_bus::PluginHooksGlobal::global(cx)
+                .is_some_and(|hooks| hooks.is_active())
             && let Ok(Some(task)) = self.store.task(id)
         {
             let weak = cx.weak_entity();
             let notice_clone = notice.clone();
-            crate::quick_add_window::run_before_task_complete(mgr, &task, cx, move |allowed, cx| {
+            desktop_common::plugin_bus::run_before_task_complete_hook(&task, cx, move |allowed, cx| {
                 if allowed {
                     let _ = weak.update(cx, |this, cx| {
                         this.complete_task_from_notice(id, &notice_clone, cx);
@@ -121,7 +122,7 @@ impl AppView {
                         NoticeAction::Complete => {
                             let res = self.store.complete(id, true).map(|_| ());
                             if res.is_ok() {
-                                desktop_common::sound::play_complete(&self.store);
+                                desktop_common::sound::play_complete(cx);
                             }
                             res
                         }
@@ -143,7 +144,7 @@ impl AppView {
                             } else {
                                 let res = self.store.toggle_checkin(habit, today).map(|_| ());
                                 if res.is_ok() {
-                                    desktop_common::sound::play_complete(&self.store);
+                                    desktop_common::sound::play_complete(cx);
                                 }
                                 res
                             }
@@ -175,7 +176,7 @@ impl AppView {
             Target::Countdown(_) => Ok(()),
         };
         if let Err(err) = done {
-            eprintln!("failed to answer the reminder: {err:#}");
+            desktop_common::logging::log_error("reminders", format!("failed to answer the reminder: {err:#}"));
         }
         self.notices.items.retain(|n| n != notice);
         desktop_common::data_version::data_changed(cx.entity_id(), cx);
@@ -191,7 +192,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(super) fn render_active_alerts(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_active_alerts(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.active_alerts.is_empty() {
             return None;
         }
@@ -204,14 +205,14 @@ impl AppView {
                 .debug_selector(|| "active-reminder-alerts".to_owned())
                 .occlude()
                 .absolute()
-                .top(title_bar::height() + px(12.))
+                .top(title_bar::height(window, cx) + px(12.))
                 .right(px(16.))
                 .w(px(320.))
                 .gap_2()
                 .children(self.active_alerts.iter().enumerate().map(|(i, notice)| {
                     let target = notice.target;
                     let focus_title = notice.title.clone();
-                    let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings);
+                    let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings, cx);
                     let actions = notice.actions();
                     let dismiss_notice = notice.clone();
                     let focus_notice = notice.clone();
@@ -372,7 +373,7 @@ impl AppView {
                     "notices-scroll",
                     v_flex().id("notices").children(self.notices.items.iter().enumerate().map(|(i, notice)| {
                         let target = notice.target;
-                        let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings);
+                        let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings, cx);
                         let actions = notice.actions();
                         let buttons = actions.iter().map(|&action| {
                             let notice = notice.clone();

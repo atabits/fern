@@ -1,6 +1,5 @@
 use chrono::{Datelike, Local, NaiveDate};
 use fern_core::{Frequency, Recurrence};
-use gpui::FontWeight;
 use ui::prelude::*;
 use ui::popover;
 
@@ -48,7 +47,10 @@ impl TaskDetail {
         let day = |date: Option<NaiveDate>| -> SharedString {
             date.map_or(SharedString::default(), |d| task_rows::short_date(d, strings).into())
         };
-        let time = |t: Option<chrono::NaiveTime>| -> SharedString { t.map_or(SharedString::default(), |t| crate::calendar::format_time(t, strings).into()) };
+        let start_time_str: SharedString =
+            draft.time.map_or(SharedString::default(), |t| crate::calendar::format_time(t, strings, cx).into());
+        let end_time_str: SharedString =
+            draft.end_time.map_or(SharedString::default(), |t| crate::calendar::format_time(t, strings, cx).into());
         let line = |label: &'static str, date_chip: AnyElement, time_chip: Option<AnyElement>| {
             h_flex()
                 .gap_2()
@@ -57,9 +59,9 @@ impl TaskDetail {
                 .children(time_chip)
         };
         let start_date = chip("range-start-date", day(draft.date), RangeField::StartDate, cx).into_any_element();
-        let start_time = (!all_day).then(|| chip("range-start-time", time(draft.time), RangeField::StartTime, cx).into_any_element());
+        let start_time = (!all_day).then(|| chip("range-start-time", start_time_str, RangeField::StartTime, cx).into_any_element());
         let end_date = chip("range-end-date", day(draft.end_date), RangeField::EndDate, cx).into_any_element();
-        let end_time = (!all_day).then(|| chip("range-end-time", time(draft.end_time), RangeField::EndTime, cx).into_any_element());
+        let end_time = (!all_day).then(|| chip("range-end-time", end_time_str, RangeField::EndTime, cx).into_any_element());
         let picker: Option<AnyElement> = match draft.range_field {
             Some(RangeField::StartDate | RangeField::EndDate) => Some(calendar_block),
             Some(field @ (RangeField::StartTime | RangeField::EndTime)) => {
@@ -72,7 +74,7 @@ impl TaskDetail {
                             .children(due_picker::time_options().into_iter().map(|t| {
                                 ListItem::new(SharedString::from(format!("range-time-{t}")))
                                     .height(px(28.))
-                                    .child(Label::new(crate::calendar::format_time(t, strings)).size(LabelSize::Small))
+                                    .child(Label::new(crate::calendar::format_time(t, strings, cx)).size(LabelSize::Small))
                                     .when(current == Some(t), |item| item.end_slot(check_mark()))
                                     .on_click(cx.listener(move |this, _, _, cx| this.update_draft(cx, |d| d.pick_range_time(t))))
                             })),
@@ -111,7 +113,7 @@ impl TaskDetail {
         let locale = i18n::locale(cx);
         let today = Local::now().date_naive();
         let month = draft.month;
-        let [d_today, d_tomorrow, d_week, d_month] = due_picker::quick_dates(today);
+        let [d_today, d_tomorrow, d_week, d_month] = due_picker::quick_dates(today, cx);
 
         let quick = |id: &'static str, icon: IconName, tip: &'static str, date: NaiveDate, cx: &mut Context<Self>| {
             div()
@@ -129,57 +131,45 @@ impl TaskDetail {
                 .on_click(cx.listener(move |this, _, _, cx| this.update_draft(cx, |d| d.pick_date(date))))
         };
 
-        let weeks: Vec<AnyElement> = calendar::month_grid(month)
-            .chunks(7)
-            .map(|week| {
-                h_flex()
-                    .children(week.iter().map(|&date| {
-                        let in_month = date.month() == month.month();
-                        let picked = if draft.range_field == Some(RangeField::EndDate) { draft.end_date } else { draft.date };
-                        let is_selected = picked == Some(date);
-                        let duration = draft.tab == DueTab::Duration;
-                        let is_today = date == today;
-                        let is_other_endpoint = duration
-                            && !is_selected
-                            && (draft.date == Some(date) || draft.end_date == Some(date));
-                        let in_range = duration
-                            && matches!((draft.date, draft.end_date), (Some(s), Some(e)) if date > s && date < e);
-                        div().flex_1().flex().justify_center().child(
-                            div()
-                                .id(SharedString::from(format!("day-{date}")))
-                                .debug_selector(move || format!("due-day-{date}"))
-                                .size(px(28.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .cursor_pointer()
-                                .when(is_selected, |el| el.bg(theme.colors().accent))
-                                .when(is_other_endpoint, |el| el.bg(theme.colors().accent.opacity(0.32)))
-                                .when(in_range, |el| el.bg(theme.colors().accent.opacity(0.14)))
-                                .when(!is_selected && !is_other_endpoint && !in_range && is_today, |el| {
-                                    el.bg(theme.colors().accent.opacity(0.18))
-                                })
-                                .when(!is_selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
-                                .child(Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(
-                                    if is_selected {
-                                        Color::OnAccent
-                                    } else if is_today || is_other_endpoint {
-                                        Color::Accent
-                                    } else if in_month {
-                                        Color::Default
-                                    } else {
-                                        Color::Muted
-                                    },
-                                ))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.update_draft(cx, |d| if duration { d.pick_range_date(date) } else { d.pick_date(date) })
-                                })),
-                        )
-                    }))
-                    .into_any_element()
-            })
-            .collect();
+        let duration = draft.tab == DueTab::Duration;
+        let picked = if draft.range_field == Some(RangeField::EndDate) {
+            draft.end_date
+        } else {
+            draft.date
+        };
+        let other_endpoint = if duration {
+            [draft.date, draft.end_date]
+                .into_iter()
+                .flatten()
+                .find(|d| Some(*d) != picked)
+        } else {
+            None
+        };
+        let mut grid_cfg = desktop_common::month_calendar::MonthGridConfig::single("", month, today);
+        grid_cfg.selected = picked;
+        grid_cfg.other_endpoint = other_endpoint;
+        grid_cfg.range = if duration {
+            match (draft.date, draft.end_date) {
+                (Some(s), Some(e)) => Some((s.min(e), s.max(e))),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        grid_cfg.debug_prefix = Some("due");
+        grid_cfg.cell_size = px(28.);
+        let entity_pick = cx.entity();
+        let weeks = desktop_common::month_calendar::render_month_grid(&grid_cfg, cx, move |date, _, cx| {
+            entity_pick.update(cx, |this, cx| {
+                this.update_draft(cx, |d| {
+                    if duration {
+                        d.pick_range_date(date)
+                    } else {
+                        d.pick_date(date)
+                    }
+                })
+            });
+        });
 
         let row = |id: &'static str, icon: IconName, label: SharedString, active: bool, menu: DueMenu, cx: &mut Context<Self>| {
             let color = if active { Color::Accent } else { Color::Default };
@@ -203,11 +193,16 @@ impl TaskDetail {
                         .size(IconSize::XSmall),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    let opened_tz = menu == DueMenu::TimeZone
+                        && this.session.due_draft.as_ref().is_some_and(|d| d.menu.as_ref() != Some(&menu));
+                    if opened_tz {
+                        this.ensure_tz_input(cx);
+                    }
                     this.update_draft(cx, |d| d.menu = if d.menu.as_ref() == Some(&menu) { None } else { Some(menu.clone()) })
                 }))
         };
         let time_label: SharedString =
-            draft.time.map_or(strings.time.into(), |t| crate::calendar::format_time(t, strings).into());
+            draft.time.map_or(strings.time.into(), |t| crate::calendar::format_time(t, strings, cx).into());
         let repeat_label: SharedString =
             draft.repeat.as_ref().map_or(strings.repeat.into(), |r| due_picker::repeat_label(r, strings).into());
 
@@ -233,7 +228,7 @@ impl TaskDetail {
                                     std::iter::once(None)
                                         .chain(due_picker::time_options().into_iter().map(Some))
                                         .map(|time| {
-                                            let label: SharedString = time.map_or(strings.no_time.into(), |t| crate::calendar::format_time(t, strings).into());
+                                            let label: SharedString = time.map_or(strings.no_time.into(), |t| crate::calendar::format_time(t, strings, cx).into());
                                             ListItem::new(SharedString::from(format!("time-{label}")))
                                                 .height(px(28.))
                                                 .child(Label::new(label).size(LabelSize::Small))
@@ -251,7 +246,11 @@ impl TaskDetail {
                     .into_any_element(),
             ),
             Some(DueMenu::TimeZone) => {
-                let query = self.tz_input.read(cx).text().to_owned();
+                let query = self
+                    .tz_input
+                    .as_ref()
+                    .map(|input| input.read(cx).text().to_owned())
+                    .unwrap_or_default();
                 let options = due_picker::timezone_options(&query);
                 Some(
                     v_flex()
@@ -287,15 +286,17 @@ impl TaskDetail {
                                 ),
                         )
                         .child(div().py_0p5().child(Divider::horizontal()))
-                        .child(
-                            h_flex()
-                                .h(px(28.))
-                                .px_2()
-                                .rounded(px(6.))
-                                .bg(theme.colors().background)
-                                .text_size(px(12.))
-                                .child(self.tz_input.clone()),
-                        )
+                        .when_some(self.tz_input.clone(), |el, input| {
+                            el.child(
+                                h_flex()
+                                    .h(px(28.))
+                                    .px_2()
+                                    .rounded(px(6.))
+                                    .bg(theme.colors().background)
+                                    .text_size(px(12.))
+                                    .child(input),
+                            )
+                        })
                         .child(
                             v_scroll(
                                 "tz-options-scroll",
@@ -332,7 +333,7 @@ impl TaskDetail {
             Some(DueMenu::Custom(rule)) => Some(self.render_custom_repeat(rule.clone(), strings, cx)),
             Some(DueMenu::Reminder) => Some(
                 v_flex()
-                    .children(due_picker::reminder_options(draft.time.is_some(), strings).into_iter().map(
+                    .children(due_picker::reminder_options(draft.time.is_some(), strings, cx).into_iter().map(
                         |(minutes, label, hint)| {
                             ListItem::new(SharedString::from(format!("reminder-{minutes}")))
                                 .height(px(28.))
@@ -355,12 +356,12 @@ impl TaskDetail {
                         draft
                             .reminders
                             .iter()
-                            .filter(|m| !due_picker::reminder_options(draft.time.is_some(), strings).iter().any(|(o, _, _)| o == *m))
+                            .filter(|m| !due_picker::reminder_options(draft.time.is_some(), strings, cx).iter().any(|(o, _, _)| o == *m))
                             .map(|&minutes| {
                                 ListItem::new(SharedString::from(format!("reminder-custom-{minutes}")))
                                     .height(px(28.))
                                     .child(
-                                        Label::new(due_picker::describe_reminder(minutes, draft.time.is_some(), strings))
+                                        Label::new(due_picker::describe_reminder(minutes, draft.time.is_some(), strings, cx))
                                             .size(LabelSize::Small),
                                     )
                                     .end_slot(check_mark())
@@ -482,7 +483,7 @@ impl TaskDetail {
         let tz_label: SharedString = due_picker::short_timezone_label(draft.timezone.as_deref(), draft.is_floating, strings)
             .unwrap_or_else(|| strings.timezone_local.to_owned())
             .into();
-        let reminder_label: SharedString = due_picker::reminder_label(&draft.reminders, draft.time.is_some(), strings)
+        let reminder_label: SharedString = due_picker::reminder_label(&draft.reminders, draft.time.is_some(), strings, cx)
             .map_or(strings.reminder.into(), Into::into);
 
         let button = |id: &'static str, label: &'static str, primary: bool| {
@@ -505,7 +506,7 @@ impl TaskDetail {
                     .child(quick("due-tomorrow", IconName::Sunrise, strings.tomorrow, d_tomorrow, cx))
                     .child(quick("due-week", IconName::CalendarPlus, strings.next_week, d_week, cx))
                     .child(quick("due-month", IconName::Moon, strings.next_month, d_month, cx));
-        let horizon_row: Option<AnyElement> = calendar::horizons_enabled().then(|| {
+        let horizon_row: Option<AnyElement> = calendar::horizons_enabled(cx).then(|| {
             use fern_core::Horizon;
             let week = Horizon::current_week(today);
             let month = Horizon::current_month(today);
@@ -562,40 +563,33 @@ impl TaskDetail {
                 }))
                 .into_any_element()
         });
+        let entity_shift = cx.entity();
+        let entity_today = cx.entity();
+        let mut header_cfg =
+            desktop_common::month_calendar::MonthHeaderConfig::surface(month, strings, "prev-month", "next-month");
+        header_cfg.today_id = Some("this-month");
+        header_cfg.today_tooltip = Some(strings.this_month);
         let calendar_block = v_flex()
             .gap_2()
-            .child(
-                h_flex()
-                    .px_1()
-                    .child(div().flex_1().child(Label::new(calendar::month_title(month, strings)).weight(FontWeight::SEMIBOLD)))
-                    .child(
-                        IconButton::new("prev-month", IconName::ChevronLeft)
-                            .size(px(22.))
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("←"))
-                            .on_click(cx.listener(|this, _, _, cx| this.shift_month(-1, cx))),
-                    )
-                    .child(
-                        IconButton::new("this-month", IconName::Circle)
-                            .size(px(22.))
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text(strings.this_month))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let today = Local::now().date_naive();
-                                this.update_draft(cx, |d| d.month = calendar::month_start(today))
-                            })),
-                    )
-                    .child(
-                        IconButton::new("next-month", IconName::ChevronRight)
-                            .size(px(22.))
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("→"))
-                            .on_click(cx.listener(|this, _, _, cx| this.shift_month(1, cx))),
-                    ),
-            )
-            .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
-                div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(Color::Muted))
-            })))
+            .child(div().px_1().child(desktop_common::month_calendar::render_month_header(
+                header_cfg,
+                cx,
+                move |delta, _, cx| {
+                    entity_shift.update(cx, |this, cx| this.shift_month(delta, cx));
+                },
+                Some(Box::new(move |_, cx| {
+                    entity_today.update(cx, |this, cx| {
+                        let today = Local::now().date_naive();
+                        this.update_draft(cx, |d| d.month = calendar::month_start(today));
+                    });
+                })),
+            )))
+            .child(desktop_common::month_calendar::render_weekday_row(
+                strings,
+                desktop_common::month_calendar::WeekdayStyle::Narrow,
+                false,
+                cx,
+            ))
             .child(v_flex().gap_0p5().children(weeks))
             .into_any_element();
         let content = v_flex()
@@ -715,7 +709,7 @@ impl TaskDetail {
         let summary = fires.map(|at| {
             strings
                 .reminder_summary
-                .replace("{time}", &crate::calendar::format_time(at, strings))
+                .replace("{time}", &crate::calendar::format_time(at, strings, cx))
                 .replace("{date}", &task_rows::format_day(strings.short_date[1], at.date(), strings))
         });
         let stepper_row = |label: &'static str, value: String, minus: AnyElement, plus: AnyElement| {
@@ -776,7 +770,7 @@ impl TaskDetail {
             .when(!has_time, |el| {
                 el.child(stepper_row(
                     strings.reminder_at,
-                    crate::calendar::format_time(custom.at, strings),
+                    crate::calendar::format_time(custom.at, strings, cx),
                     small("reminder-earlier", IconName::Minus)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.update_custom_reminder(cx, |c| c.at -= chrono::Duration::minutes(30))
@@ -789,7 +783,7 @@ impl TaskDetail {
                         .into_any_element(),
                 ))
             })
-            .child(Label::new(due_picker::describe_reminder(offset, has_time, strings)).size(LabelSize::XSmall).color(Color::Muted))
+            .child(Label::new(due_picker::describe_reminder(offset, has_time, strings, cx)).size(LabelSize::XSmall).color(Color::Muted))
             .when_some(summary, |el, summary| el.child(Label::new(summary).size(LabelSize::XSmall).color(Color::Accent)))
             .child(
                 h_flex()
@@ -1077,7 +1071,7 @@ impl TaskDetail {
                 cx.notify();
             }))
         };
-        let days = calendar::month_grid(month);
+        let days = calendar::month_grid(month, cx);
         let weeks: Vec<_> = days.chunks(7).map(|week| {
             h_flex().children(week.iter().map(|&date| {
                 let picked = rule.dates.contains(&date);
@@ -1124,7 +1118,7 @@ impl TaskDetail {
                     .child(nav("specific-prev", IconName::ChevronLeft, -1))
                     .child(nav("specific-next", IconName::ChevronRight, 1)),
             )
-            .child(h_flex().children(calendar::weekday_labels(&strings.weekdays_narrow).map(|day| {
+            .child(h_flex().children(calendar::weekday_labels(&strings.weekdays_narrow, cx).map(|day| {
                 div().flex_1().flex().justify_center().child(Label::new(day).size(LabelSize::XSmall).color(Color::Muted))
             })))
             .children(weeks)

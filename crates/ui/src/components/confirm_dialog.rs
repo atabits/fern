@@ -32,14 +32,20 @@ pub struct ConfirmDialog {
 }
 
 impl ConfirmDialog {
-    pub fn new(id: impl Into<ElementId>, title: impl Into<SharedString>) -> Self {
+    /// Creates a confirmation dialog with explicit localized `cancel_label` and `confirm_label`.
+    pub fn new(
+        id: impl Into<ElementId>,
+        title: impl Into<SharedString>,
+        cancel_label: impl Into<SharedString>,
+        confirm_label: impl Into<SharedString>,
+    ) -> Self {
         Self {
             id: id.into(),
             title: title.into(),
             description: None,
             width: px(380.),
-            cancel_label: "Cancel".into(),
-            confirm_label: "Confirm".into(),
+            cancel_label: cancel_label.into(),
+            confirm_label: confirm_label.into(),
             destructive: false,
             dismiss_on_backdrop: true,
             on_cancel: None,
@@ -217,13 +223,11 @@ mod tests {
             let secondary = self.secondary.clone();
             let confirmed = self.confirmed.clone();
             div().relative().size_full().child(
-                ConfirmDialog::new("test-confirm", "Delete recurring task?")
+                ConfirmDialog::new("test-confirm", "Delete recurring task?", "Cancel", "Delete all")
                     .width(px(360.))
                     .description(
                         "This will permanently remove the selected item and cannot be undone once confirmed across all synced devices.",
                     )
-                    .cancel_label("Cancel")
-                    .confirm_label("Delete all")
                     .destructive(true)
                     .dismiss_on_backdrop(self.dismiss_on_backdrop)
                     .on_cancel(move |_, _, _| cancelled.set(cancelled.get() + 1))

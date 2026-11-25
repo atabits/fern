@@ -162,7 +162,7 @@ impl CalendarView {
     pub(super) fn render_week(&self, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let week = self.shown_days();
+        let week = self.shown_days(cx);
         let secondary_tz = self
             .options
             .secondary_timezone
@@ -288,14 +288,14 @@ impl CalendarView {
 
         // Time axis labels and hour lines.
         let hour_label = |hour: u32| -> SharedString {
-            if hour == 12 { strings.noon.into() } else { calendar::format_hour(hour, strings).into() }
+            if hour == 12 { strings.noon.into() } else { calendar::format_hour(hour, strings, cx).into() }
         };
         let tz_hour_label = |hour: u32, tz: &str| -> String {
             let (h, m, delta) = week_axis::hour_in_timezone(axis_ref_day, hour, tz);
             let mut label = if m == 0 {
-                calendar::format_hour(h, strings)
+                calendar::format_hour(h, strings, cx)
             } else {
-                calendar::format_time(NaiveTime::from_hms_opt(h, m, 0).unwrap_or_default(), strings)
+                calendar::format_time(NaiveTime::from_hms_opt(h, m, 0).unwrap_or_default(), strings, cx)
             };
             if delta > 0 {
                 label.push_str("+1");
@@ -306,6 +306,7 @@ impl CalendarView {
         };
         let now = Local::now().time();
         let now_color = theme.status().error;
+        let now_time_label = calendar::format_time(now, strings, cx);
         let now_label_y = (week.contains(&today) && week_axis::unfolded(now))
             .then(|| week_axis::offset(now) - 7.);
         let mut axis = v_flex().w(gutter).flex_none().child(
@@ -319,8 +320,8 @@ impl CalendarView {
                 .border_b_1()
                 .border_color(theme.colors().border_variant)
                 .flex_col()
-                .child(Label::new(calendar::format_hour(0, strings)).size(LabelSize::XSmall).color(Color::Muted))
-                .child(Label::new(format!("– {}", calendar::format_hour(7, strings))).size(LabelSize::XSmall).color(Color::Muted)),
+                .child(Label::new(calendar::format_hour(0, strings, cx)).size(LabelSize::XSmall).color(Color::Muted))
+                .child(Label::new(format!("– {}", calendar::format_hour(7, strings, cx))).size(LabelSize::XSmall).color(Color::Muted)),
         );
         for hour in week_axis::FIRST_HOUR..week_axis::LAST_HOUR {
             let hour_y = week_axis::offset(NaiveTime::from_hms_opt(hour, 0, 0).unwrap_or_default()) + 2.;
@@ -357,8 +358,8 @@ impl CalendarView {
                 .border_t_1()
                 .border_color(theme.colors().border_variant)
                 .flex_col()
-                .child(Label::new(calendar::format_hour(21, strings)).size(LabelSize::XSmall).color(Color::Muted))
-                .child(Label::new(format!("– {}", calendar::format_hour(0, strings))).size(LabelSize::XSmall).color(Color::Muted)),
+                .child(Label::new(calendar::format_hour(21, strings, cx)).size(LabelSize::XSmall).color(Color::Muted))
+                .child(Label::new(format!("– {}", calendar::format_hour(0, strings, cx))).size(LabelSize::XSmall).color(Color::Muted)),
         );
 
         let columns = week.iter().copied().map(|date| {
@@ -547,7 +548,7 @@ impl CalendarView {
                                                 .px_0p5()
                                                 .bg(theme.colors().background)
                                                 .child(
-                                                    Label::new(calendar::format_time(now, strings))
+                                                    Label::new(now_time_label)
                                                         .size(LabelSize::XSmall)
                                                         .color(Color::Custom(now_color)),
                                                 ),

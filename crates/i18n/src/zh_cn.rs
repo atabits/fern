@@ -615,6 +615,8 @@ pub static ZH_CN: Strings = Strings {
     tray_stopwatch: "正计时",
     tray_always_on_top: "窗口置顶",
     tray_quit: "退出",
+    wayland_hotkeys_hint: "在 Wayland 下，请将系统快捷键绑定到命令：fern --quick-add、fern --toggle、fern --focus-mini。",
+    wayland_window_controls_hint: "在 Wayland 下，窗口置顶与最小化到托盘由桌面合成器的窗口规则管理。",
     daily_time: "时间",
     daily_title: "今日：{n} 个任务",
     daily_empty: "今日无待办任务",

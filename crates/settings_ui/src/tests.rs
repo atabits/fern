@@ -1,13 +1,19 @@
+use std::rc::Rc;
+
+use desktop_sync::subscriptions::{self, ChinaHolidaySource};
+use fern_core::Store;
+use fern_i18n::{self as i18n, CurrentLocale, Locale};
+use gpui::{AppContext as _, point, px};
+
 use super::backups_diagnostics::format_bytes;
-use super::*;
-use crate::subscriptions::ChinaHolidaySource;
+use super::{ActiveConfirm, Menu, Page, SettingsHost, SettingsWindow, shortcuts_settings_view};
 
 #[gpui::test]
 fn task_positions_share_a_painted_settings_surface(cx: &mut gpui::TestAppContext) {
     cx.update(theme::init);
     let store = Rc::new(Store::open_in_memory().unwrap());
     let (settings, cx) = cx.add_window_view(|_, cx| {
-        let mut settings = SettingsWindow::new(store, cx);
+        let mut settings = SettingsWindow::new(store, SettingsHost::noop(cx), cx);
         settings.set_page(Page::More, cx);
         settings
     });
@@ -27,12 +33,15 @@ fn task_positions_share_a_painted_settings_surface(cx: &mut gpui::TestAppContext
         cx.update(|window, _| {
             let scale = window.scale_factor();
             let positions = [add_to.center().scale(scale), overdue.center().scale(scale)];
-            assert!(window.painted_quads().iter().any(|quad| {
-                quad.background.as_solid() == Some(surface)
-                    && positions.iter().all(|point| {
-                        quad.bounds.contains(point) && quad.content_mask.bounds.contains(point)
-                    })
-            }), "both task position rows must be painted on the same settings surface");
+            assert!(
+                window.painted_quads().iter().any(|quad| {
+                    quad.background.as_solid() == Some(surface)
+                        && positions.iter().all(|point| {
+                            quad.bounds.contains(point) && quad.content_mask.bounds.contains(point)
+                        })
+                }),
+                "both task position rows must be painted on the same settings surface"
+            );
         });
     }
 }
@@ -42,12 +51,16 @@ fn china_holidays_offer_both_sources_in_settings(cx: &mut gpui::TestAppContext) 
     let store = Rc::new(Store::open_in_memory().unwrap());
     cx.update(|cx| {
         theme::init(cx);
-        assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        assert!(
+            desktop_common::keymap::load_default(&assets::Assets, cx)
+                .unwrap()
+                .is_empty()
+        );
         cx.set_global(CurrentLocale(Locale::ZhCn));
-        crate::subscriptions::init(store.clone(), cx);
+        subscriptions::init(store.clone(), cx);
     });
     let (settings, cx) = cx.add_window_view(|window, cx| {
-        let mut settings = SettingsWindow::new(store, cx);
+        let mut settings = SettingsWindow::new(store, SettingsHost::noop(cx), cx);
         settings.set_page(Page::Integrations, cx);
         window.focus(&settings.focus_handle, cx);
         settings
@@ -69,12 +82,16 @@ fn caldav_form_saves_and_preserves_credentials_on_visibility_toggle(cx: &mut gpu
     let store = Rc::new(Store::open_in_memory().unwrap());
     cx.update(|cx| {
         theme::init(cx);
-        assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        assert!(
+            desktop_common::keymap::load_default(&assets::Assets, cx)
+                .unwrap()
+                .is_empty()
+        );
         cx.set_global(CurrentLocale(Locale::En));
-        crate::subscriptions::init(store.clone(), cx);
+        subscriptions::init(store.clone(), cx);
     });
     let (settings, cx) = cx.add_window_view(|window, cx| {
-        let mut settings = SettingsWindow::new(store.clone(), cx);
+        let mut settings = SettingsWindow::new(store.clone(), SettingsHost::noop(cx), cx);
         settings.set_page(Page::Integrations, cx);
         window.focus(&settings.focus_handle, cx);
         settings
@@ -91,9 +108,13 @@ fn caldav_form_saves_and_preserves_credentials_on_visibility_toggle(cx: &mut gpu
     let fastmail_btn = cx.debug_bounds("caldav-provider-fastmail").unwrap().center();
     cx.simulate_click(fastmail_btn, gpui::Modifiers::default());
     settings.update(cx, |s, cx| {
-        s.subscription_name.update(cx, |i, cx| i.set_text("Fastmail Work", cx));
-        s.subscription_username.update(cx, |i, cx| i.set_text("alice@fastmail.com", cx));
-        s.subscription_password.update(cx, |i, cx| i.set_text("app-secret", cx));
+        s.subs.name.update(cx, |i, cx| i.set_text("Fastmail Work", cx));
+        s.subs
+            .username
+            .update(cx, |i, cx| i.set_text("alice@fastmail.com", cx));
+        s.subs
+            .password
+            .update(cx, |i, cx| i.set_text("app-secret", cx));
         s.save_subscription_form(cx);
     });
     cx.run_until_parked();
@@ -124,11 +145,15 @@ fn shortcuts_page_records_cancels_with_escape_and_confirms_reset(cx: &mut gpui::
     let store = Rc::new(Store::open_in_memory().unwrap());
     cx.update(|cx| {
         theme::init(cx);
-        assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        assert!(
+            desktop_common::keymap::load_default(&assets::Assets, cx)
+                .unwrap()
+                .is_empty()
+        );
         cx.set_global(CurrentLocale(Locale::En));
     });
     let (settings, cx) = cx.add_window_view(|window, cx| {
-        let mut settings = SettingsWindow::new(store, cx);
+        let mut settings = SettingsWindow::new(store, SettingsHost::noop(cx), cx);
         settings.set_page(Page::Shortcuts, cx);
         window.focus(&settings.focus_handle, cx);
         settings
@@ -144,10 +169,10 @@ fn shortcuts_page_records_cancels_with_escape_and_confirms_reset(cx: &mut gpui::
     cx.simulate_click(first_pill.center(), gpui::Modifiers::default());
     cx.update(|_, cx| {
         assert_eq!(
-            settings.read(cx).recording_shortcut,
+            settings.read(cx).shortcuts.recording,
             Some(shortcuts_settings_view::RecordingTarget::Action(0))
         );
-        assert!(!settings.read(cx).recording_rejected);
+        assert!(!settings.read(cx).shortcuts.rejected);
     });
     assert!(cx.debug_bounds("shortcuts-recording-hint").is_some());
 
@@ -155,33 +180,38 @@ fn shortcuts_page_records_cancels_with_escape_and_confirms_reset(cx: &mut gpui::
     cx.simulate_keystrokes("a");
     cx.update(|_, cx| {
         assert_eq!(
-            settings.read(cx).recording_shortcut,
+            settings.read(cx).shortcuts.recording,
             Some(shortcuts_settings_view::RecordingTarget::Action(0))
         );
-        assert!(settings.read(cx).recording_rejected);
+        assert!(settings.read(cx).shortcuts.rejected);
     });
 
     // Escape cancels recording and clears the rejection state without closing Settings.
     cx.simulate_keystrokes("escape");
     cx.update(|_, cx| {
-        assert_eq!(settings.read(cx).recording_shortcut, None);
-        assert!(!settings.read(cx).recording_rejected);
+        assert_eq!(settings.read(cx).shortcuts.recording, None);
+        assert!(!settings.read(cx).shortcuts.rejected);
         assert!(!settings.read(cx).closing);
     });
     assert!(cx.debug_bounds("shortcuts-recording-hint").is_none());
 
     // Clicking Reset opens the confirmation modal; Escape dismisses it without closing Settings.
     cx.simulate_click(reset_btn.center(), gpui::Modifiers::default());
-    cx.update(|_, cx| assert!(settings.read(cx).confirm_reset_shortcuts));
+    cx.update(|_, cx| {
+        assert!(matches!(
+            settings.read(cx).confirm,
+            Some(ActiveConfirm::ResetShortcuts)
+        ));
+    });
     cx.simulate_keystrokes("escape");
     cx.update(|_, cx| {
-        assert!(!settings.read(cx).confirm_reset_shortcuts);
+        assert!(settings.read(cx).confirm.is_none());
         assert!(!settings.read(cx).closing);
     });
 
     // Keymap parse errors surface cleanly in the banner at the top of Page::Shortcuts.
     cx.update(|_, cx| {
-        crate::keymap::set_errors(vec!["keymap.json: test error".to_owned()], cx);
+        desktop_common::keymap::set_errors(vec!["keymap.json: test error".to_owned()], cx);
         settings.update(cx, |_, cx| cx.notify());
     });
     assert!(cx.debug_bounds("shortcuts-keymap-errors").is_some());
@@ -202,11 +232,15 @@ fn sync_page_saves_and_reloads_e2ee_passphrase(cx: &mut gpui::TestAppContext) {
     let store = Rc::new(Store::open_in_memory().unwrap());
     cx.update(|cx| {
         theme::init(cx);
-        assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        assert!(
+            desktop_common::keymap::load_default(&assets::Assets, cx)
+                .unwrap()
+                .is_empty()
+        );
         cx.set_global(CurrentLocale(Locale::En));
     });
     let (settings, cx) = cx.add_window_view(|window, cx| {
-        let mut settings = SettingsWindow::new(store.clone(), cx);
+        let mut settings = SettingsWindow::new(store.clone(), SettingsHost::noop(cx), cx);
         settings.set_page(Page::Sync, cx);
         window.focus(&settings.focus_handle, cx);
         settings
@@ -220,8 +254,10 @@ fn sync_page_saves_and_reloads_e2ee_passphrase(cx: &mut gpui::TestAppContext) {
 
     // Populate server and token, then enter passphrase via real user input + Enter submit.
     settings.update(cx, |s, cx| {
-        s.sync_server.update(cx, |i, cx| i.set_text("https://sync.example.org", cx));
-        s.sync_token.update(cx, |i, cx| i.set_text("tok-123", cx));
+        s.sync
+            .server
+            .update(cx, |i, cx| i.set_text("https://sync.example.org", cx));
+        s.sync.token.update(cx, |i, cx| i.set_text("tok-123", cx));
     });
     cx.simulate_click(pass_bounds.center(), gpui::Modifiers::default());
     cx.simulate_input("correct-horse-battery-staple");
@@ -234,10 +270,10 @@ fn sync_page_saves_and_reloads_e2ee_passphrase(cx: &mut gpui::TestAppContext) {
     assert_eq!(saved.passphrase, "correct-horse-battery-staple");
 
     // Reopening SettingsWindow reloads the persisted E2EE passphrase.
-    let reloaded = cx.update(|_, cx| cx.new(|cx| SettingsWindow::new(store.clone(), cx)));
+    let reloaded = cx.update(|_, cx| cx.new(|cx| SettingsWindow::new(store.clone(), SettingsHost::noop(cx), cx)));
     cx.update(|_, cx| {
         assert_eq!(
-            reloaded.read(cx).sync_passphrase.read(cx).text(),
+            reloaded.read(cx).sync.passphrase.read(cx).text(),
             "correct-horse-battery-staple"
         );
     });
@@ -261,13 +297,17 @@ fn about_page_renders_auto_backups_db_health_and_restore_confirmation(
 
     cx.update(|cx| {
         theme::init(cx);
-        assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        assert!(
+            desktop_common::keymap::load_default(&assets::Assets, cx)
+                .unwrap()
+                .is_empty()
+        );
         cx.set_global(CurrentLocale(Locale::En));
     });
     let (settings, cx) = cx.add_window_view(|window, cx| {
-        let mut settings = SettingsWindow::new(store.clone(), cx);
-        settings.backups_dir_override = Some(backups_dir.clone());
-        settings.restore_target_override = Some(restore_target.clone());
+        let mut settings = SettingsWindow::new(store.clone(), SettingsHost::noop(cx), cx);
+        settings.backups.backups_dir_override = Some(backups_dir.clone());
+        settings.backups.restore_target_override = Some(restore_target.clone());
         settings.set_page(Page::About, cx);
         window.focus(&settings.focus_handle, cx);
         settings
@@ -300,7 +340,10 @@ fn about_page_renders_auto_backups_db_health_and_restore_confirmation(
     cx.simulate_click(restore_btn.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     cx.update(|_, cx| {
-        assert_eq!(settings.read(cx).pending_restore.as_ref(), Some(&newer_backup));
+        assert!(matches!(
+            &settings.read(cx).confirm,
+            Some(ActiveConfirm::RestoreBackup(path)) if path == &newer_backup
+        ));
     });
     assert!(cx.debug_bounds("confirm-restore-backup").is_some());
 
@@ -308,7 +351,7 @@ fn about_page_renders_auto_backups_db_health_and_restore_confirmation(
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     cx.update(|_, cx| {
-        assert!(settings.read(cx).pending_restore.is_none());
+        assert!(settings.read(cx).confirm.is_none());
         assert!(!settings.read(cx).closing);
     });
     assert!(cx.debug_bounds("confirm-restore-backup").is_none());
@@ -320,9 +363,9 @@ fn about_page_renders_auto_backups_db_health_and_restore_confirmation(
     settings.update(cx, |s, cx| s.confirm_restore(cx));
     cx.run_until_parked();
     cx.update(|_, cx| {
-        assert!(settings.read(cx).pending_restore.is_none());
+        assert!(settings.read(cx).confirm.is_none());
         assert_eq!(
-            settings.read(cx).backup_message.as_deref(),
+            settings.read(cx).backups.message.as_deref(),
             Some(i18n::EN.restore_on_restart)
         );
     });
@@ -333,15 +376,17 @@ fn about_page_renders_auto_backups_db_health_and_restore_confirmation(
 }
 
 #[gpui::test]
-fn features_page_prevents_disabling_last_task_frontend_and_plugins_page_renders(cx: &mut gpui::TestAppContext) {
+fn features_page_prevents_disabling_last_task_frontend_and_plugins_page_renders(
+    cx: &mut gpui::TestAppContext,
+) {
     let store = Rc::new(Store::open_in_memory().unwrap());
     cx.update(|cx| {
         theme::init(cx);
-        cx.set_global(crate::i18n::CurrentLocale(crate::i18n::Locale::En));
-        let _ = crate::keymap::reload(&assets::Assets, cx);
+        cx.set_global(CurrentLocale(Locale::En));
+        let _ = desktop_common::keymap::reload(&assets::Assets, cx);
     });
     let (settings, cx) = cx.add_window_view(|window, cx| {
-        let mut settings = SettingsWindow::new(store.clone(), cx);
+        let mut settings = SettingsWindow::new(store.clone(), SettingsHost::noop(cx), cx);
         settings.set_page(Page::Features, cx);
         window.focus(&settings.focus_handle, cx);
         settings
@@ -383,7 +428,7 @@ fn features_page_prevents_disabling_last_task_frontend_and_plugins_page_renders(
         assert!(features.things);
     });
 
-    // Switching to Page::Plugins renders PluginSettingsView cleanly.
+    // Switching to Page::Plugins renders the hosted plugin settings view cleanly.
     let plugins_nav = cx.debug_bounds("settings-plugins");
     if let Some(bounds) = plugins_nav {
         cx.simulate_click(bounds.center(), gpui::Modifiers::default());
@@ -395,90 +440,22 @@ fn features_page_prevents_disabling_last_task_frontend_and_plugins_page_renders(
 }
 
 #[gpui::test]
-fn settings_window_mounts_plugin_overlays_and_escape_dismisses_modal_and_page_first(
-    app_cx: &mut gpui::TestAppContext,
-) {
-    use desktop_common::plugin_bus::{PluginBus, PluginModalKind, PluginModalSpec};
-
-    let store = Rc::new(Store::open_in_memory().unwrap());
-    app_cx.update(|cx| {
-        theme::init(cx);
-        assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
-        cx.set_global(CurrentLocale(Locale::En));
-    });
-    let (settings, cx) = app_cx.add_window_view(|window, cx| {
-        let mut settings = SettingsWindow::new(store, cx);
-        settings.set_page(Page::Plugins, cx);
-        window.focus(&settings.focus_handle, cx);
-        settings
-    });
-    cx.simulate_resize(gpui::size(px(900.), px(720.)));
-
-    // Open an embedded plugin page AND a plugin confirm modal.
-    cx.update(|_, cx| {
-        settings.update(cx, |s, cx| {
-            s.plugin_settings.update(cx, |ps, cx| {
-                ps.open_plugin_page("demo".into(), "Demo".into(), "main".into(), cx);
-            });
-        });
-        PluginBus::update(cx, |bus| {
-            bus.open_modal(PluginModalSpec {
-                plugin_id: "demo".into(),
-                view_id: "main".into(),
-                title: "Confirm sync".into(),
-                kind: PluginModalKind::Confirm {
-                    body: "Proceed?".into(),
-                    request_id: 42,
-                },
-            });
-        });
-    });
-    cx.run_until_parked();
-
-    // First Escape closes the plugin modal without closing the embedded page or Settings.
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
-    cx.update(|_, cx| {
-        assert!(cx.global::<PluginBus>().active_modal.is_none());
-        assert_eq!(
-            settings.read(cx).plugin_settings.read(cx).active_plugin_page_id(),
-            Some(("demo", "main"))
-        );
-        assert!(!settings.read(cx).is_closing());
-    });
-
-    // Second Escape closes the embedded plugin page without closing Settings.
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
-    cx.update(|_, cx| {
-        assert_eq!(
-            settings.read(cx).plugin_settings.read(cx).active_plugin_page_id(),
-            None
-        );
-        assert!(!settings.read(cx).is_closing());
-    });
-
-    // Third Escape closes and removes the Settings window.
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
-    app_cx.update(|cx| {
-        assert!(cx.windows().is_empty(), "third Escape must close SettingsWindow");
-    });
-}
-
-#[gpui::test]
 fn subscription_delete_confirms_locale_refreshes_placeholder_and_select_scrolls(
     cx: &mut gpui::TestAppContext,
 ) {
     let store = Rc::new(Store::open_in_memory().unwrap());
     cx.update(|cx| {
         theme::init(cx);
-        assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        assert!(
+            desktop_common::keymap::load_default(&assets::Assets, cx)
+                .unwrap()
+                .is_empty()
+        );
         cx.set_global(CurrentLocale(Locale::En));
-        crate::subscriptions::init(store.clone(), cx);
+        subscriptions::init(store.clone(), cx);
     });
     let (settings, cx) = cx.add_window_view(|window, cx| {
-        let mut settings = SettingsWindow::new(store.clone(), cx);
+        let mut settings = SettingsWindow::new(store.clone(), SettingsHost::noop(cx), cx);
         settings.attach_window(window, cx);
         settings.set_page(Page::Integrations, cx);
         window.focus(&settings.focus_handle, cx);
@@ -489,7 +466,7 @@ fn subscription_delete_confirms_locale_refreshes_placeholder_and_select_scrolls(
 
     // Add a subscription directly, then test Trash confirmation + Escape + Confirm.
     cx.update(|_, cx| {
-        crate::subscriptions::feeds(cx).unwrap().update(cx, |feeds, cx| {
+        subscriptions::feeds(cx).unwrap().update(cx, |feeds, cx| {
             feeds.add("Team Calendar", "https://example.com/team.ics", None, cx);
         });
     });
@@ -529,7 +506,7 @@ fn subscription_delete_confirms_locale_refreshes_placeholder_and_select_scrolls(
     cx.run_until_parked();
     cx.update(|_, cx| {
         assert_eq!(i18n::locale(cx), Locale::Ru);
-        settings.update(cx, |s, _| s.subscription_form = None);
+        settings.update(cx, |s, _| s.subs.form = None);
     });
 
     // 19-row DailyTime select popover caps height in a 400px-tall Settings window.

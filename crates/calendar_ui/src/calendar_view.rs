@@ -43,6 +43,8 @@ use sidebar::CalendarFilter;
 use week_grid::{TimedResize, task_timed_resize_edges};
 
 const CALENDAR_HEADER_HEIGHT: f32 = 50.;
+type EventsCacheKey = (NaiveDate, NaiveDate, u64, [u32; 4]);
+type EventsCache = std::collections::HashMap<EventsCacheKey, Vec<EventBar>>;
 
 /// The user clicked a task in the calendar.
 pub struct OpenTask(pub Id);
@@ -146,10 +148,10 @@ pub struct CalendarView {
     event_editor: Option<EventEditor>,
     pending_delete_event: Option<PendingDeleteEvent>,
     pending_complete: HashSet<Id>,
-    text_edit_sync_task: Option<gpui::Task<()>>,
     loaded_window: Option<ReloadWindow>,
-    active: bool,
-    dirty: bool,
+    feeds_revision: u64,
+    events_cache: std::cell::RefCell<EventsCache>,
+    refresh: crate::data_version::ViewRefreshState,
 }
 
 /// A new task stays in a draft until it is saved. A day anchors the editor to a month cell;
@@ -204,12 +206,17 @@ impl CalendarView {
         if let Some(feeds) = crate::subscriptions::feeds(cx) {
             cx.observe(&feeds, |this, _, cx| {
                 this.year_heatmap.clear();
+                this.feeds_revision = this.feeds_revision.wrapping_add(1);
+                this.events_cache.borrow_mut().clear();
                 cx.notify();
             }).detach();
         }
         cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| {
-            this.text_edit_sync_task = None;
-            crate::data_version::data_changed(cx.entity_id(), cx);
+            crate::data_version::data_changed_scoped(
+                cx.entity_id(),
+                crate::data_version::DataScope::TASKS,
+                cx,
+            );
             this.card_updated(cx);
         })
         .detach();
@@ -218,8 +225,10 @@ impl CalendarView {
         })
         .detach();
         cx.observe_global::<crate::data_version::DataVersion>(|this, cx| {
-            if crate::data_version::changed_elsewhere(cx.entity_id(), cx) {
-                this.sync_external(cx);
+            if this.refresh.on_data_version(cx.entity_id(), cx) {
+                this.card_updated(cx);
+            } else if this.refresh.is_dirty() {
+                this.loaded_window = None;
             }
         })
         .detach();
@@ -284,10 +293,14 @@ impl CalendarView {
             event_editor: None,
             pending_delete_event: None,
             pending_complete: HashSet::new(),
-            text_edit_sync_task: None,
             loaded_window: None,
-            active: initial_active,
-            dirty: !initial_active,
+            feeds_revision: 0,
+            events_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            refresh: crate::data_version::ViewRefreshState::new(
+                initial_active,
+                crate::data_version::DataScope::ALL,
+                cx,
+            ),
         };
         if initial_active {
             this.reload(cx);
@@ -367,13 +380,20 @@ impl CalendarView {
             self.store.set_completed(id, completed)
         };
         if let Err(err) = result {
-            eprintln!("failed to toggle calendar task: {err:#}");
+            desktop_common::logging::log_error(
+                "calendar_ui",
+                format!("failed to toggle calendar task: {err:#}"),
+            );
             return;
         }
         if completed && !task.is_wont_do() {
-            desktop_common::sound::play_complete(&self.store);
+            desktop_common::sound::play_complete(cx);
         }
-        crate::data_version::data_changed(cx.entity_id(), cx);
+        crate::data_version::data_changed_scoped(
+            cx.entity_id(),
+            crate::data_version::DataScope::TASKS,
+            cx,
+        );
         self.card_updated(cx);
     }
 
@@ -493,9 +513,16 @@ impl CalendarView {
             return;
         }
         if let Err(err) = self.store.move_dates(id, date) {
-            eprintln!("failed to move the task: {err:#}");
+            desktop_common::logging::log_error(
+                "calendar_ui",
+                format!("failed to move the task: {err:#}"),
+            );
         } else {
-            crate::data_version::data_changed(cx.entity_id(), cx);
+            crate::data_version::data_changed_scoped(
+            cx.entity_id(),
+            crate::data_version::DataScope::TASKS,
+            cx,
+        );
         }
         self.reload(cx);
     }
@@ -510,9 +537,16 @@ impl CalendarView {
             ResizeEdge::End => (resized.start, day.max(resized.start)),
         };
         if let Err(err) = self.store.resize_dates(resized.id, start, end) {
-            eprintln!("failed to resize task dates: {err:#}");
+            desktop_common::logging::log_error(
+                "calendar_ui",
+                format!("failed to resize task dates: {err:#}"),
+            );
         } else {
-            crate::data_version::data_changed(cx.entity_id(), cx);
+            crate::data_version::data_changed_scoped(
+            cx.entity_id(),
+            crate::data_version::DataScope::TASKS,
+            cx,
+        );
         }
         self.reload(cx);
     }
@@ -580,9 +614,16 @@ impl CalendarView {
             existing_task.and_then(|t| t.end_time).unwrap_or(end)
         };
         if let Err(err) = self.store.resize_timed_range(resize.id, save_date, save_start, save_end, save_end_date) {
-            eprintln!("failed to resize timed task: {err:#}");
+            desktop_common::logging::log_error(
+                "calendar_ui",
+                format!("failed to resize timed task: {err:#}"),
+            );
         } else {
-            crate::data_version::data_changed(cx.entity_id(), cx);
+            crate::data_version::data_changed_scoped(
+            cx.entity_id(),
+            crate::data_version::DataScope::TASKS,
+            cx,
+        );
         }
         self.reload(cx);
     }
@@ -592,7 +633,7 @@ impl CalendarView {
             window.focus(&editor.view.focus_handle(cx), cx);
             return;
         }
-        let date = self.new_task_day(Local::now().date_naive());
+        let date = self.new_task_day(Local::now().date_naive(), cx);
         self.create_task_editor(date, None, window, cx);
     }
 
@@ -632,7 +673,11 @@ impl CalendarView {
             }
             if let EditorEvent::Saved(task) = event {
                 this.hint_if_outside_filter(*task, cx);
-                crate::data_version::data_changed(cx.entity_id(), cx);
+                crate::data_version::data_changed_scoped(
+            cx.entity_id(),
+            crate::data_version::DataScope::TASKS,
+            cx,
+        );
                 this.reload(cx);
             } else {
                 cx.notify();
@@ -854,8 +899,8 @@ impl Render for CalendarView {
                 .bg(theme.colors().surface_background)
         };
 
-        let arrange = self.arrange.map(|tab| self.render_arrange(tab, cx));
-        let shown_month = self.toolbar_month();
+        let arrange = self.arrange.map(|tab| self.render_arrange(tab, window, cx));
+        let shown_month = self.toolbar_month(cx);
         let title_text = match self.mode {
             // The original's Year shows just the year.
             CalendarMode::Year => self.month.year().to_string(),
@@ -864,7 +909,7 @@ impl Render for CalendarView {
         let can_pick_month = self.mode != CalendarMode::Year;
         let toolbar = h_flex()
             .debug_selector(|| "calendar-toolbar".to_owned())
-            .mt(crate::title_bar::header_inset())
+            .mt(crate::title_bar::header_inset(window, cx))
             .h(px(CALENDAR_HEADER_HEIGHT))
             .flex_none()
             .pl(px(16.))
@@ -929,12 +974,12 @@ impl Render for CalendarView {
                         }),
                 ),
             )
-            .when(self.mode == CalendarMode::Week && calendar::week_numbers(), |el| {
+            .when(self.mode == CalendarMode::Week && calendar::week_numbers(cx), |el| {
                 el.child(
                     Label::new(format!(
                         "{}{}{}",
                         strings.horizons_week_prefix,
-                        calendar::week_number(&calendar::week_of(self.anchor)),
+                        calendar::week_number(&calendar::week_of(self.anchor, cx)),
                         strings.horizons_week_suffix
                     ))
                         .size(LabelSize::Small)
@@ -1069,8 +1114,8 @@ impl Render for CalendarView {
             .is_some_and(calendar::is_valid_timezone);
         let horizon_banner = match self.mode {
             CalendarMode::Week => {
-                let target = self.displayed_week_horizon();
-                let goals = self.horizon_goals_for(target, today, true);
+                let target = self.displayed_week_horizon(cx);
+                let goals = self.horizon_goals_for(target, today, true, cx);
                 self.render_horizon_goals_banner(
                     "calendar-week-goals-banner",
                     strings.calendar_week_goals,
@@ -1084,7 +1129,7 @@ impl Render for CalendarView {
                     year: self.month.year(),
                     month: self.month.month(),
                 };
-                let goals = self.horizon_goals_for(target, today, true);
+                let goals = self.horizon_goals_for(target, today, true, cx);
                 self.render_horizon_goals_banner(
                     "calendar-month-goals-banner",
                     strings.calendar_month_goals,
@@ -1108,17 +1153,17 @@ impl Render for CalendarView {
                     .when(self.mode.is_timed(), |el| {
                         el.child(div().w(if secondary_tz_active { px(108.) } else { px(56.) }).flex_none())
                     })
-                    .when(matches!(self.mode, CalendarMode::Month | CalendarMode::MultiWeek(_)) && calendar::week_numbers(), |el| {
+                    .when(matches!(self.mode, CalendarMode::Month | CalendarMode::MultiWeek(_)) && calendar::week_numbers(cx), |el| {
                         el.child(div().w(px(WEEK_NUMBER_WIDTH)).flex_none())
                     })
                     // The days' weekday names: the week's, or those of the shown days.
                     .children(match self.mode {
                         CalendarMode::Month | CalendarMode::Week | CalendarMode::MultiWeek(_) => {
-                            let shown = calendar::week_of(self.anchor).map(|d| self.options.shows_day(d));
-                            crate::calendar::weekday_labels(&strings.weekdays_short).into_iter().zip(shown).filter(|(_, on)| *on).map(|(l, _)| l).collect::<Vec<_>>()
+                            let shown = calendar::week_of(self.anchor, cx).map(|d| self.options.shows_day(d));
+                            crate::calendar::weekday_labels(&strings.weekdays_short, cx).into_iter().zip(shown).filter(|(_, on)| *on).map(|(l, _)| l).collect::<Vec<_>>()
                         }
                         _ => self
-                            .shown_days()
+                            .shown_days(cx)
                             .iter()
                             .map(|d| strings.weekdays_short[d.weekday().num_days_from_monday() as usize])
                             .collect(),
@@ -1244,7 +1289,7 @@ impl Render for CalendarView {
             .size_full()
             .bg(theme.colors().calendar_background)
             .text_color(theme.colors().text)
-            .when(self.sidebar_open, |el| el.child(self.render_calendar_sidebar(cx)))
+            .when(self.sidebar_open, |el| el.child(self.render_calendar_sidebar(window, cx)))
             .child(
                 v_flex().flex_1().min_w_0().h_full()
                     .child(toolbar)

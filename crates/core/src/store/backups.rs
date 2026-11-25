@@ -6,6 +6,16 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{DATE_FORMAT, SCHEMA_VERSION, Store};
 
+/// Returns `true` when `name` is a single safe attachment/upload filename (rejects empty names,
+/// `.` / `..`, path separators, NUL bytes, Windows drive `:` colons, and control characters).
+pub fn is_safe_attachment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', '\0', ':'])
+        && !name.chars().any(char::is_control)
+}
+
 /// Summary row counts for the primary user-facing tables.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableCounts {
@@ -120,19 +130,22 @@ impl Store {
     pub fn backup_to(&self, path: &std::path::Path, attachments: Option<&std::path::Path>) -> Result<()> {
         self.conn.backup(rusqlite::MAIN_DB, path, None::<fn(rusqlite::backup::Progress)>)?;
         if let Some(dir) = attachments.filter(|dir| dir.is_dir()) {
-            let copy = Connection::open(path)?;
-            copy.execute_batch("CREATE TABLE backup_files (name TEXT PRIMARY KEY, data BLOB NOT NULL);")?;
-            for entry in std::fs::read_dir(dir)? {
-                let entry = entry?;
-                if entry.file_type()?.is_file()
-                    && let Some(name) = entry.file_name().to_str()
-                {
-                    copy.execute(
-                        "INSERT INTO backup_files (name, data) VALUES (?1, ?2)",
-                        params![name, std::fs::read(entry.path())?],
-                    )?;
+            let mut copy = Connection::open(path)?;
+            let tx = copy.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute_batch("CREATE TABLE backup_files (name TEXT PRIMARY KEY, data BLOB NOT NULL);")?;
+            {
+                let mut stmt = tx.prepare("INSERT INTO backup_files (name, data) VALUES (?1, ?2)")?;
+                for entry in std::fs::read_dir(dir)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file()
+                        && let Some(name) = entry.file_name().to_str()
+                        && is_safe_attachment_name(name)
+                    {
+                        stmt.execute(params![name, std::fs::read(entry.path())?])?;
+                    }
                 }
             }
+            tx.commit()?;
         }
         Ok(())
     }
@@ -176,22 +189,61 @@ impl Store {
             .unwrap_or(false);
         if has_files {
             if let Some(dir) = attachments {
-                if dir.is_dir() {
-                    std::fs::remove_dir_all(dir)?;
-                }
-                std::fs::create_dir_all(dir)?;
-                let mut stmt = self.conn.prepare_cached("SELECT name, data FROM backup_files")?;
-                let files = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
-                for file in files {
-                    let (name, data) = file?;
-                    // Only plain names: a backup must not write outside the folder.
-                    if !name.contains(['/', '\\']) && name != ".." {
-                        std::fs::write(dir.join(name), data)?;
-                    }
-                }
+                self.restore_attachments_atomically(dir)?;
             }
             self.conn.execute_batch("DROP TABLE backup_files;")?;
         }
         Self::migrate(&self.conn)
+    }
+
+    fn restore_attachments_atomically(&self, dir: &std::path::Path) -> Result<()> {
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let pid = std::process::id();
+        let stage_dir = dir.with_file_name(format!(
+            "{}.restore.{pid}",
+            dir.file_name().and_then(|n| n.to_str()).unwrap_or("attachments")
+        ));
+        let prev_dir = dir.with_file_name(format!(
+            "{}.prev.{pid}",
+            dir.file_name().and_then(|n| n.to_str()).unwrap_or("attachments")
+        ));
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        let _ = std::fs::remove_dir_all(&prev_dir);
+        std::fs::create_dir_all(&stage_dir)?;
+
+        let extract_result = (|| -> Result<()> {
+            let mut stmt = self.conn.prepare_cached("SELECT name, data FROM backup_files")?;
+            let files = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+            for file in files {
+                let (name, data) = file?;
+                if is_safe_attachment_name(&name) {
+                    std::fs::write(stage_dir.join(name), data)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(err) = extract_result {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(err);
+        }
+
+        let had_existing = dir.exists();
+        if had_existing && let Err(err) = std::fs::rename(dir, &prev_dir) {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(err.into());
+        }
+        if let Err(err) = std::fs::rename(&stage_dir, dir) {
+            if had_existing {
+                let _ = std::fs::rename(&prev_dir, dir);
+            }
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(err.into());
+        }
+        if had_existing {
+            let _ = std::fs::remove_dir_all(&prev_dir);
+        }
+        Ok(())
     }
 }

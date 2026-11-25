@@ -95,7 +95,8 @@ impl TaskDetail {
                 el.child(self.close_side_menu_on_hover(item("more-link-parent", IconName::ListTree, strings.link_parent).on_click(cx.listener(
                     |this, _, window, cx| {
                         this.open_popup_from_ui(Popup::LinkParent, window, cx);
-                        window.focus(&this.link_search.focus_handle(cx), cx);
+                        let search = this.ensure_link_search(cx);
+                        window.focus(&search.focus_handle(cx), cx);
                     },
                 )), cx))
             })
@@ -410,7 +411,11 @@ impl TaskDetail {
         if self.session.task.is_none() {
             return div().into_any_element();
         }
-        let query = self.link_search.read(cx).text().trim().to_lowercase();
+        let query = self
+            .link_search
+            .as_ref()
+            .map(|input| input.read(cx).text().trim().to_lowercase())
+            .unwrap_or_default();
         let list_name = |list_id: Option<Id>| -> SharedString {
             list_id
                 .and_then(|id| self.session.lists.iter().find(|l| l.id == id))
@@ -437,7 +442,7 @@ impl TaskDetail {
                     .border_b_1()
                     .border_color(theme.colors().border)
                     .child(Icon::new(IconName::Search).color(Color::Muted))
-                    .child(div().flex_1().child(self.link_search.clone())),
+                    .when_some(self.link_search.clone(), |el, input| el.child(div().flex_1().child(input))),
             )
             .when_some(linked_parent, |el, parent| {
                 let parent_title: SharedString = if parent.title.is_empty() {
@@ -542,7 +547,11 @@ impl TaskDetail {
     pub(super) fn render_list_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let current = self.session.task.as_ref().map(|t| (t.list_id, t.section_id));
-        let query = self.list_search.read(cx).text().to_owned();
+        let query = self
+            .list_search
+            .as_ref()
+            .map(|input| input.read(cx).text().to_owned())
+            .unwrap_or_default();
         let submenu_bounds = Rc::new(Cell::new(None::<gpui::Bounds<Pixels>>));
         let outside_submenu = submenu_bounds.clone();
         let rows: Vec<(Option<Id>, SharedString, IconName)> = std::iter::once((None, SharedString::new_static(strings.inbox), IconName::Inbox))
@@ -568,7 +577,7 @@ impl TaskDetail {
                     .border_b_1()
                     .border_color(theme.colors().border_variant)
                     .child(Icon::new(IconName::Search).color(Color::Muted))
-                    .child(div().flex_1().child(self.list_search.clone())),
+                    .when_some(self.list_search.clone(), |el, input| el.child(div().flex_1().child(input))),
             )
             .child(
                 v_scroll(

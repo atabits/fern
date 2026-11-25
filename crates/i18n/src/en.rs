@@ -616,6 +616,8 @@ pub static EN: Strings = Strings {
     tray_stopwatch: "Stopwatch",
     tray_always_on_top: "Keep on Top",
     tray_quit: "Quit",
+    wayland_hotkeys_hint: "On Wayland, bind desktop shortcuts to: fern --quick-add, fern --toggle, fern --focus-mini.",
+    wayland_window_controls_hint: "Wayland compositors manage Keep on Top and minimize-to-tray via window rules or the panel.",
     daily_time: "Time",
     daily_title: "Today: {n} tasks",
     daily_empty: "Nothing due today.",

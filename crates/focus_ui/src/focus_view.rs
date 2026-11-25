@@ -258,8 +258,7 @@ pub struct FocusView {
     open_record: Option<Id>,
     record_note: Entity<TextInput>,
     pending_focus: Option<PendingFocus>,
-    active: bool,
-    dirty: bool,
+    refresh: desktop_common::data_version::ViewRefreshState,
 }
 
 impl gpui::Focusable for FocusView {
@@ -300,8 +299,10 @@ impl FocusView {
         }
         let settings = FocusSettings::load(&store);
         cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
-            if desktop_common::data_version::changed_elsewhere(cx.entity_id(), cx) {
-                this.sync_external(cx);
+            if this.refresh.on_data_version(cx.entity_id(), cx)
+                || (this.refresh.is_dirty() && this.running_clock().is_some())
+            {
+                this.reload(cx);
             }
         })
         .detach();
@@ -348,8 +349,14 @@ impl FocusView {
             open_record: None,
             record_note,
             pending_focus: None,
-            active: initial_active,
-            dirty: !initial_active,
+            refresh: desktop_common::data_version::ViewRefreshState::new(
+                initial_active,
+                desktop_common::data_version::DataScope::FOCUS
+                    | desktop_common::data_version::DataScope::TASKS
+                    | desktop_common::data_version::DataScope::HABITS
+                    | desktop_common::data_version::DataScope::PREFS,
+                cx,
+            ),
         };
         if initial_active {
             this.reload(cx);
@@ -358,18 +365,14 @@ impl FocusView {
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
-        self.active = active;
-        if active && self.dirty {
-            self.dirty = false;
+        if self.refresh.set_active(active, cx) {
             self.reload(cx);
         }
     }
 
     pub fn sync_external(&mut self, cx: &mut Context<Self>) {
-        if self.active || self.running_clock().is_some() {
+        if self.running_clock().is_some() || self.refresh.mark_dirty_or_reload() {
             self.reload(cx);
-        } else {
-            self.dirty = true;
         }
     }
 
@@ -429,7 +432,7 @@ impl FocusView {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.dirty = false;
+        self.refresh.mark_clean(cx);
         let today = Local::now().date_naive();
         self.settings = FocusSettings::load(&self.store);
         self.sessions = self.store.focus_sessions().unwrap_or_default();
@@ -482,7 +485,7 @@ impl FocusView {
             _ => {}
         }
         if let Err(err) = self.store.set_setting(key, &value.to_string()) {
-            eprintln!("failed to save the focus setting: {err:#}");
+            desktop_common::logging::log_error("focus_ui", format!("failed to save the focus setting: {err:#}"));
         }
         cx.notify();
     }
@@ -619,7 +622,7 @@ impl FocusView {
 
     #[cfg(debug_assertions)]
     pub fn dev_menu(&mut self, menu: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dirty {
+        if self.refresh.is_dirty() {
             self.reload(cx);
         }
         let menu = match menu {
@@ -945,8 +948,8 @@ impl FocusView {
                             .child(
                                 Label::new(format!(
                                     "{} - {}",
-                                    crate::calendar::format_time(start, strings),
-                                    crate::calendar::format_time(session.end_local(), strings)
+                                    crate::calendar::format_time(start, strings, cx),
+                                    crate::calendar::format_time(session.end_local(), strings, cx)
                                 ))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
@@ -1021,11 +1024,9 @@ impl FocusView {
                 el.debug_selector(|| "focus-delete-all-modal".to_owned())
             })
             .child(
-                ConfirmDialog::new("focus-delete-all", strings.delete_all)
+                ConfirmDialog::new("focus-delete-all", strings.delete_all, strings.cancel, strings.delete)
                     .width(px(360.))
                     .description(strings.focus_batch_delete_message)
-                    .cancel_label(strings.cancel)
-                    .confirm_label(strings.delete)
                     .destructive(true)
                     .on_cancel(cx.listener(|this, _, _, cx| {
                         this.confirm_delete_all = false;
@@ -1034,10 +1035,14 @@ impl FocusView {
                     .on_confirm(cx.listener(|this, _, _, cx| {
                         this.confirm_delete_all = false;
                         if let Err(err) = this.store.delete_all_focus_sessions() {
-                            eprintln!("failed to delete the focus records: {err:#}");
+                            desktop_common::logging::log_error("focus_ui", format!("failed to delete the focus records: {err:#}"));
                         }
                         this.reload(cx);
-                        desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                        desktop_common::data_version::data_changed_scoped(
+                            cx.entity_id(),
+                            desktop_common::data_version::DataScope::FOCUS,
+                            cx,
+                        );
                     })),
             )
             .into_any_element()
@@ -1071,11 +1076,17 @@ impl Render for FocusView {
         }
         self.sync_ambient_sound();
         if let Some(page) = self.stats {
-            return self.render_stats(page, cx);
+            return self.render_stats(page, window, cx);
         }
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let now = now_ms();
+
+        let (clock, label, running, paused) = self.clock_state(now, strings);
+
+        if self.expanded {
+            return self.render_page(clock, label, running, paused, window, cx);
+        }
 
         // Refresh precomputed session summaries only if the calendar day rolled over.
         let today = Local::now().date_naive();
@@ -1141,12 +1152,6 @@ impl Render for FocusView {
                 self.render_timer(timer, minutes, cx)
             })
             .collect();
-
-        let (clock, label, running, paused) = self.clock_state(now, strings);
-
-        if self.expanded {
-            return self.render_page(clock, label, running, paused, cx);
-        }
         let left = v_flex()
             .flex_1()
             .min_w_0()
@@ -1156,7 +1161,7 @@ impl Render for FocusView {
             .child(
                 h_flex()
                     .relative()
-                    .mt(crate::title_bar::header_inset())
+                    .mt(crate::title_bar::header_inset(window, cx))
                     .h(px(52.))
                     .flex_none()
                     .px(px(22.))
@@ -1306,7 +1311,7 @@ impl Render for FocusView {
             .flex_none()
             .h_full()
             .px_5()
-            .child(h_flex().mt(crate::title_bar::header_inset()).h(px(52.)).child(Label::new(strings.focus_overview).size(LabelSize::Large).weight(FontWeight::MEDIUM)))
+            .child(h_flex().mt(crate::title_bar::header_inset(window, cx)).h(px(52.)).child(Label::new(strings.focus_overview).size(LabelSize::Large).weight(FontWeight::MEDIUM)))
             .child(self.render_overview(strings, cx))
             .child(self.render_record_header(true, cx))
             .when_some(self.message.clone(), |el, message| {
@@ -1343,11 +1348,14 @@ impl Render for FocusView {
             .when(self.confirm_batch_delete, |el| {
                 let strings = i18n::t(cx);
                 el.child(
-                    ConfirmDialog::new("focus-batch-delete", strings.focus_batch_delete_title)
+                    ConfirmDialog::new(
+                        "focus-batch-delete",
+                        strings.focus_batch_delete_title,
+                        strings.cancel,
+                        strings.delete,
+                    )
                         .width(px(360.))
                         .description(strings.focus_batch_delete_message)
-                        .cancel_label(strings.cancel)
-                        .confirm_label(strings.delete)
                         .destructive(true)
                         .on_cancel(cx.listener(|this, _, _, cx| {
                             this.confirm_batch_delete = false;
@@ -1357,11 +1365,15 @@ impl Render for FocusView {
                             this.confirm_batch_delete = false;
                             let ids: Vec<Id> = this.batch.drain().collect();
                             if let Err(err) = this.store.delete_focus_sessions(&ids) {
-                                eprintln!("failed to delete the records: {err:#}");
+                                desktop_common::logging::log_error("focus_ui", format!("failed to delete the records: {err:#}"));
                             }
                             this.set_record_menu(None, cx);
                             this.reload(cx);
-                            desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                            desktop_common::data_version::data_changed_scoped(
+                            cx.entity_id(),
+                            desktop_common::data_version::DataScope::FOCUS,
+                            cx,
+                        );
                         })),
                 )
             })
@@ -1376,11 +1388,14 @@ impl Render for FocusView {
                             el.debug_selector(|| "focus-timer-delete-modal".to_owned())
                         })
                         .child(
-                            ConfirmDialog::new("focus-timer-delete", strings.confirm_delete_timer)
+                            ConfirmDialog::new(
+                                "focus-timer-delete",
+                                strings.confirm_delete_timer,
+                                strings.cancel,
+                                strings.delete,
+                            )
                                 .width(px(340.))
                                 .description(name)
-                                .cancel_label(strings.cancel)
-                                .confirm_label(strings.delete)
                                 .destructive(true)
                                 .on_cancel(cx.listener(|this, _, _, cx| {
                                     this.confirm_delete_timer = None;
@@ -1389,10 +1404,14 @@ impl Render for FocusView {
                                 .on_confirm(cx.listener(move |this, _, _, cx| {
                                     this.confirm_delete_timer = None;
                                     if let Err(err) = this.store.delete_focus_timer(id) {
-                                        eprintln!("failed to delete the timer: {err:#}");
+                                        desktop_common::logging::log_error("focus_ui", format!("failed to delete the timer: {err:#}"));
                                     }
                                     this.reload(cx);
-                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                    desktop_common::data_version::data_changed_scoped(
+                            cx.entity_id(),
+                            desktop_common::data_version::DataScope::FOCUS,
+                            cx,
+                        );
                                 })),
                         ),
                 )

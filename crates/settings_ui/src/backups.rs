@@ -1,18 +1,18 @@
 use std::path::{Path, PathBuf};
 
+use desktop_common::i18n;
+use desktop_common::{DbPath, export, paths, release_notes};
+use desktop_sync::{LiveSyncStatus, sync::SyncStatus};
 use fern_core::Store;
 use fern_core::import::ImportSummary;
 use ui::prelude::*;
 
-use crate::i18n;
-use crate::release_notes;
-
-use super::{SettingsEvent, SettingsWindow};
+use super::{ActiveConfirm, SettingsEvent, SettingsWindow};
 
 fn write_temp_backup(store: &Store) -> anyhow::Result<PathBuf> {
-    let dir = crate::scratch_dir()?;
+    let dir = paths::scratch_dir()?;
     let temp = dir.join(format!("fern-backup-{}.db", std::process::id()));
-    let attachments = crate::attachments_dir().ok();
+    let attachments = paths::attachments_dir().ok();
     store.backup_to(&temp, attachments.as_deref())?;
     Ok(temp)
 }
@@ -41,7 +41,7 @@ fn build_diagnostic_report(
     locale: &str,
     db_path: Option<&Path>,
     backups_dir: Option<&Path>,
-    sync_status: &crate::sync::SyncStatus,
+    sync_status: &SyncStatus,
     db_health: Option<&desktop_common::diagnostics::DbHealth>,
 ) -> String {
     let input = desktop_common::diagnostics::DiagnosticInput {
@@ -59,36 +59,23 @@ impl SettingsWindow {
     /// "Generate Backup": all data in one file, saved where the user chooses.
     /// Runs SQLite backup + attachment bundling off the UI thread when backed by an on-disk DB.
     pub(super) fn generate_backup(&mut self, cx: &mut Context<Self>) {
-        let read = if let Some(db_path) = cx.try_global::<crate::DbPath>().map(|p| p.0.clone()) {
-            cx.background_spawn(async move {
-                let bg_store = Store::open(&db_path)?;
-                let temp = write_temp_backup(&bg_store)?;
-                read_and_remove_backup(&temp)
-            })
-        } else {
-            let temp = match write_temp_backup(&self.store) {
-                Ok(temp) => temp,
-                Err(err) => {
-                    self.backup_message = Some(err.to_string());
-                    cx.notify();
-                    return;
-                }
-            };
-            cx.background_spawn(async move { read_and_remove_backup(&temp) })
-        };
+        let read = desktop_common::DbRunner::run_global(&self.store, cx, |store| {
+            let temp = write_temp_backup(store)?;
+            read_and_remove_backup(&temp)
+        });
         cx.spawn(async move |this, cx| {
             let bytes = read.await;
             this.update(cx, |this, cx| match bytes {
                 Ok(bytes) => {
                     let name = format!("fern-backup-{}.db", chrono::Local::now().format("%Y-%m-%d"));
-                    crate::export::save_as(name, bytes, cx, |this, result, cx| {
-                        this.backup_message = crate::export::outcome(result, i18n::t(cx));
+                    export::save_as(name, bytes, cx, |this, result, cx| {
+                        this.backups.message = export::outcome(result, i18n::t(cx));
                         this.refresh_auto_backups(cx);
                         cx.notify();
                     });
                 }
                 Err(err) => {
-                    this.backup_message = Some(err.to_string());
+                    this.backups.message = Some(err.to_string());
                     cx.notify();
                 }
             })
@@ -102,17 +89,17 @@ impl SettingsWindow {
         imported: anyhow::Result<ImportSummary>,
         cx: &mut Context<Self>,
     ) {
-        self.backup_message = Some(format_ticktick_import(imported, i18n::t(cx)));
+        self.backups.message = Some(format_ticktick_import(imported, i18n::t(cx)));
         self.refresh_cached_collections(cx);
         cx.emit(SettingsEvent::Changed);
-        crate::sticky_note::data_changed(cx.entity_id(), cx);
+        desktop_common::data_version::data_changed(cx.entity_id(), cx);
         cx.notify();
     }
 
     /// "Import Backups": a Fern backup is checked now and restored on the next start; a TickTick
     /// backup (its CSV file) is parsed and imported off the UI thread.
     pub(super) fn import_backup(&mut self, cx: &mut Context<Self>) {
-        let db_path = cx.try_global::<crate::DbPath>().map(|p| p.0.clone());
+        let db_path = DbPath::get(cx);
         let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
@@ -129,7 +116,10 @@ impl SettingsWindow {
             else {
                 return;
             };
-            if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("csv")) {
+            if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
+            {
                 if let Some(db_path) = db_path {
                     let imported = cx
                         .background_spawn(async move {
@@ -142,7 +132,9 @@ impl SettingsWindow {
                         .ok();
                     return;
                 }
-                let text = cx.background_spawn(async move { std::fs::read_to_string(&path) }).await;
+                let text = cx
+                    .background_spawn(async move { std::fs::read_to_string(&path) })
+                    .await;
                 this.update(cx, |this, cx| {
                     let imported = text
                         .map_err(anyhow::Error::from)
@@ -153,7 +145,7 @@ impl SettingsWindow {
                 return;
             }
             this.update(cx, |this, cx| {
-                this.pending_restore = Some(path);
+                this.confirm = Some(ActiveConfirm::RestoreBackup(path));
                 cx.notify();
             })
             .ok();
@@ -163,19 +155,19 @@ impl SettingsWindow {
 
     pub(super) fn refresh_auto_backups(&mut self, cx: &mut Context<Self>) {
         #[cfg(test)]
-        let dir = self.backups_dir_override.clone();
+        let dir = self.backups.backups_dir_override.clone();
         #[cfg(not(test))]
-        let dir = crate::backups_dir().ok();
+        let dir = paths::backups_dir().ok();
         let Some(dir) = dir else {
-            self.auto_backups.clear();
+            self.backups.auto_backups.clear();
             cx.notify();
             return;
         };
         let task = cx.background_spawn(async move { fern_core::store::list_backups(&dir) });
-        self.auto_backups_task = Some(cx.spawn(async move |this, cx| {
+        self.backups.auto_backups_task = Some(cx.spawn(async move |this, cx| {
             let backups = task.await;
             this.update(cx, |this, cx| {
-                this.auto_backups = backups;
+                this.backups.auto_backups = backups;
                 cx.notify();
             })
             .ok();
@@ -183,7 +175,7 @@ impl SettingsWindow {
     }
 
     pub(super) fn confirm_restore(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.pending_restore.take() else {
+        let Some(ActiveConfirm::RestoreBackup(path)) = self.confirm.take() else {
             return;
         };
         cx.notify();
@@ -192,16 +184,16 @@ impl SettingsWindow {
 
     fn stage_restore(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         #[cfg(test)]
-        let target_override = self.restore_target_override.clone();
+        let target_override = self.backups.restore_target_override.clone();
         let outcome = cx.background_spawn(async move {
             fern_core::Store::check_backup(&path)?;
             #[cfg(test)]
             let target = match target_override {
                 Some(target) => target,
-                None => crate::pending_restore_path()?,
+                None => paths::pending_restore_path()?,
             };
             #[cfg(not(test))]
-            let target = crate::pending_restore_path()?;
+            let target = paths::pending_restore_path()?;
             std::fs::copy(&path, &target)?;
             Ok::<(), anyhow::Error>(())
         });
@@ -209,7 +201,7 @@ impl SettingsWindow {
             let outcome = outcome.await;
             this.update(cx, |this, cx| {
                 let strings = i18n::t(cx);
-                this.backup_message = Some(match outcome {
+                this.backups.message = Some(match outcome {
                     Ok(()) => {
                         desktop_common::diagnostics::log_event(
                             "db",
@@ -233,20 +225,20 @@ impl SettingsWindow {
     }
 
     pub(super) fn save_diagnostic_log(&mut self, cx: &mut Context<Self>) {
-        let default_dir = crate::export::default_dir();
+        let default_dir = export::default_dir();
         let filename = format!(
             "fern-diagnostics-{}.txt",
             chrono::Local::now().format("%Y-%m-%d")
         );
         let chosen = cx.prompt_for_new_path(&default_dir, Some(&filename));
-        let db_path = cx.try_global::<crate::DbPath>().map(|p| p.0.clone());
+        let db_path = DbPath::get(cx);
         #[cfg(test)]
-        let backups_dir = self.backups_dir_override.clone();
+        let backups_dir = self.backups.backups_dir_override.clone();
         #[cfg(not(test))]
-        let backups_dir = crate::backups_dir().ok();
+        let backups_dir = paths::backups_dir().ok();
         let db_health = cx.try_global::<desktop_common::diagnostics::DbHealth>().cloned();
         let sync_status = cx
-            .try_global::<crate::LiveSyncStatus>()
+            .try_global::<LiveSyncStatus>()
             .map(|s| s.0.clone())
             .unwrap_or_default();
         let locale_code = i18n::locale(cx).code().to_owned();
@@ -294,7 +286,7 @@ impl SettingsWindow {
                 let strings = i18n::t(cx);
                 match result {
                     Ok(saved_path) => {
-                        this.diagnostic_message = Some((
+                        this.backups.diagnostic_message = Some((
                             strings
                                 .diagnostic_log_saved
                                 .replace("{path}", &saved_path.display().to_string()),
@@ -308,7 +300,7 @@ impl SettingsWindow {
                         );
                         let redacted =
                             desktop_common::diagnostics::redact_sensitive(&format!("{err:#}"));
-                        this.diagnostic_message = Some((
+                        this.backups.diagnostic_message = Some((
                             strings.diagnostic_log_failed.replace("{error}", &redacted),
                             true,
                         ));

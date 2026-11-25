@@ -1,6 +1,9 @@
 use std::rc::Rc;
 
 use chrono::Datelike as _;
+use desktop_common::i18n::{self, Locale};
+use desktop_common::text_input::TextInput;
+use desktop_common::{calendar, paths, release_notes};
 use fern_core::reminder::{ALL_DAY_OFFSETS, TIMED_OFFSETS};
 use fern_core::{
     DURATIONS, DateFormat, DefaultDate, Priority, SmartList, Visibility, WEEK_STARTS,
@@ -8,13 +11,9 @@ use fern_core::{
 };
 use gpui::{Div, Entity, FontWeight, Hsla, Stateful};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, VerticalScrollbar, popover, v_scroll};
+use ui::{ConfirmDialog, Placement, PopoverAttachment, VerticalScrollbar, popover, v_scroll};
 
-use crate::calendar;
-use crate::i18n::{self, Locale};
-use crate::release_notes::{self, action_button};
-
-use super::{Menu, Page, ROW_HEIGHT, SettingsWindow};
+use super::{ActiveConfirm, Menu, Page, ROW_HEIGHT, SettingsWindow};
 
 type SelectPick = Box<dyn Fn(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>)>;
 type SelectOption = (SharedString, bool, SelectPick);
@@ -30,7 +29,119 @@ fn page_title(text: &'static str) -> Div {
 }
 
 impl SettingsWindow {
-    /// Task Default's first group: date, duration and reminders of new tasks.
+    pub(super) fn render_active_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let confirm = self.confirm.as_ref()?;
+        let strings = i18n::t(cx);
+        match confirm {
+            ActiveConfirm::RestoreBackup(path) => {
+                let filename = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("backup.db");
+                let description = strings.restore_backup_confirm_body.replace("{file}", filename);
+                Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .debug_selector(|| "confirm-restore-backup".to_owned())
+                        .child(
+                            ConfirmDialog::new(
+                                "confirm-restore-backup",
+                                strings.restore_backup_confirm_title,
+                                strings.cancel,
+                                strings.restore_action,
+                            )
+                            .description(description)
+                            .destructive(true)
+                            .on_cancel(cx.listener(|this, _, _, cx| {
+                                this.confirm = None;
+                                cx.notify();
+                            }))
+                            .on_confirm(cx.listener(|this, _, _, cx| {
+                                this.confirm_restore(cx);
+                            })),
+                        )
+                        .into_any_element(),
+                )
+            }
+            ActiveConfirm::ResetShortcuts => Some(
+                ConfirmDialog::new(
+                    "confirm-reset-shortcuts",
+                    strings.shortcut_reset_confirm_title,
+                    strings.cancel,
+                    strings.shortcut_reset_all,
+                )
+                .description(strings.shortcut_reset_confirm_body)
+                .destructive(true)
+                .on_cancel(cx.listener(|this, _, _, cx| {
+                    this.confirm = None;
+                    cx.notify();
+                }))
+                .on_confirm(cx.listener(|this, _, _, cx| {
+                    this.reset_all_shortcuts(cx);
+                }))
+                .into_any_element(),
+            ),
+            ActiveConfirm::SwitchTheme(_) => Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .when(cfg!(test), |el| {
+                        el.debug_selector(|| "confirm-switch-theme".to_owned())
+                    })
+                    .child(
+                        ConfirmDialog::new(
+                            "confirm-switch-theme",
+                            strings.switch_theme,
+                            strings.cancel,
+                            strings.theme_always,
+                        )
+                        .width(px(480.))
+                        .description(strings.theme_override_hint)
+                        .secondary_action(
+                            strings.theme_once,
+                            cx.listener(|this, _, window, cx| {
+                                this.confirm_theme_switch(false, window, cx);
+                            }),
+                        )
+                        .on_cancel(cx.listener(|this, _, _, cx| {
+                            this.confirm = None;
+                            cx.notify();
+                        }))
+                        .on_confirm(cx.listener(|this, _, window, cx| {
+                            this.confirm_theme_switch(true, window, cx);
+                        })),
+                    )
+                    .into_any_element(),
+            ),
+            ActiveConfirm::DeleteSubscription { title, .. } => Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .when(cfg!(test), |el| {
+                        el.debug_selector(|| "confirm-delete-subscription".to_owned())
+                    })
+                    .child(
+                        ConfirmDialog::new(
+                            "confirm-delete-subscription",
+                            format!("{} \"{title}\"?", strings.subscription_delete),
+                            strings.cancel,
+                            strings.subscription_delete,
+                        )
+                        .destructive(true)
+                        .on_cancel(cx.listener(|this, _, _, cx| {
+                            this.confirm = None;
+                            cx.notify();
+                        }))
+                        .on_confirm(cx.listener(|this, _, _, cx| {
+                            this.confirm_delete_subscription(cx);
+                        })),
+                    )
+                    .into_any_element(),
+            ),
+        }
+    }
+
     fn render_task_defaults(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let defaults = self.preferences.task_defaults.clone();
@@ -140,7 +251,6 @@ impl SettingsWindow {
             ))
     }
 
-    /// Task Default's priority and tag rows, above the default list.
     fn render_priority_and_tag(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let strings = i18n::t(cx);
         let defaults = self.preferences.task_defaults.clone();
@@ -201,7 +311,6 @@ impl SettingsWindow {
         ]
     }
 
-    /// A row whose value opens a dropdown of `options` (label, selected, what picking it does).
     fn select_row(
         &self,
         icon: Option<IconName>,
@@ -310,7 +419,7 @@ impl SettingsWindow {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(self.plugin_settings.clone())
+                    .child(self.host.plugin_settings_view.clone())
                     .into_any_element();
             }
             Page::Sticky => body.child(self.render_sticky(cx)).into_any_element(),
@@ -408,7 +517,6 @@ impl SettingsWindow {
         let hour12 = self.preferences.hour12;
         let week_numbers = self.preferences.week_numbers;
         let countdown_dates = self.preferences.countdown_dates;
-        // The original shows each format on the year's last day.
         let sample = chrono::NaiveDate::from_ymd_opt(chrono::Local::now().year(), 12, 31)
             .expect("December 31 exists");
         let current_format = self.preferences.date_format;
@@ -421,7 +529,7 @@ impl SettingsWindow {
                 let label = calendar::format_date_as(sample, Some(format), false, true);
                 let selected = current_format == Some(format)
                     || (current_format.is_none()
-                        && label == calendar::format_date(sample, strings));
+                        && label == calendar::format_date(sample, strings, cx));
                 (SharedString::from(label), selected, pick)
             })
             .collect();
@@ -454,7 +562,7 @@ impl SettingsWindow {
                         .child(self.select_row(
                             None,
                             strings.date_format,
-                            calendar::format_date(sample, strings).into(),
+                            calendar::format_date(sample, strings, cx).into(),
                             Menu::DateFormat,
                             date_formats,
                             cx,
@@ -501,7 +609,8 @@ impl SettingsWindow {
 
     fn render_more_page(&self, body: Stateful<Div>, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
         let current = i18n::locale(cx);
         let languages = Locale::available()
             .map(|locale| {
@@ -567,7 +676,6 @@ impl SettingsWindow {
         .child({
             let r = self.preferences.recognition;
             type RecognitionCheck = (&'static str, bool, fn(&mut fern_core::Recognition));
-            // A switch row with a hint, and the checkbox under it while the switch is on.
             let section = |id: &'static str,
                            label: &'static str,
                            hint: &'static str,
@@ -739,7 +847,8 @@ impl SettingsWindow {
 
     fn render_notifications_page(&self, body: Stateful<Div>, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
         let n = self.preferences.notifications;
         let values = [n.daily.is_some(), n.desktop, n.constant];
         let toggles: [fn(&mut fern_core::Notifications); 3] = [
@@ -757,7 +866,7 @@ impl SettingsWindow {
             .filter_map(|h| chrono::NaiveTime::from_hms_opt(h, 0, 0))
             .map(|time| {
                 let option: SelectOption = (
-                    calendar::format_time(time, strings).into(),
+                    calendar::format_time(time, strings, cx).into(),
                     n.daily == Some(time),
                     Box::new(move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
                         this.update(window, cx, |p| p.notifications.daily = Some(time))
@@ -770,7 +879,7 @@ impl SettingsWindow {
             self.select_row(
                 None,
                 strings.daily_time,
-                calendar::format_time(t, strings).into(),
+                calendar::format_time(t, strings, cx).into(),
                 Menu::DailyTime,
                 times,
                 cx,
@@ -829,20 +938,24 @@ impl SettingsWindow {
                     .child(Switch::new().toggle_state(sound_enabled))
                     .on_click(cx.listener(|this, _, _, cx| {
                         let next = !this.sound_enabled;
-                        if let Err(err) = desktop_common::sound::set_enabled(&this.store, next) {
-                            eprintln!("failed to save the completion sound setting: {err:#}");
+                        if let Err(err) = desktop_common::sound::set_enabled(&this.store, next, cx) {
+                            desktop_common::logging::log_error(
+                                "settings",
+                                format!("failed to save the completion sound setting: {err:#}"),
+                            );
                         } else {
                             this.sound_enabled = next;
                             if next {
-                                desktop_common::sound::play_complete(&this.store);
+                                desktop_common::sound::play_complete(cx);
                             }
                         }
                         cx.notify();
                     })),
             ),
         );
-        let enabled = self.minimize_to_tray;
-        let topmost = self.always_on_top;
+        let enabled = self.tray.minimize_to_tray;
+        let topmost = self.tray.always_on_top;
+        let is_wayland = paths::is_wayland_session();
         body.child(
             page_group(colors.surface_background)
                 .child(
@@ -854,43 +967,63 @@ impl SettingsWindow {
                         .child(div().flex_1().child(Label::new(strings.minimize_to_tray)))
                         .child(Switch::new().toggle_state(enabled))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            let next = !this.minimize_to_tray;
-                            if let Err(err) = crate::tray::set_enabled(&this.store, next, cx) {
-                                eprintln!("failed to save the notification area setting: {err:#}");
+                            let next = !this.tray.minimize_to_tray;
+                            if let Err(err) = (this.host.set_minimize_to_tray)(&this.store, next, cx) {
+                                desktop_common::logging::log_error(
+                                    "settings",
+                                    format!("failed to save the notification area setting: {err:#}"),
+                                );
                             } else {
-                                this.minimize_to_tray = next;
+                                this.tray.minimize_to_tray = next;
                             }
                             cx.notify();
                         })),
                 )
-                .child(
-                    h_flex()
-                        .id("always-on-top")
-                        .h(px(ROW_HEIGHT))
-                        .px_4()
-                        .cursor_pointer()
-                        .child(div().flex_1().child(Label::new(strings.tray_always_on_top)))
-                        .child(Switch::new().toggle_state(topmost))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let next = !this.always_on_top;
-                            if let Err(err) = crate::tray::set_always_on_top(&this.store, next, cx)
-                            {
-                                eprintln!("failed to save always_on_top setting: {err:#}");
-                            } else {
-                                this.always_on_top = next;
-                            }
-                            cx.notify();
-                        })),
-                ),
+                .when(!is_wayland, |group| {
+                    group.child(
+                        h_flex()
+                            .id("always-on-top")
+                            .h(px(ROW_HEIGHT))
+                            .px_4()
+                            .cursor_pointer()
+                            .child(div().flex_1().child(Label::new(strings.tray_always_on_top)))
+                            .child(Switch::new().toggle_state(topmost))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let next = !this.tray.always_on_top;
+                                if let Err(err) = (this.host.set_always_on_top)(&this.store, next, cx) {
+                                    desktop_common::logging::log_error(
+                                        "settings",
+                                        format!("failed to save always_on_top setting: {err:#}"),
+                                    );
+                                } else {
+                                    this.tray.always_on_top = next;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                })
+                .when(is_wayland, |group| {
+                    group.child(
+                        div()
+                            .px_4()
+                            .py_2p5()
+                            .border_t_1()
+                            .border_color(colors.border_variant.opacity(0.6))
+                            .text_size(px(12.))
+                            .text_color(colors.text_muted)
+                            .child(strings.wayland_window_controls_hint),
+                    )
+                }),
         )
         .into_any_element()
     }
 
     fn render_features_page(&self, body: Stateful<Div>, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
         let features = self.preferences.features;
-        let warning_color = cx.theme().status().warning;
+        let warning_color = theme.status().warning;
         let frontend_row = |id: &'static str,
                             debug_id: &'static str,
                             (name, hint): (&'static str, &'static str),
@@ -914,9 +1047,7 @@ impl SettingsWindow {
                                 .items_center()
                                 .gap_2()
                                 .child(Label::new(name))
-                                .when(beta, |row| {
-                                    row.child(Chip::new(strings.beta_badge, warning_color))
-                                }),
+                                .when(beta, |row| row.child(Chip::new(strings.beta_badge, warning_color))),
                         )
                         .child(
                             div()
@@ -1025,8 +1156,9 @@ impl SettingsWindow {
 
     fn render_sync_page(&self, body: Stateful<Div>, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
-        let field = |id: &'static str, label: &'static str, input: Entity<crate::text_input::TextInput>| {
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
+        let field = |id: &'static str, label: &'static str, input: Entity<TextInput>| {
             h_flex()
                 .h(px(40.))
                 .px_4()
@@ -1047,7 +1179,7 @@ impl SettingsWindow {
                         .child(input),
                 )
         };
-        let folder = crate::data_dir()
+        let folder = paths::data_dir()
             .map(|dir| dir.display().to_string())
             .unwrap_or_default();
         body.child(page_title(strings.data_on_device))
@@ -1072,7 +1204,7 @@ impl SettingsWindow {
                                 .variant(ButtonVariant::Secondary)
                                 .size(ButtonSize::Sm)
                                 .on_click(|_, _, cx| {
-                                    if let Ok(dir) = crate::data_dir() {
+                                    if let Ok(dir) = paths::data_dir() {
                                         cx.open_with_system(&dir);
                                     }
                                 }),
@@ -1094,12 +1226,12 @@ impl SettingsWindow {
                     .child(page_title(strings.sync_optional))
                     .child(
                         page_group(colors.surface_background)
-                            .child(field("sync-server-input", strings.sync_server, self.sync_server.clone()))
-                            .child(field("sync-token-input", strings.sync_token, self.sync_token.clone()))
+                            .child(field("sync-server-input", strings.sync_server, self.sync.server.clone()))
+                            .child(field("sync-token-input", strings.sync_token, self.sync.token.clone()))
                             .child(field(
                                 "sync-passphrase-input",
                                 strings.sync_passphrase,
-                                self.sync_passphrase.clone(),
+                                self.sync.passphrase.clone(),
                             )),
                     )
                     .child(
@@ -1123,7 +1255,8 @@ impl SettingsWindow {
 
     fn render_about_page(&self, body: Stateful<Div>, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let colors = cx.theme().colors().clone();
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
         let row = |label: &'static str, value: &'static str| {
             h_flex()
                 .h(px(ROW_HEIGHT))
@@ -1151,18 +1284,19 @@ impl SettingsWindow {
                         .whats_new_in_version
                         .replace("{version}", &notes.version);
                     let notes = notes.clone();
-                    action_button("installed-release-notes", cx)
-                        .mx_2()
-                        .min_h(px(ROW_HEIGHT))
-                        .child(div().flex_1().child(Label::new(title)))
-                        .child(
-                            Icon::new(IconName::ChevronRight)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.show_release_notes(notes.clone(), window, cx)
-                        }))
+                    div().px_2().child(
+                        ui::ListItem::new("installed-release-notes")
+                            .height(px(ROW_HEIGHT))
+                            .child(div().flex_1().child(Label::new(title)))
+                            .end_slot(
+                                Icon::new(IconName::ChevronRight)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.show_release_notes(notes.clone(), window, cx)
+                            })),
+                    )
                 }))
                 .child(row(strings.license, "AGPL-3.0-or-later")),
         )
@@ -1209,7 +1343,7 @@ impl SettingsWindow {
                             ),
                     ),
                 )
-                .children(self.backup_message.clone().map(|message| {
+                .children(self.backups.message.clone().map(|message| {
                     div()
                         .pt_1p5()
                         .px_1()

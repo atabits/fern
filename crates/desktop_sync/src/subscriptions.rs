@@ -268,23 +268,23 @@ impl Feeds {
                     // any partial error, so subsequent syncs never retry with a stale ETag.
                     for (uid, href, etag) in &outcome.upserts_pushed {
                         if let Err(err) = this.store.mark_caldav_event_clean(id, uid, href, etag.as_deref()) {
-                            eprintln!("failed to mark CalDAV event clean: {err:#}");
+                            desktop_common::logging::log_error("sync", format!("failed to mark CalDAV event clean: {err:#}"));
                         }
                     }
                     for uid in &outcome.deletes_pushed {
                         if let Err(err) = this.store.remove_caldav_event(id, uid) {
-                            eprintln!("failed to remove deleted CalDAV event: {err:#}");
+                            desktop_common::logging::log_error("sync", format!("failed to remove deleted CalDAV event: {err:#}"));
                         }
                     }
                     if let Some(remote) = &outcome.remote
                         && let Err(err) = this.store.replace_caldav_snapshot(id, &url, remote, outcome.sync_token.as_deref())
                     {
-                        eprintln!("failed to save CalDAV snapshot: {err:#}");
+                        desktop_common::logging::log_error("sync", format!("failed to save CalDAV snapshot: {err:#}"));
                     }
                     if !outcome.errors.is_empty() {
                         let msg = outcome.errors.join("; ");
                         if let Err(save_err) = this.store.save_subscription_feed(id, &url, Err(&msg)) {
-                            eprintln!("failed to save CalDAV sync error: {save_err:#}");
+                            desktop_common::logging::log_error("sync", format!("failed to save CalDAV sync error: {save_err:#}"));
                         }
                     }
                     this.reload_async(cx);
@@ -307,7 +307,7 @@ impl Feeds {
                 this.reading.remove(&id);
                 let error = feed.as_ref().err().map(|err| format!("{err:#}"));
                 if let Err(err) = this.store.save_subscription_feed(id, &url, feed.as_deref().map_err(|_| error.as_deref().unwrap_or_default())) {
-                    eprintln!("failed to keep the calendar feed: {err:#}");
+                    desktop_common::logging::log_error("sync", format!("failed to keep the calendar feed: {err:#}"));
                 }
                 this.reload_async(cx);
                 cx.notify();
@@ -387,7 +387,7 @@ impl Feeds {
         self.china_holiday_status = match saved {
             Ok(()) => ChinaHolidayStatus::Idle,
             Err(err) => {
-                eprintln!("failed to select the holiday calendar: {err:#}");
+                desktop_common::logging::log_error("sync", format!("failed to select the holiday calendar: {err:#}"));
                 ChinaHolidayStatus::Failed
             }
         };
@@ -411,7 +411,7 @@ impl Feeds {
                 self.reload_async(cx);
                 self.read(id, cx);
             }
-            Err(err) => eprintln!("failed to subscribe to the calendar: {err:#}"),
+            Err(err) => desktop_common::logging::log_error("sync", format!("failed to subscribe to the calendar: {err:#}")),
         }
         cx.notify();
     }
@@ -419,7 +419,7 @@ impl Feeds {
     pub fn update_subscription(&mut self, id: Id, name: &str, url: &str, color: Option<&str>, hidden: bool, cx: &mut Context<Self>) {
         let moved = self.calendars.iter().find(|c| c.subscription.id == id).is_some_and(|c| c.subscription.url.trim() != url.trim());
         if let Err(err) = self.store.update_subscription(id, name, url, color, hidden) {
-            eprintln!("failed to change the subscription: {err:#}");
+            desktop_common::logging::log_error("sync", format!("failed to change the subscription: {err:#}"));
         }
         self.reload_async(cx);
         if moved {
@@ -431,7 +431,7 @@ impl Feeds {
 
     pub fn delete(&mut self, id: Id, cx: &mut Context<Self>) {
         if let Err(err) = self.store.delete_subscription(id) {
-            eprintln!("failed to unsubscribe: {err:#}");
+            desktop_common::logging::log_error("sync", format!("failed to unsubscribe: {err:#}"));
         } else {
             self.reading.remove(&id);
         }
@@ -456,7 +456,7 @@ impl Feeds {
                 self.reload_async(cx);
                 self.read(id, cx);
             }
-            Err(err) => eprintln!("failed to add CalDAV calendar: {err:#}"),
+            Err(err) => desktop_common::logging::log_error("sync", format!("failed to add CalDAV calendar: {err:#}")),
         }
         cx.notify();
     }
@@ -479,7 +479,7 @@ impl Feeds {
             c.subscription.url.trim() != url.trim() || c.subscription.username != username.trim() || c.subscription.password != password
         });
         if let Err(err) = self.store.update_caldav_subscription(id, name, url, color, hidden, provider, username, password, writable) {
-            eprintln!("failed to update CalDAV calendar: {err:#}");
+            desktop_common::logging::log_error("sync", format!("failed to update CalDAV calendar: {err:#}"));
         }
         self.reload_async(cx);
         if changed {

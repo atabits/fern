@@ -37,9 +37,6 @@ impl HorizonsView {
     }
 
     pub(super) fn close_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.text_edit_sync_task.take().is_some() {
-            data_changed(cx.entity_id(), cx);
-        }
         self.detail_task = None;
         self.detail.update(cx, |d, cx| d.show(None, cx));
         window.focus(&self.focus_handle, cx);
@@ -169,7 +166,7 @@ impl HorizonsView {
             .collect()
     }
 
-    pub(super) fn render_drawer(&self, task_id: Id, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_drawer(&self, task_id: Id, today: NaiveDate, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
         let strings = i18n::t(cx);
         let task = self.tasks.iter().find(|t| t.id == task_id);
@@ -261,7 +258,7 @@ impl HorizonsView {
                     .child(
                         v_flex()
                             .px(px(16.))
-                            .pt(layout::title_bar_height() + px(8.))
+                            .pt(layout::title_bar_height(window, cx) + px(8.))
                             .pb(px(10.))
                             .border_b_1()
                             .border_color(colors.border_variant)

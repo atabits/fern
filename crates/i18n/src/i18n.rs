@@ -706,6 +706,8 @@ pub struct Strings {
     pub tray_stopwatch: &'static str,
     pub tray_always_on_top: &'static str,
     pub tray_quit: &'static str,
+    pub wayland_hotkeys_hint: &'static str,
+    pub wayland_window_controls_hint: &'static str,
     pub daily_time: &'static str,
     /// The daily notification's title; `{n}` is how many tasks.
     pub daily_title: &'static str,

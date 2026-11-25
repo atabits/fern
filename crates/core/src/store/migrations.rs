@@ -1571,6 +1571,14 @@ pub(super) const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_focus_sessions_task ON focus_sessions(task_id);
     CREATE INDEX IF NOT EXISTS idx_task_attachments_task ON task_attachments(task_id, created_at);
     ",
+    // Cover dated queries across completed/open tasks and missing FK indexes for habits/focus.
+    "
+    CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date)
+        WHERE deleted_at IS NULL AND due_date IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_focus_sessions_habit ON focus_sessions(habit_id)
+        WHERE habit_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_habit_snoozes_habit ON habit_snoozes(habit_id);
+    ",
 ];
 
 /// Current SQLite schema version (`PRAGMA user_version`).

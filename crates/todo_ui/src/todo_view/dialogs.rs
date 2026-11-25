@@ -111,7 +111,7 @@ impl TodoView {
                 el.child(div().flex_1()).child(
                     div()
                         .relative()
-                        .opacity(if self.section_menu == Some(id) || crate::touch::active() { 1. } else { 0. })
+                        .opacity(if self.overlays.section_menu == Some(id) || crate::touch::active() { 1. } else { 0. })
                         .group_hover(group, |s| s.opacity(1.))
                         .child(
                             div()
@@ -123,18 +123,18 @@ impl TodoView {
                                         .tooltip(Tooltip::text(strings.more))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
-                                            this.section_menu = Some(id);
+                                            this.overlays.section_menu = Some(id);
                                             cx.notify();
                                         })),
                                 ),
                         )
-                        .when(self.section_menu == Some(id), |el| {
+                        .when(self.overlays.section_menu == Some(id), |el| {
                             el.child(PopoverAttachment::new(
                                 Placement::BelowRight,
                                 popover(cx)
                                     .min_w(px(200.))
                                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                        this.section_menu = None;
+                                        this.overlays.section_menu = None;
                                         cx.notify();
                                     }))
                                     .child(
@@ -152,8 +152,8 @@ impl TodoView {
                                                     .child(Label::new(strings.delete_section).color(Color::Error))
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         cx.stop_propagation();
-                                                        this.section_menu = None;
-                                                        this.confirm_delete = Some(ConfirmDeleteTarget::Section(id, sec_title.clone()));
+                                                        this.overlays.section_menu = None;
+                                                        this.overlays.confirm_delete = Some(ConfirmDeleteTarget::Section(id, sec_title.clone()));
                                                         cx.notify();
                                                     })),
                                             ),
@@ -174,17 +174,17 @@ impl TodoView {
                                 .child(Label::new(strings.postpone).size(LabelSize::Small).color(Color::Accent))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.postpone_menu = true;
+                                    this.overlays.postpone_menu = true;
                                     cx.notify();
                                 })),
                         )
-                        .when(self.postpone_menu, |el| {
+                        .when(self.overlays.postpone_menu, |el| {
                             el.child(PopoverAttachment::new(
                                 Placement::BelowRight,
                                 popover(cx)
                                     .min_w(px(180.))
                                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                        this.postpone_menu = false;
+                                        this.overlays.postpone_menu = false;
                                         cx.notify();
                                     }))
                                     .children(fern_core::DefaultDate::ALL.iter().zip(strings.default_dates).map(|(&choice, name)| {
@@ -208,7 +208,7 @@ impl TodoView {
 
     /// Moves every overdue task in view to `day` (keeping its time), or clears their due dates when `None`.
     pub(super) fn postpone_overdue(&mut self, day: Option<NaiveDate>, cx: &mut Context<Self>) {
-        self.postpone_menu = false;
+        self.overlays.postpone_menu = false;
         let today = Self::today();
         let overdue: Vec<_> = self
             .tasks
@@ -226,8 +226,8 @@ impl TodoView {
 
     pub(super) fn start_rename_section(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_section_rename(cx);
-        self.section_menu = None;
-        self.column_menu = None;
+        self.overlays.section_menu = None;
+        self.kanban.column_menu = None;
         let strings = i18n::t(cx);
         let name = self.sections.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default();
         let input = cx.new(|cx| {
@@ -277,7 +277,7 @@ impl TodoView {
         .detach();
         window.focus(&input.focus_handle(cx), cx);
         self.new_section = Some(input);
-        self.header_menu_open = false;
+        self.overlays.header_menu_open = false;
         cx.notify();
     }
 
@@ -313,7 +313,7 @@ impl TodoView {
     }
 
     pub(super) fn commit_column_add(&mut self, cx: &mut Context<Self>) {
-        let Some((_, target, input)) = self.column_add.take() else { return };
+        let Some((_, target, input)) = self.kanban.column_add.take() else { return };
         let text = input.read(cx).text().to_owned();
         if !text.trim().is_empty()
             && let Some(task) = self.add_task(&text, cx)
@@ -325,18 +325,18 @@ impl TodoView {
     }
 
     pub(super) fn open_sort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sort_menu.is_none() {
-            self.sort_menu_return_focus = window.focused(cx);
-            window.focus(&self.sort_menu_focus, cx);
+        if self.overlays.sort_menu.is_none() {
+            self.overlays.sort_menu_return_focus = window.focused(cx);
+            window.focus(&self.overlays.sort_menu_focus, cx);
         }
-        self.sort_menu = Some(None);
+        self.overlays.sort_menu = Some(None);
         cx.notify();
     }
 
     pub(super) fn close_sort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sort_menu = None;
-        let previous = self.sort_menu_return_focus.take();
-        if self.sort_menu_focus.is_focused(window) {
+        self.overlays.sort_menu = None;
+        let previous = self.overlays.sort_menu_return_focus.take();
+        if self.overlays.sort_menu_focus.is_focused(window) {
             if let Some(previous) = previous {
                 window.focus(&previous, cx);
             } else {
@@ -360,20 +360,20 @@ impl TodoView {
         {
             return true;
         }
-        if self.sort_menu.is_some() {
+        if self.overlays.sort_menu.is_some() {
             self.close_sort_menu(window, cx);
             return true;
         }
-        if self.add_tags.take().is_some() {
-            if self.add_tag_input.focus_handle(cx).is_focused(window) {
-                window.focus(&self.input.focus_handle(cx), cx);
+        if self.quick_add.tags.take().is_some() {
+            if self.quick_add.tag_input.focus_handle(cx).is_focused(window) {
+                window.focus(&self.quick_add.input.focus_handle(cx), cx);
             }
             cx.notify();
             return true;
         }
 
-        if std::mem::take(&mut self.timeline_tz_menu) {
-            if self.timeline_tz_input.focus_handle(cx).is_focused(window) {
+        if std::mem::take(&mut self.timeline.tz_menu) {
+            if self.timeline.tz_input.focus_handle(cx).is_focused(window) {
                 window.focus(&self.list_focus, cx);
             }
             cx.notify();
@@ -381,25 +381,25 @@ impl TodoView {
         }
 
         // Close active confirmations and nested/modal dialogs one layer at a time before menus.
-        if std::mem::take(&mut self.confirm_empty_trash)
-            || self.confirm_delete.take().is_some()
-            || self.batch_add_pending.take().is_some()
+        if std::mem::take(&mut self.overlays.confirm_empty_trash)
+            || self.overlays.confirm_delete.take().is_some()
+            || self.quick_add.batch_add_pending.take().is_some()
         {
             cx.notify();
             return true;
         }
-        if self.folder_dialog.take().is_some() {
+        if self.overlays.folder_dialog.take().is_some() {
             cx.notify();
             return true;
         }
-        if let Some(dialog) = &self.list_dialog
+        if let Some(dialog) = &self.overlays.list_dialog
             && dialog.update(cx, |d, cx| d.dismiss_nested(cx))
         {
             return true;
         }
-        if self.filter_edit.as_ref().is_some_and(|edit| edit.preview) {
+        if self.overlays.filter_edit.as_ref().is_some_and(|edit| edit.preview) {
             self.set_filter_preview(false, cx);
-            if let Some(edit) = &self.filter_edit {
+            if let Some(edit) = &self.overlays.filter_edit {
                 window.focus(&edit.name_focus(cx), cx);
             }
             return true;
@@ -407,40 +407,40 @@ impl TodoView {
         if self.dismiss_filter_edit_nested(cx) {
             return true;
         }
-        if self.filter_edit.is_some() {
+        if self.overlays.filter_edit.is_some() {
             self.close_filter_edit(window, cx);
             return true;
         }
-        if self.list_dialog.take().is_some()
-            || self.tag_dialog.take().is_some()
-            || self.merge_dialog.take().is_some()
-            || self.view_options.take().is_some()
+        if self.overlays.list_dialog.take().is_some()
+            || self.overlays.tag_dialog.take().is_some()
+            || self.overlays.merge_dialog.take().is_some()
+            || self.overlays.view_options.take().is_some()
         {
             cx.notify();
             return true;
         }
 
         // These menus don't move keyboard focus when opened from the list.
-        let dismissed_menu = self.context_menu.take().is_some()
-            || self.habit_menu.take().is_some()
-            || self.list_menu.take().is_some()
-            || self.closed_menu.take().is_some()
+        let dismissed_menu = self.overlays.context_menu.take().is_some()
+            || self.overlays.habit_menu.take().is_some()
+            || self.overlays.list_menu.take().is_some()
+            || self.overlays.closed_menu.take().is_some()
             || self.batch_menu.take().is_some()
-            || self.column_menu.take().is_some()
-            || self.section_menu.take().is_some()
+            || self.kanban.column_menu.take().is_some()
+            || self.overlays.section_menu.take().is_some()
             || self.suggestions_open.take().is_some()
-            || std::mem::take(&mut self.header_menu_open)
-            || std::mem::take(&mut self.postpone_menu)
-            || std::mem::take(&mut self.scale_menu_open)
-            || std::mem::take(&mut self.templates_open)
-            || std::mem::take(&mut self.input_box_open)
-            || std::mem::take(&mut self.add_menu_open)
-            || self.add_date_month.take().is_some();
+            || std::mem::take(&mut self.overlays.header_menu_open)
+            || std::mem::take(&mut self.overlays.postpone_menu)
+            || std::mem::take(&mut self.timeline.scale_menu_open)
+            || std::mem::take(&mut self.quick_add.templates_open)
+            || std::mem::take(&mut self.quick_add.input_box_open)
+            || std::mem::take(&mut self.quick_add.menu_open)
+            || self.quick_add.date_month.take().is_some();
         if dismissed_menu {
-            self.context_side = None;
-            self.add_list_side = false;
-            self.add_date_row = None;
-            self.add_range = None;
+            self.overlays.context_side = None;
+            self.quick_add.list_side = false;
+            self.quick_add.date_row = None;
+            self.quick_add.range = None;
             cx.notify();
             return true;
         }
@@ -450,7 +450,7 @@ impl TodoView {
             window.focus(&self.list_focus, cx);
             return true;
         }
-        if let Some((_, _, input)) = self.column_add.take() {
+        if let Some((_, _, input)) = self.kanban.column_add.take() {
             if input.focus_handle(cx).is_focused(window) {
                 window.focus(&self.list_focus, cx);
             }
@@ -500,11 +500,11 @@ impl TodoView {
 
     /// Opens the original's Add List dialog (in a folder when given), or Edit List for `list`.
     pub(super) fn open_list_dialog(&mut self, list: Option<Id>, folder: Option<Id>, window: &mut Window, cx: &mut Context<Self>) {
-        self.list_menu = None;
-        self.header_menu_open = false;
+        self.overlays.list_menu = None;
+        self.overlays.header_menu_open = false;
         let dialog = cx.new(|cx| ListDialog::new(self.store.clone(), list, folder, window, cx));
         cx.subscribe_in(&dialog, window, |this, _, event: &DialogEvent, window, cx| {
-            this.list_dialog = None;
+            this.overlays.list_dialog = None;
             window.focus(&this.list_focus, cx);
             if let DialogEvent::Saved(id) = event {
                 crate::data_version::data_changed(cx.entity_id(), cx);
@@ -520,16 +520,16 @@ impl TodoView {
             }
         })
         .detach();
-        self.list_dialog = Some(dialog);
+        self.overlays.list_dialog = Some(dialog);
         cx.notify();
     }
 
     /// The New Folder dialog, or Edit Folder for `folder`.
     pub(super) fn open_folder_dialog(&mut self, folder: Option<Id>, window: &mut Window, cx: &mut Context<Self>) {
-        self.list_menu = None;
+        self.overlays.list_menu = None;
         let dialog = cx.new(|cx| FolderDialog::new(self.store.clone(), folder, window, cx));
         cx.subscribe_in(&dialog, window, |this, _, event: &DialogEvent, window, cx| {
-            this.folder_dialog = None;
+            this.overlays.folder_dialog = None;
             window.focus(&this.list_focus, cx);
             if matches!(event, DialogEvent::Saved(_)) {
                 crate::data_version::data_changed(cx.entity_id(), cx);
@@ -537,13 +537,13 @@ impl TodoView {
             this.reload(cx);
         })
         .detach();
-        self.folder_dialog = Some(dialog);
+        self.overlays.folder_dialog = Some(dialog);
         cx.notify();
     }
 
     /// The original's Add Tags (under `parent` for Add Sub-tag), or Edit Tag for `tag`.
     pub(super) fn open_tag_dialog(&mut self, tag: Option<String>, parent: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        self.list_menu = None;
+        self.overlays.list_menu = None;
         let editing = tag.clone();
         let dialog = cx.new(|cx| TagDialog::new(self.store.clone(), tag, parent, window, cx));
         cx.subscribe_in(&dialog, window, move |this, _, event: &TagEvent, window, cx| {
@@ -552,17 +552,17 @@ impl TodoView {
             {
                 this.view = View::Tag(name.clone());
             }
-            this.tag_dialog = None;
+            this.overlays.tag_dialog = None;
             window.focus(&this.list_focus, cx);
             this.reload(cx);
         })
         .detach();
-        self.tag_dialog = Some(dialog);
+        self.overlays.tag_dialog = Some(dialog);
         cx.notify();
     }
 
     pub(super) fn open_merge_dialog(&mut self, tag: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.list_menu = None;
+        self.overlays.list_menu = None;
         let from = tag.clone();
         let dialog = cx.new(|_| MergeDialog::new(self.store.clone(), tag));
         cx.subscribe_in(&dialog, window, move |this, _, event: &TagEvent, window, cx| {
@@ -571,12 +571,12 @@ impl TodoView {
             {
                 this.view = View::Tag(into.clone());
             }
-            this.merge_dialog = None;
+            this.overlays.merge_dialog = None;
             window.focus(&this.list_focus, cx);
             this.reload(cx);
         })
         .detach();
-        self.merge_dialog = Some(dialog);
+        self.overlays.merge_dialog = Some(dialog);
         cx.notify();
     }
 
@@ -600,16 +600,16 @@ impl TodoView {
             return;
         }
         let nesting = task_menu::TaskNesting::of(&self.store, id);
-        self.context_menu = Some((task, position, nesting));
-        self.context_side = None;
+        self.overlays.context_menu = Some((task, position, nesting));
+        self.overlays.context_side = None;
         cx.notify();
     }
 
     pub(super) fn render_empty_state(&self, strings: &'static Strings, _theme: &theme::Theme, _px_fallback: Pixels) -> AnyElement {
         let can_add = !self.is_read_only_view() && !matches!(self.view, View::Day(_) | View::Summary | View::Horizons);
-        let input = self.input.clone();
+        let input = self.quick_add.input.clone();
         let with_cta = |state: EmptyState| -> EmptyState {
-            if can_add && (!self.kanban || self.timeline) {
+            if can_add && (!self.kanban.enabled || self.timeline.enabled) {
                 state.action("empty-add-task", strings.add_task, move |_, window, cx| {
                     window.focus(&input.focus_handle(cx), cx);
                 })
@@ -658,17 +658,17 @@ impl TodoView {
     }
 
     pub(super) fn request_empty_trash(&mut self, cx: &mut Context<Self>) {
-        self.header_menu_open = false;
+        self.overlays.header_menu_open = false;
         if self.tasks.is_empty() {
             return;
         }
-        self.confirm_empty_trash = true;
+        self.overlays.confirm_empty_trash = true;
         cx.notify();
     }
 
     pub(super) fn empty_trash(&mut self, cx: &mut Context<Self>) {
-        self.header_menu_open = false;
-        self.confirm_empty_trash = false;
+        self.overlays.header_menu_open = false;
+        self.overlays.confirm_empty_trash = false;
         let result = self.store.empty_trash();
         self.check(result);
         self.reload(cx);
@@ -683,12 +683,12 @@ impl TodoView {
             .map(|t| t.title.clone())
             .or_else(|| self.store.task(id).ok().flatten().map(|t| t.title))
             .unwrap_or_default();
-        self.confirm_delete = Some(ConfirmDeleteTarget::PurgeTask(id, title));
+        self.overlays.confirm_delete = Some(ConfirmDeleteTarget::PurgeTask(id, title));
         cx.notify();
     }
 
     pub(super) fn execute_confirmed_delete(&mut self, target: ConfirmDeleteTarget, cx: &mut Context<Self>) {
-        self.confirm_delete = None;
+        self.overlays.confirm_delete = None;
         match target {
             ConfirmDeleteTarget::List(id, _) => {
                 let result = self.store.delete_list(id);
@@ -742,25 +742,25 @@ impl TodoView {
     }
 
     pub(super) fn confirm_batch_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(lines) = self.batch_add_pending.take() else {
+        let Some(lines) = self.quick_add.batch_add_pending.take() else {
             return;
         };
-        let mut shared_draft = self.add_draft.clone();
+        let mut shared_draft = self.quick_add.draft.clone();
         shared_draft.files.clear();
         for line in lines {
-            self.add_draft = shared_draft.clone();
+            self.quick_add.draft = shared_draft.clone();
             self.submit_new_task(&line, window, cx);
         }
-        self.add_draft = Default::default();
+        self.quick_add.draft = Default::default();
         cx.notify();
     }
 
     pub(super) fn paste_batch_as_one(&mut self, cx: &mut Context<Self>) {
-        let Some(lines) = self.batch_add_pending.take() else {
+        let Some(lines) = self.quick_add.batch_add_pending.take() else {
             return;
         };
         let joined = lines.join(" ");
-        self.input.update(cx, |input, cx| {
+        self.quick_add.input.update(cx, |input, cx| {
             let existing = input.text().to_owned();
             let combined = if existing.is_empty() {
                 joined
@@ -799,8 +799,8 @@ impl TodoView {
                 el.drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.10)))
                     .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
                         cx.stop_propagation();
-                        this.task_drop = None;
-                        this.task_drag_origin = None;
+                        this.panel_dnd.task_drop = None;
+                        this.panel_dnd.task_drag_origin = None;
                         this.drop_on_column(dragged.id, drop_target.clone(), cx);
                     }))
             })
@@ -837,7 +837,7 @@ impl TodoView {
                     .size_full()
                     .bg(theme.colors().background)
                     .map(|el| match self.list_activity.clone() {
-                        Some(entries) => el.child(self.render_list_activity(&entries, false, cx)),
+                        Some(entries) => el.child(self.render_list_activity(&entries, false, window, cx)),
                         None => el.child(self.detail.clone()),
                     }),
             )
@@ -893,14 +893,17 @@ impl TodoView {
                 el.debug_selector(|| "confirm-empty-trash-modal".to_owned())
             })
             .child(
-                ConfirmDialog::new("confirm-empty-trash", strings.confirm_empty_trash)
-                    .width(px(340.))
-                    .description(strings.confirm_empty_trash_hint)
-                    .cancel_label(strings.cancel)
-                    .confirm_label(strings.empty_trash)
-                    .destructive(true)
+                ConfirmDialog::new(
+                    "confirm-empty-trash",
+                    strings.confirm_empty_trash,
+                    strings.cancel,
+                    strings.empty_trash,
+                )
+                .width(px(340.))
+                .description(strings.confirm_empty_trash_hint)
+                .destructive(true)
                     .on_cancel(cx.listener(|this, _, _, cx| {
-                        this.confirm_empty_trash = false;
+                        this.overlays.confirm_empty_trash = false;
                         cx.notify();
                     }))
                     .on_confirm(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
@@ -961,14 +964,12 @@ impl TodoView {
                 el.debug_selector(|| "confirm-delete-modal".to_owned())
             })
             .child(
-                ConfirmDialog::new("confirm-delete", title)
+                ConfirmDialog::new("confirm-delete", title, strings.cancel, strings.delete)
                     .width(px(340.))
                     .description(hint)
-                    .cancel_label(strings.cancel)
-                    .confirm_label(strings.delete)
                     .destructive(true)
                     .on_cancel(cx.listener(|this, _, _, cx| {
-                        this.confirm_delete = None;
+                        this.overlays.confirm_delete = None;
                         cx.notify();
                     }))
                     .on_confirm(cx.listener(move |this, _, _, cx| {
@@ -994,7 +995,7 @@ impl TodoView {
             .width(px(380.))
             .padding(px(16.))
             .on_dismiss(cx.listener(|this, _, _, cx| {
-                this.batch_add_pending = None;
+                this.quick_add.batch_add_pending = None;
                 cx.notify();
             }))
             .child(Label::new(strings.batch_add_tasks).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
@@ -1033,7 +1034,7 @@ impl TodoView {
                                 Button::new("batch-add-cancel", strings.cancel)
                                     .variant(ButtonVariant::Secondary)
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.batch_add_pending = None;
+                                        this.quick_add.batch_add_pending = None;
                                         cx.notify();
                                     })),
                             ),

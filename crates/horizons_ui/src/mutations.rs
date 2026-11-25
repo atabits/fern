@@ -1,14 +1,13 @@
 //! Task and slot mutations, inline task creation, drag-and-drop scheduling, and undo/redo
 //! helpers for [`HorizonsView`].
 
-use std::time::Duration;
 
 use desktop_common::data_version::data_changed;
 use desktop_common::task_ops;
 use desktop_common::text_input::{Cancelled, Mode, Submitted, TextInput};
 use desktop_common::undo::UndoAction;
 use fern_core::horizon::is_horizons_inbox;
-use fern_core::{Id, Store, TaskDraft};
+use fern_core::{Id, Store, Task, TaskDraft};
 use fern_i18n as i18n;
 use gpui::{AppContext as _, Context, Entity, Focusable as _, Window, px};
 use task_ui::task_detail::{TaskTextEdited, TaskTextField};
@@ -67,15 +66,6 @@ impl HorizonsView {
             }
             cx.notify();
         }
-        self.text_edit_sync_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(300))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.text_edit_sync_task = None;
-                data_changed(cx.entity_id(), cx);
-            });
-        }));
     }
 
     pub(crate) fn select_mode(&mut self, mode: HorizonsMode, cx: &mut Context<Self>) {
@@ -152,17 +142,51 @@ impl HorizonsView {
         false
     }
 
-    pub(crate) fn toggle_task_done(&mut self, id: Id, cx: &mut Context<Self>) {
-        let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned() else {
-            return;
-        };
-        let done = !task.is_completed();
-        if let Ok(undo) = task_ops::toggle_task_completion(&self.store, &task, done, cx.entity_id(), cx) {
+    fn finish_toggle_task_done(&mut self, task: &Task, done: bool, cx: &mut Context<Self>) {
+        if let Ok(undo) = task_ops::toggle_task_completion(&self.store, task, done, cx.entity_id(), cx) {
             if let Some(action) = undo {
                 self.push_undo(UndoEntry::Single(action));
             }
             self.reload(cx);
         }
+    }
+
+    pub(crate) fn toggle_task_done(&mut self, id: Id, cx: &mut Context<Self>) {
+        let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        let done = !task.is_completed();
+        if done
+            && !task.is_wont_do()
+            && desktop_common::plugin_bus::PluginHooksGlobal::global(cx)
+                .is_some_and(|h| h.is_active())
+        {
+            if !self.pending_complete.insert(id) {
+                return;
+            }
+            let weak = cx.weak_entity();
+            desktop_common::plugin_bus::run_before_task_complete_hook(&task, cx, move |allowed, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.pending_complete.remove(&id);
+                    if !allowed {
+                        cx.notify();
+                        return;
+                    }
+                    if let Some(current) = this
+                        .tasks
+                        .iter()
+                        .find(|t| t.id == id)
+                        .cloned()
+                        .or_else(|| this.store.task(id).ok().flatten())
+                        && !current.is_completed()
+                    {
+                        this.finish_toggle_task_done(&current, true, cx);
+                    }
+                });
+            });
+            return;
+        }
+        self.finish_toggle_task_done(&task, done, cx);
     }
 
     pub(crate) fn start_inline_add(

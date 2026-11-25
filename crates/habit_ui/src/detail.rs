@@ -17,12 +17,18 @@ use crate::modal::day_unit_str;
 use crate::{ConfirmAction, DetailSubmenu, HabitView, STREAK_BEST_SETTING, StartFocus, avatar};
 
 impl HabitView {
-    pub(crate) fn render_detail(&self, habit: &Habit, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_detail(
+        &self,
+        habit: &Habit,
+        today: NaiveDate,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let status_colors = theme.status().clone();
         let id = habit.id;
-        let week_start = calendar::week_start();
+        let week_start = calendar::week_start(cx);
         let empty = HashSet::new();
         let checked = self.checkins.get(&id).unwrap_or(&empty);
         let stats = stats_with(&habit.frequency, checked, today, week_start);
@@ -112,13 +118,13 @@ impl HabitView {
                     .child(div().pb(px(3.)).child(Label::new(day_unit_str(streak_val as i64, strings)).size(LabelSize::Small).color(Color::Muted))),
             );
 
-        let weekdays = h_flex().children(calendar::weekday_labels(&strings.weekdays_short).iter().map(|day| {
+        let weekdays = h_flex().children(calendar::weekday_labels(&strings.weekdays_short, cx).iter().map(|day| {
             div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(Color::Muted))
         }));
 
         let is_archived = habit.archived;
         let has_goal = habit.goal.is_some();
-        let grid: Vec<AnyElement> = calendar::month_grid(self.month)
+        let grid: Vec<AnyElement> = calendar::month_grid(self.month, cx)
             .chunks(7)
             .map(|week| {
                 h_flex()
@@ -129,7 +135,7 @@ impl HabitView {
                         let after_archive = habit.archived_date.is_some_and(|a| date > a);
                         let blocked = is_archived || future;
                         let dimmed = !in_this_month || future || before_start || after_archive;
-                        let date_label = calendar::format_date(date, strings);
+                        let date_label = calendar::format_date(date, strings, cx);
                         let record = records.iter().find(|r| r.date == date);
                         let day_tip: SharedString = if let Some(goal) = habit.goal.as_ref() {
                             let amt = record.map(|r| r.value).unwrap_or(0.0);
@@ -194,7 +200,7 @@ impl HabitView {
                 // Header
                 .child(
                     h_flex()
-                        .mt(layout::header_inset())
+                        .mt(layout::header_inset(window, cx))
                         .h(px(52.))
                         .flex_none()
                         .gap_2()
@@ -895,7 +901,7 @@ impl HabitView {
                         let day = first + chrono::Duration::days(i as i64);
                         let tip = format!(
                             "{} · {}/{}{}",
-                            calendar::format_date(day, strings),
+                            calendar::format_date(day, strings, cx),
                             format_amount(values[i]),
                             goal_str,
                             unit_suffix

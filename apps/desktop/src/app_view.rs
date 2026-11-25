@@ -53,6 +53,48 @@ fn first_enabled_task_section(features: fern_core::Features) -> Section {
     }
 }
 
+trait WorkspaceSection {
+    fn set_section_active(&self, active: bool, cx: &mut App);
+    fn sync_section_external(&self, cx: &mut App);
+    fn focus_section(&self, window: &mut Window, cx: &mut App);
+    fn render_section(&self) -> AnyElement;
+}
+
+macro_rules! impl_workspace_section {
+    ($($view:ty),+ $(,)?) => {
+        $(
+            impl WorkspaceSection for gpui::Entity<$view> {
+                fn set_section_active(&self, active: bool, cx: &mut App) {
+                    self.update(cx, |view, cx| view.set_active(active, cx));
+                }
+
+                fn sync_section_external(&self, cx: &mut App) {
+                    self.update(cx, |view, cx| view.sync_external(cx));
+                }
+
+                fn focus_section(&self, window: &mut Window, cx: &mut App) {
+                    window.focus(&self.focus_handle(cx), cx);
+                }
+
+                fn render_section(&self) -> AnyElement {
+                    self.clone().into_any_element()
+                }
+            }
+        )+
+    };
+}
+
+impl_workspace_section!(
+    TodoView,
+    ThingsView,
+    CalendarView,
+    MatrixView,
+    CountdownView,
+    LifeClockView,
+    HabitView,
+    FocusView,
+);
+
 pub struct AppView {
     pub(crate) store: Rc<Store>,
     section: Section,
@@ -99,6 +141,8 @@ pub struct AppView {
     /// The sidebar icon under the pointer, whose name shows beside it.
     nav_hovered: Option<Section>,
     _modal_escape_sub: gpui::Subscription,
+    last_window_state: Option<desktop_common::window_state::MainWindowState>,
+    window_bounds_save_task: Option<gpui::Task<()>>,
     #[cfg(test)]
     minimized_count: usize,
 }
@@ -112,6 +156,7 @@ impl AppView {
                     crate::tray::restore_main_window();
                     window.activate_window();
                 } else {
+                    view.flush_window_state();
                     view.unmount_all_plugin_views(cx);
                     view.close_settings(cx);
                 }
@@ -121,11 +166,7 @@ impl AppView {
         if !can_quit {
             return false;
         }
-        crate::hotkeys::shutdown(cx);
-        PluginHost::shutdown(cx);
-        crate::tray::prepare_quit();
-        #[cfg(windows)]
-        crate::single_instance::release();
+        crate::shutdown::AppShutdown::run_once(cx);
         cx.quit();
         true
     }
@@ -190,7 +231,11 @@ impl AppView {
                 true
             }).unwrap_or(true)
         });
-        set_horizons_enabled(initial_prefs.features.horizons);
+        desktop_common::ActivePreferences::sync_from_preferences(
+            &initial_prefs,
+            desktop_common::sound::enabled(&store),
+            cx,
+        );
         let store_features = initial_prefs.features;
         let rail_items = initial_prefs.rail_items.clone();
         let initial_section = first_enabled_task_section(store_features);
@@ -342,10 +387,17 @@ impl AppView {
         let window_handle = window.window_handle().downcast::<Self>();
         let has_sync_config = store.sync_config().ok().flatten().is_some();
         let always_on_top = crate::tray::TrayPrefs::current(&store, cx).always_on_top;
-        let update_notice = release_notes::take_update_notice(&store, first_start).unwrap_or_else(|err| {
-            eprintln!("failed to read the update notification: {err:#}");
+        // Development builds can share the user database and must leave its update notice intact.
+        let update_notice = if cfg!(all(debug_assertions, not(test))) {
             None
-        }).map(Rc::new);
+        } else {
+            release_notes::take_update_notice(&store, first_start)
+                .unwrap_or_else(|err| {
+                    desktop_common::logging::log_error("app", format!("failed to read the update notification: {err:#}"));
+                    None
+                })
+                .map(Rc::new)
+        };
         let title_bar = cx.new(TitleBar::new);
         cx.subscribe_in(&title_bar, window, |this, _, ShowReleaseNotes(notes), window, cx| {
             this.open_settings(Some(notes.clone()), window, cx);
@@ -411,9 +463,15 @@ impl AppView {
             statistics_open: false,
             nav_hovered: None,
             _modal_escape_sub,
+            last_window_state: Some(desktop_common::window_state::capture(window)),
+            window_bounds_save_task: None,
             #[cfg(test)]
             minimized_count: 0,
         };
+        cx.observe_window_bounds(window, |this, window, cx| {
+            this.schedule_save_window_state(window, cx);
+        })
+        .detach();
         reminders::start(this.store.clone(), window.window_handle(), cx);
         cx.set_global(crate::LiveSyncStatus(this.sync.clone()));
         this.start_sync(cx);
@@ -433,7 +491,30 @@ impl AppView {
         this
     }
 
+    fn schedule_save_window_state(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if desktop_common::is_dev_state() {
+            return;
+        }
+        let state = desktop_common::window_state::capture(window);
+        self.last_window_state = Some(state.clone());
+        let store = self.store.clone();
+        self.window_bounds_save_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(400))
+                .await;
+            desktop_common::window_state::save(&store, &state);
+        }));
+    }
+
+    fn flush_window_state(&mut self) {
+        self.window_bounds_save_task = None;
+        if let Some(state) = &self.last_window_state {
+            desktop_common::window_state::save(&self.store, state);
+        }
+    }
+
     fn shutdown_for_main_window_close(&mut self, cx: &mut Context<Self>) {
+        self.flush_window_state();
         self.unmount_all_plugin_views(cx);
         self.close_settings(cx);
         PluginHost::shutdown(cx);
@@ -454,35 +535,51 @@ impl AppView {
         false
     }
 
+    fn builtin_sections(&self) -> [(Section, &dyn WorkspaceSection); 8] {
+        [
+            (Section::Tasks, &self.todo),
+            (Section::Things, &self.things),
+            (Section::Calendar, &self.calendar),
+            (Section::Matrix, &self.matrix),
+            (Section::Countdown, &self.countdown),
+            (Section::LifeClock, &self.life_clock),
+            (Section::Habits, &self.habits),
+            (Section::Pomodoro, &self.focus),
+        ]
+    }
+
+    fn builtin_section(&self, section: &Section) -> Option<&dyn WorkspaceSection> {
+        let normalized = if matches!(section, Section::Search) {
+            &Section::Tasks
+        } else {
+            section
+        };
+        self.builtin_sections()
+            .into_iter()
+            .find_map(|(sec, widget)| (sec == *normalized).then_some(widget))
+    }
+
     fn sync_active_section(&mut self, cx: &mut Context<Self>) {
         let stats = self.statistics_open;
-        let todo_active = !stats && matches!(self.section, Section::Tasks | Section::Search);
-        let things_active = !stats && self.section == Section::Things;
-        let calendar_active = !stats && self.section == Section::Calendar;
-        let matrix_active = !stats && self.section == Section::Matrix;
-        let countdown_active = !stats && self.section == Section::Countdown;
-        let life_clock_active = !stats && self.section == Section::LifeClock;
-        let habits_active = !stats && self.section == Section::Habits;
-        let focus_active = stats || self.section == Section::Pomodoro;
-        self.todo.update(cx, |view, cx| view.set_active(todo_active, cx));
-        self.things.update(cx, |view, cx| view.set_active(things_active, cx));
-        self.calendar.update(cx, |view, cx| view.set_active(calendar_active, cx));
-        self.matrix.update(cx, |view, cx| view.set_active(matrix_active, cx));
-        self.countdown.update(cx, |view, cx| view.set_active(countdown_active, cx));
-        self.life_clock.update(cx, |view, cx| view.set_active(life_clock_active, cx));
-        self.habits.update(cx, |view, cx| view.set_active(habits_active, cx));
-        self.focus.update(cx, |view, cx| view.set_active(focus_active, cx));
+        let current = if matches!(self.section, Section::Search) {
+            Section::Tasks
+        } else {
+            self.section.clone()
+        };
+        for (sec, widget) in self.builtin_sections() {
+            let active = if sec == Section::Pomodoro {
+                stats || current == Section::Pomodoro
+            } else {
+                !stats && current == sec
+            };
+            widget.set_section_active(active, cx);
+        }
     }
 
     fn sync_external_all(&self, cx: &mut Context<Self>) {
-        self.todo.update(cx, |view, cx| view.sync_external(cx));
-        self.things.update(cx, |view, cx| view.sync_external(cx));
-        self.calendar.update(cx, |view, cx| view.sync_external(cx));
-        self.matrix.update(cx, |view, cx| view.sync_external(cx));
-        self.countdown.update(cx, |view, cx| view.sync_external(cx));
-        self.life_clock.update(cx, |view, cx| view.sync_external(cx));
-        self.habits.update(cx, |view, cx| view.sync_external(cx));
-        self.focus.update(cx, |view, cx| view.sync_external(cx));
+        for (_, widget) in self.builtin_sections() {
+            widget.sync_section_external(cx);
+        }
     }
 
     pub(crate) fn sync_title_bar_appearance(&self, cx: &mut Context<Self>) {
@@ -541,17 +638,10 @@ impl AppView {
         if let Some((plugin_id, view_id)) = plugin_target {
             let view = self.ensure_plugin_view(plugin_id.as_ref(), view_id.as_ref(), window, cx);
             window.focus(&view.focus_handle(cx), cx);
-        } else {
-            match &self.section {
-                Section::Tasks | Section::Search | Section::Plugin { .. } => {}
-                Section::Things => window.focus(&self.things.focus_handle(cx), cx),
-                Section::Calendar => window.focus(&self.calendar.focus_handle(cx), cx),
-                Section::Matrix => window.focus(&self.matrix.focus_handle(cx), cx),
-                Section::Pomodoro => window.focus(&self.focus.focus_handle(cx), cx),
-                Section::Habits => window.focus(&self.habits.focus_handle(cx), cx),
-                Section::Countdown => window.focus(&self.countdown.focus_handle(cx), cx),
-                Section::LifeClock => window.focus(&self.life_clock.focus_handle(cx), cx),
-            }
+        } else if !matches!(self.section, Section::Tasks | Section::Search)
+            && let Some(widget) = self.builtin_section(&self.section)
+        {
+            widget.focus_section(window, cx);
         }
         self.sync_title_bar_appearance(cx);
         cx.notify();
@@ -603,12 +693,12 @@ impl AppView {
                     } else {
                         Section::Tasks
                     };
-                    if let Some(mgr) = crate::quick_add_window::active_hook_manager(cx)
+                    if desktop_common::plugin_bus::PluginHooksGlobal::global(cx)
+                        .is_some_and(|hooks| hooks.is_active())
                         && let Some(win) = this.window_handle
                     {
                         let (lists, preferences) = this.quick_add_context();
                         crate::quick_add_window::run_quick_add_plugins(
-                            mgr,
                             win,
                             vec![query],
                             None,
@@ -671,7 +761,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         if let Err(err) = self.store.create_task(draft.clone(), top) {
-            eprintln!("failed to create plugin-modified task: {err:#}");
+            desktop_common::logging::log_error("plugin", format!("failed to create plugin-modified task: {err:#}"));
             return;
         }
         crate::sticky_note::data_changed(cx.entity_id(), cx);
@@ -765,9 +855,13 @@ impl AppView {
     fn apply_settings_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Sync preferences and feature flags before reloading views so every view sees them live.
         let prefs = self.store.preferences().unwrap_or_default();
+        desktop_common::ActivePreferences::sync_from_preferences(
+            &prefs,
+            desktop_common::sound::enabled(&self.store),
+            cx,
+        );
         self.features = prefs.features;
         self.rail_items = prefs.rail_items;
-        set_horizons_enabled(prefs.features.horizons);
         // The default list, smart list visibility, mini calendar, week start and horizons flag show up in the views.
         self.sync_external_all(cx);
         self.has_sync_config = self.store.sync_config().ok().flatten().is_some();
@@ -839,7 +933,7 @@ impl AppView {
         let handle = match settings_window::open(self.store.clone(), notes, initial_page, window, cx) {
             Ok(handle) => handle,
             Err(err) => {
-                eprintln!("failed to open Settings: {err:#}");
+                desktop_common::logging::log_error("settings", format!("failed to open Settings: {err:#}"));
                 return;
             }
         };
@@ -1038,7 +1132,7 @@ impl Render for AppView {
         });
         let features = self.features;
         let sync_button = self.has_sync_config.then(|| sidebar::SyncButton {
-            tooltip: self.sync_tooltip(i18n::t(cx)),
+            tooltip: self.sync_tooltip(i18n::t(cx), cx),
             failed: matches!(self.sync, crate::sync::SyncStatus::Failed(_)),
             on_click: Box::new(cx.listener(|this, _, _, cx| this.sync_now(cx))),
         });
@@ -1089,27 +1183,18 @@ impl Render for AppView {
                     sync_button,
                     focus_clock,
                     features,
+                    window,
                     cx,
                 )
             });
-            let body = match &self.section {
-                Section::Tasks | Section::Search => {
-                    div().flex_1().min_w_0().h_full().child(self.todo.clone())
+            let body = if let Some(widget) = self.builtin_section(&self.section) {
+                div().flex_1().min_w_0().h_full().child(widget.render_section())
+            } else {
+                let mut el = div().flex_1().min_w_0().h_full();
+                if let Some(view) = plugin_view_entity {
+                    el = el.child(view);
                 }
-                Section::Things => div().flex_1().min_w_0().h_full().child(self.things.clone()),
-                Section::Calendar => div().flex_1().min_w_0().h_full().child(self.calendar.clone()),
-                Section::Matrix => div().flex_1().min_w_0().h_full().child(self.matrix.clone()),
-                Section::Countdown => div().flex_1().min_w_0().h_full().child(self.countdown.clone()),
-                Section::LifeClock => div().flex_1().min_w_0().h_full().child(self.life_clock.clone()),
-                Section::Habits => div().flex_1().min_w_0().h_full().child(self.habits.clone()),
-                Section::Pomodoro => div().flex_1().min_w_0().h_full().child(self.focus.clone()),
-                Section::Plugin { .. } => {
-                    let mut el = div().flex_1().min_w_0().h_full();
-                    if let Some(view) = plugin_view_entity {
-                        el = el.child(view);
-                    }
-                    el
-                }
+                el
             };
             Some((rail, body))
         } else {
@@ -1152,7 +1237,7 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &GoToHorizons, window, cx| {
                 if this.features.tasks
                     && this.features.horizons
-                    && desktop_common::calendar::horizons_enabled()
+                    && desktop_common::calendar::horizons_enabled(cx)
                 {
                     this.show_view(fern_core::View::Horizons, window, cx);
                 }
@@ -1197,7 +1282,7 @@ impl Render for AppView {
             .text_color(theme.colors().text)
             .child(content)
             .child(self.title_bar.clone())
-            .children(self.render_active_alerts(cx))
+            .children(self.render_active_alerts(window, cx))
             .child(render_plugin_overlays(window, cx))
             // A ring under a finger held long enough: lifting it opens the context menu.
             .when_some(crate::touch::held(), |el, at| {
@@ -1216,47 +1301,6 @@ impl Render for AppView {
             });
         title_bar::window_frame(root, window, cx)
     }
-}
-
-#[cfg(test)]
-static HORIZONS_FLAG_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-#[cfg(test)]
-thread_local! {
-    static HOLDS_HORIZONS_WRITE_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-pub(crate) fn set_horizons_enabled(enabled: bool) {
-    #[cfg(test)]
-    {
-        if HOLDS_HORIZONS_WRITE_LOCK.with(std::cell::Cell::get) {
-            crate::calendar::set_horizons_enabled(enabled);
-        } else {
-            let _read = HORIZONS_FLAG_LOCK.read().unwrap_or_else(|err| err.into_inner());
-            crate::calendar::set_horizons_enabled(enabled);
-        }
-    }
-    #[cfg(not(test))]
-    crate::calendar::set_horizons_enabled(enabled);
-}
-
-#[cfg(test)]
-pub(crate) struct HorizonsFlagGuard(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
-
-#[cfg(test)]
-impl Drop for HorizonsFlagGuard {
-    fn drop(&mut self) {
-        crate::calendar::set_horizons_enabled(true);
-        HOLDS_HORIZONS_WRITE_LOCK.with(|flag| flag.set(false));
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn lock_horizons_flag() -> HorizonsFlagGuard {
-    let guard = HORIZONS_FLAG_LOCK.write().unwrap_or_else(|err| err.into_inner());
-    HOLDS_HORIZONS_WRITE_LOCK.with(|flag| flag.set(true));
-    crate::calendar::set_horizons_enabled(true);
-    HorizonsFlagGuard(guard)
 }
 
 #[cfg(all(test, debug_assertions))]

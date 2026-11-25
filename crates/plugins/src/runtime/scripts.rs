@@ -1,5 +1,4 @@
-use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -7,7 +6,6 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use fern_core::plugin_store::UserScript;
-use futures::channel::oneshot;
 use rquickjs::context::EvalOptions;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use rquickjs::promise::MaybePromise;
@@ -18,11 +16,11 @@ use super::events::schedule_outbox_drain;
 use super::gate::{ClearPersistentGuard, ExecGate, GateOptions, run_with_gate};
 use super::{
     DEFAULT_COMMAND_TIMEOUT, HostUpdate, PLUGIN_MEMORY_LIMIT_BYTES, PLUGIN_STACK_LIMIT_BYTES,
-    ScriptRunResult, WorkerEnv, invoke_service,
+    ScriptRunResult, WorkerEnv, make_effect_emitter, make_service_caller,
 };
 use crate::api::{
-    EffectEmitterFn, LogEntry, PluginApiState, PluginHooks, PluginUiEffect, ServiceCallerFn,
-    install_fern_bindings, js_to_json, json_to_js,
+    LogEntry, PluginApiInit, PluginApiState, PluginUiEffect, install_fern_bindings, js_to_json,
+    json_to_js,
 };
 use crate::module_loader::{SandboxedLoader, VIRTUAL_FERN_MODULE, VIRTUAL_FERN_UI_MODULE};
 use crate::permissions::PermissionSet;
@@ -233,65 +231,32 @@ pub(super) async fn run_user_script(
         };
     };
 
-    let env_for_svc = Rc::clone(env);
-    let service_caller: ServiceCallerFn = Rc::new(move |svc_name, svc_arg, depth| {
-        let (tx, rx) = oneshot::channel();
-        let env_call = Rc::clone(&env_for_svc);
-        env_for_svc.spawn_task(async move {
-            let res = invoke_service(&env_call, &svc_name, svc_arg, depth).await;
-            let _ = tx.send(res);
-        });
-        rx
-    });
+    let service_caller = make_service_caller(env);
+    let effect_emitter = make_effect_emitter(env);
 
-    let tx_for_eff = env.update_tx.clone();
-    let wake_for_eff = env.wake_callback.clone();
-    let effect_emitter: EffectEmitterFn = Arc::new(move |eff| {
-        let _ = tx_for_eff.send(HostUpdate::UiEffect(eff));
-        if let Some(cb) = &wake_for_eff {
-            cb();
-        }
-    });
-
-    let api = Rc::new(PluginApiState {
+    let api = Rc::new(PluginApiState::new(PluginApiInit {
         plugin_id: script_id.clone(),
         permissions: perms,
         store: Rc::clone(&env.store),
         vault: env.vault.clone(),
         http_pool: Arc::clone(&env.http_pool),
         oauth_limiter: Arc::clone(&env.oauth_limiter),
-        write_depth: Cell::new(write_depth),
-        active_service_depth: Cell::new(0),
-        batch_dirty_stack: RefCell::new(Vec::new()),
-        data_dirty: Cell::new(false),
+        write_depth,
+        enforce_declared_views: false,
         declared_views: HashSet::new(),
-        settings: RefCell::new(Map::new()),
+        settings: Map::new(),
         secret_keys: HashSet::new(),
         locale: Rc::clone(&env.locale),
         theme_appearance: Rc::clone(&env.theme_appearance),
-        logs: RefCell::new(VecDeque::new()),
-        active_render_scope: RefCell::new(None),
-        handlers: RefCell::new(HashMap::new()),
-        next_handler_id: Cell::new(1),
-        views: RefCell::new(HashMap::new()),
-        modal_view: RefCell::new(None),
-        commands: RefCell::new(HashMap::new()),
-        search_providers: RefCell::new(HashMap::new()),
-        event_listeners: RefCell::new(HashMap::new()),
-        next_listener_id: Cell::new(1),
-        settings_listeners: RefCell::new(Vec::new()),
-        hooks: RefCell::new(PluginHooks::default()),
-        timers: RefCell::new(HashMap::new()),
-        services: RefCell::new(HashMap::new()),
-        pending_ui_effects: RefCell::new(VecDeque::new()),
+        logs: VecDeque::new(),
         prompt_senders: Rc::clone(&env.prompt_senders),
         next_prompt_id: Rc::clone(&env.next_prompt_id),
-        service_registrar: Rc::new(|_| {}),
+        service_registrar: Rc::new(|_| Ok(())),
         service_caller,
         view_refresher: Rc::new(|_| {}),
         effect_emitter,
         shutdown_flag: Arc::clone(&env.shutdown_flag),
-    });
+    }));
 
     let clear_guard = ClearPersistentGuard::new(
         Rc::clone(&api),

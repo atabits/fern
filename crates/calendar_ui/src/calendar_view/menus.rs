@@ -40,17 +40,17 @@ impl CalendarView {
             (Some(from), Some(to)) if event.start == event.end => format!(
                 "{}, {} – {}",
                 day(event.start),
-                calendar::format_time(from, strings),
-                calendar::format_time(to, strings)
+                calendar::format_time(from, strings, cx),
+                calendar::format_time(to, strings, cx)
             ),
             (Some(from), Some(to)) => format!(
                 "{} {} – {} {}",
                 day(event.start),
-                calendar::format_time(from, strings),
+                calendar::format_time(from, strings, cx),
                 day(event.end),
-                calendar::format_time(to, strings)
+                calendar::format_time(to, strings, cx)
             ),
-            (Some(from), None) => format!("{}, {}", day(event.start), calendar::format_time(from, strings)),
+            (Some(from), None) => format!("{}, {}", day(event.start), calendar::format_time(from, strings, cx)),
             (None, _) if event.start == event.end => format!("{}, {}", day(event.start), strings.range_all_day),
             (None, _) => format!("{} – {}", day(event.start), day(event.end)),
         };
@@ -242,7 +242,10 @@ impl CalendarView {
                                         this.store.toggle_checkin(id, date).map(|_| ())
                                     };
                                     if let Err(err) = res {
-                                        eprintln!("failed to update habit from calendar: {err:#}");
+                                        desktop_common::logging::log_error(
+                                            "calendar_ui",
+                                            format!("failed to update habit from calendar: {err:#}"),
+                                        );
                                     }
                                     desktop_common::data_version::data_changed(cx.entity_id(), cx);
                                     this.reload(cx);
@@ -392,7 +395,10 @@ impl CalendarView {
         };
         if let Some(result) = crate::task_menu::apply(&self.store, &task, action, Local::now().date_naive()) {
             if let Err(err) = result {
-                eprintln!("failed to change the task: {err:#}");
+                desktop_common::logging::log_error(
+                    "calendar_ui",
+                    format!("failed to change the task: {err:#}"),
+                );
             }
             crate::data_version::data_changed(cx.entity_id(), cx);
             self.card_updated(cx);
@@ -408,7 +414,10 @@ impl CalendarView {
             MenuAction::StickyNote => crate::sticky_opener::open_sticky_note(self.store.clone(), id, cx),
             MenuAction::Delete => {
                 if let Err(err) = self.store.delete_task(id) {
-                    eprintln!("failed to delete the task: {err:#}");
+                    desktop_common::logging::log_error(
+                        "calendar_ui",
+                        format!("failed to delete the task: {err:#}"),
+                    );
                 }
                 crate::data_version::data_changed(cx.entity_id(), cx);
                 self.card_updated(cx);
@@ -458,7 +467,10 @@ impl CalendarView {
         if let Some(feeds) = crate::subscriptions::feeds(cx) {
             feeds.update(cx, |feeds, cx| {
                 if let Err(err) = feeds.delete_event(subscription_id, uid, cx) {
-                    eprintln!("failed to delete CalDAV event: {err:#}");
+                    desktop_common::logging::log_error(
+                        "calendar_ui",
+                        format!("failed to delete CalDAV event: {err:#}"),
+                    );
                 }
             });
         }
@@ -478,10 +490,10 @@ impl CalendarView {
         let mut dialog = ConfirmDialog::new(
             "calendar-delete-event-modal",
             format!("{} \"{}\"?", strings.delete, title),
+            strings.cancel,
+            strings.delete,
         )
         .width(px(360.))
-        .cancel_label(strings.cancel)
-        .confirm_label(strings.delete)
         .destructive(true)
         .on_cancel(cx.listener(|this, _, window, cx| {
             this.pending_delete_event = None;

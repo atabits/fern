@@ -20,7 +20,7 @@ impl TodoView {
             _ => None,
         };
         let renaming = self.section_rename.as_ref().filter(|(id, _)| Some(*id) == section).map(|(_, input)| input.clone());
-        let menu_open = self.column_menu.is_some_and(|(id, _)| Some(id) == section);
+        let menu_open = self.kanban.column_menu.is_some_and(|(id, _)| Some(id) == section);
         let drag_title: SharedString = title.clone().into();
         h_flex()
             .id(SharedString::from(format!("kanban-header-{column}")))
@@ -28,7 +28,7 @@ impl TodoView {
             .pt(px(12.))
             .pb(px(6.))
             .pl(px(10.))
-            .pr(if self.kanban_column_color { px(10.) } else { px(12.) })
+            .pr(if self.kanban.column_color { px(10.) } else { px(12.) })
             .gap_1()
             .when_some(section.filter(|_| renaming.is_none()), |el, id| {
                 let dragged = DraggedColumn { id, title: drag_title.clone() };
@@ -36,7 +36,7 @@ impl TodoView {
                     .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                     .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.column_menu = Some((id, false));
+                        this.kanban.column_menu = Some((id, false));
                         cx.notify();
                     }))
             })
@@ -87,17 +87,17 @@ impl TodoView {
                                 .child(Label::new(strings.postpone).size(LabelSize::Small).color(Color::Accent))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.postpone_menu = true;
+                                    this.overlays.postpone_menu = true;
                                     cx.notify();
                                 })),
                         )
-                        .when(self.postpone_menu, |el| {
+                        .when(self.overlays.postpone_menu, |el| {
                             el.child(PopoverAttachment::new(
                                 Placement::BelowRight,
                                 popover(cx)
                                     .min_w(px(180.))
                                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                        this.postpone_menu = false;
+                                        this.overlays.postpone_menu = false;
                                         cx.notify();
                                     }))
                                     .children(fern_core::DefaultDate::ALL.iter().zip(strings.default_dates).map(|(&choice, name)| {
@@ -116,7 +116,7 @@ impl TodoView {
                         }),
                 )
             })
-            .when_some(target.filter(|t| !matches!(t, DropTarget::Complete) && !self.kanban_quick_add && !self.is_current_view_archived_list()), |el, target| {
+            .when_some(target.filter(|t| !matches!(t, DropTarget::Complete) && !self.kanban.quick_add && !self.is_current_view_archived_list()), |el, target| {
                 el.child(
                     IconButton::new(SharedString::from(format!("kanban-add-{column}")), IconName::Plus)
                         .size(px(22.))
@@ -137,7 +137,7 @@ impl TodoView {
                                 .icon_color(Color::Muted)
                                 .tooltip(Tooltip::text(strings.more))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.column_menu = if this.column_menu.is_some_and(|(open, _)| open == id) { None } else { Some((id, false)) };
+                                    this.kanban.column_menu = if this.kanban.column_menu.is_some_and(|(open, _)| open == id) { None } else { Some((id, false)) };
                                     cx.notify();
                                 })),
                         )
@@ -153,7 +153,7 @@ impl TodoView {
         };
         // The section's place among the list's sections, for Add Section to Left / Right.
         let index = self.sections.iter().position(|s| s.id == section).unwrap_or(column);
-        let side = self.column_menu.is_some_and(|(_, side)| side);
+        let side = self.kanban.column_menu.is_some_and(|(_, side)| side);
         // Move to: the Inbox and the lists, but not where the section already is.
         let owner = self.section_owner();
         let lists: Vec<ListItem> = std::iter::once((None, SharedString::new_static(strings.inbox), IconName::Inbox))
@@ -164,7 +164,7 @@ impl TodoView {
                     .start_slot(Icon::new(icon).color(Color::Muted))
                     .child(Label::new(name))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.column_menu = None;
+                        this.kanban.column_menu = None;
                         let result = this.store.move_list_section(section, to);
                         this.check(result);
                         this.reload(cx);
@@ -173,7 +173,7 @@ impl TodoView {
             .collect();
         let view = cx.entity().downgrade();
         let theme = cx.theme().clone();
-        let current_color = self.kanban_section_colors.get(&section).map(String::as_str);
+        let current_color = self.kanban.section_colors.get(&section).map(String::as_str);
         let move_bounds = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::Bounds<Pixels>>));
         let move_bounds_out = move_bounds.clone();
         popover(cx)
@@ -182,13 +182,13 @@ impl TodoView {
                 if move_bounds_out.get().is_some_and(|b| b.contains(&event.position)) {
                     return;
                 }
-                this.column_menu = None;
+                this.kanban.column_menu = None;
                 cx.notify();
             }))
             .child(item("section-rename", IconName::Pencil, strings.rename_section).on_click(cx.listener(move |this, _, window, cx| {
                 this.start_kanban_section_rename(section, window, cx);
             })))
-            .when(self.kanban_column_color, |el| {
+            .when(self.kanban.column_color, |el| {
                 let swatch = |id: SharedString, hex: Option<&'static str>, cx: &mut Context<Self>| {
                     let active = current_color == hex;
                     let fill = hex.and_then(|c| lists_panel::parse_color(Some(c)));
@@ -225,12 +225,12 @@ impl TodoView {
                 )
             })
             .child(item("section-left", IconName::BetweenVerticalStart, strings.add_section_left).on_click(cx.listener(move |this, _, window, cx| {
-                this.column_menu = None;
+                this.kanban.column_menu = None;
                 this.start_new_section(window, cx);
                 this.new_section_index = Some(index);
             })))
             .child(item("section-right", IconName::BetweenVerticalEnd, strings.add_section_right).on_click(cx.listener(move |this, _, window, cx| {
-                this.column_menu = None;
+                this.kanban.column_menu = None;
                 this.start_new_section(window, cx);
                 this.new_section_index = Some(index + 1);
             })))
@@ -243,7 +243,7 @@ impl TodoView {
                     .on_hover(move |hovered: &bool, _, cx: &mut App| {
                         if *hovered && !side {
                             view.update(cx, |this, cx| {
-                                this.column_menu = Some((section, true));
+                                this.kanban.column_menu = Some((section, true));
                                 cx.notify();
                             })
                             .ok();
@@ -264,8 +264,8 @@ impl TodoView {
                         .start_slot(Icon::new(IconName::Trash).color(Color::Error))
                         .child(Label::new(strings.delete).color(Color::Error))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.column_menu = None;
-                            this.confirm_delete = Some(super::ConfirmDeleteTarget::Section(section, section_name.clone()));
+                            this.kanban.column_menu = None;
+                            this.overlays.confirm_delete = Some(super::ConfirmDeleteTarget::Section(section, section_name.clone()));
                             cx.notify();
                         })),
                 )
@@ -397,30 +397,30 @@ impl TodoView {
     /// - within the source column: vertical reorder + horizontal indent/outdent via `plan_task_drop`
     /// - over another column: highlight the whole target column (no row insertion line)
     pub(super) fn move_kanban_task_drag(&mut self, event: &gpui::DragMoveEvent<DraggedTask>, _: &mut Window, cx: &mut Context<Self>) {
-        if self.view == View::Trash || !self.kanban || self.timeline {
+        if self.view == View::Trash || !self.kanban.enabled || self.timeline.enabled {
             return;
         }
         let pos = event.event.position;
         if !event.bounds.contains(&pos) {
-            if self.task_drop.take().is_some() | self.kanban_hover_col.take().is_some() {
+            if self.panel_dnd.task_drop.take().is_some() | self.kanban.hover_col.take().is_some() {
                 cx.notify();
             }
             return;
         }
         let dragged_id = event.drag(cx).id;
-        let start_x = match self.task_drag_origin {
+        let start_x = match self.panel_dnd.task_drag_origin {
             Some((id, x)) if id == dragged_id => x,
             _ => {
-                self.task_drag_origin = Some((dragged_id, pos.x));
+                self.panel_dnd.task_drag_origin = Some((dragged_id, pos.x));
                 pos.x
             }
         };
 
-        let source_col_idx = self.kanban_drag_rows.iter().position(|c| c.row_subs.contains_key(&dragged_id));
+        let source_col_idx = self.kanban.drag_rows.iter().position(|c| c.row_subs.contains_key(&dragged_id));
         // A column's visual card panel shrinks to content height (`max_h_full`), while its drop
         // lane extends down to the bottom of the board.
         let hovered_col_key = {
-            let cols = self.kanban_col_bounds.borrow();
+            let cols = self.kanban.col_bounds.borrow();
             cols.iter()
                 .find_map(|(k, b)| (pos.x >= b.left() && pos.x <= b.right() && pos.y >= b.top()).then(|| k.clone()))
         };
@@ -429,10 +429,10 @@ impl TodoView {
         let mut new_hover_col = None;
 
         if let Some(target_key) = hovered_col_key {
-            let source_key = source_col_idx.map(|i| self.kanban_drag_rows[i].key.as_str());
+            let source_key = source_col_idx.map(|i| self.kanban.drag_rows[i].key.as_str());
             if source_key != Some(target_key.as_str()) {
                 // Cross-column drag: reject row drop line and highlight target column if it accepts drops.
-                if let Some(target_col) = self.kanban_drag_rows.iter().find(|c| c.key == target_key)
+                if let Some(target_col) = self.kanban.drag_rows.iter().find(|c| c.key == target_key)
                     && let Some(drop_target) = &target_col.drop
                 {
                     let dragged_is_note = self.tasks.iter().any(|t| t.id == dragged_id && t.kind == Kind::Note);
@@ -442,8 +442,8 @@ impl TodoView {
                 }
             } else if let Some(src_idx) = source_col_idx {
                 // Same-column drag: use the exact same tree drop planner as List view.
-                let col = &self.kanban_drag_rows[src_idx];
-                let row_bounds = self.kanban_row_bounds.borrow();
+                let col = &self.kanban.drag_rows[src_idx];
+                let row_bounds = self.kanban.row_bounds.borrow();
                 let mut hit: Option<(Id, gpui::Bounds<Pixels>)> = None;
                 let mut bottommost_y: Option<Pixels> = None;
                 for &task_id in col.row_subs.keys() {
@@ -492,30 +492,30 @@ impl TodoView {
             }
         }
 
-        if self.task_drop != new_plan || self.kanban_hover_col != new_hover_col {
-            self.task_drop = new_plan;
-            self.kanban_hover_col = new_hover_col;
+        if self.panel_dnd.task_drop != new_plan || self.kanban.hover_col != new_hover_col {
+            self.panel_dnd.task_drop = new_plan;
+            self.kanban.hover_col = new_hover_col;
             cx.notify();
         }
     }
 
     pub(super) fn drop_task_in_kanban(&mut self, dragged: &DraggedTask, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_current_view_archived_list() || self.is_task_id_read_only(dragged.id) {
-            self.task_drop = None;
-            self.kanban_hover_col = None;
-            self.task_drag_origin = None;
+            self.panel_dnd.task_drop = None;
+            self.kanban.hover_col = None;
+            self.panel_dnd.task_drag_origin = None;
             return;
         }
-        let plan = self.task_drop.take();
-        let hover_col = self.kanban_hover_col.take();
-        self.task_drag_origin = None;
+        let plan = self.panel_dnd.task_drop.take();
+        let hover_col = self.kanban.hover_col.take();
+        self.panel_dnd.task_drag_origin = None;
         if let Some(plan) = plan {
             cx.stop_propagation();
             self.apply_kanban_task_drop(dragged.id, plan, cx);
         } else if let Some(col_key) = hover_col {
             cx.stop_propagation();
             if let Some(drop_target) =
-                self.kanban_drag_rows.iter().find(|c| c.key == col_key).and_then(|c| c.drop.clone())
+                self.kanban.drag_rows.iter().find(|c| c.key == col_key).and_then(|c| c.drop.clone())
             {
                 self.drop_on_column(dragged.id, drop_target, cx);
             }
@@ -526,7 +526,7 @@ impl TodoView {
 
     pub(super) fn apply_kanban_task_drop(&mut self, dragged: Id, plan: task_rows::TaskDropPlan, cx: &mut Context<Self>) {
         let target_sub = self
-            .kanban_drag_rows
+            .kanban.drag_rows
             .iter()
             .find_map(|c| c.row_subs.get(&plan.target_id).copied());
         let result = (|| -> anyhow::Result<()> {

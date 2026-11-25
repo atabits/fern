@@ -87,7 +87,7 @@ impl TaskDetail {
         }
         self.save(cx, |store, _| store.set_completed(id, completed));
         if completed {
-            desktop_common::sound::play_complete(&self.session.store);
+            desktop_common::sound::play_complete(cx);
         }
         self.reload_current_task();
         cx.notify();
@@ -181,7 +181,7 @@ impl TaskDetail {
             self.save(cx, |store, _| store.set_checklist_item_completed(id, completed));
         }
         if completed {
-            desktop_common::sound::play_complete(&self.session.store);
+            desktop_common::sound::play_complete(cx);
         }
         self.sync_checklist(cx);
     }
@@ -407,7 +407,7 @@ impl TaskDetail {
                 let group_name = SharedString::from(format!("subtask-row-{id}"));
                 let due = subtask
                     .due_date
-                    .map(|date| task_rows::row_due_label(date, subtask.due_time, today, strings, countdown_dates));
+                    .map(|date| task_rows::row_due_label(date, subtask.due_time, today, strings, countdown_dates, cx));
                 let checkbox_id = SharedString::from(format!("subtask-checkbox-{id}"));
                 let checkbox = if let Some(t) = sticky {
                     sticky_checkbox(

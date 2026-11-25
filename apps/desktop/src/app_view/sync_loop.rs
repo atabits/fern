@@ -3,7 +3,7 @@ use ui::prelude::*;
 
 use crate::i18n;
 
-use super::{AppView, set_horizons_enabled};
+use super::AppView;
 
 pub(super) fn format_sync_error(err: &anyhow::Error, strings: &i18n::Strings) -> String {
     if let Some(mismatch) = desktop_common::sync::is_incompatible_protocol(err) {
@@ -32,7 +32,7 @@ impl AppView {
     /// Syncs on start, whenever there are local changes to send, and every few minutes to fetch
     /// other devices' changes. Screenshots of the debug build do not sync.
     pub(super) fn start_sync(&mut self, cx: &mut Context<Self>) {
-        if std::env::var_os("FERN_DEV_STATE").is_some() || !self.has_sync_config {
+        if desktop_common::is_dev_state() || !self.has_sync_config {
             self.sync_task = None;
             return;
         }
@@ -116,7 +116,7 @@ impl AppView {
         if self.sync == crate::sync::SyncStatus::Running {
             return;
         }
-        if let Some(db_path) = cx.try_global::<crate::DbPath>().map(|p| p.0.clone()) {
+        if let Some(db_path) = desktop_common::DbPath::get(cx) {
             if !self.has_sync_config {
                 if self.store.sync_config().ok().flatten().is_none() {
                     if self.sync != crate::sync::SyncStatus::Off {
@@ -250,9 +250,8 @@ impl AppView {
             }
         };
         let transfer_config = config.clone();
-        let transfer = if let Some(db_path) = cx.try_global::<crate::DbPath>().map(|p| p.0.clone()) {
-            cx.background_spawn(async move {
-                let bg_store = Store::open(&db_path)?;
+        let transfer = if let Some(db_path) = desktop_common::DbPath::get(cx) {
+            desktop_common::DbRunner::run(Some(db_path), &self.store, cx, move |bg_store| {
                 let (upload, download) = bg_store.files_to_sync(&dir)?;
                 if upload.is_empty() && download.is_empty() {
                     return Ok(None);
@@ -337,7 +336,10 @@ impl AppView {
         let status = match result {
             Ok(()) => crate::sync::SyncStatus::Done(chrono::Local::now().naive_local()),
             Err(err) => {
-                desktop_common::diagnostics::log_event("sync", format!("sync failed: {err:#}"));
+                desktop_common::diagnostics::log_event(
+                    "sync",
+                    desktop_common::diagnostics::redact_sensitive(&format!("sync failed: {err:#}")),
+                );
                 crate::sync::SyncStatus::Failed(format_sync_error(&err, i18n::t(cx)))
             }
         };
@@ -347,6 +349,11 @@ impl AppView {
     /// Re-reads every view, after changes came from another device.
     pub(super) fn reload_all(&mut self, cx: &mut Context<Self>) {
         let prefs = self.store.preferences().unwrap_or_default();
+        desktop_common::ActivePreferences::sync_from_preferences(
+            &prefs,
+            desktop_common::sound::enabled(&self.store),
+            cx,
+        );
         self.features = prefs.features;
         self.rail_items = prefs.rail_items;
         self.has_sync_config = self.store.sync_config().ok().flatten().is_some();
@@ -356,23 +363,18 @@ impl AppView {
                 self.set_sync_status(crate::sync::SyncStatus::Off, cx);
             }
         }
-        crate::calendar::set_week_start(prefs.week_start);
-        crate::calendar::set_hour12(prefs.hour12);
-        crate::calendar::set_date_format(prefs.date_format);
-        crate::calendar::set_week_numbers(prefs.week_numbers);
-        set_horizons_enabled(prefs.features.horizons);
         self.sync_external_all(cx);
         self.sync_title_bar_appearance(cx);
         cx.notify();
     }
 
     /// The sync button's tooltip: "Sync" and how the last sync went.
-    pub(super) fn sync_tooltip(&self, strings: &'static i18n::Strings) -> String {
+    pub(super) fn sync_tooltip(&self, strings: &'static i18n::Strings, cx: &App) -> String {
         let status = match &self.sync {
             crate::sync::SyncStatus::Off if self.has_sync_config => strings.sync_never.to_owned(),
             crate::sync::SyncStatus::Off => strings.sync_off.to_owned(),
             crate::sync::SyncStatus::Running => strings.sync_running.to_owned(),
-            crate::sync::SyncStatus::Done(at) => strings.sync_done.replace("{time}", &crate::calendar::format_time(at.time(), strings)),
+            crate::sync::SyncStatus::Done(at) => strings.sync_done.replace("{time}", &crate::calendar::format_time(at.time(), strings, cx)),
             crate::sync::SyncStatus::Failed(error) => strings.sync_failed.replace("{error}", error),
         };
         format!("{}\n{status}", strings.sync)

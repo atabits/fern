@@ -12,12 +12,12 @@ impl TodoView {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(v_ix) = vacant_ix else { return false };
-        let Some(vb) = self.lists_scroll.bounds_for_item(v_ix) else { return false };
+        let Some(vb) = self.panel_dnd.lists_scroll.bounds_for_item(v_ix) else { return false };
         if content_y < f32::from(vb.top()) - 3. || content_y > f32::from(vb.bottom()) + 3. {
             return false;
         }
-        self.drag_expand = None;
-        if let Some(drag) = self.panel_drag.as_mut()
+        self.panel_dnd.drag_expand = None;
+        if let Some(drag) = self.panel_dnd.panel_drag.as_mut()
             && drag.highlight.take().is_some()
         {
             cx.notify();
@@ -31,7 +31,7 @@ impl TodoView {
         content_y: f32,
     ) -> Option<(usize, f32, f32)> {
         for r_ix in range {
-            let Some(rb) = self.lists_scroll.bounds_for_item(r_ix) else { continue };
+            let Some(rb) = self.panel_dnd.lists_scroll.bounds_for_item(r_ix) else { continue };
             let top = f32::from(rb.top());
             let bot = f32::from(rb.bottom());
             if content_y >= top && content_y <= bot {
@@ -49,10 +49,10 @@ impl TodoView {
         cx: &mut Context<Self>,
     ) {
         if !keep_expand {
-            self.drag_expand = None;
+            self.panel_dnd.drag_expand = None;
         }
         let highlight_changed = self
-            .panel_drag
+            .panel_dnd.panel_drag
             .as_mut()
             .is_some_and(|d| std::mem::replace(&mut d.highlight, next_highlight) != d.highlight);
         if changed || highlight_changed {
@@ -69,17 +69,17 @@ impl TodoView {
         use fern_core::SmartList;
         use lists_panel::{ActiveDragItem, PanelChild};
         let dragged = event.drag(cx).list;
-        if !self.panel_drag.as_ref().is_some_and(|d| d.item == ActiveDragItem::SmartList(dragged)) {
+        if !self.panel_dnd.panel_drag.as_ref().is_some_and(|d| d.item == ActiveDragItem::SmartList(dragged)) {
             return;
         }
         let content_y = self.lists_panel_content_y(event.event.position, cx);
         let visible: Vec<(SmartList, f32)> = {
-            let rows = self.lists_rows.borrow();
+            let rows = self.panel_dnd.lists_rows.borrow();
             rows.iter()
                 .enumerate()
                 .filter_map(|(ix, r)| match r {
                     PanelChild::SmartList(s) => {
-                        let b = self.lists_scroll.bounds_for_item(ix)?;
+                        let b = self.panel_dnd.lists_scroll.bounds_for_item(ix)?;
                         Some((*s, f32::from(b.center().y)))
                     }
                     _ => None,
@@ -109,7 +109,7 @@ impl TodoView {
         use lists_panel::{ActiveDragItem, PanelChild};
         let dragged = event.drag(cx).section;
         let Some((grab_offset_y, spans)) = self
-            .panel_drag
+            .panel_dnd.panel_drag
             .as_ref()
             .filter(|d| d.item == ActiveDragItem::SidebarSection(dragged))
             .map(|d| (d.grab_offset_y, d.block_spans.clone()))
@@ -118,7 +118,7 @@ impl TodoView {
         };
         let content_y = self.lists_panel_content_y(event.event.position, cx);
         let visible: Vec<(usize, SidebarSection)> = {
-            let rows = self.lists_rows.borrow();
+            let rows = self.panel_dnd.lists_rows.borrow();
             rows.iter()
                 .enumerate()
                 .filter_map(|(ix, r)| match r {
@@ -129,7 +129,7 @@ impl TodoView {
         };
         let Some(&(first_ix, _)) = visible.first() else { return };
         let Some(cur_pos) = visible.iter().position(|(_, s)| *s == dragged) else { return };
-        let Some(first_b) = self.lists_scroll.bounds_for_item(first_ix) else { return };
+        let Some(first_b) = self.panel_dnd.lists_scroll.bounds_for_item(first_ix) else { return };
         let new_pos = invariant_block_slot(f32::from(first_b.top()), &spans, cur_pos, content_y - grab_offset_y);
         if new_pos != cur_pos {
             if self.preferences.sidebar_section_order.is_empty() {
@@ -149,22 +149,22 @@ impl TodoView {
     ) {
         use lists_panel::{ActiveDragItem, PanelChild};
         let dragged = event.drag(cx).id;
-        if !self.panel_drag.as_ref().is_some_and(|d| d.item == ActiveDragItem::Filter(dragged)) {
+        if !self.panel_dnd.panel_drag.as_ref().is_some_and(|d| d.item == ActiveDragItem::Filter(dragged)) {
             return;
         }
         let content_y = self.lists_panel_content_y(event.event.position, cx);
         let (heading_bounds, visible): (Option<gpui::Bounds<Pixels>>, Vec<(Id, f32)>) = {
-            let rows = self.lists_rows.borrow();
+            let rows = self.panel_dnd.lists_rows.borrow();
             let h = rows
                 .iter()
                 .position(|r| *r == PanelChild::SectionHeading(fern_core::SidebarSection::Filters))
-                .and_then(|ix| self.lists_scroll.bounds_for_item(ix));
+                .and_then(|ix| self.panel_dnd.lists_scroll.bounds_for_item(ix));
             let vis = rows
                 .iter()
                 .enumerate()
                 .filter_map(|(ix, r)| match r {
                     PanelChild::Filter(id) => {
-                        let b = self.lists_scroll.bounds_for_item(ix)?;
+                        let b = self.panel_dnd.lists_scroll.bounds_for_item(ix)?;
                         Some((*id, f32::from(b.center().y)))
                     }
                     _ => None,
@@ -199,7 +199,7 @@ impl TodoView {
         let dragged_fid = event.drag(cx).id;
         let has_lists = event.drag(cx).has_lists;
         let Some((grab_offset_y, spans)) = self
-            .panel_drag
+            .panel_dnd.panel_drag
             .as_ref()
             .filter(|d| d.item == ActiveDragItem::Folder(dragged_fid))
             .map(|d| (d.grab_offset_y, d.block_spans.clone()))
@@ -211,12 +211,12 @@ impl TodoView {
         if !has_lists {
             // Empty folders reorder among empty folders at the bottom of Lists.
             let empty_vis: Vec<(Id, f32)> = {
-                let rows = self.lists_rows.borrow();
+                let rows = self.panel_dnd.lists_rows.borrow();
                 rows.iter()
                     .enumerate()
                     .filter_map(|(ix, r)| match r {
                         PanelChild::FolderHeader { id, empty: true, .. } => {
-                            let b = self.lists_scroll.bounds_for_item(ix)?;
+                            let b = self.panel_dnd.lists_scroll.bounds_for_item(ix)?;
                             Some((*id, f32::from(b.center().y)))
                         }
                         _ => None,
@@ -248,7 +248,7 @@ impl TodoView {
         }
 
         let (first_ix, cur_pos) = {
-            let rows = self.lists_rows.borrow();
+            let rows = self.panel_dnd.lists_rows.borrow();
             let blocks: Vec<(usize, bool)> = rows
                 .iter()
                 .enumerate()
@@ -262,7 +262,7 @@ impl TodoView {
             let Some(cur_pos) = blocks.iter().position(|&(_, is_d)| is_d) else { return };
             (first_ix, cur_pos)
         };
-        let Some(first_b) = self.lists_scroll.bounds_for_item(first_ix) else { return };
+        let Some(first_b) = self.panel_dnd.lists_scroll.bounds_for_item(first_ix) else { return };
         let new_pos = invariant_block_slot(f32::from(first_b.top()), &spans, cur_pos, content_y - grab_offset_y);
         if new_pos != cur_pos {
             reorder_non_empty_folder_in_memory(&mut self.lists, &mut self.folders, dragged_fid, new_pos);
@@ -279,7 +279,7 @@ impl TodoView {
         use lists_panel::{ActiveDragItem, PanelChild};
         let dragged_name = event.drag(cx).name.to_string();
         let Some((grab_offset_y, spans, orig_pinned)) = self
-            .panel_drag
+            .panel_dnd.panel_drag
             .as_ref()
             .filter(|d| d.item == ActiveDragItem::Tag(dragged_name.clone()))
             .map(|d| (d.grab_offset_y, d.block_spans.clone(), d.orig_tag_pinned))
@@ -288,11 +288,11 @@ impl TodoView {
         };
         let content_y = self.lists_panel_content_y(event.event.position, cx);
         let (heading_bounds, roots) = {
-            let rows = self.lists_rows.borrow();
+            let rows = self.panel_dnd.lists_rows.borrow();
             let h = rows
                 .iter()
                 .position(|r| *r == PanelChild::SectionHeading(fern_core::SidebarSection::Tags))
-                .and_then(|ix| self.lists_scroll.bounds_for_item(ix));
+                .and_then(|ix| self.panel_dnd.lists_scroll.bounds_for_item(ix));
             let vis: Vec<(usize, String, bool)> = rows
                 .iter()
                 .enumerate()
@@ -305,7 +305,7 @@ impl TodoView {
         };
         let Some(&(first_ix, _, _)) = roots.first() else { return };
         let Some(cur_pos) = roots.iter().position(|(_, n, _)| *n == dragged_name) else { return };
-        let Some(first_b) = self.lists_scroll.bounds_for_item(first_ix) else { return };
+        let Some(first_b) = self.panel_dnd.lists_scroll.bounds_for_item(first_ix) else { return };
         let new_pos = if heading_bounds.is_some_and(|hb| {
             content_y >= f32::from(hb.top()) && content_y <= f32::from(hb.bottom())
         }) {
@@ -332,11 +332,11 @@ impl TodoView {
     ) {
         use lists_panel::{ActiveDragItem, HighlightTarget, PanelChild};
         let dragged_id = event.drag(cx).id;
-        if !self.panel_drag.as_ref().is_some_and(|d| d.item == ActiveDragItem::List(dragged_id)) {
+        if !self.panel_dnd.panel_drag.as_ref().is_some_and(|d| d.item == ActiveDragItem::List(dragged_id)) {
             return;
         }
         let content_y = self.lists_panel_content_y(event.event.position, cx);
-        let rows_snapshot: Vec<PanelChild> = self.lists_rows.borrow().clone();
+        let rows_snapshot: Vec<PanelChild> = self.panel_dnd.lists_rows.borrow().clone();
 
         let vacant_ix = rows_snapshot.iter().position(|r| {
             matches!(r, PanelChild::TopList(id) | PanelChild::SubList { id, .. } if *id == dragged_id)
@@ -362,12 +362,12 @@ impl TodoView {
             self.lists.iter().any(|l| l.id != dragged_id && !l.archived && l.folder == Some(fid))
         });
 
-        if let Some(hb) = self.lists_scroll.bounds_for_item(heading_ix)
+        if let Some(hb) = self.panel_dnd.lists_scroll.bounds_for_item(heading_ix)
             && content_y <= f32::from(hb.bottom())
         {
             lists_changed = move_list_first_in_memory(&mut self.lists, &self.folders, dragged_id);
         } else if active_end_ix > heading_ix + 1
-            && let Some(last_b) = self.lists_scroll.bounds_for_item(active_end_ix - 1)
+            && let Some(last_b) = self.panel_dnd.lists_scroll.bounds_for_item(active_end_ix - 1)
             && content_y > f32::from(last_b.bottom())
         {
             lists_changed = move_list_last_top_in_memory(&mut self.lists, &self.folders, dragged_id);
@@ -503,11 +503,11 @@ impl TodoView {
     ) {
         use lists_panel::{ActiveDragItem, HighlightTarget, PanelChild};
         let dragged_name = event.drag(cx).name.to_string();
-        if !self.panel_drag.as_ref().is_some_and(|d| d.item == ActiveDragItem::Tag(dragged_name.clone())) {
+        if !self.panel_dnd.panel_drag.as_ref().is_some_and(|d| d.item == ActiveDragItem::Tag(dragged_name.clone())) {
             return;
         }
         let content_y = self.lists_panel_content_y(event.event.position, cx);
-        let rows_snapshot: Vec<PanelChild> = self.lists_rows.borrow().clone();
+        let rows_snapshot: Vec<PanelChild> = self.panel_dnd.lists_rows.borrow().clone();
 
         let vacant_ix = rows_snapshot.iter().position(|r| match r {
             PanelChild::TopTag { name, .. } | PanelChild::SubTag { name, .. } => *name == dragged_name,
@@ -534,13 +534,13 @@ impl TodoView {
             || self.preferences.visibility(fern_core::SmartList::Tags)
                 != fern_core::Visibility::IfNotEmpty;
 
-        if let Some(hb) = self.lists_scroll.bounds_for_item(heading_ix)
+        if let Some(hb) = self.panel_dnd.lists_scroll.bounds_for_item(heading_ix)
             && content_y <= f32::from(hb.bottom())
         {
             tags_changed = move_tag_first_in_memory(&mut self.tags, &dragged_name);
         } else if !self.tags_collapsed
             && tags_end_ix > heading_ix + 1
-            && let Some(last_b) = self.lists_scroll.bounds_for_item(tags_end_ix - 1)
+            && let Some(last_b) = self.panel_dnd.lists_scroll.bounds_for_item(tags_end_ix - 1)
             && content_y > f32::from(last_b.bottom())
         {
             tags_changed = move_tag_last_top_in_memory(&mut self.tags, &dragged_name);

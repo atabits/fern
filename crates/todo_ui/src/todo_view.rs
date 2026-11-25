@@ -106,6 +106,96 @@ pub(super) enum ConfirmDeleteTarget {
     BatchPurge(usize),
 }
 
+struct KanbanState {
+    pub enabled: bool,
+    pub cache: RefCell<Option<(kanban::KanbanCacheKey, Rc<Vec<kanban::BoardCol>>)>>,
+    pub column_add: Option<(usize, DropTarget, Entity<TextInput>)>,
+    pub column_menu: Option<(Id, bool)>,
+    pub column_size: u8,
+    pub column_color: bool,
+    pub quick_add: bool,
+    pub workflow: bool,
+    pub quick_adds: HashMap<String, (DropTarget, Entity<TextInput>)>,
+    pub quick_add_subs: HashMap<String, gpui::Subscription>,
+    pub col_scrolls: HashMap<String, gpui::ScrollHandle>,
+    pub section_colors: HashMap<Id, String>,
+    pub folded_sub: HashSet<String>,
+    pub scroll: gpui::ScrollHandle,
+    pub pan: Option<(Pixels, Pixels)>,
+    pub row_bounds: Rc<RefCell<HashMap<Id, gpui::Bounds<Pixels>>>>,
+    pub col_bounds: Rc<RefCell<HashMap<String, gpui::Bounds<Pixels>>>>,
+    pub drag_rows: Vec<KanbanColRows>,
+    pub hover_col: Option<String>,
+}
+
+struct TimelineState {
+    pub enabled: bool,
+    pub cache: RefCell<Option<(timeline::TimelineCacheKey, Rc<timeline::TimelineCacheData>)>>,
+    pub from: NaiveDate,
+    pub scale: usize,
+    pub scale_menu_open: bool,
+    pub arrange_open: bool,
+    pub secondary_tz: Option<String>,
+    pub tz_menu: bool,
+    pub tz_input: Entity<TextInput>,
+    pub color_by: ColorBy,
+    pub show_weekends: bool,
+    pub folded: HashSet<String>,
+}
+
+struct QuickAddState {
+    pub input: Entity<TextInput>,
+    pub due: Option<(NaiveDate, Option<chrono::NaiveTime>)>,
+    pub horizon: Option<fern_core::Horizon>,
+    pub repeat: bool,
+    pub templates_open: bool,
+    pub menu_open: bool,
+    pub list_side: bool,
+    pub draft: AddDraft,
+    pub tags: Option<Vec<String>>,
+    pub tag_input: Entity<TextInput>,
+    pub input_box_open: bool,
+    pub date_month: Option<NaiveDate>,
+    pub range: Option<crate::due_picker::DueDraft>,
+    pub date_row: Option<u8>,
+    pub attachment_error: Option<String>,
+    pub batch_add_pending: Option<Vec<String>>,
+    pub submitting_task: bool,
+}
+
+struct PanelDndState {
+    pub lists_scroll: gpui::ScrollHandle,
+    pub lists_rows: Rc<RefCell<Vec<lists_panel::PanelChild>>>,
+    pub lists_index: lists_panel::ListsPanelIndex,
+    pub lists_index_dirty: bool,
+    pub panel_drag: Option<PanelDragState>,
+    pub drag_expand: Option<(DragExpandTarget, gpui::Task<()>)>,
+    pub task_drag_origin: Option<(Id, Pixels)>,
+    pub task_drop: Option<task_rows::TaskDropPlan>,
+}
+
+struct OverlayState {
+    pub list_dialog: Option<Entity<ListDialog>>,
+    pub folder_dialog: Option<Entity<FolderDialog>>,
+    pub tag_dialog: Option<Entity<TagDialog>>,
+    pub merge_dialog: Option<Entity<MergeDialog>>,
+    pub filter_edit: Option<FilterEdit>,
+    pub list_menu: Option<(ListMenuTarget, Point<Pixels>)>,
+    pub habit_menu: Option<(Id, gpui::Point<Pixels>)>,
+    pub header_menu_open: bool,
+    pub confirm_empty_trash: bool,
+    pub confirm_delete: Option<ConfirmDeleteTarget>,
+    pub closed_menu: Option<ClosedMenu>,
+    pub sort_menu: Option<Option<SortMenu>>,
+    pub sort_menu_focus: FocusHandle,
+    pub sort_menu_return_focus: Option<FocusHandle>,
+    pub view_options: Option<bool>,
+    pub section_menu: Option<Id>,
+    pub postpone_menu: bool,
+    pub context_menu: Option<(Task, gpui::Point<Pixels>, task_menu::TaskNesting)>,
+    pub context_side: Option<u8>,
+}
+
 pub struct TodoView {
     window_handle: gpui::AnyWindowHandle,
     store: Rc<Store>,
@@ -116,212 +206,75 @@ pub struct TodoView {
     lists: Vec<List>,
     tags: Vec<Tag>,
     show_lists: bool,
-    /// The lists column's and the details' widths, as their edges were dragged.
     lists_width: f32,
     detail_width: f32,
     narrow_viewport: bool,
-    /// The edge being dragged, if any.
     resizing: Option<Panel>,
-    /// Saves the widths once the drag has rested a moment.
     save_widths: Option<gpui::Task<()>>,
     collapsed_tasks: HashSet<Id>,
     collapsed_sections: HashSet<Section>,
-    /// Day and section groups folded by their header's arrow, by their title.
     collapsed_days: HashSet<String>,
-    input: Entity<TextInput>,
-    /// Focus of the task list itself, for keyboard navigation (the `TaskList` key context).
     list_focus: FocusHandle,
-    /// The task list, drawn as Zed's lists: only the rows in view are built. `list_entries` are
-    /// what it showed last, to tell it which rows changed.
     list_state: ListState,
     list_entries: Vec<ListEntry>,
-    /// Cached `Row` slice extracted from `list_entries` so `move_task_drag` does not clone every
-    /// task on every mouse pixel.
     list_rows: Rc<Vec<Row>>,
     rows_version: u64,
     cached_rows: RefCell<Option<(RowsCacheKey, Rc<Vec<Row>>)>>,
-    kanban_cache: RefCell<Option<(kanban::KanbanCacheKey, Rc<Vec<kanban::BoardCol>>)>>,
     synced_list_key: Option<(RowsCacheKey, bool, bool)>,
-    /// Window bounds of currently painted `list_entries` rows, keyed by entry index.
     list_entry_bounds: Rc<RefCell<HashMap<usize, gpui::Bounds<Pixels>>>>,
-    /// Active task-list drag origin: `(dragged_task_id, start_mouse_x)`.
-    task_drag_origin: Option<(Id, Pixels)>,
-    /// Live drop plan while dragging a task over `#tasks`.
-    task_drop: Option<task_rows::TaskDropPlan>,
     list_colors: HashMap<Id, Hsla>,
     tag_colors: Rc<HashMap<String, Hsla>>,
     tag_colors_ci: HashMap<String, Hsla>,
-    /// The Add List / Edit List dialog and the folder dialog, while open.
-    list_dialog: Option<Entity<ListDialog>>,
-    folder_dialog: Option<Entity<FolderDialog>>,
     folders: Vec<ListFolder>,
     collapsed_folders: HashSet<Id>,
     archived_open: bool,
-    /// A right-clicked list, folder or tag in the lists column, with the point its menu opens at.
-    list_menu: Option<(ListMenuTarget, Point<Pixels>)>,
-    /// The tag dialogs, folded parent tags and whether the Tags section is folded.
-    tag_dialog: Option<Entity<TagDialog>>,
-    merge_dialog: Option<Entity<MergeDialog>>,
     collapsed_tags: HashSet<String>,
     tags_collapsed: bool,
-    drag_expand: Option<(DragExpandTarget, gpui::Task<()>)>,
-    lists_scroll: gpui::ScrollHandle,
-    lists_rows: Rc<RefCell<Vec<lists_panel::PanelChild>>>,
-    panel_drag: Option<PanelDragState>,
     search_input: Entity<TextInput>,
-    header_menu_open: bool,
-    confirm_empty_trash: bool,
-    confirm_delete: Option<ConfirmDeleteTarget>,
-    /// Lines pasted into Quick Add awaiting confirmation for Batch Add Tasks.
-    batch_add_pending: Option<Vec<String>>,
-    /// Filters of the Completed and Won't Do views; `None` lists means all lists.
     closed_range: ClosedRange,
     closed_lists: Option<Vec<Option<Id>>>,
-    closed_menu: Option<ClosedMenu>,
-    /// The header's sort menu: `Some(None)` when open, with the expanded submenu otherwise.
-    sort_menu: Option<Option<SortMenu>>,
-    sort_menu_focus: FocusHandle,
-    sort_menu_return_focus: Option<FocusHandle>,
-    /// The current list's "Show Details", read when the list loads.
     show_details: bool,
-    /// Cached per-view flags & sort/group settings (refreshed in `reload_view_settings` so
-    /// `render()` and `move_task_drag()` perform zero SQLite queries).
     show_completed: bool,
     sort_descending: bool,
     hide_new_section: bool,
     sort_by: SortBy,
     group_by: GroupBy,
-    /// The current list's layout: cards in columns instead of rows (the menu's View).
-    kanban: bool,
-    /// The original's Timeline view, and the first day it shows.
-    timeline: bool,
-    timeline_from: NaiveDate,
-    /// The Timeline's scale: 0 Day, 1 Week, 2 Month; and whether its menu is open.
-    timeline_scale: usize,
-    scale_menu_open: bool,
-    /// The Timeline's "Arrange Tasks" panel: the undated tasks, to drag onto days.
-    arrange_open: bool,
-    /// The current list's sections.
     sections: Vec<fern_core::ListSection>,
-    /// The "Add Section" field, while it is shown.
     new_section: Option<Entity<TextInput>>,
-    /// Where the new section goes among the list's sections (the column menu's Add Section to
-    /// Left / Right); `None` puts it last.
     new_section_index: Option<usize>,
-    /// The kanban: a column's "+" field (its index and value), its "…" menu (the section and
-    /// whether Move to's side menu is open), and a section being renamed.
-    column_add: Option<(usize, DropTarget, Entity<TextInput>)>,
-    column_menu: Option<(Id, bool)>,
-    /// Global kanban display options (from View Options, persisted in store settings).
-    kanban_column_size: u8,
-    kanban_column_color: bool,
-    kanban_quick_add: bool,
-    kanban_workflow: bool,
-    kanban_quick_adds: HashMap<String, (DropTarget, Entity<TextInput>)>,
-    kanban_quick_add_subs: HashMap<String, gpui::Subscription>,
-    kanban_col_scrolls: HashMap<String, gpui::ScrollHandle>,
-    timeline_secondary_tz: Option<String>,
-    timeline_tz_menu: bool,
-    timeline_tz_input: Entity<TextInput>,
-    timeline_color_by: ColorBy,
-    timeline_show_weekends: bool,
-    kanban_section_colors: HashMap<Id, String>,
-    kanban_folded_sub: HashSet<String>,
-    kanban_scroll: gpui::ScrollHandle,
-    /// Horizontal pan-to-scroll on empty kanban space: `(start_pointer_x, start_scroll_offset_x)`.
-    kanban_pan: Option<(Pixels, Pixels)>,
-    /// Window bounds of currently painted kanban task rows and columns, for drag-and-drop.
-    kanban_row_bounds: Rc<RefCell<HashMap<Id, gpui::Bounds<Pixels>>>>,
-    kanban_col_bounds: Rc<RefCell<HashMap<String, gpui::Bounds<Pixels>>>>,
-    /// Cached per-column visible rows from the last kanban render frame, for drag planning.
-    kanban_drag_rows: Vec<KanbanColRows>,
-    /// Target column key highlighted during a cross-column task drag.
-    kanban_hover_col: Option<String>,
-    /// The Timeline's groups folded up, by name.
-    timeline_folded: HashSet<String>,
-    /// Today's "Suggested Tasks" panel (the header's light bulb), and whether its Long Unfinished
-    /// list is shown in full.
     suggestions_open: Option<bool>,
     cached_suggestions: fern_core::suggest::Suggestions,
-    /// The header menu's View Options dialog and its Show Date by dropdown, while open.
-    view_options: Option<bool>,
     section_rename: Option<(Id, Entity<TextInput>)>,
     title_edit: Option<(Id, Entity<TextInput>, gpui::Subscription)>,
-    /// The "Undo" toast after completing or deleting a task, with its timer.
     undo: Option<(crate::undo::UndoAction, String, gpui::Task<()>)>,
-    /// The last undone action, available for Redo (Ctrl+Shift+Z / Ctrl+Y).
     redo: Option<(crate::undo::UndoAction, String)>,
-    /// Saved filters with their task counts, for the lists column.
     filters: Vec<(fern_core::SmartFilter, usize)>,
-    /// Settings → Smart List, read on reload.
     preferences: fern_core::Preferences,
-    /// The date quick add recognized in the field so far, shown at its end.
-    quick_add_due: Option<(NaiveDate, Option<chrono::NaiveTime>)>,
-    quick_add_horizon: Option<fern_core::Horizon>,
-    quick_add_repeat: bool,
-    /// The mini calendar: expanded to a month, which month, and the days with open tasks.
     mini_expanded: bool,
     mini_month: NaiveDate,
     busy_days: HashSet<NaiveDate>,
-    /// Today and Next 7 Days: the habits due today, whether each is checked in and its amount;
-    /// empty elsewhere or when the habit settings keep them out.
     today_habits: Rc<Vec<(fern_core::Habit, bool, f64)>>,
-    /// Today's countdowns shown in the Today list (cached on reload; empty outside Today).
     today_countdowns: Vec<fern_core::Countdown>,
-    /// Cached subtask progress `(done, total)` per parent task ID, computed in O(N) on reload.
     subtask_progress: HashMap<Id, (usize, usize)>,
-    /// Cached templates list for the quick-add templates popover.
     cached_templates: Vec<fern_core::Template>,
-    /// Right-click context menu on a habit row in Today / Next 7 Days.
-    habit_menu: Option<(Id, gpui::Point<Pixels>)>,
-    /// The Summary smart list's report.
     summary: Entity<crate::summary_view::SummaryView>,
-    /// The embedded TimeStripe-inspired Horizons planning view.
     horizons: Entity<crate::horizons_view::HorizonsView>,
-    /// The "Add Filter" / "Edit Filter" dialog, while it is open.
-    filter_edit: Option<FilterEdit>,
-    /// The "List Activities" panel, shown in place of the details while open.
     list_activity: Option<Vec<(fern_core::Activity, Id, String)>>,
-    /// The "Add task" field's template picker, while it is open.
-    templates_open: bool,
-    /// The add field's "▾" menu, its list side menu, and what it set for the next task.
-    add_menu_open: bool,
-    add_list_side: bool,
-    add_draft: AddDraft,
-    /// The "▾" menu's Tags picker while open, with the tags ticked so far, and its search field.
-    add_tags: Option<Vec<String>>,
-    add_tag_input: Entity<TextInput>,
-    /// The "▾" menu's "Input Box Setting" chooser, while open.
-    input_box_open: bool,
-    /// The field's date picker, while open, with the month it shows, and its expanded row
-    /// (0 Time, 1 Reminder, 2 Repeat).
-    add_date_month: Option<NaiveDate>,
-    /// The add field's date picker on its Duration tab: the start and end being picked.
-    add_range: Option<crate::due_picker::DueDraft>,
-    add_date_row: Option<u8>,
-    /// The section whose "…" menu is open.
-    section_menu: Option<Id>,
-    /// The overdue group's "Postpone" menu is open.
-    postpone_menu: bool,
     detail: Entity<TaskDetail>,
-    /// The board's task card, opened beside a clicked card as the original's, and its task.
     card_detail: Entity<TaskDetail>,
     card: Option<Id>,
     selected: Option<Id>,
     multi_selected: HashSet<Id>,
     selection_anchor: Option<Id>,
     batch_menu: Option<BatchMenu>,
-    /// A task row's right-click menu: the cached task, pointer window coordinates, and precomputed nesting.
-    context_menu: Option<(Task, gpui::Point<Pixels>, task_menu::TaskNesting)>,
-    /// Its side menu open: 0 Move to, 1 Start Focus.
-    context_side: Option<u8>,
     error: Option<String>,
-    add_attachment_error: Option<String>,
     pending_complete: HashSet<Id>,
-    submitting_task: bool,
-    text_edit_sync_task: Option<gpui::Task<()>>,
-    active: bool,
-    dirty: bool,
+    kanban: KanbanState,
+    timeline: TimelineState,
+    quick_add: QuickAddState,
+    panel_dnd: PanelDndState,
+    overlays: OverlayState,
+    refresh: crate::data_version::ViewRefreshState,
 }
 
 impl TodoView {
@@ -358,7 +311,7 @@ impl TodoView {
         cx.subscribe_in(&input, window, |this, _, Submitted(text), window, cx| this.submit_new_task(text, window, cx))
             .detach();
         cx.subscribe(&input, |this, _, MultiLinePasted(lines), cx| {
-            this.batch_add_pending = Some(lines.clone());
+            this.quick_add.batch_add_pending = Some(lines.clone());
             cx.notify();
         })
         .detach();
@@ -385,7 +338,7 @@ impl TodoView {
         // Enter ticks the typed tag, a new one too.
         cx.subscribe(&add_tag_input, |this, input, Submitted(text), cx| {
             let tag = text.trim().trim_start_matches('#').to_owned();
-            if let Some(picked) = this.add_tags.as_mut()
+            if let Some(picked) = this.quick_add.tags.as_mut()
                 && !tag.is_empty()
                 && !picked.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
             {
@@ -408,12 +361,8 @@ impl TodoView {
 
         // A change made in a sticky note or another view shows here without re-broadcasting DataVersion.
         cx.observe_global::<crate::data_version::DataVersion>(|this, cx| {
-            if crate::data_version::changed_elsewhere(cx.entity_id(), cx) {
-                if this.active {
-                    this.reload_inner(false, false, cx);
-                } else {
-                    this.dirty = true;
-                }
+            if this.refresh.on_data_version(cx.entity_id(), cx) {
+                this.reload_inner(false, false, cx);
             }
         })
         .detach();
@@ -423,7 +372,7 @@ impl TodoView {
             let strings = i18n::t(cx);
             this.sync_input_placeholder(cx);
             this.search_input.update(cx, |input, cx| input.set_placeholder(strings.search_placeholder, cx));
-            for (_, input) in this.kanban_quick_adds.values() {
+            for (_, input) in this.kanban.quick_adds.values() {
                 input.update(cx, |input, cx| input.set_placeholder(strings.add_task, cx));
             }
         })
@@ -445,6 +394,12 @@ impl TodoView {
             this.apply_task_text_edit(edit, false, cx);
         })
         .detach();
+        cx.subscribe(&detail, |this, _, _: &crate::task_detail::TaskTextFlushed, cx| {
+            if this.sort_by == SortBy::Title || matches!(this.view, View::Search(_) | View::Filter(_)) {
+                this.reload(cx);
+            }
+        })
+        .detach();
         cx.subscribe(&detail, |this, _, OpenTask(id), cx| this.select(*id, cx)).detach();
         cx.subscribe(&detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
         cx.subscribe(&detail, |this, _, crate::task_detail::Undoable(action, label), cx| {
@@ -464,6 +419,12 @@ impl TodoView {
         cx.subscribe(&card_detail, |this, _, _: &TaskUpdated, cx| this.card_updated(cx)).detach();
         cx.subscribe(&card_detail, |this, _, edit: &TaskTextEdited, cx| {
             this.apply_task_text_edit(edit, true, cx);
+        })
+        .detach();
+        cx.subscribe(&card_detail, |this, _, _: &crate::task_detail::TaskTextFlushed, cx| {
+            if this.sort_by == SortBy::Title || matches!(this.view, View::Search(_) | View::Filter(_)) {
+                this.reload(cx);
+            }
         })
         .detach();
         // A subtask or parent clicked in the card opens in the card.
@@ -502,107 +463,42 @@ impl TodoView {
             // As in TickTick, completed tasks sit collapsed at the bottom of the list.
             collapsed_sections: HashSet::from([Section::Completed]),
             collapsed_days: HashSet::new(),
-            input,
             list_focus: cx.focus_handle(),
             list_state: Self::new_list_state(),
             list_entries: Vec::new(),
             list_rows: Rc::new(Vec::new()),
             rows_version: 0,
             cached_rows: RefCell::new(None),
-            kanban_cache: RefCell::new(None),
             synced_list_key: None,
             list_entry_bounds: Rc::new(RefCell::new(HashMap::new())),
-            task_drag_origin: None,
-            task_drop: None,
             list_colors: HashMap::new(),
             tag_colors: Rc::new(HashMap::new()),
             tag_colors_ci: HashMap::new(),
-            list_dialog: None,
-            folder_dialog: None,
             folders: Vec::new(),
             collapsed_folders: HashSet::new(),
             archived_open: false,
-            list_menu: None,
-            tag_dialog: None,
-            merge_dialog: None,
             collapsed_tags: HashSet::new(),
             tags_collapsed: false,
-            drag_expand: None,
-            lists_scroll: gpui::ScrollHandle::new(),
-            lists_rows: Rc::new(RefCell::new(Vec::new())),
-            panel_drag: None,
             search_input,
-            header_menu_open: false,
-            confirm_empty_trash: false,
-            confirm_delete: None,
-            batch_add_pending: None,
             closed_range: ClosedRange::All,
             closed_lists: None,
-            closed_menu: None,
-            sort_menu: None,
-            sort_menu_focus: cx.focus_handle(),
-            sort_menu_return_focus: None,
             show_details: false,
             show_completed: true,
             sort_descending: false,
             hide_new_section: false,
             sort_by: SortBy::Custom,
             group_by: GroupBy::Custom,
-            kanban: false,
-            timeline: false,
-            timeline_from: Self::today(),
-            timeline_scale: 0,
-            scale_menu_open: false,
-            arrange_open: false,
             sections: Vec::new(),
             new_section: None,
             new_section_index: None,
-            column_add: None,
-            column_menu: None,
-            kanban_column_size: 1,
-            kanban_column_color: false,
-            kanban_quick_add: false,
-            kanban_workflow: false,
-            kanban_quick_adds: HashMap::new(),
-            kanban_quick_add_subs: HashMap::new(),
-            kanban_col_scrolls: HashMap::new(),
-            timeline_secondary_tz: None,
-            timeline_tz_menu: false,
-            timeline_tz_input,
-            timeline_color_by: ColorBy::List,
-            timeline_show_weekends: true,
-            kanban_section_colors: HashMap::new(),
-            kanban_folded_sub: HashSet::new(),
-            kanban_scroll: gpui::ScrollHandle::new(),
-            kanban_pan: None,
-            kanban_row_bounds: Rc::new(RefCell::new(HashMap::new())),
-            kanban_col_bounds: Rc::new(RefCell::new(HashMap::new())),
-            kanban_drag_rows: Vec::new(),
-            kanban_hover_col: None,
-            timeline_folded: HashSet::new(),
-            view_options: None,
             suggestions_open: None,
             cached_suggestions: fern_core::suggest::Suggestions::default(),
             section_rename: None,
             title_edit: None,
-            section_menu: None,
-            postpone_menu: false,
-            templates_open: false,
-            add_menu_open: false,
-            add_list_side: false,
-            add_draft: AddDraft::default(),
-            add_tags: None,
-            add_tag_input,
-            input_box_open: false,
-            add_date_month: None,
-            add_range: None,
-            add_date_row: None,
-            list_activity: None,
+            undo: None,
+            redo: None,
             filters: Vec::new(),
             preferences: Default::default(),
-            quick_add_due: None,
-            quick_add_horizon: None,
-            quick_add_repeat: false,
             mini_expanded,
             mini_month: crate::calendar::month_start(Self::today()),
             busy_days: HashSet::new(),
@@ -610,12 +506,9 @@ impl TodoView {
             today_countdowns: Vec::new(),
             subtask_progress: HashMap::new(),
             cached_templates: Vec::new(),
-            habit_menu: None,
             summary,
             horizons,
-            filter_edit: None,
-            undo: None,
-            redo: None,
+            list_activity: None,
             detail,
             card_detail,
             card: None,
@@ -623,15 +516,102 @@ impl TodoView {
             multi_selected: HashSet::new(),
             selection_anchor: None,
             batch_menu: None,
-            context_menu: None,
-            context_side: None,
             error: None,
-            add_attachment_error: None,
             pending_complete: HashSet::new(),
-            submitting_task: false,
-            text_edit_sync_task: None,
-            active: initial_active,
-            dirty: !initial_active,
+            kanban: KanbanState {
+                enabled: false,
+                cache: RefCell::new(None),
+                column_add: None,
+                column_menu: None,
+                column_size: 1,
+                column_color: false,
+                quick_add: false,
+                workflow: false,
+                quick_adds: HashMap::new(),
+                quick_add_subs: HashMap::new(),
+                col_scrolls: HashMap::new(),
+                section_colors: HashMap::new(),
+                folded_sub: HashSet::new(),
+                scroll: gpui::ScrollHandle::new(),
+                pan: None,
+                row_bounds: Rc::new(RefCell::new(HashMap::new())),
+                col_bounds: Rc::new(RefCell::new(HashMap::new())),
+                drag_rows: Vec::new(),
+                hover_col: None,
+            },
+            timeline: TimelineState {
+                enabled: false,
+                cache: RefCell::new(None),
+                from: Self::today(),
+                scale: 0,
+                scale_menu_open: false,
+                arrange_open: false,
+                secondary_tz: None,
+                tz_menu: false,
+                tz_input: timeline_tz_input,
+                color_by: ColorBy::List,
+                show_weekends: true,
+                folded: HashSet::new(),
+            },
+            quick_add: QuickAddState {
+                input,
+                due: None,
+                horizon: None,
+                repeat: false,
+                templates_open: false,
+                menu_open: false,
+                list_side: false,
+                draft: AddDraft::default(),
+                tags: None,
+                tag_input: add_tag_input,
+                input_box_open: false,
+                date_month: None,
+                range: None,
+                date_row: None,
+                attachment_error: None,
+                batch_add_pending: None,
+                submitting_task: false,
+            },
+            panel_dnd: PanelDndState {
+                lists_scroll: gpui::ScrollHandle::new(),
+                lists_rows: Rc::new(RefCell::new(Vec::new())),
+                lists_index: lists_panel::ListsPanelIndex::default(),
+                lists_index_dirty: true,
+                panel_drag: None,
+                drag_expand: None,
+                task_drag_origin: None,
+                task_drop: None,
+            },
+            overlays: OverlayState {
+                list_dialog: None,
+                folder_dialog: None,
+                tag_dialog: None,
+                merge_dialog: None,
+                filter_edit: None,
+                list_menu: None,
+                habit_menu: None,
+                header_menu_open: false,
+                confirm_empty_trash: false,
+                confirm_delete: None,
+                closed_menu: None,
+                sort_menu: None,
+                sort_menu_focus: cx.focus_handle(),
+                sort_menu_return_focus: None,
+                view_options: None,
+                section_menu: None,
+                postpone_menu: false,
+                context_menu: None,
+                context_side: None,
+            },
+            refresh: crate::data_version::ViewRefreshState::new(
+                initial_active,
+                crate::data_version::DataScope::TASKS
+                    | crate::data_version::DataScope::LISTS
+                    | crate::data_version::DataScope::HABITS
+                    | crate::data_version::DataScope::COUNTDOWN
+                    | crate::data_version::DataScope::PREFS,
+                cx,
+            ),
         };
         if initial_active {
             this.reload_inner(false, false, cx);
@@ -663,7 +643,7 @@ impl TodoView {
     }
 
     fn uses_board_layout(&self) -> bool {
-        (self.kanban || self.timeline)
+        (self.kanban.enabled || self.timeline.enabled)
             && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_))
     }
 
@@ -689,7 +669,7 @@ impl TodoView {
         if matches!(self.view, View::Summary | View::Horizons) || self.uses_board_layout() || self.uses_popup_details() {
             return None;
         }
-        self.rows_rc(i18n::t(cx)).iter().find_map(|row| match row {
+        self.rows_rc(i18n::t(cx), cx).iter().find_map(|row| match row {
             Row::Task { task, .. } => Some(task.clone()),
             Row::Section { .. } | Row::Day { .. } => None,
         })
@@ -706,16 +686,15 @@ impl TodoView {
     }
 
     fn sync_subview_active(&self, cx: &mut Context<Self>) {
-        let horizons_active = self.active && self.view == View::Horizons;
+        let active = self.refresh.is_active();
+        let horizons_active = active && self.view == View::Horizons;
         self.horizons.update(cx, |horizons, cx| horizons.set_active(horizons_active, cx));
-        let summary_active = self.active && matches!(self.view, View::Summary);
+        let summary_active = active && matches!(self.view, View::Summary);
         self.summary.update(cx, |summary, cx| summary.set_active(summary_active, cx));
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
-        self.active = active;
-        if active && self.dirty {
-            self.dirty = false;
+        if self.refresh.set_active(active, cx) {
             self.reload_inner(false, false, cx);
         } else {
             self.sync_subview_active(cx);
@@ -723,16 +702,14 @@ impl TodoView {
     }
 
     pub fn reload_external(&mut self, cx: &mut Context<Self>) {
-        self.dirty = false;
         self.reload_inner(false, false, cx);
         self.horizons.update(cx, |horizons, cx| horizons.sync_external(cx));
     }
 
     pub fn sync_external(&mut self, cx: &mut Context<Self>) {
-        if self.active {
+        if self.refresh.mark_dirty_or_reload() {
             self.reload_external(cx);
         } else {
-            self.dirty = true;
             self.horizons.update(cx, |horizons, cx| horizons.sync_external(cx));
         }
     }
@@ -742,11 +719,14 @@ impl TodoView {
     }
 
     pub(super) fn reload_inner(&mut self, mut switched: bool, notify_notes: bool, cx: &mut Context<Self>) {
-        self.dirty = false;
+        self.refresh.mark_clean(cx);
         // Sticky notes show data mutations, not view navigation.
         if notify_notes {
-            self.text_edit_sync_task = None;
-            crate::data_version::data_changed(cx.entity_id(), cx);
+            crate::data_version::data_changed_scoped(
+                cx.entity_id(),
+                crate::data_version::DataScope::TASKS | crate::data_version::DataScope::LISTS,
+                cx,
+            );
         }
         self.preferences = self.store.preferences().unwrap_or_default();
         self.sync_detail_inset(cx);
@@ -781,7 +761,7 @@ impl TodoView {
             switched = true;
         }
         // If Horizons was turned off in Settings -> Features, leave View::Horizons cleanly.
-        if !crate::calendar::horizons_enabled() && self.view == View::Horizons {
+        if !crate::calendar::horizons_enabled(cx) && self.view == View::Horizons {
             self.view = View::Today;
             switched = true;
         }
@@ -806,35 +786,35 @@ impl TodoView {
             .filter_map(|t| t.due_date)
             .collect();
         self.reload_view_settings();
-        self.kanban_column_size = match self.store.setting("kanban:column_size").ok().flatten().as_deref() {
+        self.kanban.column_size = match self.store.setting("kanban:column_size").ok().flatten().as_deref() {
             Some("s") => 0,
             Some("l") => 2,
             _ => 1,
         };
-        self.kanban_column_color = self.store.setting("kanban:column_color").ok().flatten().is_some_and(|v| v == "1");
-        self.kanban_quick_add = self.store.setting("kanban:quick_add").ok().flatten().is_some_and(|v| v == "1");
-        self.timeline_secondary_tz = self
+        self.kanban.column_color = self.store.setting("kanban:column_color").ok().flatten().is_some_and(|v| v == "1");
+        self.kanban.quick_add = self.store.setting("kanban:quick_add").ok().flatten().is_some_and(|v| v == "1");
+        self.timeline.secondary_tz = self
             .store
             .setting("timeline_secondary_tz")
             .ok()
             .flatten()
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty() && crate::calendar::is_valid_timezone(s));
-        self.timeline_color_by = self
+        self.timeline.color_by = self
             .store
             .setting("timeline_color_by")
             .ok()
             .flatten()
             .and_then(|c| ColorBy::from_code(&c))
             .unwrap_or(ColorBy::List);
-        self.timeline_show_weekends = self
+        self.timeline.show_weekends = self
             .store
             .setting("timeline_show_weekends")
             .ok()
             .flatten()
             .as_deref()
             != Some("0");
-        self.timeline_scale = self
+        self.timeline.scale = self
             .store
             .setting(&format!("timeline_scale:{}", self.view_key()))
             .ok()
@@ -846,7 +826,7 @@ impl TodoView {
             Some(list) => self.store.list_sections(list).unwrap_or_default(),
             None => Vec::new(),
         };
-        self.kanban_section_colors = self
+        self.kanban.section_colors = self
             .sections
             .iter()
             .filter_map(|s| {
@@ -873,10 +853,10 @@ impl TodoView {
         if self.suggestions_open.is_some() && self.view == View::Today {
             self.cached_suggestions = fern_core::suggest::suggestions(&all_tasks, today);
         }
-        if let Some(edit) = self.filter_edit.as_mut() {
+        if let Some(edit) = self.overlays.filter_edit.as_mut() {
             edit.all_tasks = all_tasks.clone();
         }
-        if self.templates_open {
+        if self.quick_add.templates_open {
             self.cached_templates = self.store.templates().unwrap_or_default();
         }
         if let Some(counts) = self.check(self.store.counts_from(&all_tasks, today)) {
@@ -893,8 +873,9 @@ impl TodoView {
             self.tags = tags;
             self.refresh_tag_colors();
         }
-        self.reload_today_habits();
+        self.reload_today_habits(cx);
         self.reload_today_countdowns();
+        self.panel_dnd.lists_index_dirty = true;
         self.invalidate_rows();
         let lists = self.active_lists();
         if switched {
@@ -960,7 +941,7 @@ impl TodoView {
     fn apply_task_text_edit(&mut self, edit: &TaskTextEdited, is_card: bool, cx: &mut Context<Self>) {
         if matches!(self.view, View::Search(_) | View::Filter(_))
             || self.sort_settings().0 == SortBy::Title
-            || self.dirty
+            || self.refresh.is_dirty()
         {
             if is_card {
                 self.card_updated(cx);
@@ -982,15 +963,6 @@ impl TodoView {
         }
         self.invalidate_rows();
         cx.notify();
-        self.text_edit_sync_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(300))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.text_edit_sync_task = None;
-                crate::data_version::data_changed(cx.entity_id(), cx);
-            });
-        }));
     }
 
     fn refresh_subtask_progress(&mut self) {
@@ -1024,9 +996,9 @@ impl TodoView {
         }
     }
 
-    fn view_title(&self, strings: &Strings) -> SharedString {
+    fn view_title(&self, strings: &Strings, cx: &App) -> SharedString {
         let filters: Vec<fern_core::SmartFilter> = self.filters.iter().map(|(f, _)| f.clone()).collect();
-        lists_panel::title(&self.view, &self.lists, &filters, strings)
+        lists_panel::title(&self.view, &self.lists, &filters, strings, cx)
     }
 
 
@@ -1098,14 +1070,14 @@ impl TodoView {
 
 impl Focusable for TodoView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.input.focus_handle(cx)
+        self.quick_add.input.focus_handle(cx)
     }
 }
 
 impl Render for TodoView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !cx.has_active_drag() {
-            if self.panel_drag.is_some() {
+            if self.panel_dnd.panel_drag.is_some() {
                 self.restore_panel_drag_snapshot();
             }
             self.clear_task_drag_state();
@@ -1113,18 +1085,18 @@ impl Render for TodoView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let closed_header = matches!(self.view, View::Completed | View::WontDo);
-        let add_focused = self.input.focus_handle(cx).is_focused(window);
-        let input_focus = self.input.focus_handle(cx);
+        let add_focused = self.quick_add.input.focus_handle(cx).is_focused(window);
+        let input_focus = self.quick_add.input.focus_handle(cx);
         let today = Self::today();
         // The original's "too narrow" window: the details then follow View Options' layout.
         let popup_details = self.uses_popup_details();
         // The dragged width, narrowed while the window leaves the task list too little room.
         let view_width = f32::from(window.viewport_size().width) - crate::sidebar::WIDTH;
         let detail_width = self.detail_width.min(self.max_detail_width(view_width)).max(DETAIL_MIN_WIDTH);
-        let timeline_view = self.timeline
-            && !self.kanban
+        let timeline_view = self.timeline.enabled
+            && !self.kanban.enabled
             && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
-        let kanban_view = (self.kanban || timeline_view)
+        let kanban_view = (self.kanban.enabled || timeline_view)
             && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
         // The original's kanban and timeline have no add field on top: a kanban column has its
         // own "+".
@@ -1138,7 +1110,7 @@ impl Render for TodoView {
                 Some(self.render_kanban_board(&tag_colors, today, strings, window, cx)),
             )
         } else {
-            (self.sync_list_entries(strings), None)
+            (self.sync_list_entries(strings, cx), None)
         };
 
         let list = self.render_list_pane(
@@ -1151,6 +1123,7 @@ impl Render for TodoView {
             rows_empty,
             strings,
             &theme,
+            window,
             cx,
         );
 
@@ -1163,6 +1136,8 @@ impl Render for TodoView {
         let on_drop_task = move |view, id, _: &mut Window, cx: &mut App| {
             this.update(cx, |this, cx| this.drop_on_view(view, id, cx)).ok();
         };
+
+        self.ensure_lists_index();
 
         h_flex()
             .relative()
@@ -1198,8 +1173,8 @@ impl Render for TodoView {
                 this.finish_panel_drag_up(event, window, cx);
             }))
             .when(self.show_lists, |el| {
-                let active_drag = self.panel_drag.as_ref().map(|d| &d.item);
-                let highlight_target = self.panel_drag.as_ref().and_then(|d| d.highlight.as_ref());
+                let active_drag = self.panel_dnd.panel_drag.as_ref().map(|d| &d.item);
+                let highlight_target = self.panel_dnd.panel_drag.as_ref().and_then(|d| d.highlight.as_ref());
                 el.child(div().relative().flex_none().h_full().child(lists_panel::render(
                     lists_panel::Props {
                         filters: &self.filters,
@@ -1210,14 +1185,15 @@ impl Render for TodoView {
                         tags: &self.tags,
                         strings,
                         folders: &self.folders,
+                        index: &self.panel_dnd.lists_index,
                         collapsed_folders: &self.collapsed_folders,
                         archived_open: self.archived_open,
                         collapsed_tags: &self.collapsed_tags,
                         tags_collapsed: self.tags_collapsed,
                         mini: lists_panel::MiniCalendar { expanded: self.mini_expanded, month: self.mini_month, busy: &self.busy_days },
                         width: self.lists_width,
-                        scroll_handle: &self.lists_scroll,
-                        rows_out: &self.lists_rows,
+                        scroll_handle: &self.panel_dnd.lists_scroll,
+                        rows_out: &self.panel_dnd.lists_rows,
                         active_drag,
                         highlight_target,
                     },
@@ -1237,6 +1213,7 @@ impl Render for TodoView {
                             this.update(cx, |this, cx| this.mini_action(action, cx)).ok();
                         }
                     },
+                    window,
                     cx,
                 )).child(self.resize_handle(Panel::Lists, cx)))
             })
@@ -1266,8 +1243,8 @@ impl Render for TodoView {
                         .w(px(detail_width))
                         .h_full()
                         .map(|el| match self.list_activity.clone() {
-                            Some(entries) => el.child(self.render_list_activity(&entries, true, cx)),
-                            None if multi => el.child(self.render_batch_panel(strings, cx)),
+                            Some(entries) => el.child(self.render_list_activity(&entries, true, window, cx)),
+                            None if multi => el.child(self.render_batch_panel(strings, window, cx)),
                             None => el.child(self.detail.clone()),
                         })
                         .child(self.resize_handle(Panel::Detail, cx)),
@@ -1291,24 +1268,24 @@ impl Render for TodoView {
                     )
                 },
             )
-            .when_some(self.filter_edit.as_ref().map(|edit| self.render_filter_edit(edit, window, cx)), |el, dialog| el.child(dialog))
+            .when_some(self.overlays.filter_edit.as_ref().map(|edit| self.render_filter_edit(edit, window, cx)), |el, dialog| el.child(dialog))
             .when_some(self.undo.as_ref().map(|(_, label, _)| label.clone()), |el, label| {
                 el.child(self.render_undo_toast(label, strings, &theme, cx))
             })
             .children(self.render_context_menu(strings, cx))
             .children(self.render_habit_context_menu(strings, cx))
             .children(self.render_list_menu(strings, cx))
-            .children(self.view_options.map(|menu| self.render_view_options(menu, strings, cx)))
+            .children(self.overlays.view_options.map(|menu| self.render_view_options(menu, strings, cx)))
             .children(self.suggestions_open.filter(|_| self.view == View::Today).map(|all| self.render_suggestions(all, strings, cx)))
-            .children(self.list_dialog.clone())
-            .children(self.folder_dialog.clone())
-            .children(self.tag_dialog.clone())
-            .children(self.merge_dialog.clone())
-            .when(self.confirm_empty_trash, |el| el.child(self.render_confirm_empty_trash(strings, cx)))
-            .when_some(self.confirm_delete.clone(), |el, target| {
+            .children(self.overlays.list_dialog.clone())
+            .children(self.overlays.folder_dialog.clone())
+            .children(self.overlays.tag_dialog.clone())
+            .children(self.overlays.merge_dialog.clone())
+            .when(self.overlays.confirm_empty_trash, |el| el.child(self.render_confirm_empty_trash(strings, cx)))
+            .when_some(self.overlays.confirm_delete.clone(), |el, target| {
                 el.child(self.render_confirm_delete(target, strings, cx))
             })
-            .when_some(self.batch_add_pending.clone(), |el, lines| {
+            .when_some(self.quick_add.batch_add_pending.clone(), |el, lines| {
                 el.child(self.render_batch_add_modal(lines, strings, &theme, cx))
             })
     }

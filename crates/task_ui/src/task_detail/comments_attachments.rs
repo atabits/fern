@@ -37,7 +37,7 @@ impl TaskDetail {
                 let id = comment.id;
                 let when = chrono::DateTime::from_timestamp_millis(comment.created_at)
                     .map(|t| t.with_timezone(&Local).naive_local())
-                    .map(|t| format!("{} {}", crate::calendar::format_date(t.date(), strings), crate::calendar::format_time(t.time(), strings)))
+                    .map(|t| format!("{} {}", crate::calendar::format_date(t.date(), strings, cx), crate::calendar::format_time(t.time(), strings, cx)))
                     .unwrap_or_default();
                 let group_name = SharedString::from(format!("comment-row-{id}"));
                 h_flex()

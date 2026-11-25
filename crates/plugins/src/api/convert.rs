@@ -42,7 +42,7 @@ pub fn js_value_to_ui_node<'js>(
     scope: &str,
 ) -> Result<UiNode> {
     let mut visited = 0usize;
-    let json_val = js_ui_to_json(ctx, val, state, scope, 0, &mut visited)?;
+    let json_val = js_to_json_with_mode(ctx, val, JsWalkMode::Ui { state, scope }, 0, &mut visited)?;
     let mut node: UiNode = serde_json::from_value(json_val)
         .context("view render() returned invalid UiNode tree")?;
     node.sanitize_tree()?;
@@ -63,108 +63,46 @@ fn is_ui_handler_prop(key: &str) -> bool {
     )
 }
 
-fn js_ui_to_json<'js>(
-    ctx: &Ctx<'js>,
-    val: Value<'js>,
-    state: &PluginApiState,
-    scope: &str,
-    depth: usize,
-    visited: &mut usize,
-) -> Result<JsonValue> {
-    *visited += 1;
-    ensure!(
-        *visited <= MAX_JSON_NODES,
-        "UI tree exceeds maximum node budget ({MAX_JSON_NODES})"
-    );
-    ensure!(depth < MAX_JSON_DEPTH, "UI tree nesting exceeds {MAX_JSON_DEPTH}");
-    if let Some(func) = val.as_function() {
-        let id = state.register_handler(ctx, scope, func.clone())?;
-        return Ok(JsonValue::from(HandlerId(id).0));
-    }
-    if val.is_null() || val.is_undefined() {
-        return Ok(JsonValue::Null);
-    }
-    if let Some(b) = val.as_bool() {
-        return Ok(JsonValue::Bool(b));
-    }
-    if let Some(i) = val.as_int() {
-        return Ok(JsonValue::from(i));
-    }
-    if let Some(f) = val.as_float() {
-        return Ok(js_float_to_json(f));
-    }
-    if let Some(s) = val.as_string() {
-        return Ok(JsonValue::String(s.to_string()?));
-    }
-    if val.is_array() {
-        let arr = Array::from_value(val)?;
-        let len = arr.len();
-        ensure!(
-            len <= MAX_JSON_ARRAY_LEN,
-            "UI array length {len} exceeds maximum allowed ({MAX_JSON_ARRAY_LEN})"
-        );
-        let mut out = Vec::with_capacity(len.min(MAX_JSON_PREALLOC));
-        for item in arr.iter::<Value<'js>>() {
-            out.push(js_ui_to_json(ctx, item?, state, scope, depth + 1, visited)?);
-        }
-        return Ok(JsonValue::Array(out));
-    }
-    if let Some(obj) = val.as_object() {
-        let mut map = Map::new();
-        for prop in obj.props::<String, Value<'js>>() {
-            *visited += 1;
-            ensure!(
-                *visited <= MAX_JSON_NODES,
-                "UI tree exceeds maximum node budget ({MAX_JSON_NODES})"
-            );
-            let (k, v) = prop?;
-            if v.is_undefined() {
-                continue;
-            }
-            if is_ui_handler_prop(&k) {
-                if let Some(func) = v.as_function() {
-                    let id = state.register_handler(ctx, scope, func.clone())?;
-                    map.insert(k, JsonValue::from(id));
-                    continue;
-                }
-                if let Some(hid) = v.as_int().and_then(|n| u32::try_from(n).ok()).or_else(|| {
-                    v.as_float().and_then(|f| {
-                        (f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f <= f64::from(u32::MAX))
-                            .then_some(f as u32)
-                    })
-                }) {
-                    state.rehome_default_handler(scope, hid)?;
-                    map.insert(k, JsonValue::from(hid));
-                    continue;
-                }
-            }
-            if v.is_function() {
-                continue;
-            }
-            map.insert(k, js_ui_to_json(ctx, v, state, scope, depth + 1, visited)?);
-        }
-        return Ok(JsonValue::Object(map));
-    }
-    Ok(JsonValue::Null)
+#[derive(Clone, Copy)]
+enum JsWalkMode<'a> {
+    Plain,
+    Ui {
+        state: &'a PluginApiState,
+        scope: &'a str,
+    },
 }
 
 pub fn js_to_json<'js>(ctx: &Ctx<'js>, val: Value<'js>) -> Result<JsonValue> {
     let mut visited = 0usize;
-    js_to_json_inner(ctx, val, 0, &mut visited)
+    js_to_json_with_mode(ctx, val, JsWalkMode::Plain, 0, &mut visited)
 }
 
-fn js_to_json_inner<'js>(
+fn js_to_json_with_mode<'js>(
     ctx: &Ctx<'js>,
     val: Value<'js>,
+    mode: JsWalkMode<'_>,
     depth: usize,
     visited: &mut usize,
 ) -> Result<JsonValue> {
+    let kind_label = match mode {
+        JsWalkMode::Plain => "JSON value",
+        JsWalkMode::Ui { .. } => "UI tree",
+    };
     *visited += 1;
     ensure!(
         *visited <= MAX_JSON_NODES,
-        "JSON value exceeds maximum node budget ({MAX_JSON_NODES})"
+        "{kind_label} exceeds maximum node budget ({MAX_JSON_NODES})"
     );
-    ensure!(depth < MAX_JSON_DEPTH, "JSON nesting exceeds {MAX_JSON_DEPTH}");
+    ensure!(
+        depth < MAX_JSON_DEPTH,
+        "{kind_label} nesting exceeds {MAX_JSON_DEPTH}"
+    );
+    if let JsWalkMode::Ui { state, scope } = mode
+        && let Some(func) = val.as_function()
+    {
+        let id = state.register_handler(ctx, scope, func.clone())?;
+        return Ok(JsonValue::from(HandlerId(id).0));
+    }
     if val.is_null() || val.is_undefined() {
         return Ok(JsonValue::Null);
     }
@@ -190,21 +128,21 @@ fn js_to_json_inner<'js>(
         let mut out = Vec::with_capacity(len.min(MAX_JSON_PREALLOC));
         for item in arr.iter::<Value<'js>>() {
             let item = item?;
-            if item.is_undefined() || item.is_function() {
+            if matches!(mode, JsWalkMode::Plain) && (item.is_undefined() || item.is_function()) {
                 *visited += 1;
                 ensure!(
                     *visited <= MAX_JSON_NODES,
-                    "JSON value exceeds maximum node budget ({MAX_JSON_NODES})"
+                    "{kind_label} exceeds maximum node budget ({MAX_JSON_NODES})"
                 );
                 out.push(JsonValue::Null);
             } else {
-                out.push(js_to_json_inner(ctx, item, depth + 1, visited)?);
+                out.push(js_to_json_with_mode(ctx, item, mode, depth + 1, visited)?);
             }
         }
         return Ok(JsonValue::Array(out));
     }
     if let Some(obj) = val.as_object() {
-        if obj.is_function() {
+        if matches!(mode, JsWalkMode::Plain) && obj.is_function() {
             return Ok(JsonValue::Null);
         }
         let mut map = Map::new();
@@ -212,21 +150,56 @@ fn js_to_json_inner<'js>(
             *visited += 1;
             ensure!(
                 *visited <= MAX_JSON_NODES,
-                "JSON value exceeds maximum node budget ({MAX_JSON_NODES})"
+                "{kind_label} exceeds maximum node budget ({MAX_JSON_NODES})"
             );
             let (k, v) = prop?;
-            if v.is_undefined() || v.is_function() {
+            if v.is_undefined() {
                 continue;
             }
-            map.insert(k, js_to_json_inner(ctx, v, depth + 1, visited)?);
+            if let JsWalkMode::Ui { state, scope } = mode
+                && is_ui_handler_prop(&k)
+            {
+                if let Some(func) = v.as_function() {
+                    let id = state.register_handler(ctx, scope, func.clone())?;
+                    map.insert(k, JsonValue::from(id));
+                    continue;
+                }
+                if let Some(hid) = v.as_int().and_then(|n| u32::try_from(n).ok()).or_else(|| {
+                    v.as_float().and_then(|f| {
+                        (f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f <= f64::from(u32::MAX))
+                            .then_some(f as u32)
+                    })
+                }) {
+                    state.rehome_default_handler(scope, hid)?;
+                    map.insert(k, JsonValue::from(hid));
+                    continue;
+                }
+            }
+            if v.is_function() {
+                continue;
+            }
+            map.insert(k, js_to_json_with_mode(ctx, v, mode, depth + 1, visited)?);
         }
         return Ok(JsonValue::Object(map));
     }
-    let _ = ctx;
     Ok(JsonValue::Null)
 }
 
 pub fn json_to_js<'js>(ctx: &Ctx<'js>, val: &JsonValue) -> rquickjs::Result<Value<'js>> {
+    json_to_js_inner(ctx, val, 0)
+}
+
+fn json_to_js_inner<'js>(
+    ctx: &Ctx<'js>,
+    val: &JsonValue,
+    depth: usize,
+) -> rquickjs::Result<Value<'js>> {
+    if depth >= MAX_JSON_DEPTH {
+        return Err(Exception::throw_message(
+            ctx,
+            &format!("JSON nesting exceeds {MAX_JSON_DEPTH}"),
+        ));
+    }
     match val {
         JsonValue::Null => Ok(Value::new_null(ctx.clone())),
         JsonValue::Bool(b) => rquickjs::IntoJs::into_js(*b, ctx),
@@ -246,14 +219,14 @@ pub fn json_to_js<'js>(ctx: &Ctx<'js>, val: &JsonValue) -> rquickjs::Result<Valu
         JsonValue::Array(items) => {
             let arr = Array::new(ctx.clone())?;
             for (idx, item) in items.iter().enumerate() {
-                arr.set(idx, json_to_js(ctx, item)?)?;
+                arr.set(idx, json_to_js_inner(ctx, item, depth + 1)?)?;
             }
             Ok(arr.into_value())
         }
         JsonValue::Object(map) => {
             let obj = Object::new(ctx.clone())?;
             for (k, v) in map {
-                obj.set(k.as_str(), json_to_js(ctx, v)?)?;
+                obj.set(k.as_str(), json_to_js_inner(ctx, v, depth + 1)?)?;
             }
             Ok(obj.into_value())
         }

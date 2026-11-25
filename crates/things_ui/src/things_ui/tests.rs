@@ -8,6 +8,7 @@ fn setup_env(cx: &mut TestAppContext) {
     cx.update(|cx| {
         theme::init(cx);
         cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true);
     });
 }
 
@@ -46,6 +47,7 @@ fn things_view_construction_navigation_and_open_task(cx: &mut TestAppContext) {
     store.set_completed(done_task.id, true).unwrap();
 
     setup_env(cx);
+    cx.update(|cx| desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true));
     let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
     cx.simulate_resize(size(px(960.), px(640.)));
     cx.run_until_parked();
@@ -494,6 +496,7 @@ fn reorder_after_respects_view_grouping_axis_and_blocks_logbook(cx: &mut TestApp
     store.set_completed(t_done_b.id, true).unwrap();
 
     setup_env(cx);
+    cx.update(|cx| desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true));
     let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
     cx.run_until_parked();
 
@@ -580,6 +583,7 @@ fn reorder_after_respects_view_grouping_axis_and_blocks_logbook(cx: &mut TestApp
 fn empty_state_cta_and_logged_toggle_do_not_bubble_collapse(cx: &mut TestAppContext) {
     let store = Rc::new(Store::open_in_memory().unwrap());
     setup_env(cx);
+    cx.update(|cx| desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true));
     let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
     cx.simulate_resize(size(px(960.), px(640.)));
     cx.run_until_parked();
@@ -645,6 +649,7 @@ fn popover_outside_clicks_do_not_reopen_or_collapse_expanded_card(cx: &mut TestA
         .unwrap();
 
     setup_env(cx);
+    cx.update(|cx| desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true));
     let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
     cx.simulate_resize(size(px(960.), px(640.)));
     cx.run_until_parked();
@@ -721,6 +726,7 @@ fn empty_area_and_due_only_magic_drop_never_spawn_ghost_tasks(cx: &mut TestAppCo
     let folder = store.add_list_folder("Personal").unwrap();
 
     setup_env(cx);
+    cx.update(|cx| desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true));
     let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
     cx.simulate_resize(size(px(960.), px(640.)));
     cx.run_until_parked();
@@ -816,6 +822,7 @@ fn completing_expanded_task_or_hiding_logged_clears_expanded_in_project(
         .unwrap();
 
     setup_env(cx);
+    cx.update(|cx| desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true));
     let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
     cx.simulate_resize(size(px(960.), px(640.)));
     cx.run_until_parked();
@@ -1129,22 +1136,8 @@ fn before_task_complete_hook_blocks_things_completion_and_toasts(cx: &mut TestAp
     });
 }
 
-static HORIZONS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct RestoreHorizonsEnabled;
-
-impl Drop for RestoreHorizonsEnabled {
-    fn drop(&mut self) {
-        calendar::set_horizons_enabled(true);
-    }
-}
-
 #[gpui::test]
 fn horizon_tasks_appear_in_anytime_and_someday_with_badges(cx: &mut TestAppContext) {
-    let _lock = HORIZONS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _restore = RestoreHorizonsEnabled;
-    calendar::set_horizons_enabled(true);
-
     let store = Rc::new(Store::open_in_memory().unwrap());
     let today = ThingsView::today();
 
@@ -1210,6 +1203,7 @@ fn horizon_tasks_appear_in_anytime_and_someday_with_badges(cx: &mut TestAppConte
         .unwrap();
 
     setup_env(cx);
+    cx.update(|cx| desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true));
     let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
     cx.simulate_resize(size(px(960.), px(640.)));
     cx.run_until_parked();
@@ -1253,22 +1247,19 @@ fn horizon_tasks_appear_in_anytime_and_someday_with_badges(cx: &mut TestAppConte
     }
 
     // Disabling Horizons hides the horizon badge pills cleanly.
-    calendar::set_horizons_enabled(false);
-    cx.update(|_, cx| view.update(cx, |v, cx| v.reload(cx)));
+    cx.update(|_, cx| {
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = false);
+        view.update(cx, |v, cx| v.reload(cx));
+    });
     cx.run_until_parked();
     for id in [t_year.id, t_decade.id, t_life.id] {
         let sel: &'static str = format!("things-horizon-chip-{id}").leak();
         assert!(cx.debug_bounds(sel).is_none(), "horizon badge must hide when disabled");
     }
-    calendar::set_horizons_enabled(true);
 }
 
 #[gpui::test]
 fn when_picker_horizon_chips_gate_on_feature_flag_and_persist_horizon(cx: &mut TestAppContext) {
-    let _lock = HORIZONS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _restore = RestoreHorizonsEnabled;
-    calendar::set_horizons_enabled(true);
-
     let store = Rc::new(Store::open_in_memory().unwrap());
     let today = ThingsView::today();
     let task = store
@@ -1283,6 +1274,7 @@ fn when_picker_horizon_chips_gate_on_feature_flag_and_persist_horizon(cx: &mut T
         .unwrap();
 
     setup_env(cx);
+    cx.update(|cx| desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = true));
     let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
     cx.simulate_resize(size(px(960.), px(720.)));
     cx.run_until_parked();
@@ -1325,8 +1317,8 @@ fn when_picker_horizon_chips_gate_on_feature_flag_and_persist_horizon(cx: &mut T
     assert_eq!(store.task(task.id).unwrap().unwrap().horizon, Some(Horizon::Life));
 
     // Disabling Horizons hides the Horizon quick-pick row completely in WhenPicker.
-    calendar::set_horizons_enabled(false);
     cx.update(|window, cx| {
+        desktop_common::ActivePreferences::update(cx, |p| p.horizons_enabled = false);
         view.update(cx, |v, cx| {
             v.open_task(task.id, window, cx);
             v.handle_card_action(CardAction::TogglePopover(CardPopover::When), window, cx);
@@ -1336,8 +1328,6 @@ fn when_picker_horizon_chips_gate_on_feature_flag_and_persist_horizon(cx: &mut T
     assert!(cx.debug_bounds("things-when-popover").is_some());
     assert!(cx.debug_bounds("things-when-horizons").is_none());
     assert!(cx.debug_bounds("when-horizon-week").is_none());
-
-    calendar::set_horizons_enabled(true);
 }
 
 #[gpui::test]
@@ -1467,7 +1457,7 @@ fn title_notes_invalidate_groups_checklist_enter_focuses_next_and_invalid_when_s
     cx.run_until_parked();
     cx.update(|_, cx| {
         let v = view.read(cx);
-        let groups = v.groups_rc(today, i18n::t(cx));
+        let groups = v.groups_rc(today, i18n::t(cx), cx);
         let cached_task = groups
             .iter()
             .flat_map(|g| g.tasks.iter())
@@ -1564,8 +1554,8 @@ fn new_inactive_skips_initial_reload_until_activated_or_opened(cx: &mut TestAppC
     setup_env(cx);
     let (view, cx) = cx.add_window_view(|window, cx| {
         let view = ThingsView::new_inactive(store.clone(), window, cx);
-        assert!(!view.active);
-        assert!(view.dirty);
+        assert!(!view.refresh.is_active());
+        assert!(view.refresh.is_dirty());
         assert!(view.tasks().is_empty());
         assert_eq!(view.counts, ThingsCounts::default());
         view
@@ -1574,8 +1564,8 @@ fn new_inactive_skips_initial_reload_until_activated_or_opened(cx: &mut TestAppC
     cx.update(|_, cx| {
         view.update(cx, |v, cx| v.set_active(true, cx));
         let v = view.read(cx);
-        assert!(v.active);
-        assert!(!v.dirty);
+        assert!(v.refresh.is_active());
+        assert!(!v.refresh.is_dirty());
         assert_eq!(v.tasks().len(), 1);
         assert_eq!(v.counts.inbox, 1);
         assert_eq!(v.counts.today, 1);
@@ -1583,10 +1573,10 @@ fn new_inactive_skips_initial_reload_until_activated_or_opened(cx: &mut TestAppC
 
     let (view_open, cx) = cx.add_window_view(|window, cx| {
         let mut view = ThingsView::new_inactive(store.clone(), window, cx);
-        assert!(view.dirty);
+        assert!(view.refresh.is_dirty());
         assert!(view.tasks().is_empty());
         view.open_task(inbox_task.id, window, cx);
-        assert!(!view.dirty);
+        assert!(!view.refresh.is_dirty());
         assert_eq!(view.view(), ThingsViewKind::Inbox);
         assert_eq!(view.expanded_task(), Some(inbox_task.id));
         view

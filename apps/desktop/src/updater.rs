@@ -46,6 +46,7 @@ pub enum Status {
 pub struct Updater {
     store: Rc<Store>,
     install: Option<Install>,
+    automatic: bool,
     status: Status,
     staged: Option<PathBuf>,
     restarting: bool,
@@ -77,7 +78,15 @@ pub fn init(store: Rc<Store>, cx: &mut App) {
             .detach();
     }
     let updater = cx.new(|cx| {
-        let mut updater = Updater { store, install, status: Status::Idle, staged: None, restarting: false };
+        let automatic = store.setting(SETTING).ok().flatten().as_deref() != Some("off");
+        let mut updater = Updater {
+            store,
+            install,
+            automatic,
+            status: Status::Idle,
+            staged: None,
+            restarting: false,
+        };
         updater.start(cx);
         updater
     });
@@ -120,12 +129,13 @@ impl Updater {
     }
 
     pub fn automatic(&self) -> bool {
-        self.store.setting(SETTING).ok().flatten().as_deref() != Some("off")
+        self.automatic
     }
 
     pub fn set_automatic(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.automatic = on;
         if let Err(err) = self.store.set_setting(SETTING, if on { "on" } else { "off" }) {
-            eprintln!("failed to save the update setting: {err:#}");
+            desktop_common::logging::log_error("updater", format!("failed to save the update setting: {err:#}"));
         }
         if on && matches!(self.status, Status::Idle | Status::Failed(_)) {
             self.check(cx);
@@ -166,7 +176,7 @@ impl Updater {
                         this.status = Status::Ready(Rc::new(notes));
                     }
                     Err(err) => {
-                        eprintln!("failed to download the update: {err:#}");
+                        desktop_common::logging::log_error("updater", format!("failed to download the update: {err:#}"));
                         this.status = Status::Failed(format!("{err:#}"));
                     }
                 }
@@ -188,7 +198,7 @@ impl Updater {
             _ => return,
         };
         if let Err(err) = notes.cache_for_restart(&self.store) {
-            eprintln!("failed to cache release notes: {err:#}");
+            desktop_common::logging::log_error("updater", format!("failed to cache release notes: {err:#}"));
         }
         if matches!(self.status, Status::Available(_)) {
             cx.open_url(&notes.url);
@@ -211,16 +221,13 @@ impl Updater {
                     if let Some(hook) = cx.try_global::<BeforeRestartHook>().map(|h| h.0.clone()) {
                         hook(cx);
                     }
-                    // Release global hotkeys, tray icon, and single-instance mutex BEFORE
+                    // Release global hotkeys, tray icon, and single-instance mutex/socket BEFORE
                     // spawning the new process so it does not hit hotkey lockout or forward back.
-                    crate::hotkeys::shutdown(cx);
-                    crate::tray::prepare_quit();
-                    #[cfg(windows)]
-                    crate::single_instance::release();
+                    crate::shutdown::AppShutdown::run_once(cx);
                     match install.launch(&staged) {
                         Ok(()) => cx.quit(),
                         Err(err) => {
-                            eprintln!("failed to launch the updated app: {err:#}");
+                            desktop_common::logging::log_error("updater", format!("failed to launch the updated app: {err:#}"));
                             this.restarting = false;
                             this.staged = None;
                             this.status = Status::Failed(format!("{err:#}"));
@@ -229,7 +236,7 @@ impl Updater {
                     }
                 }
                 Err(err) => {
-                    eprintln!("failed to install the update: {err:#}");
+                    desktop_common::logging::log_error("updater", format!("failed to install the update: {err:#}"));
                     this.restarting = false;
                     this.staged = None;
                     this.status = Status::Failed(format!("{err:#}"));
@@ -270,7 +277,7 @@ enum Install {
 impl Install {
     fn current() -> Option<Self> {
         // A development build would replace itself with a release.
-        if cfg!(debug_assertions) || std::env::var_os("FERN_DEV_STATE").is_some() {
+        if cfg!(debug_assertions) || desktop_common::is_dev_state() {
             return None;
         }
         let exe = std::env::current_exe().ok()?;
@@ -289,13 +296,33 @@ impl Install {
             }
             return Some(Install::MacApp(app.to_owned()));
         }
-        if let Some(path) = crate::portable::app_image() {
+        if let Some(install) = Install::detect_linux_install(
+            &exe,
+            crate::portable::app_image(),
+            desktop_common::is_flatpak(),
+            std::env::var_os("SNAP").is_some_and(|v| !v.is_empty()),
+        ) {
+            return Some(install);
+        }
+        None
+    }
+
+    fn detect_linux_install(
+        exe: &Path,
+        app_image: Option<PathBuf>,
+        is_flatpak: bool,
+        snap: bool,
+    ) -> Option<Install> {
+        if is_flatpak || exe.starts_with("/app") || snap || exe.starts_with("/snap") {
+            return None;
+        }
+        if let Some(path) = app_image {
             return Some(Install::AppImage(path));
         }
-        if exe.starts_with("/usr") {
+        if exe.starts_with("/usr") || exe.starts_with("/nix/store") || exe.starts_with("/opt") {
             return Some(Install::Managed);
         }
-        Some(Install::Tarball(exe))
+        Some(Install::Tarball(exe.to_path_buf()))
     }
 
     /// The end of the package's name, after `fern-<version>-<os>-<arch>` (see script/package).
@@ -739,6 +766,7 @@ mod tests {
                 status: Status::Ready(Rc::new(notes)),
                 staged: None,
                 restarting: false,
+                automatic: false,
             });
             cx.set_global(GlobalUpdater(updater));
         });
@@ -769,5 +797,42 @@ mod tests {
     fn names_the_old_copy() {
         assert_eq!(old_path(Path::new("/Applications/Fern.app")), Path::new("/Applications/Fern.app.old"));
         assert_eq!(old_path(Path::new("dir/fern.exe")), Path::new("dir/fern.exe.old"));
+    }
+
+    #[test]
+    fn detects_linux_install_sources() {
+        assert_eq!(
+            Install::detect_linux_install(Path::new("/app/bin/fern"), None, true, false),
+            None
+        );
+        assert_eq!(
+            Install::detect_linux_install(Path::new("/snap/fern/1/usr/bin/fern"), None, false, true),
+            None
+        );
+        assert_eq!(
+            Install::detect_linux_install(
+                Path::new("/tmp/.mount_Fern/usr/bin/fern"),
+                Some(PathBuf::from("/home/u/Fern.AppImage")),
+                false,
+                false,
+            ),
+            Some(Install::AppImage(PathBuf::from("/home/u/Fern.AppImage")))
+        );
+        assert_eq!(
+            Install::detect_linux_install(Path::new("/nix/store/abc-fern/bin/fern"), None, false, false),
+            Some(Install::Managed)
+        );
+        assert_eq!(
+            Install::detect_linux_install(Path::new("/usr/bin/fern"), None, false, false),
+            Some(Install::Managed)
+        );
+        assert_eq!(
+            Install::detect_linux_install(Path::new("/opt/fern/fern"), None, false, false),
+            Some(Install::Managed)
+        );
+        assert_eq!(
+            Install::detect_linux_install(Path::new("/home/u/.local/bin/fern"), None, false, false),
+            Some(Install::Tarball(PathBuf::from("/home/u/.local/bin/fern")))
+        );
     }
 }

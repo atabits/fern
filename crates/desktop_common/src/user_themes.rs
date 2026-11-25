@@ -18,6 +18,28 @@ pub const SAMPLE_THEME_FILE: &str = "custom-theme.json";
 const POLL_INTERVAL: Duration = Duration::from_millis(2500);
 const DEBOUNCE: Duration = Duration::from_millis(100);
 
+/// Background closure returning `(themes, errors)` contributed by enabled theme plugins.
+pub type PluginThemesCollector = Box<dyn FnOnce() -> (Vec<Theme>, Vec<String>) + Send>;
+
+type PluginThemesProviderFn = Arc<dyn Fn(&App) -> Option<PluginThemesCollector> + Send + Sync>;
+
+struct PluginThemesProvider(PluginThemesProviderFn);
+
+impl Global for PluginThemesProvider {}
+
+/// Registers the host callback that snapshots enabled theme plugins for background loading.
+pub fn set_plugin_themes_provider(
+    provider: impl Fn(&App) -> Option<PluginThemesCollector> + Send + Sync + 'static,
+    cx: &mut App,
+) {
+    cx.set_global(PluginThemesProvider(Arc::new(provider)));
+}
+
+fn take_plugin_themes_collector(cx: &App) -> Option<PluginThemesCollector> {
+    cx.try_global::<PluginThemesProvider>()
+        .and_then(|provider| (provider.0)(cx))
+}
+
 /// An explicit "just this time" choice expires on restart or the next system appearance change.
 #[derive(Clone)]
 pub struct TemporaryTheme {
@@ -29,7 +51,10 @@ pub struct TemporaryTheme {
 impl Global for TemporaryTheme {}
 
 pub fn system_dark(window: &Window) -> bool {
-    matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
+    matches!(
+        window.appearance(),
+        WindowAppearance::Dark | WindowAppearance::VibrantDark
+    )
 }
 
 pub fn remembered(selection: &ThemeSelection, dark: bool, cx: &App) -> Arc<Theme> {
@@ -70,7 +95,7 @@ pub fn apply_theme(selection: &ThemeSelection, window: &Window, cx: &mut App) ->
 }
 
 pub fn themes_dir() -> Result<PathBuf> {
-    Ok(crate::data_dir()?.join(THEMES_DIR))
+    Ok(crate::paths::data_dir()?.join(THEMES_DIR))
 }
 
 pub fn ensure_themes_dir() -> Result<PathBuf> {
@@ -95,25 +120,13 @@ fn ensure_sample_theme_file_at(dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn enabled_theme_plugins(cx: &App) -> Vec<plugin_ui::PluginInfo> {
-    plugin_ui::PluginHost::global(cx)
-        .map(|host| {
-            host.plugins()
-                .iter()
-                .filter(|p| p.enabled && !p.manifest.contributions.themes.is_empty())
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn load_user_and_plugin_themes(
     dir: &Path,
-    theme_plugins: &[plugin_ui::PluginInfo],
+    plugin_collector: Option<PluginThemesCollector>,
 ) -> (Vec<Theme>, Vec<String>) {
     let (mut themes, mut errors) = theme::load_themes_from_dir(dir);
-    if !theme_plugins.is_empty() {
-        let (plugin_themes, plugin_errors) = plugin_ui::collect_plugin_themes(theme_plugins);
+    if let Some(collector) = plugin_collector {
+        let (plugin_themes, plugin_errors) = collector();
         themes.extend(plugin_themes);
         errors.extend(plugin_errors);
     }
@@ -124,7 +137,7 @@ pub fn load(cx: &mut App) {
     let Ok(dir) = themes_dir() else { return };
     let (themes, errors) = theme::load_themes_from_dir(&dir);
     for error in &errors {
-        eprintln!("theme: {error}");
+        crate::logging::log_warn("theme", error);
     }
     theme::reload_user_themes(themes, errors, cx);
 }
@@ -132,10 +145,10 @@ pub fn load(cx: &mut App) {
 /// Reloads user themes off the UI thread and applies the active theme selection.
 pub fn reload_and_apply_async(store: Rc<Store>, window: AnyWindowHandle, cx: &mut App) {
     let Ok(dir) = themes_dir() else { return };
-    let theme_plugins = enabled_theme_plugins(cx);
+    let collector = take_plugin_themes_collector(cx);
     let task = cx
         .background_executor()
-        .spawn(async move { load_user_and_plugin_themes(&dir, &theme_plugins) });
+        .spawn(async move { load_user_and_plugin_themes(&dir, collector) });
     cx.spawn(async move |cx| {
         let (themes, errors) = task.await;
         cx.update(|cx| {
@@ -147,11 +160,11 @@ pub fn reload_and_apply_async(store: Rc<Store>, window: AnyWindowHandle, cx: &mu
 
 /// Ensures the sample theme file exists off the UI thread, reloads themes, and opens the file.
 pub fn create_and_open_sample_async(store: Rc<Store>, window: AnyWindowHandle, cx: &mut App) {
-    let theme_plugins = enabled_theme_plugins(cx);
+    let collector = take_plugin_themes_collector(cx);
     let task = cx.background_executor().spawn(async move {
         let path = ensure_sample_theme_file()?;
         let loaded = themes_dir()
-            .map(|dir| load_user_and_plugin_themes(&dir, &theme_plugins))
+            .map(|dir| load_user_and_plugin_themes(&dir, collector))
             .unwrap_or_default();
         Ok::<_, anyhow::Error>((path, loaded))
     });
@@ -162,7 +175,7 @@ pub fn create_and_open_sample_async(store: Rc<Store>, window: AnyWindowHandle, c
                 cx.open_with_system(&path);
             });
         }
-        Err(err) => eprintln!("theme: {err:#}"),
+        Err(err) => crate::logging::log_error("theme", format!("{err:#}")),
     })
     .detach();
 }
@@ -174,7 +187,7 @@ pub fn open_themes_dir_async(cx: &mut App) {
         Ok(dir) => {
             cx.update(|cx| cx.open_with_system(&dir));
         }
-        Err(err) => eprintln!("theme: {err:#}"),
+        Err(err) => crate::logging::log_error("theme", format!("{err:#}")),
     })
     .detach();
 }
@@ -187,7 +200,7 @@ fn apply_loaded(
     cx: &mut App,
 ) {
     for error in &errors {
-        eprintln!("theme: {error}");
+        crate::logging::log_warn("theme", error);
     }
     theme::reload_user_themes(themes, errors, cx);
     let selection = store.preferences().unwrap_or_default().theme;
@@ -277,10 +290,10 @@ pub fn watch(store: Rc<Store>, window: AnyWindowHandle, cx: &mut App) {
             };
             last_fp = final_fp;
 
-            let theme_plugins = cx.update(|cx| enabled_theme_plugins(cx));
+            let collector = cx.update(|cx| take_plugin_themes_collector(cx));
             let load_dir = dir.clone();
             let (themes, errors) = bg
-                .spawn(async move { load_user_and_plugin_themes(&load_dir, &theme_plugins) })
+                .spawn(async move { load_user_and_plugin_themes(&load_dir, collector) })
                 .await;
 
             let alive = cx.update(|cx| {

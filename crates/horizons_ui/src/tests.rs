@@ -432,6 +432,8 @@ fn typing_in_detail_drawer_updates_card_title_via_task_text_edited(cx: &mut Test
         assert_eq!(v.detail.read(cx).task_title(), Some("Initial horizon!"));
         assert!(cx.try_global::<DataVersion>().is_none());
     });
+    cx.executor().advance_clock(std::time::Duration::from_millis(260));
+    cx.run_until_parked();
     assert_eq!(store.task(task.id).unwrap().unwrap().title, "Initial horizon!");
 
     let observer = cx.update(|_, cx| cx.new(|_| ()));
@@ -504,4 +506,51 @@ fn inline_add_open_task_escape_and_undo_focus_guards(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(cx.debug_bounds("horizons-drawer").is_none());
     assert!(cx.update(|window, cx| view.read(cx).focus_handle.is_focused(window)));
+}
+
+#[gpui::test]
+fn before_task_complete_hook_blocks_horizons_completion_and_toasts(cx: &mut TestAppContext) {
+    use desktop_common::plugin_bus::{PluginBus, PluginHookDecision, PluginHooksGlobal};
+    use std::sync::Arc;
+
+    setup_app(cx);
+    let store = Rc::new(Store::open_in_memory().expect("in-memory store"));
+    let today = HorizonsView::today();
+    let task = store
+        .create_task(
+            fern_core::TaskDraft {
+                title: "Blocked horizon task".into(),
+                due_date: Some(today),
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("task");
+
+    cx.update(|cx| {
+        PluginHooksGlobal::set_global(
+            PluginHooksGlobal::new(
+                Arc::new(|_| Ok(PluginHookDecision::Allow)),
+                Arc::new(|_| Ok(PluginHookDecision::Cancel("blocked by rule".into()))),
+                Arc::new(|_| Ok(PluginHookDecision::Allow)),
+            ),
+            cx,
+        );
+    });
+
+    let (view, cx) = cx.add_window_view(|window, cx| HorizonsView::new(store.clone(), window, cx));
+    cx.run_until_parked();
+
+    view.update(cx, |this, cx| this.toggle_task_done(task.id, cx));
+    cx.run_until_parked();
+
+    assert!(
+        !store.task(task.id).unwrap().unwrap().is_completed(),
+        "beforeTaskComplete Cancel hook must block Horizons completion"
+    );
+    let has_toast = cx.update(|_window, cx| {
+        PluginBus::global(cx)
+            .is_some_and(|bus| bus.toasts.iter().any(|t| t.message == "blocked by rule"))
+    });
+    assert!(has_toast, "cancelled Horizons completion must push warning toast");
 }

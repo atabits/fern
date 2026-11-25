@@ -414,6 +414,8 @@ fn clicking_note_editors_dismisses_native_popups_without_losing_the_click(cx: &m
     cx.update(|_, cx| assert!(note.read(cx).palette.is_none()));
     cx.simulate_keystrokes("enter");
     cx.simulate_input(" after dismissal");
+    cx.executor().advance_clock(std::time::Duration::from_millis(260));
+    cx.run_until_parked();
     assert!(store.task(task.id).unwrap().unwrap().notes.ends_with(" after dismissal"));
 }
 
@@ -596,6 +598,8 @@ fn external_notes_and_checklist_changes_sync_into_open_note_editors(cx: &mut Tes
     let preview = cx.debug_bounds("task-notes-preview").unwrap().center();
     cx.simulate_click(preview, Modifiers::default());
     cx.simulate_input("!");
+    cx.executor().advance_clock(std::time::Duration::from_millis(260));
+    cx.run_until_parked();
     assert_eq!(store.task(task.id).unwrap().unwrap().notes, "Updated elsewhere!");
 
     // Clicking into the checklist row and typing appends to the renamed item title.
@@ -603,6 +607,8 @@ fn external_notes_and_checklist_changes_sync_into_open_note_editors(cx: &mut Tes
     let row = cx.debug_bounds(selector).unwrap().center();
     cx.simulate_click(row, Modifiers::default());
     cx.simulate_input("?");
+    cx.executor().advance_clock(std::time::Duration::from_millis(260));
+    cx.run_until_parked();
     assert_eq!(store.checklist(task.id).unwrap()[0].title, "Renamed elsewhere?");
     let _ = note;
 }

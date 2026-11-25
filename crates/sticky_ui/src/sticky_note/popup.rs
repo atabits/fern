@@ -170,7 +170,10 @@ pub(super) fn attach(
                 0,
                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
             ) {
-                eprintln!("failed to remove sticky popup frame: {err}");
+                desktop_common::logging::log_error(
+                    "sticky_ui",
+                    format!("failed to remove sticky popup frame: {err}"),
+                );
             }
             if tooltip {
                 let style = GetWindowLongPtrW(popup, GWL_EXSTYLE);
@@ -209,7 +212,10 @@ fn fit_window(_window: &mut Window, _bounds: Bounds<Pixels>, _cx: &mut App) -> b
                         SWP_NOACTIVATE | SWP_NOZORDER,
                     )
                 } {
-                    eprintln!("failed to position sticky popup: {err}");
+                    desktop_common::logging::log_error(
+                        "sticky_ui",
+                        format!("failed to position sticky popup: {err}"),
+                    );
                 }
             })
             .detach();
@@ -373,7 +379,10 @@ impl DetailPopup {
                         previous.update(cx, |_, window, _| window.remove_window()).ok();
                     }
                     Err(error) => {
-                        eprintln!("failed to reposition sticky task menu: {error:#}");
+                        desktop_common::logging::log_error(
+                            "sticky_ui",
+                            format!("failed to reposition sticky task menu: {error:#}"),
+                        );
                         previous.update(cx, |popup, _, _| popup.replacing = false).ok();
                     }
                 }

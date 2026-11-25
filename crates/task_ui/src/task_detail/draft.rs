@@ -21,7 +21,7 @@ pub(super) struct NewTask {
 }
 
 impl NewTask {
-    fn parse_title(&self, task: &Task, text: &str, lists: &[List], today: NaiveDate) -> ParsedTask {
+    fn parse_title(&self, task: &Task, text: &str, lists: &[List], today: NaiveDate, cx: &App) -> ParsedTask {
         let names: Vec<_> = lists.iter().map(|list| list.name.clone()).collect();
         let mut recognition = self.recognition;
         recognition.dates &= !self.date_changed;
@@ -31,7 +31,7 @@ impl NewTask {
                 today,
                 &names,
                 recognition,
-                calendar::horizons_enabled(),
+                calendar::horizons_enabled(cx),
             )
         } else {
             parse_quick_add_on_day(text, task.due_date.unwrap_or(today), &names, recognition)
@@ -190,6 +190,7 @@ impl TaskDetail {
             self.title.read(cx).text(),
             &self.session.lists,
             Local::now().date_naive(),
+            cx,
         );
         self.title.update(cx, |input, cx| {
             input.set_highlights(draft.parsed_title.spans.clone(), cx)
@@ -254,7 +255,7 @@ impl TaskDetail {
                 true
             }
             Err(error) => {
-                eprintln!("failed to create task: {error:#}");
+                desktop_common::logging::log_error("task_detail", format!("failed to create task: {error:#}"));
                 if let Some(draft) = self.session.draft.as_mut() {
                     draft.save_failed = true;
                 }
@@ -300,7 +301,7 @@ impl TaskDetail {
             .filter(|list| !list.archived)
             .collect();
         let today = Local::now().date_naive();
-        let parsed = draft.parse_title(task, text, &lists, today);
+        let parsed = draft.parse_title(task, text, &lists, today, cx);
         let due = draft.due(task, &parsed, today);
         let mut list_id = draft.list_id(task, &parsed, &lists);
         let title = if parsed.title.is_empty() {
@@ -416,7 +417,7 @@ impl TaskDetail {
                     Some(item)
                 }
                 Err(error) => {
-                    eprintln!("failed to add checklist item: {error:#}");
+                    desktop_common::logging::log_error("task_detail", format!("failed to add checklist item: {error:#}"));
                     None
                 }
             }

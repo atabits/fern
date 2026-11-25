@@ -17,7 +17,7 @@ pub(super) fn set_compact(window: &Window, compact: bool) {
         return;
     };
     if !install(hwnd, compact) {
-        eprintln!("failed to update sticky note size constraints");
+        desktop_common::logging::log_error("sticky_ui", "failed to update sticky note size constraints");
     }
 }
 

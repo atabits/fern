@@ -124,7 +124,7 @@ impl CalendarView {
         let mut habits: HashMap<NaiveDate, Vec<(&'a fern_core::Habit, Option<&'a fern_core::Checkin>)>> =
             HashMap::new();
         if self.options.show_habits && first <= today {
-            let week_start = calendar::week_start();
+            let week_start = calendar::week_start(cx);
             let hist_last = last.min(today);
             for habit in &self.habits {
                 let recs = self.habit_records.get(&habit.id).map(Vec::as_slice).unwrap_or(&[]);
@@ -231,7 +231,7 @@ impl CalendarView {
 
     pub(super) fn day_extras(&self, date: NaiveDate, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let today = Local::now().date_naive();
-        let week_start = calendar::week_start();
+        let week_start = calendar::week_start(cx);
         let mut habits: Vec<(&fern_core::Habit, Option<&fern_core::Checkin>)> = Vec::new();
         if self.options.show_habits && date <= today {
             for habit in &self.habits {
@@ -292,7 +292,7 @@ impl CalendarView {
             let time_badge = (date == today)
                 .then(|| habit.reminders.first().copied())
                 .flatten()
-                .map(|t| calendar::format_time(t, strings));
+                .map(|t| calendar::format_time(t, strings, cx));
             items.push(
                 div()
                     .relative()
@@ -351,7 +351,7 @@ impl CalendarView {
                             .child(Label::new(session.title.clone()).size(LabelSize::XSmall).color(Color::Muted).truncate()),
                     )
                     .when_some(start, |el, start| {
-                        el.child(Label::new(calendar::format_time(start, strings)).size(LabelSize::XSmall).color(Color::Muted))
+                        el.child(Label::new(calendar::format_time(start, strings, cx)).size(LabelSize::XSmall).color(Color::Muted))
                     })
                     .into_any_element(),
             );
@@ -379,7 +379,7 @@ impl CalendarView {
         let strings = i18n::t(cx);
         let open = self.open_event.as_ref() == Some(&(event.key.clone(), event.start));
         let key = (event.key.clone(), event.start);
-        let column = calendar::week_of(date).iter().position(|d| *d == date).unwrap_or(0);
+        let column = calendar::week_of(date, cx).iter().position(|d| *d == date).unwrap_or(0);
         let card = event.clone();
         let draggable = event.writable && !event.recurring;
         let dragged = DraggedEvent {
@@ -402,7 +402,7 @@ impl CalendarView {
             .border_l_2()
             .border_color(event.color)
             .when_some(event.start_time.filter(|_| event.start == date), |el, time| {
-                el.child(Label::new(calendar::format_time(time, strings)).size(LabelSize::XSmall).color(Color::Muted))
+                el.child(Label::new(calendar::format_time(time, strings, cx)).size(LabelSize::XSmall).color(Color::Muted))
             })
             .child(div().flex_1().min_w_0().child(Label::new(event.title).size(LabelSize::XSmall).truncate()))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -543,7 +543,7 @@ impl CalendarView {
                     }),
             )
             .when_some(editor, |el, editor| {
-                let days: Vec<_> = calendar::week_of(date).into_iter().filter(|day| self.options.shows_day(*day)).collect();
+                let days: Vec<_> = calendar::week_of(date, cx).into_iter().filter(|day| self.options.shows_day(*day)).collect();
                 let column = days.iter().position(|day| *day == date).unwrap_or(0);
                 let placement = if column < days.len() / 2 { Placement::RightOf } else { Placement::LeftOf };
                 el.child(PopoverAttachment::new(placement, editor.view.clone()))
@@ -632,7 +632,7 @@ impl CalendarView {
         };
         let strings = i18n::t(cx);
         let tip: SharedString = match task.due_time {
-            Some(time) => format!("{} {}", calendar::format_time(time, strings), title).into(),
+            Some(time) => format!("{} {}", calendar::format_time(time, strings, cx), title).into(),
             None => title.clone().into(),
         };
         let body = h_flex()
@@ -696,7 +696,7 @@ impl CalendarView {
             // As in the original, the card opens on the bar's left, or on its right in the first
             // days of the week, where there is no room.
             .when_some(day.filter(|d| self.card == Some((id, *d))), |el, day| {
-                let column = calendar::week_of(day).iter().position(|d| *d == day).unwrap_or(0);
+                let column = calendar::week_of(day, cx).iter().position(|d| *d == day).unwrap_or(0);
                 let placement = if column < 3 { Placement::RightOf } else { Placement::LeftOf };
                 el.relative().child(PopoverAttachment::new(placement, self.render_card(cx)))
             })
@@ -704,14 +704,14 @@ impl CalendarView {
 
     pub(super) fn render_month_grid(&self, today: NaiveDate, has_horizon_banner: bool, window: &Window, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors();
-        let shown_weeks = self.month_grid_weeks();
+        let shown_weeks = self.month_grid_weeks(cx);
         let buckets = shown_weeks
             .first()
             .zip(shown_weeks.last())
             .map(|(first_w, last_w)| self.bucket_range(first_w[0], last_w[6], today, cx));
         let banner_height = if has_horizon_banner { HORIZON_BANNER_HEIGHT } else { 0. };
         let grid_height = window.viewport_size().height
-            - crate::title_bar::header_inset()
+            - crate::title_bar::header_inset(window, cx)
             - crate::title_bar::frame_vertical_inset(window)
             - px(CALENDAR_HEADER_HEIGHT + WEEKDAY_HEADER_HEIGHT + banner_height + 1.);
         let slots = day_item_slots(grid_height / shown_weeks.len().max(1) as f32);
@@ -726,7 +726,7 @@ impl CalendarView {
                     .items_stretch()
                     .min_h_0()
                     // Settings → Show Week Numbers: "W42" before each week, as in the original.
-                    .when(calendar::week_numbers(), |el| {
+                    .when(calendar::week_numbers(cx), |el| {
                         el.child(
                             div()
                                 .w(px(WEEK_NUMBER_WIDTH))

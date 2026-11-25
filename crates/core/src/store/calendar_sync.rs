@@ -119,12 +119,12 @@ impl Store {
         writable: bool,
     ) -> Result<()> {
         let url = url.trim();
-        let prev_url: Option<String> = self
-            .conn
-            .query_row("SELECT url FROM calendar_subscriptions WHERE id = ?1", params![id.to_string()], |r| r.get(0))
-            .optional()?;
-        let url_changed = prev_url.as_deref() != Some(url);
         self.in_tx(|| {
+            let prev_url: Option<String> = self
+                .conn
+                .query_row("SELECT url FROM calendar_subscriptions WHERE id = ?1", params![id.to_string()], |r| r.get(0))
+                .optional()?;
+            let url_changed = prev_url.as_deref() != Some(url);
             self.conn.execute(
                 "UPDATE calendar_subscriptions
                  SET name = ?2, color = ?4, hidden = ?5, kind = 'caldav',
@@ -301,19 +301,20 @@ impl Store {
 
             let now = now_ms();
             self.conn.execute("DELETE FROM calendar_events WHERE subscription_id = ?1 AND dirty = 0", params![subscription_id.to_string()])?;
+            let sub_id = subscription_id.to_string();
+            let mut upsert = self.conn.prepare_cached(
+                "INSERT INTO calendar_events (subscription_id, uid, href, etag, ics, dirty, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                 ON CONFLICT(subscription_id, uid) DO UPDATE SET
+                     href = excluded.href,
+                     etag = excluded.etag,
+                     ics = excluded.ics,
+                     dirty = 0,
+                     updated_at = excluded.updated_at
+                 WHERE calendar_events.dirty = 0",
+            )?;
             for ev in remote {
-                self.conn.execute(
-                    "INSERT INTO calendar_events (subscription_id, uid, href, etag, ics, dirty, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
-                     ON CONFLICT(subscription_id, uid) DO UPDATE SET
-                         href = excluded.href,
-                         etag = excluded.etag,
-                         ics = excluded.ics,
-                         dirty = 0,
-                         updated_at = excluded.updated_at
-                     WHERE calendar_events.dirty = 0",
-                    params![subscription_id.to_string(), ev.uid, ev.href, ev.etag, ev.ics, now],
-                )?;
+                upsert.execute(params![sub_id, ev.uid, ev.href, ev.etag, ev.ics, now])?;
             }
             rebuild_caldav_feed(&self.conn, subscription_id)?;
             self.conn.execute(

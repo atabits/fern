@@ -597,3 +597,19 @@ fn status_filter_matches_in_progress_todo_combined_and_syncs() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn default_smart_filters_have_distinct_non_nil_ids() -> Result<()> {
+    let store = Store::open_in_memory()?;
+    let first = SmartFilter { name: "First".into(), ..SmartFilter::default() };
+    let second = SmartFilter { name: "Second".into(), ..SmartFilter::default() };
+
+    assert!(!first.id.is_nil());
+    assert!(!second.id.is_nil());
+    assert_ne!(first.id, second.id);
+
+    store.save_filter(&first)?;
+    store.save_filter(&second)?;
+    assert_eq!(store.filters()?.len(), 2);
+    Ok(())
+}

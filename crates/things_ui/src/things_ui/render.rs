@@ -32,24 +32,33 @@ impl ThingsView {
         }
     }
 
-    fn render_header(&self, today: NaiveDate, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let theme_colors = theme.colors().clone();
-        let status = theme.status().clone();
+    fn render_header(
+        &self,
+        today: NaiveDate,
+        strings: &'static Strings,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (accent, surface_background, info, warning, error, success) = {
+            let t = cx.theme();
+            let c = t.colors();
+            let s = t.status();
+            (c.accent, c.surface_background, s.info, s.warning, s.error, s.success)
+        };
 
         let (icon_el, title, subtitle): (AnyElement, SharedString, Option<String>) = match self.view {
             ThingsViewKind::Inbox => (
-                Icon::new(IconName::Inbox).size(IconSize::XLarge).color(Color::Custom(status.info)).into_any_element(),
+                Icon::new(IconName::Inbox).size(IconSize::XLarge).color(Color::Custom(info)).into_any_element(),
                 strings.things_inbox.into(),
                 None,
             ),
             ThingsViewKind::Today => (
-                Icon::new(IconName::Sun).size(IconSize::XLarge).color(Color::Custom(status.warning)).into_any_element(),
+                Icon::new(IconName::Sun).size(IconSize::XLarge).color(Color::Custom(warning)).into_any_element(),
                 strings.things_today.into(),
                 Some(calendar::day_header(today, today, strings)),
             ),
             ThingsViewKind::Upcoming => (
-                Icon::new(IconName::CalendarDays).size(IconSize::XLarge).color(Color::Custom(status.error)).into_any_element(),
+                Icon::new(IconName::CalendarDays).size(IconSize::XLarge).color(Color::Custom(error)).into_any_element(),
                 strings.things_upcoming.into(),
                 None,
             ),
@@ -64,7 +73,7 @@ impl ThingsView {
                 None,
             ),
             ThingsViewKind::Logbook => (
-                Icon::new(IconName::CircleCheck).size(IconSize::XLarge).color(Color::Custom(status.success)).into_any_element(),
+                Icon::new(IconName::CircleCheck).size(IconSize::XLarge).color(Color::Custom(success)).into_any_element(),
                 strings.things_logbook.into(),
                 None,
             ),
@@ -89,7 +98,7 @@ impl ThingsView {
                 let prog = self.progress.get(&lid).copied().unwrap_or_default();
                 let ring_color = proj
                     .and_then(|l| colors::parse_color(l.color.as_deref()))
-                    .unwrap_or(theme_colors.accent);
+                    .unwrap_or(accent);
                 let completed = proj.is_some_and(|l| l.completed_at.is_some());
                 (
                     sidebar::project_donut(prog, completed, ring_color, px(22.), px(3.)).into_any_element(),
@@ -104,7 +113,7 @@ impl ThingsView {
                 let is_completed = proj.completed_at.is_some();
                 let deadline_label = proj
                     .deadline
-                    .map(|d| task_rows::due_label(d, None, today, strings).0)
+                    .map(|d| task_rows::due_label(d, None, today, strings, cx).0)
                     .unwrap_or_else(|| strings.things_deadline.to_owned());
                 let deadline_open = self
                     .deadline_picker
@@ -183,7 +192,11 @@ impl ThingsView {
                                             .set_list_project_fields(list_id, &p.notes, p.deadline, next_at)
                                             .is_ok()
                                         {
-                                            data_version::data_changed(cx.entity_id(), cx);
+                                            data_version::data_changed_scoped(
+                                                cx.entity_id(),
+                                                data_version::DataScope::TASKS,
+                                                cx,
+                                            );
                                             this.reload(cx);
                                         }
                                     }
@@ -196,7 +209,7 @@ impl ThingsView {
                                 .px_2()
                                 .py_1()
                                 .rounded(px(6.))
-                                .bg(theme_colors.surface_background.opacity(0.6))
+                                .bg(surface_background.opacity(0.6))
                                 .text_size(px(13.))
                                 .child(input),
                         )
@@ -211,7 +224,7 @@ impl ThingsView {
             .flex_none()
             .child(
                 h_flex()
-                    .mt(layout::header_inset())
+                    .mt(layout::header_inset(window, cx))
                     .h(px(54.))
                     .px_6()
                     .gap_2()
@@ -248,7 +261,7 @@ impl ThingsView {
                             .flex_none()
                             .items_center()
                             .gap_2()
-                            .child(Chip::new(strings.beta_badge, status.warning))
+                            .child(Chip::new(strings.beta_badge, warning))
                             .child(
                                 div()
                                     .flex_none()
@@ -371,10 +384,18 @@ impl ThingsView {
         )
     }
 
-    pub(super) fn render_task_pane(&self, today: NaiveDate, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors().clone();
-        let accent = colors.accent;
-        let groups = self.groups_rc(today, strings);
+    pub(super) fn render_task_pane(
+        &self,
+        today: NaiveDate,
+        strings: &'static Strings,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (accent, border_variant, ghost_element_hover, background) = {
+            let c = cx.theme().colors();
+            (c.accent, c.border_variant, c.ghost_element_hover, c.background)
+        };
+        let groups = self.groups_rc(today, strings, cx);
         let active_drag = cx.has_active_drag();
         self.row_bounds.borrow_mut().clear();
 
@@ -494,7 +515,7 @@ impl ThingsView {
                     .px_3()
                     .rounded(px(8.))
                     .border_1()
-                    .border_color(colors.border_variant)
+                    .border_color(border_variant)
                     .flex()
                     .items_center()
                     .child(
@@ -569,7 +590,7 @@ impl ThingsView {
                         .py_1()
                         .cursor_pointer()
                         .rounded(px(6.))
-                        .hover(|s| s.bg(colors.ghost_element_hover))
+                        .hover(move |s| s.bg(ghost_element_hover))
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             this.show_logged_in_project = !this.show_logged_in_project;
@@ -645,8 +666,8 @@ impl ThingsView {
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(colors.background)
-            .child(self.render_header(today, strings, cx))
+            .bg(background)
+            .child(self.render_header(today, strings, window, cx))
             .child(
                 v_scroll(
                     "things-main-scroll",

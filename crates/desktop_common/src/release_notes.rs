@@ -3,7 +3,6 @@
 use anyhow::Result;
 use fern_core::Store;
 use serde::{Deserialize, Serialize};
-use ui::prelude::*;
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUNDLED_NOTES: &str = include_str!(concat!(env!("OUT_DIR"), "/release-notes.md"));
@@ -46,7 +45,10 @@ fn cached(store: &Store, version: &str) -> Result<Option<ReleaseNotes>> {
     let notes: ReleaseNotes = match serde_json::from_str(&value) {
         Ok(notes) => notes,
         Err(err) => {
-            eprintln!("failed to parse cached release notes for {version}: {err:#}");
+            crate::logging::log_error(
+                "release_notes",
+                format!("failed to parse cached release notes for {version}: {err:#}"),
+            );
             return Ok(None);
         }
     };
@@ -56,7 +58,10 @@ fn cached(store: &Store, version: &str) -> Result<Option<ReleaseNotes>> {
 pub fn installed(store: &Store) -> Option<ReleaseNotes> {
     cached(store, CURRENT_VERSION)
         .unwrap_or_else(|err| {
-            eprintln!("failed to read cached release notes: {err:#}");
+            crate::logging::log_error(
+                "release_notes",
+                format!("failed to read cached release notes: {err:#}"),
+            );
             None
         })
         .or_else(bundled)
@@ -69,8 +74,8 @@ fn bundled() -> Option<ReleaseNotes> {
 }
 
 pub fn take_update_notice(store: &Store, first_start: bool) -> Result<Option<ReleaseNotes>> {
-    // Development builds can share the normal database and must leave its notice available.
-    if cfg!(all(debug_assertions, not(test))) || std::env::var_os("FERN_DEV_STATE").is_some() {
+    // Dev-state screenshot/fixture launches must leave any real notice available.
+    if crate::is_dev_state() {
         return Ok(None);
     }
     notice_for_launch(store, CURRENT_VERSION, first_start, bundled)
@@ -85,8 +90,12 @@ fn notice_for_launch(
     let previous = store.setting(LAST_STARTED_VERSION)?;
     // Older Fern versions did not record their version. An existing database is the signal
     // on the first launch that has support for release notes.
-    let upgraded = previous.as_deref().map_or(!first_start, |previous| is_newer(version, previous));
-    let downgraded = previous.as_deref().is_some_and(|previous| is_newer(previous, version));
+    let upgraded = previous
+        .as_deref()
+        .map_or(!first_start, |previous| is_newer(version, previous));
+    let downgraded = previous
+        .as_deref()
+        .is_some_and(|previous| is_newer(previous, version));
     let notes = if downgraded {
         None
     } else {
@@ -111,7 +120,12 @@ fn claim_notice(store: &Store, notes: Option<ReleaseNotes>) -> Result<Option<Rel
 /// Whether version `a` comes after `b`; both `major.minor.patch`, anything after `-` ignored.
 pub fn is_newer(a: &str, b: &str) -> bool {
     let parts = |version: &str| -> Option<Vec<u64>> {
-        version.split('-').next()?.split('.').map(|part| part.parse().ok()).collect()
+        version
+            .split('-')
+            .next()?
+            .split('.')
+            .map(|part| part.parse().ok())
+            .collect()
     };
     match (parts(a), parts(b)) {
         (Some(a), Some(b)) => a > b,
@@ -122,7 +136,8 @@ pub fn is_newer(a: &str, b: &str) -> bool {
 fn changes<'a>(body: &'a str, version: &str) -> &'a str {
     // The release job appends a shared downloads and installation section. Older releases
     // predate the marker and start that section with the same opening sentence.
-    let len = body.split_inclusive('\n')
+    let len = body
+        .split_inclusive('\n')
         .take_while(|line| {
             line.trim_end() != "<!-- fern-release-template -->"
                 && !line.starts_with("Fern is a free, open-source task manager:")
@@ -136,24 +151,6 @@ fn changes<'a>(body: &'a str, version: &str) -> &'a str {
         return body.split_once('\n').map_or("", |(_, notes)| notes.trim());
     }
     body
-}
-
-pub fn action_button(id: &'static str, cx: &App) -> Stateful<ui::HorizontalStack> {
-    let colors = cx.theme().colors();
-    h_flex()
-        .id(id)
-        .tab_index(0)
-        .flex_none()
-        .min_h(px(28.))
-        .px_2()
-        .gap_1()
-        .rounded(px(6.))
-        .border_1()
-        .border_color(gpui::transparent_black())
-        .cursor_pointer()
-        .hover(|style| style.bg(colors.element_hover))
-        .active(|style| style.bg(colors.element_selected))
-        .focus_visible(|style| style.border_color(colors.accent))
 }
 
 #[cfg(test)]

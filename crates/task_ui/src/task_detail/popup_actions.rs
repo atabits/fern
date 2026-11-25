@@ -33,8 +33,8 @@ impl TaskDetail {
     pub fn sticky_popup_inputs(&self, cx: &App) -> (Option<FocusHandle>, [Entity<TextInput>; 2]) {
         let input = match self.session.popup {
             Some(Popup::Tags | Popup::InlineTags) => Some(&self.tag_input),
-            Some(Popup::List) => Some(&self.list_search),
-            Some(Popup::LinkParent) => Some(&self.link_search),
+            Some(Popup::List) => self.list_search.as_ref(),
+            Some(Popup::LinkParent) => self.link_search.as_ref(),
             _ => None,
         };
         (
@@ -122,7 +122,9 @@ impl TaskDetail {
             Popup::Due => {
                 self.session.preferences = self.session.store.preferences().unwrap_or_default();
                 let today = Local::now().date_naive();
-                self.tz_input.update(cx, |input, cx| input.set_text("", cx));
+                if let Some(input) = &self.tz_input {
+                    input.update(cx, |input, cx| input.set_text("", cx));
+                }
                 self.session.due_draft = self.session.task.as_ref().map(|task| self.due_preview(task, today));
             }
             Popup::Tags | Popup::InlineTags => {
@@ -136,7 +138,8 @@ impl TaskDetail {
                 self.tag_input.update(cx, |input, cx| input.set_text("", cx));
             }
             Popup::List => {
-                self.list_search.update(cx, |input, cx| input.set_text("", cx));
+                let list_search = self.ensure_list_search(cx);
+                list_search.update(cx, |input, cx| input.set_text("", cx));
                 self.list_submenu = None;
                 self.session.list_sections = self.session.store.all_list_sections().unwrap_or_default();
             }
@@ -145,7 +148,8 @@ impl TaskDetail {
             }
             Popup::Priority | Popup::More => {}
             Popup::LinkParent => {
-                self.link_search.update(cx, |input, cx| input.set_text("", cx));
+                let link_search = self.ensure_link_search(cx);
+                link_search.update(cx, |input, cx| input.set_text("", cx));
                 self.session.link_parent_candidates = self.link_parent_candidates();
             }
             Popup::Estimate => {
@@ -198,7 +202,8 @@ impl TaskDetail {
             "tags" => self.open_tags(Popup::Tags, window, cx),
             "link-parent" if self.can_link_parent() => {
                 self.open_popup_from_ui(Popup::LinkParent, window, cx);
-                window.focus(&self.link_search.focus_handle(cx), cx);
+                let search = self.ensure_link_search(cx);
+                window.focus(&search.focus_handle(cx), cx);
             }
             _ => {}
         }
@@ -331,12 +336,21 @@ impl TaskDetail {
     fn popup_input_focused(&self, window: &Window, cx: &App) -> bool {
         match self.session.popup {
             Some(Popup::Tags | Popup::InlineTags) => self.tag_input.focus_handle(cx).is_focused(window),
-            Some(Popup::LinkParent) => self.link_search.focus_handle(cx).is_focused(window),
+            Some(Popup::LinkParent) => self
+                .link_search
+                .as_ref()
+                .is_some_and(|input| input.focus_handle(cx).is_focused(window)),
             Some(Popup::Due) => {
                 self.time_input.focus_handle(cx).is_focused(window)
-                    || self.tz_input.focus_handle(cx).is_focused(window)
+                    || self
+                        .tz_input
+                        .as_ref()
+                        .is_some_and(|input| input.focus_handle(cx).is_focused(window))
             }
-            Some(Popup::List) => self.list_search.focus_handle(cx).is_focused(window),
+            Some(Popup::List) => self
+                .list_search
+                .as_ref()
+                .is_some_and(|input| input.focus_handle(cx).is_focused(window)),
             _ => false,
         }
     }
@@ -394,7 +408,7 @@ impl TaskDetail {
                     match self.session.store.delete_attachment(&att, dir) {
                         Ok(()) => cx.emit(TaskUpdated),
                         Err(err) => {
-                            eprintln!("failed to remove the attachment: {err:#}");
+                            desktop_common::logging::log_error("task_detail", format!("failed to remove the attachment: {err:#}"));
                         }
                     }
                     self.sync_attachments();
@@ -405,7 +419,7 @@ impl TaskDetail {
                 match self.session.store.delete_comment(id) {
                     Ok(()) => cx.emit(TaskUpdated),
                     Err(err) => {
-                        eprintln!("failed to delete the comment: {err:#}");
+                        desktop_common::logging::log_error("task_detail", format!("failed to delete the comment: {err:#}"));
                     }
                 }
                 self.sync_comments();
@@ -660,7 +674,7 @@ impl TaskDetail {
                 }
             }
             Err(error) => {
-                eprintln!("failed to save task tags: {error:#}");
+                desktop_common::logging::log_error("task_detail", format!("failed to save task tags: {error:#}"));
                 draft.save_failed = true;
                 cx.notify();
             }

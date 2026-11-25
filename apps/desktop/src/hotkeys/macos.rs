@@ -153,7 +153,10 @@ pub(super) fn start(shared: Arc<Mutex<Shared>>, _stopped_cv: Arc<Condvar>, tx: U
         )
     };
     if status != 0 || handler.is_null() {
-        eprintln!("failed to install macOS global hotkey handler: OSStatus {status}");
+        desktop_common::logging::log_error(
+            "hotkeys",
+            format!("failed to install macOS global hotkey handler: OSStatus {status}"),
+        );
         return;
     }
     MAC_STATE.with(|slot| {

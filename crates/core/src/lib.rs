@@ -49,5 +49,8 @@ pub use model::{Activity, Attachment, Comment, Estimate, ChecklistItem, ListSect
 pub use preferences::{DURATIONS, Features, Notifications, DateFormat, DefaultDate, Preferences, QuickDate, RailItemId, RailSection, SidebarSection, TaskDefaults, SmartList, ThemeMode, ThemeSelection, Visibility, WEEK_STARTS, next_week_date};
 pub use quick_add::{ParsedTask, Recognition, parse_quick_add, parse_quick_add_on_day, parse_quick_add_with, parse_quick_add_with_horizons};
 pub use recurrence::{Frequency, Recurrence};
-pub use store::{BackupEntry, FolderDropTarget, MAX_SUBTASK_DEPTH, SCHEMA_VERSION, Store, TableCounts, list_backups};
+pub use store::{
+    BackupEntry, FolderDropTarget, MAX_SUBTASK_DEPTH, SCHEMA_VERSION, Store, TableCounts,
+    is_safe_attachment_name, list_backups,
+};
 pub use task_tree::TaskTree;

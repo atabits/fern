@@ -6,7 +6,7 @@ use chrono::NaiveDate;
 use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::model::{ChecklistItem, Id, Kind, List, ListDraft, ListFolder, Tag};
+use crate::model::{Id, Kind, List, ListDraft, ListFolder, Tag};
 
 use super::{DATE_FORMAT, FolderDropTarget, SortTable, Store, now_ms, parse_uuid};
 
@@ -24,24 +24,27 @@ impl Store {
     }
 
     pub(super) fn replace_task_tags(&self, id: Id, tags: &[String]) -> Result<()> {
-        let mut existing: Vec<String> = self
+        let mut by_lower: HashMap<String, String> = self
             .conn
             .prepare_cached("SELECT name FROM tags")?
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|name| (name.to_lowercase(), name))
+            .collect();
         let id = id.to_string();
         self.conn.execute("DELETE FROM task_tags WHERE task_id = ?1", [&id])?;
         for tag in tags.iter().map(|t| Self::sanitize_tag_name(t)).filter(|t| !t.is_empty()) {
-            let tag = tag.as_str();
-            let name = match existing.iter().find(|e| e.to_lowercase() == tag.to_lowercase()) {
+            let lower = tag.to_lowercase();
+            let name = match by_lower.get(&lower) {
                 Some(name) => name.clone(),
                 None => {
                     self.conn.execute(
                         "INSERT OR IGNORE INTO tags (name, created_at) VALUES (?1, ?2)",
-                        params![tag, now_ms()],
+                        params![&tag, now_ms()],
                     )?;
-                    existing.push(tag.to_owned());
-                    tag.to_owned()
+                    by_lower.insert(lower, tag.clone());
+                    tag
                 }
             };
             self.conn.execute(
@@ -107,13 +110,23 @@ impl Store {
         let name = name.trim().trim_start_matches('#').trim();
         anyhow::ensure!(!name.is_empty(), "a tag needs a name");
         anyhow::ensure!(!name.chars().any(|c| c.is_ascii_control()), "tag name cannot contain control characters");
-        anyhow::ensure!(!self.tags()?.iter().any(|t| t.name.to_lowercase() == name.to_lowercase()), "the tag already exists");
-        self.check_parent(None, parent)?;
-        self.conn.execute(
-            "INSERT INTO tags (name, color, parent, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![name, color, parent, now_ms()],
-        )?;
-        Ok(())
+        self.in_tx(|| {
+            let lower = name.to_lowercase();
+            let tags = self.tags()?;
+            anyhow::ensure!(
+                !tags.iter().any(|t| t.name.to_lowercase() == lower),
+                "the tag already exists"
+            );
+            if let Some(parent) = parent {
+                let found = tags.iter().find(|t| t.name == parent).context("no such parent tag")?;
+                anyhow::ensure!(found.parent.is_none(), "a sub-tag cannot have sub-tags");
+            }
+            self.conn.execute(
+                "INSERT INTO tags (name, color, parent, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![name, color, parent, now_ms()],
+            )?;
+            Ok(())
+        })
     }
 
     /// The original's Edit Tag: name, color and parent. A new name is a new row (the name is the
@@ -122,8 +135,8 @@ impl Store {
         let new_name = new_name.trim().trim_start_matches('#').trim();
         anyhow::ensure!(!new_name.is_empty(), "a tag needs a name");
         anyhow::ensure!(!new_name.chars().any(|c| c.is_ascii_control()), "tag name cannot contain control characters");
-        self.check_parent(Some(name), parent)?;
         self.in_tx(|| {
+            self.check_parent(Some(name), parent)?;
             if new_name != name {
                 anyhow::ensure!(
                     !self.tags()?.iter().any(|t| t.name != name && t.name.to_lowercase() == new_name.to_lowercase()),
@@ -402,12 +415,14 @@ impl Store {
         let name = draft.name.trim();
         anyhow::ensure!(!name.is_empty(), "a list needs a name");
         let id = Uuid::now_v7();
-        self.conn.execute(
-            "INSERT INTO lists (id, name, created_at, sort_order) VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM lists))",
-            params![id.to_string(), name, now_ms()],
-        )?;
-        self.update_list(id, draft)?;
-        self.lists()?.into_iter().find(|l| l.id == id).context("list not found")
+        self.in_tx(|| {
+            self.conn.execute(
+                "INSERT INTO lists (id, name, created_at, sort_order) VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM lists))",
+                params![id.to_string(), name, now_ms()],
+            )?;
+            self.update_list(id, draft)?;
+            self.lists()?.into_iter().find(|l| l.id == id).context("list not found")
+        })
     }
 
     /// Saves the Edit List dialog's choices.
@@ -479,19 +494,29 @@ impl Store {
             let draft = ListDraft { name: format!("{}{suffix}", list.name), ..ListDraft::of(&list) };
             let copy = self.add_list(&draft)?;
             self.place_list(copy.id, Some(id), list.folder)?;
+            let mut section_map: HashMap<String, String> = HashMap::new();
             for section in self.list_sections(Some(id))? {
-                self.add_list_section(Some(copy.id), &section.name)?;
+                let copied_section = self.add_list_section(Some(copy.id), &section.name)?;
+                section_map.insert(section.id.to_string(), copied_section.id.to_string());
             }
-            let root_ids: Vec<String> = self
-                .conn
-                .prepare_cached(
-                    "SELECT id FROM tasks
-                     WHERE list_id = ?1 AND parent_id IS NULL AND completed_at IS NULL AND deleted_at IS NULL
-                     ORDER BY sort_order, rowid DESC",
-                )?
-                .query_map([id.to_string()], |row| row.get(0))?
+            // Fetch open tasks ordered parent-before-child so parent_id can be remapped cleanly.
+            let mut src_stmt = self.conn.prepare_cached(
+                "WITH RECURSIVE tree(id, parent_id, section_id, sort_order, created_at, depth) AS (
+                     SELECT id, NULL, section_id, sort_order, created_at, 0
+                     FROM tasks
+                     WHERE list_id = ?1 AND parent_id IS NULL AND completed_at IS NULL AND wont_do_at IS NULL AND deleted_at IS NULL
+                     UNION ALL
+                     SELECT t.id, t.parent_id, t.section_id, t.sort_order, t.created_at, tree.depth + 1
+                     FROM tasks t
+                     JOIN tree ON t.parent_id = tree.id
+                     WHERE t.list_id = ?1 AND t.completed_at IS NULL AND t.wont_do_at IS NULL AND t.deleted_at IS NULL AND tree.depth < 16
+                 )
+                 SELECT id, parent_id, section_id FROM tree ORDER BY depth, sort_order, created_at",
+            )?;
+            let source_tasks: Vec<(String, Option<String>, Option<String>)> = src_stmt
+                .query_map([id.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .collect::<Result<_, _>>()?;
-            if !root_ids.is_empty() {
+            if !source_tasks.is_empty() {
                 let copy_list_id = copy.id.to_string();
                 let base_sort: i64 = self.conn.query_row(
                     "SELECT COALESCE(MAX(sort_order), 0) + 1024 FROM tasks",
@@ -506,11 +531,11 @@ impl Store {
                          start_date, schedule_bucket, horizon, created_at, sort_order
                      )
                      SELECT
-                         ?1, parent_id, kind, title, notes, priority, due_date, due_time,
-                         ?3, NULL, repeat, reminders, end_date, end_time,
+                         ?1, ?2, kind, title, notes, priority, due_date, due_time,
+                         ?4, ?5, repeat, reminders, end_date, end_time,
                          estimate, location, timezone, is_floating, constant_reminder,
-                         start_date, schedule_bucket, horizon, ?4, ?5
-                     FROM tasks WHERE id = ?2",
+                         start_date, schedule_bucket, horizon, ?6, ?7
+                     FROM tasks WHERE id = ?3",
                 )?;
                 let mut copy_tags = self.conn.prepare_cached(
                     "INSERT INTO task_tags (task_id, tag) SELECT ?1, tag FROM task_tags WHERE task_id = ?2",
@@ -523,13 +548,24 @@ impl Store {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )?;
                 let now = now_ms();
-                for (idx, src_id) in root_ids.iter().enumerate() {
+                let mut task_map: HashMap<String, String> = HashMap::with_capacity(source_tasks.len());
+                for (idx, (src_id, src_parent, src_section)) in source_tasks.into_iter().enumerate() {
                     let dst_id = Uuid::now_v7().to_string();
+                    let dst_parent = src_parent.as_deref().and_then(|p| task_map.get(p)).cloned();
+                    let dst_section = src_section.as_deref().and_then(|s| section_map.get(s)).cloned();
                     let sort_order = base_sort + (idx as i64) * 1024;
-                    insert_task.execute(params![&dst_id, src_id, &copy_list_id, now, sort_order])?;
-                    copy_tags.execute(params![&dst_id, src_id])?;
+                    insert_task.execute(params![
+                        &dst_id,
+                        dst_parent,
+                        &src_id,
+                        &copy_list_id,
+                        dst_section,
+                        now,
+                        sort_order,
+                    ])?;
+                    copy_tags.execute(params![&dst_id, &src_id])?;
                     let items: Vec<(String, bool)> = read_checklist
-                        .query_map([src_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .query_map([&src_id], |row| Ok((row.get(0)?, row.get(1)?)))?
                         .collect::<Result<_, _>>()?;
                     for (pos, (title, completed)) in items.into_iter().enumerate() {
                         insert_checklist.execute(params![
@@ -541,6 +577,7 @@ impl Store {
                             now,
                         ])?;
                     }
+                    task_map.insert(src_id, dst_id);
                 }
             }
             self.lists()?.into_iter().find(|l| l.id == copy.id).context("list not found")
@@ -846,27 +883,20 @@ impl Store {
     /// attachment files in `dir` (or the store's default attachment directory).
     pub fn delete_list_with_dir(&self, id: Id, dir: Option<&Path>) -> Result<()> {
         let removed_files = self.in_tx(|| {
-            let files = self.collect_attachment_files_for_query(
+            let id_str = id.to_string();
+            let files = self.cleanup_task_subtree_artifacts(
                 "WITH RECURSIVE sub(id) AS (
                      SELECT id FROM tasks WHERE list_id = ?1
                      UNION
                      SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
-                 )
-                 SELECT a.id || '-' || a.name FROM task_attachments a JOIN sub ON a.task_id = sub.id",
-                params![id.to_string()],
+                 )",
+                params![&id_str],
             )?;
             self.conn.execute(
-                "WITH RECURSIVE sub(id) AS (
-                     SELECT id FROM tasks WHERE list_id = ?1
-                     UNION
-                     SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
-                 )
-                 DELETE FROM plugin_entity_meta
-                 WHERE entity_type = 'task' AND entity_id IN (SELECT id FROM sub)",
-                [id.to_string()],
+                "DELETE FROM plugin_entity_meta WHERE entity_type = 'list' AND entity_id = ?1",
+                [&id_str],
             )?;
-            self.conn.execute("DELETE FROM lists WHERE id = ?1", [id.to_string()])?;
-            self.prune_sync_uploaded(&files)?;
+            self.conn.execute("DELETE FROM lists WHERE id = ?1", [&id_str])?;
             Ok(files)
         })?;
         self.unlink_attachment_files(&removed_files, dir);
@@ -909,98 +939,5 @@ impl Store {
             }
             Ok(())
         })
-    }
-
-    /// The task's checklist in display order.
-    pub fn checklist(&self, task: Id) -> Result<Vec<ChecklistItem>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT id, task_id, title, completed_at IS NOT NULL FROM checklist_items
-             WHERE task_id = ?1 ORDER BY sort_order, rowid",
-        )?;
-        let items = stmt
-            .query_map([task.to_string()], |row| {
-                Ok(ChecklistItem {
-                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
-                    task_id: parse_uuid(&row.get::<_, String>(1)?, 1)?,
-                    title: row.get(2)?,
-                    completed: row.get(3)?,
-                })
-            })?
-            .collect::<Result<_, _>>()?;
-        Ok(items)
-    }
-
-    /// Adds an item to the end of the checklist, or right after `after` when given.
-    pub fn add_checklist_item(&self, task: Id, title: &str, after: Option<Id>) -> Result<ChecklistItem> {
-        self.in_tx(|| {
-            let position: i64 = match after {
-                Some(after) => {
-                    let position: i64 = self.conn.query_row(
-                        "SELECT sort_order FROM checklist_items WHERE id = ?1",
-                        [after.to_string()],
-                        |row| row.get(0),
-                    )?;
-                    self.conn.execute(
-                        "UPDATE checklist_items SET sort_order = sort_order + 1
-                         WHERE task_id = ?1 AND sort_order > ?2",
-                        params![task.to_string(), position],
-                    )?;
-                    position + 1
-                }
-                None => self.conn.query_row(
-                    "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM checklist_items WHERE task_id = ?1",
-                    [task.to_string()],
-                    |row| row.get(0),
-                )?,
-            };
-            let item = ChecklistItem { id: Uuid::now_v7(), task_id: task, title: title.trim().to_owned(), completed: false };
-            self.conn.execute(
-                "INSERT INTO checklist_items (id, task_id, title, sort_order, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![item.id.to_string(), task.to_string(), item.title, position, now_ms()],
-            )?;
-            Ok(item)
-        })
-    }
-
-    pub fn set_checklist_item_title(&self, id: Id, title: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE checklist_items SET title = ?2 WHERE id = ?1",
-            params![id.to_string(), title],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_checklist_item_completed(&self, id: Id, completed: bool) -> Result<()> {
-        self.conn.execute(
-            "UPDATE checklist_items SET completed_at = ?2 WHERE id = ?1",
-            params![id.to_string(), completed.then(now_ms)],
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_checklist_item(&self, id: Id) -> Result<()> {
-        self.conn.execute("DELETE FROM checklist_items WHERE id = ?1", [id.to_string()])?;
-        Ok(())
-    }
-
-    pub(super) fn checklist_progress(&self, ids_json: Option<&str>) -> Result<HashMap<Id, (usize, usize)>> {
-        let mut stmt = self.conn.prepare_cached(if ids_json.is_some() {
-            "SELECT task_id, COUNT(completed_at), COUNT(*) FROM checklist_items
-             WHERE task_id IN (SELECT value FROM json_each(?1))
-             GROUP BY task_id"
-        } else {
-            "SELECT task_id, COUNT(completed_at), COUNT(*) FROM checklist_items GROUP BY task_id"
-        })?;
-        let mut progress = HashMap::new();
-        for row in stmt.query_map(rusqlite::params_from_iter(ids_json), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
-        })? {
-            let (task, done, total) = row?;
-            if let Ok(id) = Uuid::parse_str(&task) {
-                progress.insert(id, (done as usize, total as usize));
-            }
-        }
-        Ok(progress)
     }
 }

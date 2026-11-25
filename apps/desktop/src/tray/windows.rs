@@ -4,7 +4,6 @@ use std::cell::{Cell, RefCell};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use gpui::Window;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
@@ -169,15 +168,11 @@ pub(super) fn prepare_channel() -> UnboundedReceiver<TrayAction> {
 }
 
 pub(super) fn init(window: &Window, prefs: TrayPrefs, labels: TrayLabels) {
-    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+    let Some(hwnd) = desktop_common::win32::hwnd_from_window(window) else {
         return;
     };
-    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-        return;
-    };
-    let hwnd = HWND(handle.hwnd.get() as _);
     if !unsafe { SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0) }.as_bool() {
-        eprintln!("failed to install the notification area handler");
+        desktop_common::logging::log_error("tray", "failed to install the notification area handler");
         return;
     }
     update_labels(labels);
@@ -207,7 +202,7 @@ fn apply_topmost(hwnd: HWND, topmost: bool) {
     if let Err(err) =
         unsafe { SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) }
     {
-        eprintln!("failed to update always-on-top: {err}");
+        desktop_common::logging::log_error("tray", format!("failed to update always-on-top: {err}"));
     }
 }
 

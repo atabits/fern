@@ -9,7 +9,10 @@ use plugins::PromptReplyValue;
 use plugins::ui_ast::{UiEvent, UiTreePayload};
 
 use super::updates::{apply_registry_changed, push_toast_capped};
-use super::{PluginHost, PluginViewOp, WakeSignal};
+use super::{
+    PluginHost, PluginViewOp, WakeSignal, view_map_contains, view_map_get, view_map_insert,
+    view_map_remove,
+};
 
 impl PluginHost {
     pub(super) fn enqueue_plugin_op(plugin_id: String, op: PluginViewOp, cx: &mut App) {
@@ -106,9 +109,9 @@ impl PluginHost {
                                 if matches {
                                     cx.update_global::<PluginHost, _>(|host, _| {
                                         host.loaded_theme_signature = None;
-                                        host.views.retain(|(p, _), _| p != &plugin_id);
-                                        host.view_errors.retain(|(p, _), _| p != &plugin_id);
-                                        host.view_revisions.retain(|(p, _), _| p != &plugin_id);
+                                        host.views.remove(&plugin_id);
+                                        host.view_errors.remove(&plugin_id);
+                                        host.view_revisions.remove(&plugin_id);
                                         host.op_state
                                             .borrow_mut()
                                             .invalidate_plugin_views(&plugin_id);
@@ -118,8 +121,10 @@ impl PluginHost {
                                             .or_insert(0);
                                         *rev = rev.wrapping_add(1);
                                         if let Err(err) = res {
-                                            host.view_errors.insert(
-                                                (plugin_id.clone(), String::new()),
+                                            view_map_insert(
+                                                &mut host.view_errors,
+                                                &plugin_id,
+                                                String::new(),
                                                 format!("{err:#}"),
                                             );
                                         }
@@ -160,41 +165,55 @@ impl PluginHost {
                                 }
                                 cx.update_global::<PluginHost, _>(|host, _| {
                                     host.loaded_theme_signature = None;
-                                    host.views.retain(|(p, _), _| p != &plugin_id);
-                                    host.view_errors.retain(|(p, _), _| p != &plugin_id);
-                                    host.view_revisions.retain(|(p, _), _| p != &plugin_id);
+                                    host.views.remove(&plugin_id);
+                                    host.view_errors.remove(&plugin_id);
+                                    host.view_revisions.remove(&plugin_id);
                                     let rev = host
                                         .plugin_revisions
                                         .entry(plugin_id.clone())
                                         .or_insert(0);
                                     *rev = rev.wrapping_add(1);
                                     let rev_val = *rev;
-                                    let key = (plugin_id.clone(), view_id.clone());
                                     let mut ops = host.op_state.borrow_mut();
                                     ops.in_flight_reload_or_reset.remove(&plugin_id);
                                     let is_current =
-                                        ops.view_generations.get(&key) == Some(&generation);
+                                        view_map_get(&ops.view_generations, &plugin_id, &view_id)
+                                            == Some(&generation);
                                     if is_current {
-                                        ops.mounting_views.remove(&key);
+                                        ops.clear_mounting(&plugin_id, &view_id);
                                     }
                                     drop(ops);
                                     match res {
                                         Err(reload_err) => {
-                                            host.view_errors.insert(
-                                                (plugin_id.clone(), String::new()),
+                                            view_map_insert(
+                                                &mut host.view_errors,
+                                                &plugin_id,
+                                                String::new(),
                                                 format!("{reload_err:#}"),
                                             );
                                         }
                                         Ok(mount_res) => {
                                             if is_current {
-                                                host.view_revisions.insert(key.clone(), rev_val);
+                                                view_map_insert(
+                                                    &mut host.view_revisions,
+                                                    &plugin_id,
+                                                    view_id.clone(),
+                                                    rev_val,
+                                                );
                                                 match mount_res {
                                                     Ok(payload) => {
-                                                        host.views.insert(key, Arc::new(payload));
+                                                        view_map_insert(
+                                                            &mut host.views,
+                                                            &plugin_id,
+                                                            view_id,
+                                                            Arc::new(payload),
+                                                        );
                                                     }
                                                     Err(mount_err) => {
-                                                        host.view_errors.insert(
-                                                            key,
+                                                        view_map_insert(
+                                                            &mut host.view_errors,
+                                                            &plugin_id,
+                                                            view_id,
                                                             format!("{mount_err:#}"),
                                                         );
                                                     }
@@ -269,8 +288,7 @@ impl PluginHost {
             let mut ops = host.op_state.borrow_mut();
             let generation = ops.next_view_gen(&plugin_id, &view_id);
             if mount {
-                ops.mounting_views
-                    .insert((plugin_id.clone(), view_id.clone()));
+                ops.set_mounting(&plugin_id, &view_id);
             }
             generation
         };
@@ -290,23 +308,22 @@ impl PluginHost {
 
     /// Unmounts a plugin view off the UI thread and evicts its cached tree immediately.
     pub fn unmount_view_async(plugin_id: String, view_id: String, cx: &mut App) {
-        let key = (plugin_id.clone(), view_id.clone());
         let had_cached = cx.try_global::<Self>().is_some_and(|h| {
-            h.views.contains_key(&key)
-                || h.view_errors.contains_key(&key)
-                || h.view_revisions.contains_key(&key)
+            view_map_contains(&h.views, &plugin_id, &view_id)
+                || view_map_contains(&h.view_errors, &plugin_id, &view_id)
+                || view_map_contains(&h.view_revisions, &plugin_id, &view_id)
         });
         if had_cached {
             cx.update_global::<Self, _>(|host, _| {
-                host.views.remove(&key);
-                host.view_errors.remove(&key);
-                host.view_revisions.remove(&key);
+                view_map_remove(&mut host.views, &plugin_id, &view_id);
+                view_map_remove(&mut host.view_errors, &plugin_id, &view_id);
+                view_map_remove(&mut host.view_revisions, &plugin_id, &view_id);
             });
         }
         let has_mgr = if let Some(host) = cx.try_global::<Self>() {
             let mut ops = host.op_state.borrow_mut();
             let _ = ops.next_view_gen(&plugin_id, &view_id);
-            ops.mounting_views.remove(&key);
+            ops.clear_mounting(&plugin_id, &view_id);
             host.manager.is_some()
         } else {
             false
@@ -318,7 +335,6 @@ impl PluginHost {
 
     /// Sequentially reloads a plugin and mounts `view_id` in a single queued task (no race or double-mount).
     pub fn reload_and_mount_view_async(plugin_id: String, view_id: String, cx: &mut App) {
-        let key = (plugin_id.clone(), view_id.clone());
         let generation = {
             let Some(host) = cx.try_global::<Self>() else {
                 return;
@@ -328,13 +344,13 @@ impl PluginHost {
             }
             let mut ops = host.op_state.borrow_mut();
             let generation = ops.next_view_gen(&plugin_id, &view_id);
-            ops.mounting_views.insert(key.clone());
+            ops.set_mounting(&plugin_id, &view_id);
             generation
         };
         cx.update_global::<Self, _>(|host, _| {
-            host.views.remove(&key);
-            host.view_errors.retain(|(p, _), _| p != &plugin_id);
-            host.view_revisions.remove(&key);
+            view_map_remove(&mut host.views, &plugin_id, &view_id);
+            host.view_errors.remove(&plugin_id);
+            view_map_remove(&mut host.view_revisions, &plugin_id, &view_id);
         });
         Self::enqueue_plugin_op(
             plugin_id,
@@ -348,7 +364,6 @@ impl PluginHost {
 
     /// Sequentially resets a circuit-broken plugin and mounts `view_id` without racing or double-mounting.
     pub fn reset_and_mount_view_async(plugin_id: String, view_id: String, cx: &mut App) {
-        let key = (plugin_id.clone(), view_id.clone());
         let generation = {
             let Some(host) = cx.try_global::<Self>() else {
                 return;
@@ -358,11 +373,11 @@ impl PluginHost {
             }
             let mut ops = host.op_state.borrow_mut();
             let generation = ops.next_view_gen(&plugin_id, &view_id);
-            ops.mounting_views.insert(key);
+            ops.set_mounting(&plugin_id, &view_id);
             generation
         };
         cx.update_global::<Self, _>(|host, _| {
-            host.view_errors.retain(|(p, _), _| p != &plugin_id);
+            host.view_errors.remove(&plugin_id);
         });
         Self::enqueue_plugin_op(
             plugin_id,
@@ -534,14 +549,13 @@ fn apply_view_render_result(
     signal: &Arc<WakeSignal>,
     cx: &mut App,
 ) {
-    let key = (plugin_id.to_owned(), view_id.to_owned());
     let is_current = cx.try_global::<PluginHost>().is_some_and(|host| {
         if !Arc::ptr_eq(&host.wake_signal, signal) {
             return false;
         }
         let mut ops = host.op_state.borrow_mut();
-        if ops.view_generations.get(&key) == Some(&generation) {
-            ops.mounting_views.remove(&key);
+        if view_map_get(&ops.view_generations, plugin_id, view_id) == Some(&generation) {
+            ops.clear_mounting(plugin_id, view_id);
             true
         } else {
             false
@@ -554,9 +568,14 @@ fn apply_view_render_result(
         Ok(payload) => PluginHost::set_view_tree(plugin_id, view_id, payload, cx),
         Err(err) => {
             cx.update_global::<PluginHost, _>(|host, _| {
-                let rev = host.plugin_revision(&key.0);
-                host.view_revisions.insert(key.clone(), rev);
-                host.view_errors.insert(key, format!("{err:#}"));
+                let rev = host.plugin_revision(plugin_id);
+                view_map_insert(&mut host.view_revisions, plugin_id, view_id.to_owned(), rev);
+                view_map_insert(
+                    &mut host.view_errors,
+                    plugin_id,
+                    view_id.to_owned(),
+                    format!("{err:#}"),
+                );
             });
         }
     }

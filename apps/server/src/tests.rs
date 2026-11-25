@@ -627,7 +627,42 @@ fn concurrent_file_uploads_and_sync_leave_no_temp_files() {
         .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
         .collect();
     assert!(leftover_tmps.is_empty(), "atomic PUT must leave zero temp files: {leftover_tmps:?}");
-
     drop(http);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gc_preserves_dot_prefixed_temp_files_even_at_zero_grace() {
+    let dir = unique_temp_dir("fern-server-gc-dot");
+    let db_path = dir.join("fern-server.db");
+    let files_dir = dir.join("fern-server.db.files");
+    let server = Server::open(&db_path).unwrap();
+
+    let in_flight = files_dir.join(".item.txt.tmp.123.0");
+    write_file_with_age(&in_flight, b"partial", Duration::ZERO);
+    let stats = server.gc_files(Duration::ZERO).unwrap();
+    assert_eq!(stats.scanned, 0);
+    assert_eq!(stats.removed, 0);
+    assert!(in_flight.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn internal_errors_return_500_without_leaking_sqlite_details() {
+    let server = Server::open_in_memory().unwrap();
+    // Corrupt schema on purpose to force an internal SQLite error in sync() while keeping handle valid.
+    server.conn.execute_batch("DROP TABLE changes;").unwrap();
+    let http = TestHttpServer::start(server, "tok", DEFAULT_GC_GRACE);
+    let (status, body) = http_request(
+        http.port,
+        "POST",
+        "/sync",
+        Some("tok"),
+        br#"{"protocol":2,"device":"d1","since":0,"changes":[]}"#,
+    );
+    assert_eq!(status, 500);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("internal server error"), "got {text}");
+    assert!(!text.contains("changes"), "must not leak SQL schema details: {text}");
 }

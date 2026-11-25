@@ -13,110 +13,148 @@ use crate::model::Id;
 
 use super::{DATE_FORMAT, SNOOZE_FORMAT, Store, TIME_FORMAT, now_ms, parse_uuid};
 
+const SELECT_HABITS_SQL: &str =
+    "SELECT id, name, goal_amount, goal_unit, goal_step, reminders, frequency, icon, color,
+            start_date, goal_days, section, archived_at, icon_checkins, constant_reminder,
+            record_enable, ex_dates, sort_order
+     FROM habits";
+
+fn habit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Habit> {
+    let step = row.get::<_, Option<f64>>(4)?.unwrap_or(1.0);
+    let goal = row.get::<_, Option<f64>>(2)?.map(|amount| Goal {
+        amount: polish_amount(amount).max(0.01),
+        unit: row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default(),
+        mode: CheckinMode::from_storage(step),
+    });
+    let reminders = row
+        .get::<_, Option<String>>(5)?
+        .map(|times| {
+            times
+                .split(',')
+                .filter_map(|t| NaiveTime::parse_from_str(t.trim(), TIME_FORMAT).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let frequency = row
+        .get::<_, Option<String>>(6)?
+        .map(|f| crate::habit::Frequency::from_storage(&f))
+        .unwrap_or_default();
+    let archived_at: Option<i64> = row.get(12)?;
+    let archived_date = archived_at
+        .and_then(|ms| chrono::Local.timestamp_millis_opt(ms).single())
+        .map(|dt| dt.date_naive());
+    let mut ex_dates: Vec<NaiveDate> = row
+        .get::<_, Option<String>>(16)?
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|d| NaiveDate::parse_from_str(d.trim(), DATE_FORMAT).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    ex_dates.sort_unstable();
+    ex_dates.dedup();
+    Ok(Habit {
+        id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+        name: row.get(1)?,
+        goal,
+        reminders,
+        frequency,
+        icon: row.get(7)?,
+        color: row.get(8)?,
+        start_date: row
+            .get::<_, Option<String>>(9)?
+            .and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()),
+        goal_days: row.get(10)?,
+        section: row
+            .get::<_, Option<String>>(11)?
+            .map(|s| HabitSection::from_key(&s))
+            .unwrap_or_default(),
+        archived: archived_at.is_some(),
+        archived_date,
+        icon_checkins: row.get(13)?,
+        constant_reminder: row.get(14)?,
+        record_enable: row.get::<_, Option<bool>>(15)?.unwrap_or(false),
+        ex_dates,
+        sort_order: row.get::<_, Option<i64>>(17)?.unwrap_or(0),
+    })
+}
+
+struct NormalizedHabitDraft<'a> {
+    name: &'a str,
+    goal: Option<Goal>,
+    reminders: Vec<NaiveTime>,
+    reminders_text: Vec<String>,
+    constant_reminder: bool,
+    frequency: crate::habit::Frequency,
+    icon: Option<String>,
+    color: Option<String>,
+    goal_days: Option<u32>,
+}
+
+fn normalize_habit_draft<'a>(draft: &'a HabitDraft) -> Result<NormalizedHabitDraft<'a>> {
+    let name = draft.name.trim();
+    anyhow::ensure!(!name.is_empty(), "a habit needs a name");
+    let goal = match &draft.goal {
+        Some(g) => {
+            let amount = polish_amount(g.amount);
+            anyhow::ensure!(amount > 0.0, "a goal needs an amount");
+            let mode = match g.mode {
+                CheckinMode::Auto { step } => CheckinMode::Auto { step: polish_amount(step).max(0.01) },
+                other => other,
+            };
+            Some(Goal { amount, unit: g.unit.trim().to_owned(), mode })
+        }
+        None => None,
+    };
+    let mut reminders = draft.reminders.clone();
+    reminders.sort();
+    reminders.dedup();
+    reminders.truncate(MAX_REMINDERS);
+    let reminders_text: Vec<String> = reminders.iter().map(|t| t.format(TIME_FORMAT).to_string()).collect();
+    let constant_reminder = !reminders.is_empty() && draft.constant_reminder;
+    let frequency = draft.frequency.normalize();
+    let icon = draft
+        .icon
+        .as_deref()
+        .map(str::trim)
+        .filter(|i| !i.is_empty())
+        .map(|i| i.chars().take(2).collect::<String>());
+    let color = draft.color.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(str::to_owned);
+    let goal_days = draft.goal_days.filter(|n| *n > 0);
+    Ok(NormalizedHabitDraft {
+        name,
+        goal,
+        reminders,
+        reminders_text,
+        constant_reminder,
+        frequency,
+        icon,
+        color,
+        goal_days,
+    })
+}
+
 impl Store {
     pub fn habits(&self) -> Result<Vec<Habit>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT id, name, goal_amount, goal_unit, goal_step, reminders, frequency, icon, color,
-                    start_date, goal_days, section, archived_at, icon_checkins, constant_reminder,
-                    record_enable, ex_dates, sort_order
-             FROM habits
-             ORDER BY sort_order, created_at, rowid",
-        )?;
-        let habits = stmt
-            .query_map([], |row| {
-                let step = row.get::<_, Option<f64>>(4)?.unwrap_or(1.0);
-                let goal = row.get::<_, Option<f64>>(2)?.map(|amount| Goal {
-                    amount: polish_amount(amount).max(0.01),
-                    unit: row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default(),
-                    mode: CheckinMode::from_storage(step),
-                });
-                let reminders = row
-                    .get::<_, Option<String>>(5)?
-                    .map(|times| {
-                        times
-                            .split(',')
-                            .filter_map(|t| NaiveTime::parse_from_str(t.trim(), TIME_FORMAT).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let frequency = row
-                    .get::<_, Option<String>>(6)?
-                    .map(|f| crate::habit::Frequency::from_storage(&f))
-                    .unwrap_or_default();
-                let archived_at: Option<i64> = row.get(12)?;
-                let archived_date = archived_at
-                    .and_then(|ms| chrono::Local.timestamp_millis_opt(ms).single())
-                    .map(|dt| dt.date_naive());
-                let mut ex_dates: Vec<NaiveDate> = row
-                    .get::<_, Option<String>>(16)?
-                    .map(|raw| {
-                        raw.split(',')
-                            .filter_map(|d| NaiveDate::parse_from_str(d.trim(), DATE_FORMAT).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                ex_dates.sort_unstable();
-                ex_dates.dedup();
-                Ok(Habit {
-                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
-                    name: row.get(1)?,
-                    goal,
-                    reminders,
-                    frequency,
-                    icon: row.get(7)?,
-                    color: row.get(8)?,
-                    start_date: row
-                        .get::<_, Option<String>>(9)?
-                        .and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()),
-                    goal_days: row.get(10)?,
-                    section: row
-                        .get::<_, Option<String>>(11)?
-                        .map(|s| HabitSection::from_key(&s))
-                        .unwrap_or_default(),
-                    archived: archived_at.is_some(),
-                    archived_date,
-                    icon_checkins: row.get(13)?,
-                    constant_reminder: row.get(14)?,
-                    record_enable: row.get::<_, Option<bool>>(15)?.unwrap_or(false),
-                    ex_dates,
-                    sort_order: row.get::<_, Option<i64>>(17)?.unwrap_or(0),
-                })
-            })?
-            .collect::<Result<_, _>>()?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!("{SELECT_HABITS_SQL} ORDER BY sort_order, created_at, rowid"))?;
+        let habits = stmt.query_map([], habit_from_row)?.collect::<Result<_, _>>()?;
         Ok(habits)
+    }
+
+    /// Loads a single habit by ID without scanning the whole table.
+    pub fn habit(&self, id: Id) -> Result<Option<Habit>> {
+        self.conn
+            .prepare_cached(&format!("{SELECT_HABITS_SQL} WHERE id = ?1"))?
+            .query_row([id.to_string()], habit_from_row)
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Creates a habit atomically with all fields from `draft`.
     pub fn create_habit(&self, draft: &HabitDraft) -> Result<Habit> {
-        let name = draft.name.trim();
-        anyhow::ensure!(!name.is_empty(), "a habit needs a name");
-        let goal = match &draft.goal {
-            Some(g) => {
-                let amount = polish_amount(g.amount);
-                anyhow::ensure!(amount > 0.0, "a goal needs an amount");
-                let mode = match g.mode {
-                    CheckinMode::Auto { step } => CheckinMode::Auto { step: polish_amount(step).max(0.01) },
-                    other => other,
-                };
-                Some(Goal { amount, unit: g.unit.trim().to_owned(), mode })
-            }
-            None => None,
-        };
-        let mut reminders = draft.reminders.clone();
-        reminders.sort();
-        reminders.dedup();
-        reminders.truncate(MAX_REMINDERS);
-        let reminders_text: Vec<String> = reminders.iter().map(|t| t.format(TIME_FORMAT).to_string()).collect();
-        let constant_reminder = !reminders.is_empty() && draft.constant_reminder;
-        let frequency = draft.frequency.normalize();
-        let icon = draft
-            .icon
-            .as_deref()
-            .map(str::trim)
-            .filter(|i| !i.is_empty())
-            .map(|i| i.chars().take(2).collect::<String>());
-        let color = draft.color.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(str::to_owned);
-        let goal_days = draft.goal_days.filter(|n| *n > 0);
+        let norm = normalize_habit_draft(draft)?;
         let id = Uuid::now_v7();
 
         let sort_order = self.in_tx(|| {
@@ -133,18 +171,18 @@ impl Store {
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     id.to_string(),
-                    name,
-                    goal.as_ref().map(|g| g.amount),
-                    goal.as_ref().map(|g| g.unit.as_str()),
-                    goal.as_ref().map_or(1.0, |g| g.mode.to_storage()),
-                    (!reminders_text.is_empty()).then(|| reminders_text.join(",")),
-                    frequency.to_storage(),
-                    icon,
-                    color,
+                    norm.name,
+                    norm.goal.as_ref().map(|g| g.amount),
+                    norm.goal.as_ref().map(|g| g.unit.as_str()),
+                    norm.goal.as_ref().map_or(1.0, |g| g.mode.to_storage()),
+                    (!norm.reminders_text.is_empty()).then(|| norm.reminders_text.join(",")),
+                    norm.frequency.to_storage(),
+                    norm.icon,
+                    norm.color,
                     draft.start_date.map(|d| d.format(DATE_FORMAT).to_string()),
-                    goal_days,
+                    norm.goal_days,
                     draft.section.key(),
-                    constant_reminder,
+                    norm.constant_reminder,
                     draft.record_enable,
                     next_order,
                     now_ms(),
@@ -155,19 +193,19 @@ impl Store {
 
         Ok(Habit {
             id,
-            name: name.to_owned(),
-            goal,
-            reminders,
-            frequency,
-            icon,
-            color,
+            name: norm.name.to_owned(),
+            goal: norm.goal,
+            reminders: norm.reminders,
+            frequency: norm.frequency,
+            icon: norm.icon,
+            color: norm.color,
             start_date: draft.start_date,
-            goal_days,
+            goal_days: norm.goal_days,
             section: draft.section,
             archived: false,
             archived_date: None,
             icon_checkins: false,
-            constant_reminder,
+            constant_reminder: norm.constant_reminder,
             record_enable: draft.record_enable,
             ex_dates: Vec::new(),
             sort_order,
@@ -176,36 +214,7 @@ impl Store {
 
     /// Updates all editable fields of a habit atomically in a single statement.
     pub fn save_habit(&self, id: Id, draft: &HabitDraft) -> Result<()> {
-        let name = draft.name.trim();
-        anyhow::ensure!(!name.is_empty(), "a habit needs a name");
-        let goal = match &draft.goal {
-            Some(g) => {
-                let amount = polish_amount(g.amount);
-                anyhow::ensure!(amount > 0.0, "a goal needs an amount");
-                let mode = match g.mode {
-                    CheckinMode::Auto { step } => CheckinMode::Auto { step: polish_amount(step).max(0.01) },
-                    other => other,
-                };
-                Some(Goal { amount, unit: g.unit.trim().to_owned(), mode })
-            }
-            None => None,
-        };
-        let mut reminders = draft.reminders.clone();
-        reminders.sort();
-        reminders.dedup();
-        reminders.truncate(MAX_REMINDERS);
-        let reminders_text: Vec<String> = reminders.iter().map(|t| t.format(TIME_FORMAT).to_string()).collect();
-        let constant_reminder = !reminders.is_empty() && draft.constant_reminder;
-        let frequency = draft.frequency.normalize();
-        let icon = draft
-            .icon
-            .as_deref()
-            .map(str::trim)
-            .filter(|i| !i.is_empty())
-            .map(|i| i.chars().take(2).collect::<String>());
-        let color = draft.color.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(str::to_owned);
-        let goal_days = draft.goal_days.filter(|n| *n > 0);
-
+        let norm = normalize_habit_draft(draft)?;
         self.conn.execute(
             "UPDATE habits SET
                 name = ?2,
@@ -224,18 +233,18 @@ impl Store {
              WHERE id = ?1",
             params![
                 id.to_string(),
-                name,
-                goal.as_ref().map(|g| g.amount),
-                goal.as_ref().map(|g| g.unit.as_str()),
-                goal.as_ref().map_or(1.0, |g| g.mode.to_storage()),
-                (!reminders_text.is_empty()).then(|| reminders_text.join(",")),
-                frequency.to_storage(),
-                icon,
-                color,
+                norm.name,
+                norm.goal.as_ref().map(|g| g.amount),
+                norm.goal.as_ref().map(|g| g.unit.as_str()),
+                norm.goal.as_ref().map_or(1.0, |g| g.mode.to_storage()),
+                (!norm.reminders_text.is_empty()).then(|| norm.reminders_text.join(",")),
+                norm.frequency.to_storage(),
+                norm.icon,
+                norm.color,
                 draft.start_date.map(|d| d.format(DATE_FORMAT).to_string()),
-                goal_days,
+                norm.goal_days,
                 draft.section.key(),
-                constant_reminder,
+                norm.constant_reminder,
                 draft.record_enable,
             ],
         )?;
@@ -247,8 +256,15 @@ impl Store {
     }
 
     pub fn delete_habit(&self, id: Id) -> Result<()> {
-        self.conn.execute("DELETE FROM habits WHERE id = ?1", [id.to_string()])?;
-        Ok(())
+        self.in_tx(|| {
+            let id_str = id.to_string();
+            self.conn.execute(
+                "DELETE FROM plugin_entity_meta WHERE entity_type = 'habit' AND entity_id = ?1",
+                [&id_str],
+            )?;
+            self.conn.execute("DELETE FROM habits WHERE id = ?1", [&id_str])?;
+            Ok(())
+        })
     }
 
     /// Sets a habit's icon (an emoji or up to two characters; empty for the initial) and color.
@@ -311,16 +327,18 @@ impl Store {
     pub fn add_habit_section(&self, name: &str) -> Result<crate::habit::CustomSection> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a section needs a name");
-        let existing_count: i64 = self.conn.query_row("SELECT COUNT(*) FROM habit_sections", [], |row| row.get(0))?;
-        anyhow::ensure!((existing_count as usize) < MAX_CUSTOM_SECTIONS, "too many custom sections");
-        let next_order: i64 =
-            self.conn.query_row("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM habit_sections", [], |row| row.get(0))?;
-        let section = crate::habit::CustomSection { id: Uuid::now_v7(), name: name.to_owned(), sort_order: next_order };
-        self.conn.execute(
-            "INSERT INTO habit_sections (id, name, sort_order, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![section.id.to_string(), section.name, section.sort_order, now_ms()],
-        )?;
-        Ok(section)
+        self.in_tx(|| {
+            let existing_count: i64 = self.conn.query_row("SELECT COUNT(*) FROM habit_sections", [], |row| row.get(0))?;
+            anyhow::ensure!((existing_count as usize) < MAX_CUSTOM_SECTIONS, "too many custom sections");
+            let next_order: i64 =
+                self.conn.query_row("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM habit_sections", [], |row| row.get(0))?;
+            let section = crate::habit::CustomSection { id: Uuid::now_v7(), name: name.to_owned(), sort_order: next_order };
+            self.conn.execute(
+                "INSERT INTO habit_sections (id, name, sort_order, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![section.id.to_string(), section.name, section.sort_order, now_ms()],
+            )?;
+            Ok(section)
+        })
     }
 
     pub fn rename_habit_section(&self, id: Id, name: &str) -> Result<()> {
@@ -396,13 +414,15 @@ impl Store {
     /// "Snooze" in a habit's reminder: remind again at `at`. Snoozes more than a day old are
     /// dropped on the way.
     pub fn snooze_habit(&self, id: Id, at: NaiveDateTime) -> Result<()> {
-        let stale = (at - chrono::Duration::days(1)).format(SNOOZE_FORMAT).to_string();
-        self.conn.execute("DELETE FROM habit_snoozes WHERE at < ?1", [stale])?;
-        self.conn.execute(
-            "INSERT INTO habit_snoozes (habit_id, at) VALUES (?1, ?2)",
-            params![id.to_string(), at.format(SNOOZE_FORMAT).to_string()],
-        )?;
-        Ok(())
+        self.in_tx(|| {
+            let stale = (at - chrono::Duration::days(1)).format(SNOOZE_FORMAT).to_string();
+            self.conn.execute("DELETE FROM habit_snoozes WHERE at < ?1", [stale])?;
+            self.conn.execute(
+                "INSERT INTO habit_snoozes (habit_id, at) VALUES (?1, ?2)",
+                params![id.to_string(), at.format(SNOOZE_FORMAT).to_string()],
+            )?;
+            Ok(())
+        })
     }
 
     /// Snoozed habit reminders, as (habit, when to remind again).
@@ -502,12 +522,35 @@ impl Store {
 
     /// Removes `date` from `habit`'s skipped dates.
     pub fn unskip_habit_date(&self, habit: Id, date: NaiveDate) -> Result<()> {
-        let mut dates = self.read_ex_dates(habit)?;
-        let before = dates.len();
-        dates.retain(|d| *d != date);
-        if dates.len() != before {
-            self.write_ex_dates(habit, &dates)?;
-        }
+        self.in_tx(|| {
+            let mut dates = self.read_ex_dates(habit)?;
+            let before = dates.len();
+            dates.retain(|d| *d != date);
+            if dates.len() != before {
+                self.write_ex_dates(habit, &dates)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn upsert_checkin_row(
+        &self,
+        habit: Id,
+        date: NaiveDate,
+        value: f64,
+        goal: f64,
+        status: CheckinStatus,
+    ) -> Result<()> {
+        let date_str = date.format(DATE_FORMAT).to_string();
+        self.conn
+            .prepare_cached(
+                "INSERT INTO habit_checkins (habit_id, date, value, goal, status) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(habit_id, date) DO UPDATE SET
+                     value = excluded.value,
+                     goal = COALESCE(habit_checkins.goal, excluded.goal),
+                     status = excluded.status",
+            )?
+            .execute(params![habit.to_string(), date_str, value, goal, status.to_i64()])?;
         Ok(())
     }
 
@@ -566,11 +609,7 @@ impl Store {
                 return Ok(false);
             }
             let eff_goal = existing.and_then(|(_, g)| g).filter(|g| *g > 0.0).unwrap_or(goal);
-            self.conn.execute(
-                "INSERT INTO habit_checkins (habit_id, date, value, goal, status) VALUES (?1, ?2, ?3, ?4, 2)
-                 ON CONFLICT(habit_id, date) DO UPDATE SET value = excluded.value, goal = COALESCE(habit_checkins.goal, excluded.goal), status = 2",
-                params![habit.to_string(), date_str, eff_goal, eff_goal],
-            )?;
+            self.upsert_checkin_row(habit, date, eff_goal, eff_goal, CheckinStatus::Done)?;
             self.unskip_habit_date(habit, date)?;
             Ok(true)
         })
@@ -606,14 +645,7 @@ impl Store {
             let base = if status == CheckinStatus::Undone { 0.0 } else { current };
             let next = polish_amount(base + step);
             let next_status = if next >= eff_goal { CheckinStatus::Done } else { CheckinStatus::Unlabeled };
-            self.conn.execute(
-                "INSERT INTO habit_checkins (habit_id, date, value, goal, status) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(habit_id, date) DO UPDATE SET
-                     value = excluded.value,
-                     goal = COALESCE(habit_checkins.goal, excluded.goal),
-                     status = excluded.status",
-                params![habit.to_string(), date_str, next, eff_goal, next_status.to_i64()],
-            )?;
+            self.upsert_checkin_row(habit, date, next, eff_goal, next_status)?;
             self.unskip_habit_date(habit, date)?;
             Ok(next)
         })
@@ -643,14 +675,7 @@ impl Store {
                 .map_or(0.0, |(v, _, _)| v);
             let next = polish_amount(base + delta);
             let next_status = if next >= eff_goal { CheckinStatus::Done } else { CheckinStatus::Unlabeled };
-            self.conn.execute(
-                "INSERT INTO habit_checkins (habit_id, date, value, goal, status) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(habit_id, date) DO UPDATE SET
-                     value = excluded.value,
-                     goal = COALESCE(habit_checkins.goal, excluded.goal),
-                     status = excluded.status",
-                params![habit.to_string(), date_str, next, eff_goal, next_status.to_i64()],
-            )?;
+            self.upsert_checkin_row(habit, date, next, eff_goal, next_status)?;
             self.unskip_habit_date(habit, date)?;
             Ok(next)
         })
@@ -678,14 +703,7 @@ impl Store {
                 .flatten();
             let eff_goal = existing_goal.filter(|g| *g > 0.0).unwrap_or(goal);
             let status = if amount >= eff_goal { CheckinStatus::Done } else { CheckinStatus::Unlabeled };
-            self.conn.execute(
-                "INSERT INTO habit_checkins (habit_id, date, value, goal, status) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(habit_id, date) DO UPDATE SET
-                     value = excluded.value,
-                     goal = COALESCE(habit_checkins.goal, excluded.goal),
-                     status = excluded.status",
-                params![habit.to_string(), date_str, amount, eff_goal, status.to_i64()],
-            )?;
+            self.upsert_checkin_row(habit, date, amount, eff_goal, status)?;
             self.unskip_habit_date(habit, date)?;
             Ok(())
         })
@@ -694,16 +712,8 @@ impl Store {
     /// Explicitly marks `date` as Unachieved / failed (value = 0, status = Undone), preserving logs.
     pub fn mark_checkin_undone(&self, habit: Id, date: NaiveDate) -> Result<()> {
         self.in_tx(|| {
-            let date_str = date.format(DATE_FORMAT).to_string();
             let (goal, _) = self.habit_goal_and_mode(habit)?;
-            self.conn.execute(
-                "INSERT INTO habit_checkins (habit_id, date, value, goal, status) VALUES (?1, ?2, 0, ?3, 1)
-                 ON CONFLICT(habit_id, date) DO UPDATE SET
-                     value = 0,
-                     goal = COALESCE(habit_checkins.goal, excluded.goal),
-                     status = 1",
-                params![habit.to_string(), date_str, goal],
-            )?;
+            self.upsert_checkin_row(habit, date, 0.0, goal, CheckinStatus::Undone)?;
             self.unskip_habit_date(habit, date)?;
             Ok(())
         })

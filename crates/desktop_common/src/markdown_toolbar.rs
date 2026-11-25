@@ -29,7 +29,8 @@ pub type OnAction<V> = Rc<dyn Fn(&mut V, ToolbarAction, &mut Window, &mut Contex
 pub fn render<V: 'static>(id: &'static str, headings_open: bool, attach: bool, cx: &mut Context<V>, on_action: OnAction<V>) -> ui::HorizontalStack {
     let size = if attach { px(19.) } else { px(28.) };
     let strings = i18n::t(cx);
-    let colors = cx.theme().colors().clone();
+    let theme = cx.theme().clone();
+    let colors = theme.colors();
     let names = strings.markdown_tools;
     // (format, icon, the tooltip's sample of the Markdown, the shortcut)
     let tools: [(Option<Format>, IconName, String, Option<&str>); 13] = [

@@ -46,7 +46,11 @@ jobs:
 
       - name: Install system libraries
         if: runner.os == 'Linux'
-        run: script/linux-deps
+        run: |
+          script/linux-deps
+          sudo apt-get install -y --no-install-recommends rpm desktop-file-utils appstream
+          desktop-file-validate assets/linux/fern-tasks.desktop
+          appstreamcli validate --no-net --explain assets/linux/io.github.atabits.fern.metainfo.xml
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -60,7 +64,7 @@ jobs:
       - name: Version
         id: version
         run: |
-          crate_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          crate_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1 | tr -d '\r')
           if [ "$RELEASE" = true ]; then
             echo "version=$crate_version" >> "$GITHUB_OUTPUT"
           else
@@ -148,6 +152,7 @@ jobs:
             dist/*.dmg
             dist/*.exe
             dist/*.deb
+            dist/*.rpm
             dist/*.AppImage
             dist/*.tar.gz
             dist/*.zip
@@ -174,7 +179,7 @@ jobs:
       - name: Release notes
         id: notes
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1 | tr -d '\r')
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if git ls-remote --exit-code --tags origin "v$version" > /dev/null; then
             echo "::error::v$version is already released; raise the version in Cargo.toml"
@@ -194,3 +199,43 @@ jobs:
           files: dist/*
           # Published by hand once the packages are checked.
           draft: true
+
+  publish-aur:
+    name: Update AUR (optional)
+    if: inputs.release && github.ref == 'refs/heads/main' && secrets.AUR_SSH_PRIVATE_KEY != ''
+    needs: [package, release]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: fern-*-unknown-linux-gnu
+          merge-multiple: true
+
+      - name: Update AUR PKGBUILD and .SRCINFO
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1 | tr -d '\r')
+          sha_x86=$(sha256sum "dist/fern-${version}-linux-x86_64.tar.gz" | awk '{print $1}')
+          sha_arm=$(sha256sum "dist/fern-${version}-linux-arm64.tar.gz" | awk '{print $1}')
+          bash script/update-aur "$version" "$sha_x86" "$sha_arm"
+
+      - name: Push to AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur_ed25519
+          chmod 600 ~/.ssh/aur_ed25519
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_ed25519 -o IdentitiesOnly=yes"
+          git clone ssh://aur@aur.archlinux.org/fern-tasks-bin.git /tmp/aur-repo
+          cp packaging/aur/PKGBUILD packaging/aur/.SRCINFO /tmp/aur-repo/
+          cd /tmp/aur-repo
+          git config user.name "atabits-bot"
+          git config user.email "endlessspring.of@gmail.com"
+          if ! git diff --quiet; then
+            git commit -am "Update to v$(sed -n 's/^pkgver=//p' PKGBUILD)"
+            git push origin master
+          fi

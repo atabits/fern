@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.atabits.fern</id>
+  <launchable type="desktop-id">fern-tasks.desktop</launchable>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <name>Fern</name>
+  <name xml:lang="ru">Fern</name>
+  <name xml:lang="zh_CN">Fern</name>
+  <summary>Tasks, horizons, calendar, habits, focus, and plugins in one native app</summary>
+  <summary xml:lang="ru">Задачи, горизонты, календарь, привычки, фокус и плагины в одном нативном приложении</summary>
+  <summary xml:lang="zh_CN">集任务、时间视野、日历、习惯、专注与插件于一体的原生应用</summary>
+  <developer_name>Amin Atabiev</developer_name>
+  <description>
+    <p>
+      Fern is a fast, local-first desktop task manager and productivity suite written in Rust and rendered on the GPU with GPUI.
+      No account, no subscription, and no cloud are required: your data lives in SQLite on your machine with daily automatic backups.
+    </p>
+    <ul>
+      <li>Task lists, Kanban boards, timelines, nested subtasks, and natural-language Quick Add (English, Russian, Simplified Chinese)</li>
+      <li>Horizons panoramic planning across Today, Week, Month, Quarter, Year, Decade, and Life</li>
+      <li>Day, week, month, multi-day, year, and agenda calendars with two-way CalDAV synchronization</li>
+      <li>Eisenhower Matrix, Habit Tracker, Pomodoro &amp; Stopwatch with Focus Mini window, Sticky Notes, and Life Clock</li>
+      <li>Sandboxed QuickJS-NG plugins, live-reloaded custom JSONC themes, and optional self-hosted E2EE sync server</li>
+    </ul>
+  </description>
+  <url type="homepage">https://fern.atabits.com</url>
+  <url type="help">https://github.com/atabits/fern/blob/main/docs/linux-distribution.md</url>
+  <url type="bugtracker">https://github.com/atabits/fern/issues</url>
+  <categories>
+    <category>Office</category>
+    <category>ProjectManagement</category>
+  </categories>
+  <keywords>
+    <keyword>todo</keyword>
+    <keyword>tasks</keyword>
+    <keyword>calendar</keyword>
+    <keyword>habits</keyword>
+    <keyword>pomodoro</keyword>
+    <keyword>productivity</keyword>
+  </keywords>
+  <provides>
+    <binary>fern</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <screenshots>
+    <screenshot type="default">
+      <caption>Tasks view with Markdown details and checklists</caption>
+      <image>https://raw.githubusercontent.com/atabits/fern/main/docs/screenshots/tasks.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Horizons panoramic planner across Today, Week, Month, Year, and Life</caption>
+      <image>https://raw.githubusercontent.com/atabits/fern/main/docs/screenshots/horizons.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Calendar view with two-way CalDAV synchronization</caption>
+      <image>https://raw.githubusercontent.com/atabits/fern/main/docs/screenshots/calendar.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Focus timer and statistics</caption>
+      <image>https://raw.githubusercontent.com/atabits/fern/main/docs/screenshots/focus.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="0.3.0" date="2026-11-24">
+      <description>
+        <p>Linux native polish release with Horizons, QuickJS-NG plugin ecosystem, Web preview parity, and multi-distro packaging (.deb, .rpm, AppImage, AUR, Flatpak, Nix).</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -14,7 +14,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 target=$1
-version=${2:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}
+version=${2:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1 | tr -d '\r')}
 case "$target" in
     aarch64-*) arch=arm64 ;;
     x86_64-*) arch=x86_64 ;;
@@ -30,7 +30,7 @@ if [ -z "${FERN_PREBUILT:-}" ]; then
     cargo build --release --locked --target "$target" -p fern_desktop -p fern_server
 fi
 
-bin="target/$target/release"
+bin="${CARGO_TARGET_DIR:-target}/$target/release"
 dist="dist"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -123,16 +123,24 @@ EOF
         ;;
     linux)
         mkdir -p "$work/$name"
-        cp "$bin/fern" assets/linux/fern-tasks.desktop assets/linux/fern.svg LICENSE README.md "$work/$name/"
+        cp "$bin/fern" assets/linux/fern-tasks.desktop assets/linux/fern.svg \
+            assets/linux/io.github.atabits.fern.metainfo.xml LICENSE README.md "$work/$name/"
+        cp assets/icon/icon-256.png "$work/$name/fern.png"
         tar -C "$work" -czf "$dist/$name.tar.gz" "$name"
 
-        # A .deb for Debian and Ubuntu, where it installs with a double click.
+        # A .deb for Debian, Ubuntu and Mint.
         if command -v dpkg-deb > /dev/null; then
             deb="$work/deb"
             mkdir -p "$deb/DEBIAN" "$deb/usr/bin" "$deb/usr/share/applications" \
-                "$deb/usr/share/icons/hicolor/scalable/apps" "$deb/usr/share/doc/fern-tasks"
+                "$deb/usr/share/metainfo" \
+                "$deb/usr/share/icons/hicolor/256x256/apps" \
+                "$deb/usr/share/icons/hicolor/scalable/apps" \
+                "$deb/usr/share/doc/fern-tasks"
             cp "$bin/fern" "$deb/usr/bin/fern"
+            chmod 0755 "$deb/usr/bin/fern"
             cp assets/linux/fern-tasks.desktop "$deb/usr/share/applications/"
+            cp assets/linux/io.github.atabits.fern.metainfo.xml "$deb/usr/share/metainfo/"
+            cp assets/icon/icon-256.png "$deb/usr/share/icons/hicolor/256x256/apps/fern.png"
             cp assets/linux/fern.svg "$deb/usr/share/icons/hicolor/scalable/apps/"
             cp LICENSE "$deb/usr/share/doc/fern-tasks/copyright"
             cat > "$deb/DEBIAN/control" <<EOF
@@ -143,7 +151,8 @@ Maintainer: Amin Atabiev <endlessspring.of@gmail.com>
 Homepage: https://github.com/atabits/fern
 Section: utils
 Priority: optional
-Depends: libc6, libfontconfig1, libfreetype6, libvulkan1, libwayland-client0, libx11-xcb1, libxcb1, libxkbcommon0, libxkbcommon-x11-0
+Depends: libc6, libegl1, libgles2 | libgl1, libfontconfig1, libfreetype6, libvulkan1, libwayland-client0, libx11-xcb1, libxcb1, libxkbcommon0, libxkbcommon-x11-0
+Recommends: libgl1-mesa-dri, mesa-vulkan-drivers, fonts-noto-color-emoji, pipewire-audio | pulseaudio-utils
 Description: Tasks, calendar, habits and focus in one native app
  A free, open-source native task manager. It works offline,
  needs no account and keeps the data on this computer.
@@ -151,8 +160,76 @@ EOF
             dpkg-deb -Zxz --root-owner-group --build "$deb" "$dist/$name.deb" > /dev/null
         fi
 
+        # An .rpm for Fedora, RHEL, openSUSE and derivatives.
+        if command -v rpmbuild > /dev/null; then
+            rpm_top="$work/rpmbuild"
+            rpm_arch=$([ "$arch" = arm64 ] && echo aarch64 || echo x86_64)
+            rpm_ver=$(printf '%s' "$version" | tr '-' '~')
+            mkdir -p "$rpm_top/RPMS" "$rpm_top/BUILD" "$rpm_top/SOURCES" "$rpm_top/SPECS" "$rpm_top/SRPMS"
+            rpm_stage="$work/rpm-stage"
+            mkdir -p "$rpm_stage"
+            cp "$bin/fern" "$rpm_stage/fern"
+            cp assets/linux/fern-tasks.desktop "$rpm_stage/"
+            cp assets/linux/io.github.atabits.fern.metainfo.xml "$rpm_stage/"
+            cp assets/icon/icon-256.png "$rpm_stage/fern.png"
+            cp assets/linux/fern.svg "$rpm_stage/"
+            cp LICENSE "$rpm_stage/"
+            cat > "$rpm_top/SPECS/fern-tasks.spec" <<EOF
+%global debug_package %{nil}
+%global _build_id_links none
+
+Name:           fern-tasks
+Version:        $rpm_ver
+Release:        1%{?dist}
+Summary:        Tasks, horizons, calendar, habits, focus, and plugins in one native app
+License:        AGPL-3.0-or-later
+URL:            https://github.com/atabits/fern
+Requires:       mesa-libEGL
+Requires:       mesa-libGL
+Requires:       vulkan-loader
+Requires:       fontconfig
+Requires:       freetype
+Requires:       libwayland-client
+Requires:       libxcb
+Requires:       libxkbcommon
+Requires:       libxkbcommon-x11
+Requires:       hicolor-icon-theme
+Recommends:     mesa-vulkan-drivers
+Recommends:     google-noto-color-emoji-fonts
+Recommends:     pipewire-utils
+
+%description
+Fern is a free, open-source native task manager written in Rust and GPU-rendered with GPUI.
+It works offline, needs no account, and keeps your data locally in SQLite.
+
+%install
+install -Dm0755 "$rpm_stage/fern" %{buildroot}%{_bindir}/fern
+install -Dm0644 "$rpm_stage/fern-tasks.desktop" %{buildroot}%{_datadir}/applications/fern-tasks.desktop
+install -Dm0644 "$rpm_stage/io.github.atabits.fern.metainfo.xml" %{buildroot}%{_datadir}/metainfo/io.github.atabits.fern.metainfo.xml
+install -Dm0644 "$rpm_stage/fern.png" %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/fern.png
+install -Dm0644 "$rpm_stage/fern.svg" %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/fern.svg
+install -Dm0644 "$rpm_stage/LICENSE" %{buildroot}%{_datadir}/licenses/fern-tasks/LICENSE
+
+%files
+%{_datadir}/licenses/fern-tasks/LICENSE
+%{_bindir}/fern
+%{_datadir}/applications/fern-tasks.desktop
+%{_datadir}/metainfo/io.github.atabits.fern.metainfo.xml
+%{_datadir}/icons/hicolor/256x256/apps/fern.png
+%{_datadir}/icons/hicolor/scalable/apps/fern.svg
+EOF
+            rpmbuild -bb --quiet \
+                --define "_topdir $rpm_top" \
+                --target "$rpm_arch" \
+                "$rpm_top/SPECS/fern-tasks.spec"
+            rpm_built=$(find "$rpm_top/RPMS" -name '*.rpm' -print -quit)
+            [ -n "$rpm_built" ] || { echo "rpmbuild produced no rpm" >&2; exit 1; }
+            cp "$rpm_built" "$dist/$name.rpm"
+        fi
+
         appdir="$work/AppDir"
         mkdir -p "$appdir/usr/bin" "$appdir/usr/lib" "$appdir/usr/share/applications" \
+            "$appdir/usr/share/metainfo" \
             "$appdir/usr/share/icons/hicolor/256x256/apps" "$appdir/usr/share/icons/hicolor/scalable/apps"
         cp "$bin/fern" "$appdir/usr/bin/fern"
         # Bundle the XKB libraries that are not installed on every Linux system
@@ -169,6 +246,7 @@ EOF
         done
         cp assets/linux/fern-tasks.desktop "$appdir/"
         cp assets/linux/fern-tasks.desktop "$appdir/usr/share/applications/"
+        cp assets/linux/io.github.atabits.fern.metainfo.xml "$appdir/usr/share/metainfo/"
         cp assets/icon/icon-256.png "$appdir/fern.png"
         cp assets/icon/icon-256.png "$appdir/usr/share/icons/hicolor/256x256/apps/fern.png"
         cp assets/linux/fern.svg "$appdir/usr/share/icons/hicolor/scalable/apps/"

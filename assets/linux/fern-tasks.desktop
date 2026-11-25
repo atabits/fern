@@ -3,10 +3,26 @@ Type=Application
 Name=Fern
 GenericName=Task Manager
 Comment=Tasks, calendar, habits and focus in one app
+Comment[ru]=Задачи, календарь, привычки и фокус в одном приложении
+Comment[zh_CN]=集任务、日历、习惯与专注为一体的原生应用
 Exec=fern %u
 Icon=fern
 Categories=Office;ProjectManagement;
 Keywords=todo;tasks;calendar;habits;pomodoro;
 MimeType=x-scheme-handler/fern;
 StartupWMClass=fern-tasks
+StartupNotify=true
 Terminal=false
+Actions=quick-add;focus-mini;
+
+[Desktop Action quick-add]
+Name=Quick Add Task
+Name[ru]=Быстрое добавление задачи
+Name[zh_CN]=快速添加任务
+Exec=fern --quick-add
+
+[Desktop Action focus-mini]
+Name=Toggle Focus Mini Window
+Name[ru]=Мини-окно фокуса
+Name[zh_CN]=切换专注小窗
+Exec=fern --focus-mini

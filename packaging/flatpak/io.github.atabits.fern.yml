@@ -1,0 +1,43 @@
+app-id: io.github.atabits.fern
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: fern
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --socket=pulseaudio
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --filesystem=xdg-documents:ro
+  - --filesystem=xdg-download
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/fern/cargo
+
+modules:
+  - name: fern
+    buildsystem: simple
+    build-commands:
+      - cargo --offline build --release --locked -p fern_desktop
+      - install -Dm0755 target/release/fern /app/bin/fern
+      - sed 's|^Icon=fern$|Icon=io.github.atabits.fern|; s|^StartupWMClass=fern-tasks$|StartupWMClass=io.github.atabits.fern|' assets/linux/fern-tasks.desktop > io.github.atabits.fern.desktop
+      - install -Dm0644 io.github.atabits.fern.desktop /app/share/applications/io.github.atabits.fern.desktop
+      - sed 's|<launchable type="desktop-id">fern-tasks.desktop</launchable>|<launchable type="desktop-id">io.github.atabits.fern.desktop</launchable>|' assets/linux/io.github.atabits.fern.metainfo.xml > io.github.atabits.fern.metainfo.xml
+      - install -Dm0644 io.github.atabits.fern.metainfo.xml /app/share/metainfo/io.github.atabits.fern.metainfo.xml
+      - install -Dm0644 assets/linux/fern.svg /app/share/icons/hicolor/scalable/apps/io.github.atabits.fern.svg
+      - install -Dm0644 assets/icon/icon-256.png /app/share/icons/hicolor/256x256/apps/io.github.atabits.fern.png
+      - install -Dm0644 LICENSE /app/share/licenses/io.github.atabits.fern/LICENSE
+    sources:
+      - type: git
+        url: https://github.com/atabits/fern.git
+        tag: v0.3.0
+      # Generate offline crate sources via packaging/flatpak/generate-cargo-sources.sh before Flathub submission.
+      - cargo-sources.json

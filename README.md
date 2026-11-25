@@ -81,14 +81,17 @@ Every [GitHub Release](https://github.com/atabits/fern/releases/latest) includes
 |---|---|
 | **macOS** (Apple Silicon / Intel) | `fern-<version>-macos-arm64.dmg` / `fern-<version>-macos-x86_64.dmg` |
 | **Windows** (x86_64) | `fern-<version>-windows-x86_64-setup.exe` (installer) or `.zip` (standalone / portable) |
-| **Debian / Ubuntu** (x86_64 / ARM64) | `fern-<version>-linux-<arch>.deb` |
-| **Any Linux** (x86_64 / ARM64) | `fern-<version>-linux-<arch>.AppImage` or `.tar.gz` |
+| **Debian / Ubuntu / Linux Mint** | `fern-<version>-linux-<arch>.deb` (`sudo apt install ./fern-*.deb`) |
+| **Fedora / RHEL / openSUSE** | `fern-<version>-linux-<arch>.rpm` (`sudo dnf install ./fern-*.rpm`) — plus `packaging/rpm/fern-tasks.spec` for COPR |
+| **Arch Linux / EndeavourOS / CachyOS** | `packaging/aur/PKGBUILD` (`fern-tasks-bin` AUR recipe) or `.tar.gz` |
+| **NixOS / Nix Flakes** | `nix run github:atabits/fern` (`flake.nix` + `packaging/nix/package.nix`) |
+| **Any Linux** (x86_64 / ARM64) | `fern-<version>-linux-<arch>.AppImage`, `.tar.gz`, or Flathub manifest `packaging/flatpak/io.github.atabits.fern.yml` |
 | **Sync Server** (every platform) | `fern-server-<version>-<os>-<arch>.tar.gz` / `.zip` |
 
-> **Note on unsigned builds:** Desktop builds are not code-signed yet (see [docs/code-signing.md](docs/code-signing.md)).
+> **Note on unsigned builds & Linux tips:** Desktop builds are not code-signed yet (see [docs/code-signing.md](docs/code-signing.md)).
 > - **macOS:** open **System Settings → Privacy & Security → Open Anyway**, or run `xattr -d com.apple.quarantine /Applications/Fern.app`.
 > - **Windows:** in SmartScreen, click **More info → Run anyway**.
-> - **Linux:** install `.deb` via `sudo apt install ./fern-*.deb`, or `chmod +x fern-*.AppImage` and run it.
+> - **Linux & Wayland:** see [docs/linux-distribution.md](docs/linux-distribution.md). On Wayland compositors (GNOME, KDE, Hyprland, Sway), bind global shortcuts directly to `fern --quick-add`, `fern --toggle`, or `fern --focus-mini` (forwarded over the single-instance Unix socket).
 
 ### 3. Build from Source
 

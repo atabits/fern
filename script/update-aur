@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+version=${1:?usage: script/update-aur <version> <sha256-x86_64> <sha256-arm64>}
+sha_x86=${2:?missing sha256 for linux-x86_64}
+sha_arm=${3:?missing sha256 for linux-arm64}
+
+pkgbuild="packaging/aur/PKGBUILD"
+srcinfo="packaging/aur/.SRCINFO"
+
+sed -i "s/^pkgver=.*/pkgver=${version}/" "$pkgbuild"
+sed -i "s/^pkgrel=.*/pkgrel=1/" "$pkgbuild"
+sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${sha_x86}')/" "$pkgbuild"
+sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${sha_arm}')/" "$pkgbuild"
+
+if command -v makepkg > /dev/null && [ "$(id -u)" -ne 0 ]; then
+    (cd packaging/aur && makepkg --printsrcinfo > .SRCINFO)
+else
+    # Update version, sources, and checksums in-place so package metadata never drifts from PKGBUILD.
+    sed -i \
+        -e "s|^\tpkgver = .*|\tpkgver = ${version}|" \
+        -e "s|^\tpkgrel = .*|\tpkgrel = 1|" \
+        -e "s|^\tsource_x86_64 = .*|\tsource_x86_64 = fern-${version}-linux-x86_64.tar.gz::https://github.com/atabits/fern/releases/download/v${version}/fern-${version}-linux-x86_64.tar.gz|" \
+        -e "s|^\tsha256sums_x86_64 = .*|\tsha256sums_x86_64 = ${sha_x86}|" \
+        -e "s|^\tsource_aarch64 = .*|\tsource_aarch64 = fern-${version}-linux-arm64.tar.gz::https://github.com/atabits/fern/releases/download/v${version}/fern-${version}-linux-arm64.tar.gz|" \
+        -e "s|^\tsha256sums_aarch64 = .*|\tsha256sums_aarch64 = ${sha_arm}|" \
+        "$srcinfo"
+fi
+echo "Updated packaging/aur/{PKGBUILD,.SRCINFO} for v${version}"

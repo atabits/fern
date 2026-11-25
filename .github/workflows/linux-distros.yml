@@ -1,0 +1,129 @@
+name: Linux Multi-Distro Verification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "apps/desktop/**"
+      - "crates/desktop_common/**"
+      - "crates/sticky_ui/**"
+      - "crates/focus_ui/**"
+      - "assets/linux/**"
+      - "packaging/**"
+      - "script/package"
+      - ".github/workflows/linux-distros.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  GUI_SMOKE: |
+    ldd /usr/bin/fern | grep -q "not found" && exit 1 || true
+    fern --version
+    fern --help > /dev/null
+    export XDG_DATA_HOME=/tmp/data XDG_RUNTIME_DIR=/tmp/run
+    mkdir -p "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+    xvfb-run -a -s "-screen 0 1280x800x24" dbus-run-session -- bash -c '
+      export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      openbox >/dev/null 2>&1 &
+      sleep 1
+      fern >/tmp/out 2>/tmp/err &
+      P=$!
+      sleep 4
+      kill -0 $P
+      fern --quick-add
+      kill $P; wait $P 2>/dev/null || true
+    '
+
+jobs:
+  build-linux-packages:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          script/linux-deps
+          sudo apt-get install -y --no-install-recommends rpm desktop-file-utils appstream
+          desktop-file-validate assets/linux/fern-tasks.desktop
+          appstreamcli validate --no-net --explain assets/linux/io.github.atabits.fern.metainfo.xml
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          target: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-distros
+      - run: |
+          cargo build --release --locked --target x86_64-unknown-linux-gnu -p fern_desktop -p fern_server
+          FERN_PREBUILT=1 script/package x86_64-unknown-linux-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-dist-x86_64
+          path: dist/
+
+  verify-distros:
+    needs: build-linux-packages
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu-24.04, debian-12, fedora-41, archlinux, nix-eval]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-dist-x86_64
+          path: dist
+
+      - name: Verify Ubuntu 24.04 (.deb + GUI + IPC)
+        if: matrix.distro == 'ubuntu-24.04'
+        run: |
+          docker run --rm -e GUI_SMOKE -v "$PWD/dist:/dist" ubuntu:24.04 bash -ec '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends /dist/fern-*-linux-x86_64.deb xvfb xauth openbox mesa-vulkan-drivers dbus-x11 x11-utils
+            bash -ec "$GUI_SMOKE"
+          '
+
+      - name: Verify Debian 12 (.deb + GUI + IPC)
+        if: matrix.distro == 'debian-12'
+        run: |
+          docker run --rm -e GUI_SMOKE -v "$PWD/dist:/dist" debian:bookworm bash -ec '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends /dist/fern-*-linux-x86_64.deb xvfb xauth openbox mesa-vulkan-drivers dbus-x11 x11-utils
+            bash -ec "$GUI_SMOKE"
+          '
+
+      - name: Verify Fedora 41 (.rpm + AppImage + GUI + IPC)
+        if: matrix.distro == 'fedora-41'
+        run: |
+          docker run --rm -e GUI_SMOKE -v "$PWD/dist:/dist" fedora:41 bash -ec '
+            dnf install -y /dist/fern-*-linux-x86_64.rpm xorg-x11-server-Xvfb xorg-x11-xauth openbox mesa-vulkan-drivers dbus-daemon
+            chmod +x /dist/fern-*-linux-x86_64.AppImage
+            /dist/fern-*-linux-x86_64.AppImage --appimage-extract-and-run --version
+            bash -ec "$GUI_SMOKE"
+          '
+
+      - name: Verify Arch Linux (PKGBUILD + GUI + IPC)
+        if: matrix.distro == 'archlinux'
+        run: |
+          docker run --rm -e GUI_SMOKE -v "$PWD:/repo" -v "$PWD/dist:/dist" archlinux:latest bash -ec '
+            pacman -Syu --noconfirm --needed base-devel fontconfig freetype2 libglvnd libxcb libxkbcommon libxkbcommon-x11 vulkan-icd-loader wayland hicolor-icon-theme vulkan-swrast xorg-server-xvfb xorg-xauth openbox dbus
+            useradd -m builder
+            mkdir -p /tmp/aur
+            cp /repo/packaging/aur/PKGBUILD /tmp/aur/
+            ver=$(sed -n "s/^pkgver=//p" /tmp/aur/PKGBUILD)
+            sed -i "s|^source_x86_64=.*|source_x86_64=(\"fern-${ver}-linux-x86_64.tar.gz::file:///dist/fern-${ver}-linux-x86_64.tar.gz\")|" /tmp/aur/PKGBUILD
+            chown -R builder:builder /tmp/aur
+            su - builder -c "cd /tmp/aur && makepkg -f --skipchecksums --noconfirm"
+            pacman -U --noconfirm /tmp/aur/*.pkg.tar.zst
+            bash -ec "$GUI_SMOKE"
+          '
+
+      - name: Verify Nix syntax and flake structure
+        if: matrix.distro == 'nix-eval'
+        run: |
+          docker run --rm -v "$PWD:/repo" nixos/nix:latest sh -ec '
+            cd /repo
+            nix-instantiate --parse flake.nix > /dev/null
+            nix-instantiate --parse packaging/nix/package.nix > /dev/null
+          '

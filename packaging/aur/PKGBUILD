@@ -1,0 +1,51 @@
+# Maintainer: Amin Atabiev <endlessspring.of@gmail.com>
+pkgname=fern-tasks-bin
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="Tasks, horizons, calendar, habits, focus, and plugins in one native app"
+arch=('x86_64' 'aarch64')
+url="https://fern.atabits.com"
+license=('AGPL-3.0-or-later')
+provides=('fern-tasks')
+conflicts=('fern-tasks' 'fern-tasks-git')
+options=('!strip' '!debug')
+depends=(
+  'fontconfig'
+  'freetype2'
+  'glibc'
+  'hicolor-icon-theme'
+  'libglvnd'
+  'libxcb'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'vulkan-icd-loader'
+  'wayland'
+)
+optdepends=(
+  'mesa: software and hardware Vulkan/EGL drivers'
+  'vulkan-driver: GPU Vulkan driver'
+  'noto-fonts-emoji: color emoji rendering in task titles and lists'
+  'pipewire: completion chimes and focus ambient sounds'
+  'libpulse: PulseAudio fallback for completion chimes'
+)
+source_x86_64=("fern-${pkgver}-linux-x86_64.tar.gz::https://github.com/atabits/fern/releases/download/v${pkgver}/fern-${pkgver}-linux-x86_64.tar.gz")
+source_aarch64=("fern-${pkgver}-linux-arm64.tar.gz::https://github.com/atabits/fern/releases/download/v${pkgver}/fern-${pkgver}-linux-arm64.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  local pkg_arch
+  if [ "$CARCH" = "aarch64" ]; then
+    pkg_arch="arm64"
+  else
+    pkg_arch="x86_64"
+  fi
+  cd "${srcdir}/fern-${pkgver}-linux-${pkg_arch}"
+
+  install -Dm0755 fern "${pkgdir}/usr/bin/fern"
+  install -Dm0644 fern-tasks.desktop "${pkgdir}/usr/share/applications/fern-tasks.desktop"
+  install -Dm0644 fern.png "${pkgdir}/usr/share/icons/hicolor/256x256/apps/fern.png"
+  install -Dm0644 fern.svg "${pkgdir}/usr/share/icons/hicolor/scalable/apps/fern.svg"
+  install -Dm0644 io.github.atabits.fern.metainfo.xml "${pkgdir}/usr/share/metainfo/io.github.atabits.fern.metainfo.xml"
+  install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

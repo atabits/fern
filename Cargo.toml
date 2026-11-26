@@ -32,6 +32,8 @@ members = [
 edition = "2024"
 version = "0.3.0"
 license = "AGPL-3.0-or-later"
+repository = "https://github.com/atabits/fern"
+homepage = "https://fern.atabits.com"
 
 [workspace.lints.clippy]
 dbg_macro = "deny"
@@ -67,6 +69,7 @@ todo_ui = { path = "crates/todo_ui" }
 ui = { path = "crates/ui" }
 
 anyhow = "1"
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash", "std"] }
 async-io = "2"
 base64 = "0.22"
 block2 = "0.6"
@@ -78,6 +81,7 @@ dispatch2 = "0.3"
 futures = "0.3"
 getrandom = { version = "0.2", features = ["js"] }
 hex = "0.4"
+hmac = "0.12"
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 notify-rust = "4"
 objc2 = "0.6"
@@ -139,6 +143,7 @@ sha2 = "0.10"
 smallvec = "1"
 sqlite-wasm-rs = { version = "0.6", features = ["wasm-bindgen"] }
 strum = { version = "0.27", features = ["derive"] }
+subtle = "2"
 tempfile = "3"
 tiny_http = "0.12"
 ureq = "3"

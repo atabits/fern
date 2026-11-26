@@ -75,6 +75,16 @@ fn cache_tag(passphrase: &str, salt: &[u8]) -> [u8; 32] {
 }
 
 impl E2eeKey {
+    /// Wraps an already-derived or unwrapped 256-bit symmetric key (e.g., a Fern Cloud vault DEK).
+    pub fn from_raw_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Exposes the raw 256-bit key bytes (for wrapping or zeroized vault persistence).
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// Derives (or retrieves from the in-memory LRU cache) the 256-bit key for `passphrase`
     /// using the default domain salt.
     pub fn from_passphrase(passphrase: &str) -> Result<Self, E2eeError> {

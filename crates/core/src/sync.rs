@@ -16,6 +16,7 @@ use rusqlite::{OptionalExtension as _, params, params_from_iter};
 use serde_json::{Map, Value as Json};
 use sha2::{Digest as _, Sha256};
 
+use crate::cloud::CloudMeta;
 use crate::e2ee::{self, E2eeError, E2eeKey};
 use crate::store::Store;
 
@@ -195,6 +196,18 @@ const SYNC_PASSPHRASE: &str = "sync_passphrase";
 const SYNC_DEVICE: &str = "sync_device";
 const SYNC_SENT: &str = "sync_sent";
 const SYNC_SEEN: &str = "sync_seen";
+const CLOUD_SERVER: &str = "cloud_server";
+const CLOUD_USER_ID: &str = "cloud_user_id";
+const CLOUD_EMAIL: &str = "cloud_email";
+const CLOUD_DISPLAY_NAME: &str = "cloud_display_name";
+
+/// Active synchronization mode for this local database.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SyncMode {
+    Off,
+    Cloud(CloudMeta),
+    SelfHosted(SyncConfig),
+}
 
 /// A sync on its way: the request to send, and what it covers of the local log.
 pub struct SyncRequest {
@@ -277,19 +290,134 @@ impl Store {
         Ok(self.sync_position()? > self.sync_number(SYNC_SENT)?)
     }
 
+    /// Non-secret metadata for the currently connected Fern Cloud account, if any.
+    pub fn cloud_meta(&self) -> Result<Option<CloudMeta>> {
+        let server_url = self.setting(CLOUD_SERVER)?.unwrap_or_default();
+        let user_id = self.setting(CLOUD_USER_ID)?.unwrap_or_default();
+        let email = self.setting(CLOUD_EMAIL)?.unwrap_or_default();
+        let display_name = self.setting(CLOUD_DISPLAY_NAME)?.unwrap_or_default();
+        let meta = CloudMeta {
+            server_url,
+            user_id,
+            email,
+            display_name,
+        };
+        Ok(meta.is_configured().then_some(meta))
+    }
+
+    /// Updates or clears the non-secret Fern Cloud account metadata. Switching to a different
+    /// cloud server or user ID resets sync cursors and watermarks so the new vault syncs cleanly.
+    pub fn set_cloud_meta(&self, meta: Option<&CloudMeta>) -> Result<()> {
+        self.in_tx(|| {
+            match meta {
+                Some(meta) => {
+                    let prev_server = self.setting(CLOUD_SERVER)?.unwrap_or_default();
+                    let prev_user = self.setting(CLOUD_USER_ID)?.unwrap_or_default();
+                    let server = meta.server_url.trim();
+                    let user_id = meta.user_id.trim();
+                    let changed_account = prev_server != server || prev_user != user_id;
+                    if changed_account {
+                        self.set_setting(SYNC_SENT, "0")?;
+                        self.set_setting(SYNC_SEEN, "0")?;
+                        self.conn.execute("DELETE FROM sync_uploaded", [])?;
+                        self.conn.execute("DELETE FROM sync_watermarks", [])?;
+                    }
+                    self.set_setting(CLOUD_SERVER, server)?;
+                    self.set_setting(CLOUD_USER_ID, user_id)?;
+                    self.set_setting(CLOUD_EMAIL, meta.email.trim())?;
+                    self.set_setting(CLOUD_DISPLAY_NAME, meta.display_name.trim())?;
+                }
+                None => {
+                    self.set_setting(CLOUD_SERVER, "")?;
+                    self.set_setting(CLOUD_USER_ID, "")?;
+                    self.set_setting(CLOUD_EMAIL, "")?;
+                    self.set_setting(CLOUD_DISPLAY_NAME, "")?;
+                    self.set_setting(SYNC_SENT, "0")?;
+                    self.set_setting(SYNC_SEEN, "0")?;
+                    self.conn.execute("DELETE FROM sync_uploaded", [])?;
+                    self.conn.execute("DELETE FROM sync_watermarks", [])?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Resets sync cursors so the next sync pushes all local rows and pulls full server state.
+    pub fn reset_sync_cursors(&self, clear_watermarks: bool) -> Result<()> {
+        self.in_tx(|| {
+            self.set_setting(SYNC_SENT, "0")?;
+            self.set_setting(SYNC_SEEN, "0")?;
+            self.conn.execute("DELETE FROM sync_uploaded", [])?;
+            if clear_watermarks {
+                self.conn.execute("DELETE FROM sync_watermarks", [])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Wipes all synced user entities and sync logs without generating deletion tombstones.
+    /// Called when switching directly from one signed-in Fern Cloud user to a different `user_id`
+    /// so the previous account's local rows are never uploaded into the new account's vault.
+    pub fn clear_synced_user_data(&self) -> Result<()> {
+        self.in_tx(|| {
+            self.conn.execute_batch(
+                "PRAGMA defer_foreign_keys = ON; INSERT INTO sync_applying VALUES (1);",
+            )?;
+            let wipe_res = (|| -> Result<()> {
+                for &(table, _) in SYNCED.iter().rev() {
+                    self.conn.execute(&format!("DELETE FROM {table}"), [])?;
+                }
+                self.conn.execute("DELETE FROM sync_log", [])?;
+                self.conn.execute("DELETE FROM sync_uploaded", [])?;
+                self.conn.execute("DELETE FROM sync_watermarks", [])?;
+                self.set_setting(SYNC_SENT, "0")?;
+                self.set_setting(SYNC_SEEN, "0")?;
+                Ok(())
+            })();
+            let cleanup_res = self.conn.execute("DELETE FROM sync_applying", []);
+            wipe_res?;
+            cleanup_res?;
+            Ok(())
+        })
+    }
+
+    /// Returns the active synchronization mode (Fern Cloud takes precedence over self-hosted when connected).
+    pub fn sync_mode(&self) -> Result<SyncMode> {
+        if let Some(meta) = self.cloud_meta()? {
+            return Ok(SyncMode::Cloud(meta));
+        }
+        if let Some(cfg) = self.sync_config()?
+            && cfg.is_configured()
+        {
+            return Ok(SyncMode::SelfHosted(cfg));
+        }
+        Ok(SyncMode::Off)
+    }
+
+    /// Last remote server sequence number seen by this device.
+    pub fn sync_seen_position(&self) -> Result<i64> {
+        self.sync_number(SYNC_SEEN)
+    }
+
     /// The next sync's request: this device's unsent changes and what it has seen.
     pub fn sync_request(&self) -> Result<SyncRequest> {
-        let (changes, sent) = self.changes_since(self.sync_number(SYNC_SENT)?)?;
         let passphrase = self.setting(SYNC_PASSPHRASE)?.unwrap_or_default();
         let e2ee_key = if passphrase.is_empty() {
             None
         } else {
             Some(E2eeKey::from_passphrase(&passphrase)?)
         };
+        self.sync_request_with_key(e2ee_key.as_ref())
+    }
+
+    /// Builds a sync request encrypting outbound rows with an explicit `E2eeKey` (e.g., an
+    /// unlocked Fern Cloud Vault DEK) instead of the self-hosted `sync_passphrase` setting.
+    pub fn sync_request_with_key(&self, e2ee_key: Option<&E2eeKey>) -> Result<SyncRequest> {
+        let (changes, sent) = self.changes_since(self.sync_number(SYNC_SENT)?)?;
         let mut wire_changes = Vec::with_capacity(changes.len());
         for change in changes {
             let fk = change.row.as_ref().and_then(|row| change_file_key(&change.entity, row));
-            let row = match (&e2ee_key, change.row) {
+            let row = match (e2ee_key, change.row) {
                 (Some(key), Some(row)) => Some(key.encrypt_row(&change.entity, &change.key, &row)?),
                 (_, row) => row,
             };
@@ -324,6 +452,22 @@ impl Store {
     /// Applies the server's answer to `request` and returns both the applied change count and
     /// how many offline note conflicts were preserved.
     pub fn finish_sync_detailed(&self, request: &SyncRequest, answer: &Json) -> Result<SyncOutcome> {
+        let passphrase = self.setting(SYNC_PASSPHRASE)?.unwrap_or_default();
+        let e2ee_key = if passphrase.is_empty() {
+            None
+        } else {
+            Some(E2eeKey::from_passphrase(&passphrase)?)
+        };
+        self.finish_sync_detailed_with_key(request, answer, e2ee_key.as_ref())
+    }
+
+    /// Applies the server's answer using an explicit `E2eeKey` (such as a Fern Cloud Vault DEK).
+    pub fn finish_sync_detailed_with_key(
+        &self,
+        request: &SyncRequest,
+        answer: &Json,
+        e2ee_key: Option<&E2eeKey>,
+    ) -> Result<SyncOutcome> {
         if let Some(server_proto) = answer.get("protocol").and_then(Json::as_u64) {
             let server_proto = u32::try_from(server_proto).unwrap_or(u32::MAX);
             let min_server = answer
@@ -348,7 +492,7 @@ impl Store {
             .collect::<Result<Vec<_>>>()?;
         let position = answer["position"].as_i64().context("the server's answer has no position")?;
         self.in_tx(|| {
-            let outcome = self.apply_changes_detailed(&received)?;
+            let outcome = self.apply_changes_detailed_with_key(&received, e2ee_key)?;
             self.set_setting(SYNC_SENT, &request.sent.to_string())?;
             self.set_setting(SYNC_SEEN, &position.to_string())?;
             self.compact_sync_log()?;
@@ -476,12 +620,26 @@ impl Store {
     /// Applies changes from another device and returns both the applied change count and the
     /// number of offline note conflicts preserved.
     pub fn apply_changes_detailed(&self, changes: &[Change]) -> Result<SyncOutcome> {
+        let passphrase = self.setting(SYNC_PASSPHRASE)?.unwrap_or_default();
+        let e2ee_key = if passphrase.is_empty() {
+            None
+        } else {
+            Some(E2eeKey::from_passphrase(&passphrase)?)
+        };
+        self.apply_changes_detailed_with_key(changes, e2ee_key.as_ref())
+    }
+
+    /// Applies changes from another device using an explicit `E2eeKey` (e.g., an unlocked Fern
+    /// Cloud Vault DEK) instead of the `sync_passphrase` setting.
+    pub fn apply_changes_detailed_with_key(
+        &self,
+        changes: &[Change],
+        explicit_key: Option<&E2eeKey>,
+    ) -> Result<SyncOutcome> {
         self.in_tx(|| {
             // Rows may arrive before the rows they point to.
             self.conn.execute_batch("PRAGMA defer_foreign_keys = ON; INSERT INTO sync_applying VALUES (1);")?;
             let sync_sent = self.sync_number(SYNC_SENT)?;
-            let passphrase = self.setting(SYNC_PASSPHRASE)?.unwrap_or_default();
-            let mut e2ee_key: Option<E2eeKey> = None;
 
             let mut ordered: Vec<&Change> = changes.iter().collect();
             let rank = |entity: &str| SYNCED.iter().position(|(name, _)| *name == entity).unwrap_or(usize::MAX);
@@ -516,18 +674,10 @@ impl Store {
                     Some(raw_row) => {
                         let decrypted_row;
                         let plain_row = if e2ee::is_encrypted_row(raw_row) {
-                            let key = match &e2ee_key {
-                                Some(k) => k,
-                                None => {
-                                    if passphrase.is_empty() {
-                                        return Err(E2eeError::PassphraseRequired.into());
-                                    }
-                                    e2ee_key.insert(E2eeKey::from_passphrase(&passphrase)?)
-                                }
-                            };
+                            let key = explicit_key.ok_or(E2eeError::PassphraseRequired)?;
                             decrypted_row = key.decrypt_row(&change.entity, &change.key, raw_row)?;
                             &decrypted_row
-                        } else if !passphrase.is_empty() {
+                        } else if explicit_key.is_some() {
                             return Err(E2eeError::Malformed(
                                 "received unencrypted sync row while E2EE is enabled".into(),
                             )

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use desktop_common::plugin_bus::PluginBus;
 use fern_core::{RailItemId, Store, link::DeepLink};
@@ -118,7 +120,10 @@ pub struct AppView {
     sync: crate::sync::SyncStatus,
     sync_task: Option<gpui::Task<()>>,
     sync_generation: u64,
-    /// Cached `store.sync_config().is_some()` so `render` never queries SQLite every frame.
+    cloud_sse_stop: Option<Arc<AtomicBool>>,
+    cloud_sse_task: Option<gpui::Task<()>>,
+    cloud_push_debounce: Option<gpui::Task<()>>,
+    /// Cached `store.sync_mode() != SyncMode::Off` so `render` never queries SQLite every frame.
     pub(crate) has_sync_config: bool,
     /// Cached `tray::always_on_top` so `render_account_menu` never queries SQLite every frame.
     always_on_top: bool,
@@ -385,7 +390,8 @@ impl AppView {
         })
         .detach();
         let window_handle = window.window_handle().downcast::<Self>();
-        let has_sync_config = store.sync_config().ok().flatten().is_some();
+        let has_sync_config =
+            !matches!(store.sync_mode(), Ok(fern_core::sync::SyncMode::Off) | Err(_));
         let always_on_top = crate::tray::TrayPrefs::current(&store, cx).always_on_top;
         // Development builds can share the user database and must leave its update notice intact.
         let update_notice = if cfg!(all(debug_assertions, not(test))) {
@@ -415,6 +421,14 @@ impl AppView {
         cx.observe_global::<i18n::CurrentLocale>(|_, cx| {
             let code = cx.global::<i18n::CurrentLocale>().0.code().to_owned();
             PluginHost::set_appearance(Some(code), None, cx);
+        })
+        .detach();
+        cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
+            this.schedule_cloud_push_debounce(cx);
+        })
+        .detach();
+        cx.observe_global::<desktop_common::sync::LiveCloudSnapshot>(|_, cx| {
+            cx.notify();
         })
         .detach();
         let _modal_escape_sub = cx.intercept_keystrokes(|event, _window, cx| {
@@ -450,6 +464,9 @@ impl AppView {
             sync: crate::sync::SyncStatus::Off,
             sync_task: None,
             sync_generation: 0,
+            cloud_sse_stop: None,
+            cloud_sse_task: None,
+            cloud_push_debounce: None,
             has_sync_config,
             always_on_top,
             last_tray_tooltip: "Fern".to_owned(),
@@ -514,6 +531,7 @@ impl AppView {
     }
 
     fn shutdown_for_main_window_close(&mut self, cx: &mut Context<Self>) {
+        self.stop_cloud_realtime(cx);
         self.flush_window_state();
         self.unmount_all_plugin_views(cx);
         self.close_settings(cx);
@@ -864,14 +882,15 @@ impl AppView {
         self.rail_items = prefs.rail_items;
         // The default list, smart list visibility, mini calendar, week start and horizons flag show up in the views.
         self.sync_external_all(cx);
-        self.has_sync_config = self.store.sync_config().ok().flatten().is_some();
+        self.has_sync_config =
+            !matches!(self.store.sync_mode(), Ok(fern_core::sync::SyncMode::Off) | Err(_));
         self.sync_generation = self.sync_generation.wrapping_add(1);
+        self.refresh_cloud_snapshot_from_store(cx);
         if self.has_sync_config {
-            if self.sync_task.is_none() {
-                self.start_sync(cx);
-            }
+            self.start_sync(cx);
         } else {
             self.sync_task = None;
+            self.stop_cloud_realtime(cx);
             if self.sync != crate::sync::SyncStatus::Off {
                 self.set_sync_status(crate::sync::SyncStatus::Off, cx);
             }
@@ -930,7 +949,18 @@ impl AppView {
             }
             self.settings = None;
         }
-        let handle = match settings_window::open(self.store.clone(), notes, initial_page, window, cx) {
+        let weak_for_sync = cx.weak_entity();
+        let sync_now_cb: Rc<dyn Fn(&mut App)> = Rc::new(move |cx| {
+            let _ = weak_for_sync.update(cx, |this, cx| this.sync_now(cx));
+        });
+        let handle = match settings_window::open(
+            self.store.clone(),
+            notes,
+            initial_page,
+            sync_now_cb,
+            window,
+            cx,
+        ) {
             Ok(handle) => handle,
             Err(err) => {
                 desktop_common::logging::log_error("settings", format!("failed to open Settings: {err:#}"));
@@ -1127,6 +1157,33 @@ impl Render for AppView {
             }
         };
         let on_avatar = cx.listener(|this, _, _, cx| this.set_account_menu(!this.account_menu_open, cx));
+        let avatar_badge = cx
+            .try_global::<desktop_common::sync::LiveCloudSnapshot>()
+            .map(|g| &g.0)
+            .filter(|s| s.signed_in)
+            .map(|snap| {
+                let status = theme.status();
+                let dot = if matches!(self.sync, crate::sync::SyncStatus::Failed(_)) {
+                    Some(status.error)
+                } else {
+                    match snap.realtime {
+                        desktop_common::sync::RealtimeStatus::Live => Some(status.success),
+                        desktop_common::sync::RealtimeStatus::Connecting => Some(status.warning),
+                        desktop_common::sync::RealtimeStatus::Disconnected => None,
+                        desktop_common::sync::RealtimeStatus::SessionExpired => Some(status.error),
+                    }
+                };
+                sidebar::AvatarBadge {
+                    initials: Some(snap.initials.clone()),
+                    status_dot: dot,
+                    tooltip: Some(if snap.display_name.trim().is_empty() {
+                        snap.email.clone()
+                    } else {
+                        format!("{} ({})", snap.display_name, snap.email)
+                    }),
+                }
+            })
+            .unwrap_or_default();
         let account_menu = self.account_menu_open.then(|| {
             PopoverAttachment::new(Placement::RightTop, self.render_account_menu(cx)).into_any_element()
         });
@@ -1178,6 +1235,7 @@ impl Render for AppView {
                     on_select,
                     on_start_rail_drag,
                     on_avatar,
+                    avatar_badge,
                     account_menu,
                     bell,
                     sync_button,

@@ -340,6 +340,7 @@ fn main() -> Result<()> {
         cx.set_global(DbPath(db_path));
         cx.set_global(db_health);
         cx.set_global(LiveSyncStatus::default());
+        cx.set_global(desktop_common::sync::LiveCloudSnapshot::default());
         ui::init_label_metrics(text_system, cx);
         theme::init(cx);
         user_themes::load(cx);
@@ -355,6 +356,7 @@ fn main() -> Result<()> {
         );
         apply_initial_theme(&initial_prefs.theme, system_dark, cx);
         cx.set_http_client(http::UreqHttpClient::new());
+        desktop_common::cloud_vault::bootstrap_os_keychain(cx);
         if let Err(err) = Assets.load_fonts(cx) {
             desktop_common::logging::log_error("app", format!("failed to load the fonts: {err:#}"));
         }

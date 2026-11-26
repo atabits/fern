@@ -690,3 +690,21 @@ fn e2ee_rejects_plaintext_downgrade_injection() -> Result<()> {
     assert_eq!(e2ee_client.sync_request()?.body["since"], 0);
     Ok(())
 }
+
+#[test]
+fn clear_synced_user_data_wipes_entities_without_tombstones() -> Result<()> {
+    let store = Store::open_in_memory()?;
+    let list = store.create_list("Account A List")?;
+    let task = store.add_task("Account A secret task")?;
+    store.set_list(task.id, Some(list.id))?;
+    assert!(store.has_unsent_changes()?);
+
+    store.clear_synced_user_data()?;
+
+    assert!(store.tasks()?.is_empty());
+    assert!(store.lists()?.is_empty());
+    // Must emit zero deletion tombstones so switching to Account B never deletes B's rows or uploads A's rows.
+    assert!(!store.has_unsent_changes()?);
+    assert!(store.changes_since(0)?.0.is_empty());
+    Ok(())
+}

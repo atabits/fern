@@ -218,13 +218,20 @@ fn match_secret_kv(text: &str, i: usize) -> Option<(usize, String)> {
         return None;
     }
     let rest = &text[i..];
-    let kw_len = if starts_with_ascii_ci(rest, "passphrase") {
-        "passphrase".len()
-    } else if starts_with_ascii_ci(rest, "token") {
-        "token".len()
-    } else {
-        return None;
-    };
+    let kw_len = [
+        "passphrase",
+        "password",
+        "recovery_key",
+        "refresh_token",
+        "access_token",
+        "auth_key",
+        "vault_key",
+        "ticket",
+        "token",
+    ]
+    .into_iter()
+    .find(|kw| starts_with_ascii_ci(rest, kw))
+    .map(str::len)?;
     let mut pos = kw_len;
     let key_quoted = prev_byte(text, i).filter(|b| *b == b'"' || *b == b'\'');
 
@@ -435,17 +442,23 @@ pub fn build_diagnostic_report(store: &Store, input: &DiagnosticInput<'_>) -> St
         }
     }
 
-    // Sync section (NEVER include server URL, bearer token, or E2EE passphrase)
+    // Sync section (NEVER include server URL, email, bearer token, vault key, or E2EE passphrase)
     let _ = writeln!(out);
     let _ = writeln!(out, "[Sync]");
-    match store.sync_config() {
-        Ok(Some(config)) => {
-            let configured = if config.is_configured() { "yes" } else { "no" };
+    match store.sync_mode() {
+        Ok(fern_core::sync::SyncMode::Cloud(_)) => {
+            let _ = writeln!(out, "mode: fern-cloud");
+            let _ = writeln!(out, "configured: yes");
+            let _ = writeln!(out, "e2ee: enabled (zero-knowledge)");
+        }
+        Ok(fern_core::sync::SyncMode::SelfHosted(config)) => {
             let e2ee = if config.passphrase.is_empty() { "disabled" } else { "enabled" };
-            let _ = writeln!(out, "configured: {configured}");
+            let _ = writeln!(out, "mode: self-hosted");
+            let _ = writeln!(out, "configured: yes");
             let _ = writeln!(out, "e2ee: {e2ee}");
         }
-        Ok(None) => {
+        Ok(fern_core::sync::SyncMode::Off) => {
+            let _ = writeln!(out, "mode: off");
             let _ = writeln!(out, "configured: no");
             let _ = writeln!(out, "e2ee: disabled");
         }

@@ -191,17 +191,18 @@ Your database (`tasks.db`), attachments, themes, plugins, and daily backups live
 
 ---
 
-### 🔐 Optional Self-Hosted Sync (E2EE)
+### 🔐 Optional Sync: Fern Cloud (Zero-Knowledge) & Self-Hosted `fern-server`
 
-Sync between devices by running `fern-server` on your own machine or VPS:
+Fern works 100% offline with zero account required. When you want seamless sync across Desktop and Web, choose whichever mode fits you:
+
+- **Fern Cloud (Zero-Knowledge E2EE, optional hosted service):** Sign in or create an account directly in **Settings → Data & Sync** (Desktop & Web) at **[fern.atabits.com](https://fern.atabits.com)**. Fern Cloud is an optional private hosted service operated by the author to help fund Fern's development — your password never leaves your device in plaintext (Argon2id + HKDF-SHA256 split-key, ChaCha20-Poly1305 vault key, offline Recovery Key, real-time SSE sync).
+- **Self-Hosted `fern-server`:** Run a single-binary sync server on your own machine or VPS:
 
 ```bash
 FERN_TOKEN=$(openssl rand -base64 32) fern-server --listen 127.0.0.1:8650
 ```
 
-Enter your server's HTTPS address, token, and an optional **Encryption Passphrase** in **Settings → Data & Sync**. With a passphrase set, Fern encrypts every synced task, note, and attachment client-side using **ChaCha20-Poly1305** (PBKDF2-HMAC-SHA256) before it ever leaves your device.
-
-Read **[docs/self-hosting.md](docs/self-hosting.md)** for the full security model, Caddy/Nginx TLS configs, Docker Compose, `systemd`, online backups, and attachment garbage collection.
+Enter your server's HTTPS address, token, and an optional **Encryption Passphrase** in **Settings → Data & Sync**. Read **[docs/self-hosting.md](docs/self-hosting.md)** for the full security model, Caddy/Nginx TLS configs, Docker Compose, `systemd`, online backups, and attachment garbage collection.
 
 ---
 
@@ -225,7 +226,7 @@ Fern **0.3** is actively developed and ready for daily desktop use, with a few c
 - **Unsigned desktop builds:** Windows SmartScreen and macOS Gatekeeper warn on first launch (see [Download](#2-download-desktop-recommended-for-daily-use) and [docs/code-signing.md](docs/code-signing.md)).
 - **Beta features:** **Things View** and the **Plugins Ecosystem** are marked Beta — APIs and visual details may still evolve.
 - **No native mobile app yet:** Use the **[Web Preview](https://fern.atabits.com)** from a browser today; a native Android client sharing `crates/core` via UniFFI is planned.
-- **Self-hosted sync only:** Fern has no centralized cloud account. Multi-device sync runs through your own `fern-server`.
+- **Optional zero-knowledge sync:** Fern works 100% offline out of the box, or syncs across Desktop and Web via zero-knowledge **Fern Cloud** or your own self-hosted `fern-server`.
 - **Automatic updates:** Desktop builds check GitHub Releases in the background and install on **Restart to Update** (configurable in **Settings → About**; `.deb` packages update through your system package manager).
 - **TickTick parity:** [docs/parity.md](docs/parity.md) tracks detailed parity status. Team/collaborative features (shared lists, assignees) are intentionally out of scope.
 
@@ -260,7 +261,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 script/package <target>                                      # build release packages into dist/
 ```
 
-- Read [docs/architecture.md](docs/architecture.md) and [AGENTS.md](AGENTS.md) before contributing.
+- Read [CONTRIBUTING.md](CONTRIBUTING.md), [docs/architecture.md](docs/architecture.md), and [AGENTS.md](AGENTS.md) before contributing.
+- All pull requests require agreement with the [Contributor License Agreement (CLA)](CLA.md).
+- Report security issues privately — see [SECURITY.md](SECURITY.md).
 - Code, comments, docs, and commit messages are in English.
 - UI strings live in `crates/i18n/src/` — add any new locale or string across all `Strings` tables.
 - Building an extension? Check out [docs/plugins/README.md](docs/plugins/README.md) and the `@fern/sdk` TypeScript/JSX workflow.
@@ -269,10 +272,13 @@ Thanks to [HeliusHao](https://github.com/HeliusHao) for contributing the Simplif
 
 ---
 
-## 📄 License
+## 📄 License & Governance
 
-Fern is free software licensed under the [GNU Affero General Public License v3.0 or later](LICENSE).  
-If you distribute a modified version or run one as a network service (such as a sync server), you must make its source available under the same license.
+Copyright © Amin Atabiev and contributors.
+
+- **Fern Desktop, `fern-server`, and all crates in this repository** are free software licensed under the [GNU Affero General Public License v3.0 or later](LICENSE) (`AGPL-3.0-or-later`). If you distribute a modified version or operate one as a network service, you must make its complete corresponding source code available under the same license.
+- **Fern Cloud** (the optional hosted multi-tenant sync service at `fern.atabits.com`) is a separate private service operated by the copyright holder to sustain development. Fern never requires Fern Cloud and works 100% locally offline or with the open-source `fern-server`.
+- **Contributions** to this repository require agreement with [CLA.md](CLA.md) so the maintainer can legally sustain the project, publish to platform app stores, and operate Fern Cloud while keeping Fern open source under AGPL-3.0-or-later.
 
 Third-party components:
 - [GPUI](https://github.com/zed-industries/zed): Apache-2.0 (`crates/desktop_common/src/text_input/` started from GPUI's `examples/input.rs`).

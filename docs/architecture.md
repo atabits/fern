@@ -45,13 +45,14 @@ apps/
 - Cross-view actions flow through GPUI `EventEmitter` + `cx.subscribe` / `cx.subscribe_in` in `apps/desktop/src/app_view.rs`, and cross-window refresh uses `desktop_common::data_version::data_changed`.
 - `crates/core` has no GPUI dependency, enabling reuse across `apps/server`, WebAssembly targets, and future mobile clients (via UniFFI).
 
-## Sync & End-to-End Encryption
+## Sync, Fern Cloud & End-to-End Encryption
 
-Devices sync through a self-hosted `fern-server` row by row (`crates/core/src/sync.rs` and `crates/desktop_sync/`):
+Devices can stay 100% local, sync through **Fern Cloud**, or sync through a self-hosted `fern-server` row by row (`crates/core/src/sync.rs`, `crates/core/src/cloud.rs`, and `crates/desktop_sync/`):
 
 - SQLite triggers record every write to synced tables in `sync_log` (`table`, `row key`, `timestamp`), so all write paths are captured consistently. `compact_sync_log` retains only the latest entry per row.
 - Each device sends `changes_since(position)` and applies remote changes with `apply_changes` using last-write-wins watermarks, deferred foreign-key validation at commit, and echo suppression so applied changes are not re-logged.
-- **Protocol v2 & E2EE:** When an encryption passphrase is configured, clients derive a 256-bit key via PBKDF2-HMAC-SHA256 and encrypt row payloads and attachment blobs locally with **ChaCha20-Poly1305** and domain-separated AAD before upload (see [self-hosting.md](self-hosting.md)).
+- **Fern Cloud Zero-Knowledge Vault (`crates/core/src/cloud.rs`):** Accounts use a split-key design. Clients run **Argon2id** (`m=19456 KiB, t=2, p=1`, unique 16-byte salt) and split the master key via **HKDF-SHA256** into an `auth_key` (sent over TLS and hashed again server-side with Argon2id) and a client-only `kek` that unwraps a random 256-bit `VaultKey` (ChaCha20-Poly1305). A 256-bit Crockford Base32 **Recovery Key** independently wraps the same `VaultKey`, enabling password changes and recovery without re-encrypting rows. On Desktop, sessions persist in an OS-protected `cloud-session.vault` whose master key is stored in the OS keychain via GPUI (Windows Credential Manager, macOS Keychain, Linux Secret Service, with DPAPI/`0600` local fallback); HTTP calls share pooled keep-alive agents behind a single-flight session coordinator, and real-time cross-device push uses single-use-ticket Server-Sent Events (`/api/v1/events`).
+- **Self-Hosted Protocol v2 & E2EE (`apps/server`):** When an encryption passphrase is configured for `fern-server`, clients derive a 256-bit key via PBKDF2-HMAC-SHA256 and encrypt row payloads and attachment blobs locally with **ChaCha20-Poly1305** and domain-separated AAD before upload (see [self-hosting.md](self-hosting.md)).
 - `fern-server` (`apps/server`) persists the latest change of each row with a monotonic server sequence number in SQLite (`POST /sync`), stores attachment and countdown-cover blobs in `<data>.files/` (`PUT`/`GET`/`DELETE /files/<key>`), exposes `GET /health` and `POST /gc`, and speaks plain HTTP behind a TLS reverse proxy.
 - Device-local preferences (such as active views, theme mode, and habit snoozes) are intentionally not synced so each device can keep its own layout.
 

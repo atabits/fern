@@ -26,6 +26,7 @@ use ui::v_scroll;
 mod appearance_view;
 mod backups;
 mod backups_diagnostics;
+mod cloud_page;
 mod integrations;
 mod pages;
 mod shortcuts_settings_view;
@@ -41,6 +42,7 @@ const SYNC_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Page {
+    Cloud,
     Features,
     Notifications,
     SmartList,
@@ -147,6 +149,7 @@ pub struct SettingsHost {
     pub check_for_updates: Rc<dyn Fn(&mut App)>,
     pub restart_to_update: Rc<dyn Fn(&mut App)>,
     pub observe_updater: SettingsObserverFn,
+    pub sync_now: Rc<dyn Fn(&mut App)>,
 }
 
 struct EmptyHostView;
@@ -181,6 +184,7 @@ impl SettingsHost {
             check_for_updates: Rc::new(|_| {}),
             restart_to_update: Rc::new(|_| {}),
             observe_updater: Rc::new(|_| None),
+            sync_now: Rc::new(|_| {}),
         }
     }
 }
@@ -253,6 +257,7 @@ pub struct SettingsWindow {
     tray: TrayState,
     installed_notes: Option<Rc<ReleaseNotes>>,
     release_notes: Option<Rc<ReleaseNotes>>,
+    cloud: cloud_page::CloudSettingsState,
     sync: SyncSettingsState,
     subs: SubscriptionSettingsState,
     backups: BackupSettingsState,
@@ -357,9 +362,12 @@ impl SettingsWindow {
         let sync_server = field("https://fern.example.org", config.server, false, cx);
         let sync_token = field("", config.token, true, cx);
         let sync_passphrase = field(i18n::t(cx).sync_passphrase_placeholder, config.passphrase, true, cx);
+        let cloud = cloud_page::CloudSettingsState::new(cx);
         let updates = (host.observe_updater)(cx);
         let feeds = subscriptions::feeds(cx).map(|feeds| cx.observe(&feeds, |_, _, cx| cx.notify()));
         let tray_sub = (host.observe_tray)(cx);
+        cx.observe_global::<desktop_common::sync::LiveCloudSnapshot>(|_, cx| cx.notify())
+            .detach();
         cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
             this.refresh_cached_collections(cx);
         })
@@ -399,6 +407,7 @@ impl SettingsWindow {
             tray,
             installed_notes,
             release_notes: None,
+            cloud,
             sync: SyncSettingsState {
                 server: sync_server,
                 token: sync_token,
@@ -488,6 +497,7 @@ impl SettingsWindow {
             this.sync.passphrase.update(cx, |input, cx| {
                 input.set_placeholder(strings.sync_passphrase_placeholder, cx);
             });
+            this.cloud.refresh_placeholders(strings, cx);
             this.subs.name.update(cx, |input, cx| {
                 input.set_placeholder(strings.subscription_name_placeholder, cx);
             });
@@ -565,6 +575,9 @@ impl SettingsWindow {
         self.themes.save_error = None;
         if page == Page::About {
             self.refresh_auto_backups(cx);
+        }
+        if matches!(page, Page::Cloud | Page::Sync) {
+            self.load_cloud_details_if_signed_in(cx);
         }
         #[cfg(not(test))]
         if changed && page == Page::Shortcuts {
@@ -673,6 +686,7 @@ impl SettingsWindow {
             desktop_common::data_version::data_changed(cx.entity_id(), cx);
         }
         let page = match page {
+            "cloud" => Page::Cloud,
             "smart-list" => Page::SmartList,
             "appearance" => Page::Appearance,
             "more" => Page::More,
@@ -750,6 +764,116 @@ impl SettingsWindow {
             item(id, icon, strings.settings_pages[index], self.page == target)
                 .on_click(cx.listener(move |this, _, _, cx| this.set_page(target, cx)))
         };
+        let cloud_meta = self.store.cloud_meta().ok().flatten();
+        let signed_in = cloud_meta.is_some();
+        let cloud_card = cloud_meta.map(|meta| {
+            let theme = cx.theme().clone();
+            let colors = theme.colors();
+            let status_colors = theme.status();
+            let cloud_snap = cx
+                .try_global::<desktop_common::sync::LiveCloudSnapshot>()
+                .map(|g| g.0.clone())
+                .unwrap_or_default();
+            let cloud_selected = self.page == Page::Cloud;
+            let title = if !meta.display_name.trim().is_empty() {
+                meta.display_name.clone()
+            } else {
+                meta.email.split('@').next().unwrap_or("Fern").to_owned()
+            };
+            let live_dot = match cloud_snap.realtime {
+                desktop_common::sync::RealtimeStatus::Live => Some(status_colors.success),
+                desktop_common::sync::RealtimeStatus::Connecting => Some(status_colors.warning),
+                desktop_common::sync::RealtimeStatus::Disconnected => None,
+                desktop_common::sync::RealtimeStatus::SessionExpired => Some(status_colors.error),
+            };
+            let initials = meta.initials();
+            div()
+                .id("settings-cloud-card")
+                .debug_selector(|| "settings-cloud".to_owned())
+                .mb_2()
+                .p_2()
+                .rounded(px(10.))
+                .cursor_pointer()
+                .bg(if cloud_selected {
+                    colors.element_selected
+                } else {
+                    colors.surface_background
+                })
+                .border_1()
+                .border_color(if cloud_selected {
+                    colors.accent.opacity(0.45)
+                } else {
+                    colors.border_variant
+                })
+                .hover(|s| {
+                    s.bg(if cloud_selected {
+                        colors.element_selected
+                    } else {
+                        colors.element_hover
+                    })
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Cloud, cx)))
+                .child(
+                    h_flex()
+                        .gap_2p5()
+                        .items_center()
+                        .child(
+                            div()
+                                .relative()
+                                .size(px(34.))
+                                .flex_none()
+                                .rounded(px(9.))
+                                .bg(colors.accent.opacity(0.16))
+                                .border_1()
+                                .border_color(colors.accent.opacity(0.32))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(colors.accent)
+                                        .child(initials),
+                                )
+                                .when_some(live_dot, |el, dot| {
+                                    el.child(
+                                        div()
+                                            .absolute()
+                                            .bottom(px(-2.))
+                                            .right(px(-2.))
+                                            .size(px(9.))
+                                            .rounded_full()
+                                            .bg(dot)
+                                            .border_1()
+                                            .border_color(colors.panel_background),
+                                    )
+                                }),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    Label::new(title)
+                                        .size(LabelSize::Small)
+                                        .weight(FontWeight::SEMIBOLD)
+                                        .truncate(),
+                                )
+                                .child(
+                                    Label::new(meta.email)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                        )
+                        .child(
+                            Icon::new(IconName::ChevronRight)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+        });
         v_flex()
             .flex_none()
             .w(px(240.))
@@ -767,6 +891,10 @@ impl SettingsWindow {
                         .pr(px(12.))
                         .pb_2()
                         .gap_0p5()
+                        .when_some(cloud_card, |nav, card| {
+                            nav.child(card)
+                                .child(div().px_1().pb_1p5().child(Divider::horizontal()))
+                        })
                         .child(
                             item("settings-features", IconName::LayoutGrid, strings.features, self.page == Page::Features)
                                 .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Features, cx))),
@@ -784,8 +912,13 @@ impl SettingsWindow {
                                 .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sticky, cx))),
                         )
                         .child(
-                            item("settings-sync", IconName::RefreshCw, strings.data_and_sync, self.page == Page::Sync)
-                                .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sync, cx))),
+                            item(
+                                "settings-sync",
+                                IconName::RefreshCw,
+                                strings.data_and_sync,
+                                self.page == Page::Sync || (self.page == Page::Cloud && !signed_in),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sync, cx))),
                         )
                         .child(
                             item("settings-integrations", IconName::CalendarDays, strings.integrations, self.page == Page::Integrations)
@@ -970,7 +1103,7 @@ impl Render for SettingsWindow {
         let about = strings.settings_pages[5];
         let page = match &self.release_notes {
             Some(notes) => self.render_release_notes(notes, cx),
-            None => self.render_page(cx),
+            None => self.render_page(window, cx),
         };
         let chrome = SettingsChrome::for_window(window, cx);
         let overlays = (self.host.render_plugin_overlays)(window, cx);

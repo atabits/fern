@@ -124,10 +124,79 @@ impl AppView {
 
     pub(super) fn render_account_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let colors = theme.colors();
+        let status = theme.status();
         let topmost = self.always_on_top;
+        let cloud = cx
+            .try_global::<desktop_common::sync::LiveCloudSnapshot>()
+            .map(|g| g.0.clone())
+            .filter(|s| s.signed_in);
         popover(cx)
-            .min_w(px(196.))
+            .min_w(px(224.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_account_menu(false, cx)))
+            .when_some(cloud, |menu, snap| {
+                let title = if snap.display_name.trim().is_empty() {
+                    snap.email.clone()
+                } else {
+                    snap.display_name.clone()
+                };
+                let rt_color = match snap.realtime {
+                    desktop_common::sync::RealtimeStatus::Live => status.success,
+                    desktop_common::sync::RealtimeStatus::Connecting => status.warning,
+                    desktop_common::sync::RealtimeStatus::Disconnected => colors.text_muted,
+                    desktop_common::sync::RealtimeStatus::SessionExpired => status.error,
+                };
+                menu.child(
+                    v_flex()
+                        .px_3()
+                        .py_2()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .size(px(8.))
+                                        .rounded_full()
+                                        .flex_none()
+                                        .bg(rt_color),
+                                )
+                                .child(
+                                    Label::new(title)
+                                        .size(LabelSize::Small)
+                                        .weight(gpui::FontWeight::SEMIBOLD)
+                                        .truncate(),
+                                ),
+                        )
+                        .child(
+                            Label::new(snap.email)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                        .child(Chip::new(strings.cloud_e2ee_badge, status.success)),
+                )
+                .child(
+                    ListItem::new("account-cloud-sync-now")
+                        .start_slot(Icon::new(IconName::RefreshCw).color(Color::Icon))
+                        .child(Label::new(strings.cloud_sync_now))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.account_menu_open = false;
+                            this.sync_now(cx);
+                        })),
+                )
+                .child(
+                    ListItem::new("account-cloud-manage")
+                        .start_slot(Icon::new(IconName::User).color(Color::Accent))
+                        .child(Label::new(strings.cloud_manage_account))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_settings_page(settings_window::Page::Cloud, window, cx);
+                        })),
+                )
+                .child(div().my_1().child(Divider::horizontal()))
+            })
             .child(
                 ListItem::new("account-settings")
                     .start_slot(Icon::new(IconName::Settings).color(Color::Icon))

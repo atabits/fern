@@ -5,6 +5,7 @@ pub mod agenda;
 pub mod attachment;
 pub mod caldav;
 pub mod calendar_options;
+pub mod cloud;
 pub mod countdown;
 pub mod e2ee;
 pub mod filter;

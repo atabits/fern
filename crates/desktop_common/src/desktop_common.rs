@@ -1,6 +1,8 @@
 pub mod actions;
 pub mod active_preferences;
 pub mod calendar;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cloud_vault;
 pub mod colors;
 pub mod completion_mark;
 pub mod countdown_helpers;
@@ -28,7 +30,10 @@ pub mod sticky_windows;
 pub mod sync_types;
 pub mod sync {
     pub use crate::sync_types::{
-        SyncStatus, attachment_error, is_e2ee_error, is_incompatible_protocol,
+        CloudApiError, CloudAttachmentBridge, CloudAttachmentOpenFn, CloudAttachmentUploadFn,
+        CloudSyncSnapshot, LiveCloudSnapshot, RealtimeStatus, SyncStatus, attachment_error,
+        cloud_api_error, is_e2ee_error, is_grace_conflict, is_incompatible_protocol,
+        is_session_expired, rate_limit_retry_after,
     };
 }
 pub mod task_ops;

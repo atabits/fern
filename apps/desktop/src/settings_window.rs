@@ -17,6 +17,7 @@ pub use settings_ui::{
 
 fn build_host_with_plugins(
     store: Rc<Store>,
+    sync_now: Rc<dyn Fn(&mut App)>,
     cx: &mut App,
 ) -> (SettingsHost, Entity<plugin_ui::PluginSettingsView>) {
     let plugin_settings = cx.new(|cx| plugin_ui::PluginSettingsView::new(store.clone(), cx));
@@ -125,6 +126,7 @@ fn build_host_with_plugins(
         observe_updater: Rc::new(|cx| {
             updater::updater(cx).map(|updater| cx.observe(&updater, |_, _, cx| cx.notify()))
         }),
+        sync_now,
     };
     (host, plugin_settings)
 }
@@ -134,10 +136,11 @@ pub fn open(
     store: Rc<Store>,
     notes: Option<Rc<ReleaseNotes>>,
     initial_page: Option<Page>,
+    sync_now: Rc<dyn Fn(&mut App)>,
     parent: &Window,
     cx: &mut App,
 ) -> anyhow::Result<WindowHandle<SettingsWindow>> {
-    let (host, _) = build_host_with_plugins(store.clone(), cx);
+    let (host, _) = build_host_with_plugins(store.clone(), sync_now, cx);
     settings_ui::open(store, host, notes, initial_page, parent, cx)
 }
 
@@ -176,7 +179,7 @@ mod tests {
         let plugin_settings_holder = Rc::new(std::cell::RefCell::new(None));
         let holder = Rc::clone(&plugin_settings_holder);
         let (settings, cx) = app_cx.add_window_view(|window, cx| {
-            let (host, plugin_settings) = build_host_with_plugins(store.clone(), cx);
+            let (host, plugin_settings) = build_host_with_plugins(store.clone(), Rc::new(|_| {}), cx);
             *holder.borrow_mut() = Some(plugin_settings);
             let mut settings = SettingsWindow::new(store, host, cx);
             settings.set_page(Page::Plugins, cx);

@@ -944,6 +944,24 @@ impl Store {
         Ok(attachment)
     }
 
+    /// Records metadata for a file already encrypted and uploaded directly to Fern Cloud
+    /// (used by browser WASM builds without a host filesystem attachments directory).
+    pub fn save_cloud_attachment_record(&self, attachment: &Attachment) -> Result<Attachment> {
+        let count = self.conn.execute(
+            "INSERT INTO task_attachments (id, task_id, name, size, created_at)
+             SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ?2 AND deleted_at IS NULL)",
+            params![
+                attachment.id.to_string(),
+                attachment.task_id.to_string(),
+                attachment.name,
+                attachment.size as i64,
+                attachment.created_at,
+            ],
+        )?;
+        anyhow::ensure!(count == 1, "cannot attach to a deleted or missing task");
+        Ok(attachment.clone())
+    }
+
     /// A task's attachments, oldest first.
     pub fn attachments(&self, task: Id) -> Result<Vec<Attachment>> {
         let mut stmt = self.conn.prepare_cached(

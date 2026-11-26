@@ -173,6 +173,18 @@ impl TextInput {
         self
     }
 
+    pub fn is_masked(&self) -> bool {
+        self.masked
+    }
+
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        if self.masked != masked {
+            self.masked = masked;
+            self.last_layout = None;
+            cx.notify();
+        }
+    }
+
     /// Toggles read-only mode: text can still be selected and copied, but edits are ignored.
     pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
         if self.read_only != read_only {

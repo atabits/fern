@@ -122,6 +122,16 @@ pub fn plugin_secrets_key_path() -> Result<std::path::PathBuf> {
     Ok(data_dir()?.join("plugin-secrets.key"))
 }
 
+/// Encrypted Fern Cloud session vault file, stored outside `tasks.db` and excluded from backups/sync.
+pub fn cloud_session_path() -> Result<std::path::PathBuf> {
+    Ok(data_dir()?.join("cloud-session.vault"))
+}
+
+/// Master key file for `cloud-session.vault` (DPAPI-protected on Windows, `0600` on Unix).
+pub fn cloud_session_key_path() -> Result<std::path::PathBuf> {
+    Ok(data_dir()?.join("cloud-session.key"))
+}
+
 /// Offline registry catalog and ETag cache directory (`<data_dir>/plugins/.registry-cache`).
 pub fn plugin_registry_cache_dir() -> Result<std::path::PathBuf> {
     Ok(plugins_dir()?.join(".registry-cache"))

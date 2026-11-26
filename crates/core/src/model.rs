@@ -221,9 +221,14 @@ pub struct Attachment {
 }
 
 impl Attachment {
+    /// Canonical storage filename (`<id>-<name>`) shared across local disk and cloud E2EE sync.
+    pub fn storage_name(&self) -> String {
+        format!("{}-{}", self.id, self.name)
+    }
+
     /// Where the copy lives in the attachment folder `dir`.
     pub fn path(&self, dir: &std::path::Path) -> std::path::PathBuf {
-        dir.join(format!("{}-{}", self.id, self.name))
+        dir.join(self.storage_name())
     }
 }
 

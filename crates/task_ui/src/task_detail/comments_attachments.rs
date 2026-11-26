@@ -207,6 +207,8 @@ impl TaskDetail {
                 None => self.session.attachments_dir.as_ref().map(|dir| attachment.path(dir)),
             };
             let removed = attachment.clone();
+            let storage_name = attachment.storage_name();
+            let display_name = attachment.name.clone();
             let att_id = attachment.id;
             let group_name = SharedString::from(format!("attachment-{att_id}"));
             let is_image = attachment
@@ -281,6 +283,8 @@ impl TaskDetail {
                 .on_click(move |_, _, cx| {
                     if let Some(path) = &path {
                         cx.open_with_system(path);
+                    } else if let Some(bridge) = cx.try_global::<desktop_common::sync::CloudAttachmentBridge>().cloned() {
+                        (bridge.open)(storage_name.clone(), display_name.clone(), cx);
                     }
                 })
         }))

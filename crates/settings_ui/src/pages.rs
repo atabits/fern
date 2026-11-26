@@ -392,7 +392,7 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    pub(super) fn render_page(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_page(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let body = v_flex()
             .id("settings-page")
             .debug_selector(|| "settings-page".to_owned())
@@ -404,13 +404,14 @@ impl SettingsWindow {
             .pb_6()
             .gap_4();
         let page = match self.page {
+            Page::Cloud => self.render_cloud_page(body, window, cx),
             Page::SmartList => self.render_smart_list_page(body, cx),
             Page::DateTime => self.render_date_time_page(body, cx),
             Page::Appearance => body.child(self.render_appearance(cx)).into_any_element(),
             Page::More => self.render_more_page(body, cx),
             Page::Notifications => self.render_notifications_page(body, cx),
             Page::Features => self.render_features_page(body, cx),
-            Page::Sync => self.render_sync_page(body, cx),
+            Page::Sync => self.render_sync_page(body, window, cx),
             Page::Integrations => body.children(self.render_integrations(cx)).into_any_element(),
             Page::Plugins => {
                 return div()
@@ -1154,80 +1155,67 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn render_sync_page(&self, body: Stateful<Div>, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sync_page(
+        &self,
+        body: Stateful<Div>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use gpui::Focusable as _;
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let colors = theme.colors();
+        let cloud_card = self.render_cloud_summary_card(cx);
         let field = |id: &'static str, label: &'static str, input: Entity<TextInput>| {
+            let focused = input.focus_handle(cx).is_focused(window);
             h_flex()
-                .h(px(40.))
+                .h(px(42.))
                 .px_4()
                 .gap_4()
-                .child(div().w(px(110.)).flex_none().child(Label::new(label).truncate()))
+                .child(
+                    div()
+                        .w(px(110.))
+                        .flex_none()
+                        .child(Label::new(label).size(LabelSize::Small).truncate()),
+                )
                 .child(
                     div()
                         .debug_selector(move || id.to_owned())
                         .flex_1()
                         .min_w_0()
                         .overflow_hidden()
-                        .h(px(28.))
-                        .px_2()
+                        .h(px(32.))
+                        .px_2p5()
                         .flex()
                         .items_center()
-                        .rounded(px(6.))
+                        .rounded(px(7.))
                         .bg(colors.background)
+                        .border_1()
+                        .border_color(if focused { colors.accent } else { colors.border })
+                        .text_size(px(13.))
                         .child(input),
                 )
         };
         let folder = paths::data_dir()
             .map(|dir| dir.display().to_string())
             .unwrap_or_default();
-        body.child(page_title(strings.data_on_device))
-            .child(
-                page_group(colors.surface_background).child(
-                    h_flex()
-                        .h(px(ROW_HEIGHT))
-                        .px_4()
-                        .gap_4()
-                        .child(Label::new(strings.data_folder))
-                        .child(
-                            div()
-                                .id("data-folder-path")
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .tooltip(Tooltip::text(folder.clone()))
-                                .child(Label::new(folder).color(Color::Muted).truncate()),
-                        )
-                        .child(
-                            Button::new("open-data-folder", strings.open_folder)
-                                .variant(ButtonVariant::Secondary)
-                                .size(ButtonSize::Sm)
-                                .on_click(|_, _, cx| {
-                                    if let Ok(dir) = paths::data_dir() {
-                                        cx.open_with_system(&dir);
-                                    }
-                                }),
-                        ),
-                ),
-            )
-            .child(
-                div()
-                    .pt_2()
-                    .pb_4()
-                    .px_1()
-                    .text_size(px(12.))
-                    .text_color(colors.text_muted)
-                    .child(strings.data_hint),
-            )
+        body.child(cloud_card)
             .child(
                 v_flex()
                     .gap_1p5()
                     .child(page_title(strings.sync_optional))
                     .child(
                         page_group(colors.surface_background)
-                            .child(field("sync-server-input", strings.sync_server, self.sync.server.clone()))
-                            .child(field("sync-token-input", strings.sync_token, self.sync.token.clone()))
+                            .child(field(
+                                "sync-server-input",
+                                strings.sync_server,
+                                self.sync.server.clone(),
+                            ))
+                            .child(field(
+                                "sync-token-input",
+                                strings.sync_token,
+                                self.sync.token.clone(),
+                            ))
                             .child(field(
                                 "sync-passphrase-input",
                                 strings.sync_passphrase,
@@ -1238,16 +1226,56 @@ impl SettingsWindow {
                         div()
                             .pt_1()
                             .px_1()
-                            .text_size(px(12.))
+                            .text_size(px(11.5))
                             .text_color(colors.text_muted)
                             .child(strings.sync_passphrase_hint),
                     )
                     .child(
                         div()
                             .px_1()
-                            .text_size(px(12.))
+                            .text_size(px(11.5))
                             .text_color(colors.text_muted)
                             .child(strings.sync_hint),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .child(page_title(strings.data_on_device))
+                    .child(
+                        page_group(colors.surface_background).child(
+                            h_flex()
+                                .h(px(ROW_HEIGHT))
+                                .px_4()
+                                .gap_4()
+                                .child(Label::new(strings.data_folder))
+                                .child(
+                                    div()
+                                        .id("data-folder-path")
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .tooltip(Tooltip::text(folder.clone()))
+                                        .child(Label::new(folder).color(Color::Muted).truncate()),
+                                )
+                                .child(
+                                    Button::new("open-data-folder", strings.open_folder)
+                                        .variant(ButtonVariant::Secondary)
+                                        .size(ButtonSize::Sm)
+                                        .on_click(|_, _, cx| {
+                                            if let Ok(dir) = paths::data_dir() {
+                                                cx.open_with_system(&dir);
+                                            }
+                                        }),
+                                ),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .px_1()
+                            .text_size(px(11.5))
+                            .text_color(colors.text_muted)
+                            .child(strings.data_hint),
                     ),
             )
             .into_any_element()

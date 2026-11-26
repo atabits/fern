@@ -637,6 +637,12 @@ impl TaskDetail {
             return;
         }
         let Some(task) = self.session.task.as_ref().filter(|task| !task.is_deleted()).map(|task| task.id) else { return };
+        if self.session.attachments_dir.is_none()
+            && let Some(bridge) = cx.try_global::<desktop_common::sync::CloudAttachmentBridge>().cloned()
+        {
+            (bridge.upload)(task, cx);
+            return;
+        }
         let chosen = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: true, prompt: None });
         cx.spawn(async move |this, cx| {
             let Some(paths) = chosen.await.ok().and_then(Result::ok).flatten() else { return };

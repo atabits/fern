@@ -307,6 +307,14 @@ pub struct SyncButton {
     pub on_click: ClickCallback,
 }
 
+/// Optional signed-in Fern Cloud avatar appearance for the top-left account tile.
+#[derive(Clone, Debug, Default)]
+pub struct AvatarBadge {
+    pub initials: Option<String>,
+    pub status_dot: Option<Hsla>,
+    pub tooltip: Option<String>,
+}
+
 /// `account_menu` is rendered next to the avatar while the account menu is open.
 #[allow(clippy::too_many_arguments)]
 pub fn render(
@@ -319,6 +327,7 @@ pub fn render(
     on_select: impl Fn(Section, &mut Window, &mut App) + Clone + 'static,
     on_start_drag: impl Fn(Section, &mut App) + Clone + 'static,
     on_avatar: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    avatar_badge: AvatarBadge,
     account_menu: Option<AnyElement>,
     bell: Bell,
     sync: Option<SyncButton>,
@@ -492,15 +501,51 @@ pub fn render(
                 .mb(px(7.))
                 .size(px(32.))
                 .rounded(px(6.))
-                .bg(colors.avatar_background)
+                .bg(if avatar_badge.initials.is_some() {
+                    colors.accent.opacity(0.20)
+                } else {
+                    colors.avatar_background
+                })
+                .when(avatar_badge.initials.is_some(), |el| {
+                    el.border_1().border_color(colors.accent.opacity(0.45))
+                })
                 .flex()
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
                 .hover(|s| s.opacity(0.85))
-                .when(account_menu.is_none(), |el| el.tooltip(Tooltip::text(strings.settings)))
+                .when(account_menu.is_none(), |el| {
+                    let tip = avatar_badge
+                        .tooltip
+                        .unwrap_or_else(|| strings.settings.to_owned());
+                    el.tooltip(Tooltip::text(tip))
+                })
                 .on_click(on_avatar)
-                .child(Icon::new(IconName::User).color(colors.avatar_icon))
+                .child(if let Some(initials) = avatar_badge.initials {
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(colors.sidebar_icon)
+                        .child(initials)
+                        .into_any_element()
+                } else {
+                    Icon::new(IconName::User)
+                        .color(colors.avatar_icon)
+                        .into_any_element()
+                })
+                .when_some(avatar_badge.status_dot, |el, dot| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .bottom(px(-2.))
+                            .right(px(-2.))
+                            .size(px(9.))
+                            .rounded_full()
+                            .bg(dot)
+                            .border_1()
+                            .border_color(colors.sidebar_border),
+                    )
+                })
                 .children(account_menu),
         )
         // Scroll the section icons in a short window so the controls below stay reachable.

@@ -528,10 +528,16 @@ fn automatic_gc_runs_after_sync_threshold() {
         let (status, _) = http_request(http.port, "POST", "/sync", Some(token), sync_body);
         assert_eq!(status, 200);
     }
-    // Automatic GC runs right after sending the 200th response; synchronize with a follow-up request.
+    // Automatic GC runs right after sending the threshold response on its worker thread;
+    // poll briefly so Windows CI does not race against concurrent `/health` handling.
     assert_eq!(http_request(http.port, "GET", "/health", None, b"").0, 200);
+    let orphan = files_dir.join("stale-orphan.bin");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while orphan.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(
-        !files_dir.join("stale-orphan.bin").exists(),
+        !orphan.exists(),
         "automatic GC should remove orphaned files after reaching sync threshold"
     );
 

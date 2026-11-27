@@ -202,19 +202,33 @@ jobs:
 
   publish-aur:
     name: Update AUR (optional)
-    if: inputs.release && github.ref == 'refs/heads/main' && secrets.AUR_SSH_PRIVATE_KEY != ''
+    if: inputs.release && github.ref == 'refs/heads/main'
     needs: [package, release]
     runs-on: ubuntu-24.04
+    env:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
     steps:
+      - name: Check AUR secret
+        id: check
+        run: |
+          if [ -n "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.check.outputs.enabled == 'true'
 
       - uses: actions/download-artifact@v4
+        if: steps.check.outputs.enabled == 'true'
         with:
           path: dist
           pattern: fern-*-unknown-linux-gnu
           merge-multiple: true
 
       - name: Update AUR PKGBUILD and .SRCINFO
+        if: steps.check.outputs.enabled == 'true'
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1 | tr -d '\r')
           sha_x86=$(sha256sum "dist/fern-${version}-linux-x86_64.tar.gz" | awk '{print $1}')
@@ -222,8 +236,7 @@ jobs:
           bash script/update-aur "$version" "$sha_x86" "$sha_arm"
 
       - name: Push to AUR
-        env:
-          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        if: steps.check.outputs.enabled == 'true'
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur_ed25519

@@ -1,5 +1,5 @@
 Name:           fern-tasks
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Tasks, horizons, calendar, habits, focus, and plugins in one native app
 
@@ -72,5 +72,8 @@ appstreamcli validate --no-net %{buildroot}%{_datadir}/metainfo/io.github.atabit
 %{_datadir}/icons/hicolor/scalable/apps/fern.svg
 
 %changelog
+* Fri Nov 27 2026 Amin Atabiev <endlessspring.of@gmail.com> - 0.4.0-1
+- Add zero-knowledge Fern Cloud sync, OS keychain vault, realtime SSE, and performance/UI polish
+
 * Tue Nov 24 2026 Amin Atabiev <endlessspring.of@gmail.com> - 0.3.0-1
 - Initial Fedora/COPR package release

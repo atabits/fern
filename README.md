@@ -221,7 +221,7 @@ Fern is not affiliated with, endorsed by, or connected to TickTick or its develo
 
 ## ⚠️ Important Notes
 
-Fern **0.3** is actively developed and ready for daily desktop use, with a few caveats to keep in mind:
+Fern **0.4** is actively developed and ready for daily desktop use, with a few caveats to keep in mind:
 
 - **Unsigned desktop builds:** Windows SmartScreen and macOS Gatekeeper warn on first launch (see [Download](#2-download-desktop-recommended-for-daily-use) and [docs/code-signing.md](docs/code-signing.md)).
 - **Beta features:** **Things View** and the **Plugins Ecosystem** are marked Beta — APIs and visual details may still evolve.
